@@ -1,0 +1,24 @@
+server:
+  host: 127.0.0.1
+  port: 43211
+  ui_dist: ""
+  debug: false
+
+supabase:
+  url: ${ANIRAKU_SUPABASE_URL}
+  anon_key: ${ANIRAKU_SUPABASE_ANON_KEY}
+  service_key: ${ANIRAKU_SUPABASE_SERVICE_KEY}
+  jwt_aud: authenticated
+  jwks_url: ${ANIRAKU_SUPABASE_URL}/.well-known/jwks.json
+
+providers:
+  primary: miruro
+  fallback: senshi
+
+logging:
+  level: info
+  format: json
+
+update:
+  channel: stable
+  url: https://api.aniraku.app/update

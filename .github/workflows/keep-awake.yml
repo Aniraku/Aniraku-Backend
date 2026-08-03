@@ -1,0 +1,73 @@
+name: keep-awake
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # Every 5 minutes
+  workflow_dispatch:
+
+concurrency:
+  group: keep-awake
+  cancel-in-progress: true   # Prevent overlapping runs
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+
+    steps:
+      - name: Aggressive keep-alive ping
+        run: |
+          set +e   # Don't exit on first failure
+
+          ENDPOINTS=(
+            "https://aniraku-backend.onrender.com/api/v1/health"
+            "https://miruro-api-v3.onrender.com/"
+          )
+
+          ping_url() {
+            local url=$1
+            local attempt=$2
+            local code
+
+            code=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 12 \
+              --connect-timeout 8 \
+              -H "User-Agent: GitHub-KeepAlive/2.0" \
+              -L \
+              "$url")
+
+            if [[ "$code" =~ ^(200|201|204|301|302)$ ]]; then
+              echo "[OK]  $url → $code (attempt $attempt)"
+              return 0
+            else
+              echo "[FAIL] $url → $code (attempt $attempt)"
+              return 1
+            fi
+          }
+
+          echo "===== Keep-Alive started at $(date -u) ====="
+
+          for url in "${ENDPOINTS[@]}"; do
+            success=false
+            for i in 1 2 3; do
+              if ping_url "$url" "$i"; then
+                success=true
+                break
+              fi
+              sleep $((i * 4))   # 4s → 8s backoff
+            done
+
+            if [ "$success" = false ]; then
+              echo "⚠ WARNING: $url failed all 3 attempts"
+            fi
+          done
+
+          # Second wave after short delay (helps fight cold starts harder)
+          sleep 20
+
+          echo "----- Second wave -----"
+          for url in "${ENDPOINTS[@]}"; do
+            ping_url "$url" "2nd-wave" || true
+          done
+
+          echo "===== Keep-Alive finished at $(date -u) ====="

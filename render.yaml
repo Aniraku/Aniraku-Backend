@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: aniraku-backend
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: PORT
+        value: "43211"
+      - key: ANIRAKU_SERVER_HOST
+        value: "0.0.0.0"
+      - key: ANIRAKU_SERVER_DEBUG
+        value: "false"
+      - key: ANIRAKU_SUPABASE_URL
+        sync: false
+      - key: ANIRAKU_SUPABASE_ANON_KEY
+        sync: false
+      - key: ANIRAKU_SUPABASE_SERVICE_KEY
+        sync: false
