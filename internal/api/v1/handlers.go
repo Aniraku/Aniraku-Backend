@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
-	"github.com/rs/zerolog"
 	utls "github.com/refraction-networking/utls"
+	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/auth"
@@ -34,6 +34,13 @@ var (
 	Commit    = "dev"
 	BuildDate = "unknown"
 )
+
+// noRedirects rejects every redirect at the client layer. Backing off at the
+// first hop means an upstream cannot bounce this server at an arbitrary
+// internal target, even one the dialer's IP guard would later permit.
+func noRedirects(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
+}
 
 // ponytail: caps page to prevent AniList abuse from deep pagination
 func parsePageParam(r *http.Request, defaultVal int) int {
@@ -63,12 +70,12 @@ type keyCacheEntry struct {
 }
 
 type Handlers struct {
-	cfg              *config.Config
-	log              zerolog.Logger
-	mal              *mal.Client
-	stream           *streaming.Manager
-	h2Client         *http.Client
-	h1Client         *http.Client
+	cfg               *config.Config
+	log               zerolog.Logger
+	mal               *mal.Client
+	stream            *streaming.Manager
+	h2Client          *http.Client
+	h1Client          *http.Client
 	httpClient        *http.Client
 	goTLSClient       *http.Client
 	miruroProxyURL    string
@@ -83,7 +90,15 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 			return (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, "udp", "8.8.8.8:53")
 		},
 	}
-	baseDialer := &net.Dialer{Timeout: 15 * time.Second, Resolver: resolver}
+	baseDialer := &net.Dialer{
+		Timeout:  15 * time.Second,
+		Resolver: resolver,
+		// SSRF guard: every outbound socket this server dials passes through
+		// this check on the final resolved IP. This is the authoritative
+		// boundary that defeats DNS rebinding and redirects, because any
+		// connection to a private address must eventually dial it here.
+		Control: ssrfGuardControl,
+	}
 
 	h2Transport := &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -128,25 +143,30 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 	httpClient := &http.Client{
 		Timeout:   30 * time.Second,
 		Transport: &http.Transport{DialContext: baseDialer.DialContext},
+		// Never follow redirects server-side. hls.js re-requests the
+		// redirected URL through the proxy itself; following here would let
+		// an upstream bounce the server at any internal endpoint.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	goTLSClient := &http.Client{
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
-			DialContext:       baseDialer.DialContext,
+			DialContext:         baseDialer.DialContext,
 			MaxIdleConnsPerHost: 10,
 		},
+		CheckRedirect: noRedirects,
 	}
 	h := &Handlers{
-		cfg:              cfg,
-		log:              log,
-		mal:              mal.NewClient(log),
-		stream:           streaming.NewManager(log, miruroProxyURL, httpClient),
-		h2Client:         &http.Client{Timeout: 30 * time.Second, Transport: h2Transport},
-		h1Client:         &http.Client{Timeout: 30 * time.Second, Transport: h1Transport},
-		httpClient:       httpClient,
-		goTLSClient:      goTLSClient,
-		miruroProxyURL:   miruroProxyURL,
-		miruroProxyClient: &http.Client{Timeout: 60 * time.Second},
+		cfg:               cfg,
+		log:               log,
+		mal:               mal.NewClient(log),
+		stream:            streaming.NewManager(log, miruroProxyURL, httpClient),
+		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: noRedirects},
+		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: noRedirects},
+		httpClient:        httpClient,
+		goTLSClient:       goTLSClient,
+		miruroProxyURL:    miruroProxyURL,
+		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: noRedirects},
 	}
 
 	// ponytail: global lock, per-account locks if throughput matters
@@ -179,9 +199,74 @@ func (h *Handlers) respondError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// mapMalToAniList returns the input ID as-is (frontend uses AniList IDs directly).
-func (h *Handlers) mapMalToAniList(_ context.Context, malID int) (int, error) {
-	return malID, nil
+// resolveMalIDsToAniList maps a batch of MyAnimeList IDs (as returned by the
+// Jikan search/browse fallback) to AniList IDs in a single GraphQL round trip
+// via the idMal_in filter. IDs without a mapping are omitted from the result.
+func (h *Handlers) resolveMalIDsToAniList(ctx context.Context, malIDs []int) (map[int]int, error) {
+	mapped := map[int]int{}
+	if len(malIDs) == 0 {
+		return mapped, nil
+	}
+	query := `query ($ids: [Int]) { Page(perPage: 50) { media(idMal_in: $ids, type: ANIME) { id idMal } } }`
+	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]any{"ids": malIDs}})
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.h2Client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("resolve mal ids: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("resolve mal ids: upstream %s", resp.Status)
+	}
+
+	var out struct {
+		Data struct {
+			Page struct {
+				Media []struct {
+					ID    int `json:"id"`
+					IDMal int `json:"idMal"`
+				} `json:"media"`
+			} `json:"Page"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("resolve mal ids: decode: %w", err)
+	}
+	for _, m := range out.Data.Page.Media {
+		if m.IDMal > 0 && m.ID > 0 {
+			mapped[m.IDMal] = m.ID
+		}
+	}
+	return mapped, nil
+}
+
+// normalizeSearchResults rekeys Jikan search/browse results onto AniList IDs.
+// Jikan results carry the MAL ID in Media.ID; every downstream consumer (stream,
+// episodes, dub check, relations) is AniList-keyed, so conversion happens once
+// here at the search boundary instead of at each consumer.
+func (h *Handlers) normalizeSearchResults(ctx context.Context, media []anilist.Anime) error {
+	malIDs := make([]int, 0, len(media))
+	for i := range media {
+		if media[i].ID > 0 {
+			malIDs = append(malIDs, media[i].ID)
+		}
+	}
+	mapped, err := h.resolveMalIDsToAniList(ctx, malIDs)
+	if err != nil {
+		return err
+	}
+	for i := range media {
+		if anilistID, ok := mapped[media[i].ID]; ok {
+			malID := media[i].ID
+			media[i].ID = anilistID
+			media[i].IDMal = &malID
+		}
+	}
+	return nil
 }
 
 func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
@@ -228,10 +313,19 @@ func (h *Handlers) getAnimeFromAniList(ctx context.Context, id int) (*anilist.An
 		a.ID = int(id)
 	}
 	if title, ok := media["title"].(map[string]any); ok {
-		if v, ok := title["romaji"].(string); ok { a.Title.Romaji = &v }
-		if v, ok := title["english"].(string); ok { a.Title.English = &v }
-		if v, ok := title["native"].(string); ok { a.Title.Native = &v }
-		if v, ok := title["userPreferred"].(string); ok { v2 := v; a.Title.UserPreferred = &v2 }
+		if v, ok := title["romaji"].(string); ok {
+			a.Title.Romaji = &v
+		}
+		if v, ok := title["english"].(string); ok {
+			a.Title.English = &v
+		}
+		if v, ok := title["native"].(string); ok {
+			a.Title.Native = &v
+		}
+		if v, ok := title["userPreferred"].(string); ok {
+			v2 := v
+			a.Title.UserPreferred = &v2
+		}
 	}
 	if genres, ok := media["genres"].([]any); ok {
 		for _, g := range genres {
@@ -254,18 +348,18 @@ func (h *Handlers) GetAnime(w http.ResponseWriter, r *http.Request) {
 	// Use AniList GraphQL proxy (avoids Jikan 504s)
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english native userPreferred } coverImage { extraLarge large medium color } bannerImage format status episodes duration genres averageScore popularity description season seasonYear nextAiringEpisode { episode airingAt } isAdult } }`
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": id}})
-	
+
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	
+
 	resp, err := h.h2Client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	var result map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
 	data, _ := result["data"].(map[string]any)
@@ -274,7 +368,7 @@ func (h *Handlers) GetAnime(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadGateway, "invalid anime data")
 		return
 	}
-	
+
 	h.respondJSON(w, http.StatusOK, media)
 }
 
@@ -308,18 +402,18 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// Use AniList GraphQL
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english userPreferred } coverImage { extraLarge large medium } episodes format status nextAiringEpisode { episode airingAt } } }`
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": id}})
-	
+
 	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	
+
 	resp, err := h.h2Client.Do(req)
 	if err != nil || resp.StatusCode != 200 {
 		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	var result map[string]any
 	json.NewDecoder(resp.Body).Decode(&result)
 	data, _ := result["data"].(map[string]any)
@@ -328,7 +422,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadGateway, "invalid anime data")
 		return
 	}
-	
+
 	episodeCount := 0
 	if eps, ok := media["episodes"].(float64); ok && eps > 0 {
 		episodeCount = int(eps)
@@ -434,8 +528,8 @@ func (h *Handlers) GetSimilar(w http.ResponseWriter, r *http.Request) {
 	anime, anilistErr := h.getAnimeFromAniList(r.Context(), id)
 	if anilistErr == nil && len(anime.Genres) > 0 {
 		filters := anilist.BrowseFilters{
-			Genre:  anime.Genres[:1],
-			Sort:   "SCORE_DESC",
+			Genre: anime.Genres[:1],
+			Sort:  "SCORE_DESC",
 		}
 		results, err := h.browseAniList(r.Context(), filters, page, perPage)
 		if err == nil {
@@ -533,13 +627,10 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 		ctx = streaming.WithRefresh(ctx)
 	}
 
-	// ponytail: map MAL ID → AniList ID for Miruro streaming
-	anilistID, err := h.mapMalToAniList(ctx, req.AnimeID)
-	if err != nil {
-		h.log.Warn().Err(err).Int("malId", req.AnimeID).Msg("failed to map MAL to AniList")
-		h.respondError(w, http.StatusNotFound, "anime not found for streaming")
-		return
-	}
+	// AniList-keyed: the frontend sends AniList IDs, and Miruro sources are
+	// AniList-keyed too. MAL IDs are normalized to AniList IDs at the search
+	// boundary, never here.
+	anilistID := req.AnimeID
 
 	// Find best source for the requested provider/lang only
 	result, err := h.stream.GetSourcesForProvider(ctx, "", req.Episode, req.Provider, req.Lang, req.Quality, anilistID)
@@ -582,13 +673,8 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ctx := r.Context()
-	// ponytail: map MAL ID → AniList ID for Miruro streaming
-	anilistID, err := h.mapMalToAniList(ctx, animeID)
-	if err != nil {
-		h.log.Warn().Err(err).Int("malId", animeID).Msg("failed to map MAL to AniList")
-		h.respondError(w, http.StatusNotFound, "anime not found for streaming")
-		return
-	}
+	// AniList-keyed; IDs are normalized at the search boundary.
+	anilistID := animeID
 	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang)
 	h.respondJSON(w, http.StatusOK, servers)
 }
@@ -605,17 +691,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		decodedURL = targetURL
 	}
 
-	// Basic SSRF guard: only http(s), block obvious local/metadata targets
+	// SSRF guard: cheap fast-fail on obviously bad hostnames. The dialer
+	// Control hook (ssrfGuardControl) remains the authoritative boundary for
+	// resolved-IP checks covering DNS rebinding, redirects, and alt encodings.
 	parsed, err := url.Parse(decodedURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
 		return
 	}
-	host := strings.ToLower(parsed.Hostname())
-	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" ||
-		host == "::1" || strings.HasPrefix(host, "10.") || strings.HasPrefix(host, "192.168.") ||
-		strings.HasPrefix(host, "172.") || strings.HasPrefix(host, "169.254.") ||
-		host == "metadata.google.internal" {
+	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
 		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
 		return
 	}
@@ -782,9 +866,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, error) {
+	// The uTLS fingerprinting chain (h2 → h1 → native Go TLS) exists to get
+	// past CDN bot detection. Every transport dials through baseDialer, whose
+	// ssrfGuardControl re-validates the resolved IP on each connection, so
+	// redirects to private targets are rejected at dial time and no client
+	// follows redirects at all (noRedirects).
 	if !https {
 		return h.httpClient.Do(req)
 	}
+
 	resp, err := h.h2Client.Do(req)
 	if err == nil {
 		return resp, nil
@@ -1043,6 +1133,52 @@ func (h *Handlers) SaveAnimeProgress(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	animeID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid anime id")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	defer r.Body.Close()
+	var input struct {
+		Episode   int  `json:"episode"`
+		Position  int  `json:"position_sec"`
+		Completed bool `json:"completed"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &input); err != nil {
+			h.respondError(w, http.StatusBadRequest, "invalid progress payload")
+			return
+		}
+	}
+
+	payload := []map[string]any{{
+		"user_id":      userID,
+		"anime_id":     animeID,
+		"episode":      input.Episode,
+		"position_sec": input.Position,
+		"completed":    input.Completed,
+		"updated_at":   "now()",
+	}}
+	raw, _ := json.Marshal(payload)
+
+	resp, err := h.supabaseRequest(r.Context(), "POST",
+		"/rest/v1/anime_progress?on_conflict=user_id,anime_id",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("anime progress upsert failed")
+		h.respondError(w, http.StatusBadGateway, "failed to save progress")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		h.log.Warn().Str("detail", supabaseErrorBody(resp)).Msg("anime progress upsert rejected")
+		h.respondError(w, http.StatusBadGateway, "failed to save progress")
+		return
+	}
+
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
@@ -1052,17 +1188,62 @@ func (h *Handlers) SaveMangaProgress(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	mangaID, err := strconv.Atoi(chi.URLParam(r, "id"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid manga id")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+	r.Body.Close()
+	var input struct {
+		Chapter   int  `json:"chapter"`
+		Page      int  `json:"page"`
+		Completed bool `json:"completed"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &input); err != nil {
+			h.respondError(w, http.StatusBadRequest, "invalid progress payload")
+			return
+		}
+	}
+
+	raw, _ := json.Marshal([]map[string]any{{
+		"user_id":    userID,
+		"manga_id":   mangaID,
+		"chapter":    input.Chapter,
+		"page":       input.Page,
+		"completed":  input.Completed,
+		"updated_at": "now()",
+	}})
+
+	resp, err := h.supabaseRequest(r.Context(), "POST",
+		"/rest/v1/manga_progress?on_conflict=user_id,manga_id",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("manga progress upsert failed")
+		h.respondError(w, http.StatusBadGateway, "failed to save progress")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		h.log.Warn().Str("detail", supabaseErrorBody(resp)).Msg("manga progress upsert rejected")
+		h.respondError(w, http.StatusBadGateway, "failed to save progress")
+		return
+	}
+
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 }
 
 type watchHistoryEntry struct {
-	AnimeID     int    `json:"anime_id"`
-	AnimeTitle  string `json:"anime_title"`
-	AnimeImage  string `json:"anime_image"`
-	Episode     int    `json:"episode_number"`
-	Progress    int    `json:"progress"`
-	Duration    int    `json:"duration"`
-	Timestamp   int64  `json:"timestamp"`
+	AnimeID    int    `json:"anime_id"`
+	AnimeTitle string `json:"anime_title"`
+	AnimeImage string `json:"anime_image"`
+	Episode    int    `json:"episode_number"`
+	Progress   int    `json:"progress"`
+	Duration   int    `json:"duration"`
+	Timestamp  int64  `json:"timestamp"`
 }
 
 type continueWatchingItem struct {
@@ -1082,29 +1263,20 @@ func (h *Handlers) GetContinueWatching(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	supabaseURL := h.cfg.Supabase.URL
-	serviceKey := h.cfg.Supabase.ServiceKey
-	if supabaseURL == "" || serviceKey == "" {
-		h.respondJSON(w, http.StatusOK, []continueWatchingItem{})
-		return
-	}
-
-	reqURL := supabaseURL + "/rest/v1/watch_history?select=anime_id,anime_title,anime_image,episode_number,progress,duration,timestamp&user_id=eq." + userID + "&order=timestamp.desc&limit=30"
-
-	req, err := http.NewRequestWithContext(r.Context(), "GET", reqURL, nil)
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/watch_history?select=anime_id,anime_title,anime_image,episode_number,progress,duration,timestamp&user_id=eq."+encodePath(userID)+"&order=timestamp.desc&limit=30",
+		nil, nil)
 	if err != nil {
-		h.respondJSON(w, http.StatusOK, []continueWatchingItem{})
-		return
-	}
-	req.Header.Set("apikey", serviceKey)
-	req.Header.Set("Authorization", "Bearer "+serviceKey)
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
+		h.log.Warn().Err(err).Msg("continue-watching fetch failed")
 		h.respondJSON(w, http.StatusOK, []continueWatchingItem{})
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondJSON(w, http.StatusOK, []continueWatchingItem{})
+		return
+	}
 
 	var history []watchHistoryEntry
 	if err := json.NewDecoder(resp.Body).Decode(&history); err != nil {
@@ -1172,6 +1344,13 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			h.log.Warn().Err(err).Str("query", q).Msg("anilist filtered search failed, falling back to jikan")
 			results, err = h.mal.Browse(r.Context(), filters, page, perPage)
+			if err == nil {
+				// Jikan results are MAL-keyed; rekey onto AniList IDs so the
+				// watch flow (stream/episodes) works unchanged.
+				if nerr := h.normalizeSearchResults(r.Context(), results.Data.Page.Media); nerr != nil {
+					h.log.Warn().Err(nerr).Msg("failed to normalize jikan browse results")
+				}
+			}
 		}
 		if err != nil {
 			h.log.Warn().Err(err).Str("query", q).Msg("filtered search failed")
@@ -1197,6 +1376,12 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		// fallback: use AniList search via browseAniList with search term
 		fallbackFilters := anilist.BrowseFilters{Search: q, Sort: "SEARCH_MATCH"}
 		results, err = h.browseAniList(r.Context(), fallbackFilters, page, perPage)
+	} else {
+		// Jikan results are MAL-keyed; rekey onto AniList IDs so the watch
+		// flow (stream/episodes) works unchanged.
+		if nerr := h.normalizeSearchResults(r.Context(), results.Data.Page.Media); nerr != nil {
+			h.log.Warn().Err(nerr).Msg("failed to normalize jikan search results")
+		}
 	}
 	if err != nil {
 		h.log.Warn().Err(err).Str("query", q).Msg("search failed")
@@ -1232,52 +1417,344 @@ func (h *Handlers) ImportStatus(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) GetProfile(w http.ResponseWriter, r *http.Request) {
 	username := chi.URLParam(r, "username")
-	h.respondJSON(w, http.StatusOK, map[string]string{"username": username, "status": "placeholder"})
+	if username == "" {
+		h.respondError(w, http.StatusBadRequest, "username required")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/profiles?select=username,display_name,avatar_url,bio,location,socials,created_at&username=eq."+url.QueryEscape(username)+"&limit=1",
+		nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("profile fetch failed")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch profile")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.respondError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+
+	var profiles []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&profiles); err != nil {
+		h.respondError(w, http.StatusBadGateway, "failed to decode profile")
+		return
+	}
+	if len(profiles) == 0 {
+		h.respondError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, profiles[0])
 }
 
 func (h *Handlers) UpdateProfile(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	r.Body.Close()
+	var input map[string]any
+	if err := json.Unmarshal(body, &input); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid profile payload")
+		return
+	}
+	// Never allow a caller to change their own role.
+	delete(input, "role")
+	if len(input) == 0 {
+		h.respondError(w, http.StatusBadRequest, "no fields to update")
+		return
+	}
+	input["updated_at"] = "now()"
+	raw, _ := json.Marshal(input)
+
+	resp, err := h.supabaseRequest(r.Context(), "PATCH",
+		"/rest/v1/profiles?id=eq."+encodePath(userID),
+		bytes.NewReader(raw), nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("profile update failed")
+		h.respondError(w, http.StatusBadGateway, "failed to update profile")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to update profile")
+		return
+	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
 func (h *Handlers) AddFavorite(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+	r.Body.Close()
+	var input struct {
+		MediaID   int    `json:"mediaId"`
+		MediaType string `json:"mediaType"`
+	}
+	if err := json.Unmarshal(body, &input); err != nil || input.MediaID <= 0 {
+		h.respondError(w, http.StatusBadRequest, "valid mediaId required")
+		return
+	}
+	if input.MediaType == "" {
+		input.MediaType = "anime"
+	}
+	if input.MediaType != "anime" && input.MediaType != "manga" {
+		h.respondError(w, http.StatusBadRequest, "mediaType must be anime or manga")
+		return
+	}
+
+	raw, _ := json.Marshal([]map[string]any{{
+		"user_id":    userID,
+		"media_id":   input.MediaID,
+		"media_type": input.MediaType,
+	}})
+
+	resp, err := h.supabaseRequest(r.Context(), "POST",
+		"/rest/v1/favorites?on_conflict=user_id,media_id,media_type",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("favorite add failed")
+		h.respondError(w, http.StatusBadGateway, "failed to add favorite")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to add favorite")
+		return
+	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "added"})
 }
 
 func (h *Handlers) RemoveFavorite(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	mediaID, err := strconv.Atoi(chi.URLParam(r, "mediaId"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid media id")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "DELETE",
+		"/rest/v1/favorites?user_id=eq."+encodePath(userID)+"&media_id=eq."+strconv.Itoa(mediaID),
+		nil, map[string]string{"Prefer": "return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("favorite remove failed")
+		h.respondError(w, http.StatusBadGateway, "failed to remove favorite")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to remove favorite")
+		return
+	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "removed"})
 }
 
 func (h *Handlers) ListFavorites(w http.ResponseWriter, r *http.Request) {
-	h.respondJSON(w, http.StatusOK, map[string]any{"favorites": []any{}})
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/favorites?select=media_id,media_type,added_at&user_id=eq."+encodePath(userID)+"&order=added_at.desc&limit=200",
+		nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("favorites fetch failed")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch favorites")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to fetch favorites")
+		return
+	}
+
+	var favorites []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&favorites); err != nil {
+		h.respondError(w, http.StatusBadGateway, "failed to decode favorites")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]any{"favorites": favorites})
 }
 
 func (h *Handlers) ClientLog(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	r.Body.Close()
+	var entry struct {
+		Level   string `json:"level"`
+		Message string `json:"message"`
+		Data    any    `json:"data"`
+	}
+	_ = json.Unmarshal(body, &entry)
+	msg := entry.Message
+	if msg == "" {
+		msg = "(empty client log)"
+	}
+	h.log.Info().Str("user", userID).Str("level", entry.Level).Any("data", entry.Data).Msg("client log: " + msg)
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "received"})
 }
 
 func (h *Handlers) GetSetting(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	key := chi.URLParam(r, "key")
-	h.respondJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+	if key == "" {
+		h.respondError(w, http.StatusBadRequest, "key required")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/user_settings?select=value&user_id=eq."+encodePath(userID)+"&key=eq."+url.QueryEscape(key)+"&limit=1",
+		nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("setting fetch failed")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch setting")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.respondJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+		return
+	}
+
+	var rows []struct {
+		Value any `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		h.respondJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+		return
+	}
+	if len(rows) == 0 {
+		h.respondJSON(w, http.StatusOK, map[string]string{"key": key, "value": ""})
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]any{"key": key, "value": rows[0].Value})
 }
 
 func (h *Handlers) UpdateSetting(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	key := chi.URLParam(r, "key")
+	if key == "" {
+		h.respondError(w, http.StatusBadRequest, "key required")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	r.Body.Close()
+	var input struct {
+		Value any `json:"value"`
+	}
+	if err := json.Unmarshal(body, &input); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid setting payload")
+		return
+	}
+
+	raw, _ := json.Marshal([]map[string]any{{
+		"user_id":    userID,
+		"key":        key,
+		"value":      input.Value,
+		"updated_at": "now()",
+	}})
+
+	resp, err := h.supabaseRequest(r.Context(), "POST",
+		"/rest/v1/user_settings?on_conflict=user_id,key",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("setting upsert failed")
+		h.respondError(w, http.StatusBadGateway, "failed to save setting")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to save setting")
+		return
+	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 }
 
 func (h *Handlers) GetNotifications(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/notifications?select=id,type,message,anime_id,read,created_at&user_id=eq."+encodePath(userID)+"&order=created_at.desc&limit=50",
+		nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("notifications fetch failed")
 		h.respondJSON(w, http.StatusOK, []any{})
 		return
 	}
-	// Notifications are stored in Supabase, frontend queries directly
-	h.respondJSON(w, http.StatusOK, []any{})
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondJSON(w, http.StatusOK, []any{})
+		return
+	}
+
+	var notifications []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&notifications); err != nil {
+		h.respondJSON(w, http.StatusOK, []any{})
+		return
+	}
+	h.respondJSON(w, http.StatusOK, notifications)
 }
 
 func (h *Handlers) MarkNotificationRead(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	notifID := chi.URLParam(r, "id")
+	if notifID == "" {
+		h.respondError(w, http.StatusBadRequest, "notification id required")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "PATCH",
+		"/rest/v1/notifications?id=eq."+encodePath(notifID)+"&user_id=eq."+encodePath(userID),
+		bytes.NewReader([]byte(`{"read":true}`)), nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("notification read failed")
+		h.respondError(w, http.StatusBadGateway, "failed to update notification")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to update notification")
 		return
 	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "marked"})
@@ -1287,6 +1764,21 @@ func (h *Handlers) MarkAllNotificationsRead(w http.ResponseWriter, r *http.Reque
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "PATCH",
+		"/rest/v1/notifications?user_id=eq."+encodePath(userID)+"&read=eq.false",
+		bytes.NewReader([]byte(`{"read":true}`)), nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("notifications read-all failed")
+		h.respondError(w, http.StatusBadGateway, "failed to update notifications")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to update notifications")
 		return
 	}
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "all marked"})
@@ -1299,15 +1791,12 @@ func (h *Handlers) GetMiruroEpisodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ponytail: map MAL ID → AniList ID for Miruro
-	malID, err := strconv.Atoi(idStr)
+	// The frontend is AniList-keyed; Miruro is also AniList-keyed, so the ID
+	// passes through unchanged. MAL IDs are normalized to AniList IDs at the
+	// search boundary, never here.
+	anilistID, err := strconv.Atoi(idStr)
 	if err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
-		return
-	}
-	anilistID, err := h.mapMalToAniList(r.Context(), malID)
-	if err != nil {
-		h.respondError(w, http.StatusNotFound, "anime not found")
 		return
 	}
 
@@ -1333,31 +1822,71 @@ func (h *Handlers) GetMiruroEpisodes(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
+	anilistID, err := strconv.Atoi(idStr)
+	if err != nil || anilistID <= 0 {
 		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
 		return
 	}
 
-	relations, err := h.mal.GetRelations(r.Context(), id)
+	// Relations come from AniList directly so node IDs stay AniList-keyed,
+	// matching the shape the frontend consumes on the anime detail page.
+	query := `query ($id: Int) { Media(id: $id, type: ANIME) { relations { edges { relationType node { id idMal title { romaji english native userPreferred } coverImage { extraLarge large medium } format type status } } } } }`
+	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": anilistID}})
+
+	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
-		h.log.Warn().Err(err).Int("id", id).Msg("failed to fetch relations from AniList")
+		h.log.Warn().Err(err).Int("id", anilistID).Msg("failed to fetch relations from AniList")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Int("status", resp.StatusCode).Msg("anilist relations request failed")
 		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, relations)
+	var out struct {
+		Data struct {
+			Media struct {
+				Relations json.RawMessage `json:"relations"`
+			} `json:"Media"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
+		return
+	}
+	if len(out.Errors) > 0 {
+		h.log.Warn().Str("detail", out.Errors[0].Message).Int("id", anilistID).Msg("anilist relations error")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
+		return
+	}
+	if len(out.Data.Media.Relations) == 0 {
+		h.respondError(w, http.StatusNotFound, "relations not found")
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, out.Data.Media.Relations)
 }
 
 func (h *Handlers) HasDub(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
-	id, err := strconv.Atoi(idStr)
+	// AniList-keyed, like every other route; IDs are normalized at the search
+	// boundary.
+	anilistID, err := strconv.Atoi(idStr)
 	if err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
 		return
 	}
 
-	anilistID, _ := h.mapMalToAniList(r.Context(), id)
 	hasDub := h.stream.HasAnimeDub(r.Context(), anilistID)
 	h.respondJSON(w, http.StatusOK, map[string]bool{"hasDub": hasDub})
 }

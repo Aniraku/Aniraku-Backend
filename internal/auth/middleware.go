@@ -12,6 +12,15 @@ type contextKey string
 
 const UserIDKey contextKey = "user_id"
 
+const tokenKey contextKey = "raw_token"
+
+func Token(ctx context.Context) string {
+	if t, ok := ctx.Value(tokenKey).(string); ok {
+		return t
+	}
+	return ""
+}
+
 func Middleware(verifier *Verifier, log zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +45,7 @@ func Middleware(verifier *Verifier, log zerolog.Logger) func(http.Handler) http.
 			}
 
 			ctx := context.WithValue(r.Context(), UserIDKey, userID)
+			ctx = context.WithValue(ctx, tokenKey, rawToken)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}

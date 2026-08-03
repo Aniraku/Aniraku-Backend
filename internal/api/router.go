@@ -1,6 +1,7 @@
 package api
 
 import (
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -29,12 +30,15 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	// prevents abuse that causes AniList 502s
 	rl := middleware.NewRateLimiter(30, 60, time.Second)
 
+	// Supabase publishes JWKS under /auth/v1, not the project root.
+	// The previous default (`/.well-known/jwks.json`) 404s, which made
+	// every authenticated route fail with "invalid token".
 	jwksURL := cfg.Supabase.JWKSURL
 	if jwksURL == "" {
-		jwksURL = cfg.Supabase.URL + "/.well-known/jwks.json"
+		jwksURL = strings.TrimRight(cfg.Supabase.URL, "/") + "/auth/v1/.well-known/jwks.json"
 	}
 	jwks := auth.NewJWKS(jwksURL, log)
-	issuer := cfg.Supabase.URL + "/auth/v1"
+	issuer := strings.TrimRight(cfg.Supabase.URL, "/") + "/auth/v1"
 	verifier := auth.NewVerifier(jwks, issuer, cfg.Supabase.JWTAud, log)
 	authMiddleware := auth.Middleware(verifier, log)
 
