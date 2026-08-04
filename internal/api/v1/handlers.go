@@ -1080,6 +1080,18 @@ func isMediaPlaylistPath(p string) bool {
 }
 
 func needsProxyRewrite(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return !isAllowedProxyHost(parsed.Hostname()) || hasKnownRewriteKeys(rawURL)
+}
+
+// hasKnownRewriteKeys returns true for CDN hostnames that must be proxied even
+// if they're on the allowlist — these are hosts where the player's direct
+// request would be rejected at the CDN without custom headers or transport
+// (e.g. Senshi's TLS fingerprint filtering, uTLS-required hosts).
+func hasKnownRewriteKeys(rawURL string) bool {
 	lower := strings.ToLower(rawURL)
 	return strings.Contains(lower, "senshi") ||
 		strings.Contains(lower, "ninstream") ||
