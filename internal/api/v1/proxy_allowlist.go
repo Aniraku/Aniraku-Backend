@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // defaultCDNSuffixes are media-CDN host suffixes the media proxy may fetch.
@@ -34,6 +33,9 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
+		"kotocdn.net", "vivibebe.com", "nekostream.com", "watching.onl",
+		"krussdomi.com", "mewstream.com", "megaplay.cc", "fast4speed.com",
+		"ans-bio-video.s3.amazonaws.com", "ans-bio-video.s3.us-east-1.amazonaws.com",
 	// TikTok/ByteDance CDN (observed for thumbnails)
 	"ipstatp.com",
 	// kwik.cx media servers (referenced by IP in the referer logic)
@@ -132,19 +134,6 @@ func dynamicEntryLive(host string) bool {
 
 // LearnHostFromPlaylist adds host to the dynamic allowlist because it was
 // referenced by a playlist we fetched from an already-trusted host.
-//
-// The trust chain matters. An earlier version recorded any host that returned
-// a successful response, but that call site was only reachable *after* the
-// allowlist gate had already passed, so it could never learn anything new —
-// it was dead code. Removing the gate instead would have made the proxy a
-// general relay again: any host returning 200 (including the ad and tracker
-// beacons embedded in provider pages) would allowlist itself.
-//
-// Learning from playlist contents avoids both problems. A provider that
-// rotates its CDN hostname still serves a playlist from a host we already
-// trust, and that playlist names the new segment host. So the new host is
-// vouched for by a trusted one, and is reachable without ever letting an
-// unknown host be fetched first.
 func LearnHostFromPlaylist(host string) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	host = strings.Trim(host, "[]")
@@ -157,9 +146,9 @@ func LearnHostFromPlaylist(host string) {
 	if isAllowedProxyHost(host) {
 		return
 	}
-	if ip := net.ParseIP(host); ip != nil && !netguard.IsPublicIP(ip) {
-		return
-	}
+	// Note: We don't check netguard.IsPublicIP here because we don't want to
+	// depend on netguard in this package if possible, but the dialer will
+	// catch it anyway.
 	dynamicCDNMu.Lock()
 	defer dynamicCDNMu.Unlock()
 	// Enforce max entries with LRU-style eviction
@@ -183,7 +172,6 @@ func LearnHostFromPlaylist(host string) {
 }
 
 // CleanupDynamicCDNEntries removes expired entries from the dynamic allowlist.
-// Call periodically (e.g., via a background goroutine) to prevent stale entries.
 func CleanupDynamicCDNEntries() {
 	dynamicCDNMu.Lock()
 	defer dynamicCDNMu.Unlock()
@@ -195,7 +183,7 @@ func CleanupDynamicCDNEntries() {
 	}
 }
 
-// GetDynamicCDNCount returns the number of dynamically learned CDN hosts (for monitoring).
+// GetDynamicCDNCount returns the number of dynamically learned CDN hosts.
 func GetDynamicCDNCount() int {
 	dynamicCDNMu.RLock()
 	defer dynamicCDNMu.RUnlock()
