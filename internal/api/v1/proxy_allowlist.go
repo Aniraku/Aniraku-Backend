@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // defaultCDNSuffixes are media-CDN host suffixes the media proxy may fetch.
@@ -33,11 +34,57 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
-		"kotocdn.net", "vivibebe.com", "nekostream.com", "watching.onl",
-		"krussdomi.com", "mewstream.com", "megaplay.cc", "fast4speed.com",
-		"ans-bio-video.s3.amazonaws.com", "ans-bio-video.s3.us-east-1.amazonaws.com",
-	// TikTok/ByteDance CDN (observed for thumbnails)
-	"ipstatp.com",
+	// New CDN hosts (observed 2026-08-04)
+	"norami.top",
+	"fast4speed.rsvp",
+	// Additional anime CDN hosts from DeepSeek audit
+	"ans-bio-video.com",
+	"ans-bio-video.net",
+	"ans-bio-video.org",
+	"bio-video.net",
+	"bio-video.org",
+	"bio-video.com",
+	"ans-bio-video.s3.amazonaws.com",
+	"ans-bio-video.s3.us-east-1.amazonaws.com",
+	"streamtape.to",
+	"streamtape.cc",
+	"megaplay.live",
+	"megaplay.site",
+	"megaplay.top",
+	"megaplay.xyz",
+	"megaplay.pro",
+	"megaplay.club",
+	"megaplay.cc",
+	"uwucdn.net",
+	"owocdn.net",
+	"kotocdn.net",
+	"kotocdn.site",
+	"kotocdn.top",
+	"vivibebe.net",
+	"vivibebe.site",
+	"vivibebe.top",
+	"vivibebe.com",
+	"nekostream.net",
+	"nekostream.site",
+	"nekostream.top",
+	"nekostream.com",
+	"watching.onl",
+	"watching.site",
+	"krussdomi.net",
+	"krussdomi.site",
+	"krussdomi.com",
+	"mewstream.net",
+	"mewstream.site",
+	"mewstream.com",
+	"fast4speed.net",
+	"fast4speed.site",
+	"fast4speed.top",
+	"fast4speed.com",
+	// Observed Miruro provider CDN hosts (2026-08-04)
+	"mikora.top",
+	"mikora.site",
+	"mikora.buzz",
+	"vidtub.mikora.top",
 	// kwik.cx media servers (referenced by IP in the referer logic)
 	"185.237.106.79", "203.188.166.228",
 }
@@ -146,9 +193,9 @@ func LearnHostFromPlaylist(host string) {
 	if isAllowedProxyHost(host) {
 		return
 	}
-	// Note: We don't check netguard.IsPublicIP here because we don't want to
-	// depend on netguard in this package if possible, but the dialer will
-	// catch it anyway.
+	if ip := net.ParseIP(host); ip != nil && !netguard.IsPublicIP(ip) {
+		return
+	}
 	dynamicCDNMu.Lock()
 	defer dynamicCDNMu.Unlock()
 	// Enforce max entries with LRU-style eviction
