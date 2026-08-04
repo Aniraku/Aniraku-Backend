@@ -843,8 +843,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Record successful proxy host for dynamic allowlist learning
-	RecordSuccessfulProxyHost(parsed.Hostname())
+	// Learning happens where a trusted playlist names its media hosts
+	// (rewriteHLSPlaylist), not here. Recording the host at this point could
+	// never learn anything: this code is only reachable once the allowlist
+	// gate above has already passed.
 
 	if isKey && resp.StatusCode == http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -938,6 +940,31 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 		basePrefix = strings.Join(baseParts[:len(baseParts)-1], "/")
 	}
 
+	// Only a playlist we fetched from an allowed host may vouch for the hosts
+	// it references. Proxy() gates on isAllowedProxyHost before fetching, so
+	// in production this holds by construction; re-checking keeps the trust
+	// chain explicit and correct if this is ever called from elsewhere.
+	vouching := false
+	if pb, err := url.Parse(baseURL); err == nil {
+		vouching = isAllowedProxyHost(strings.ToLower(pb.Hostname()))
+	}
+	learnPlaylistTarget := func(rawURL string) {
+		if !vouching {
+			return
+		}
+		u, err := url.Parse(rawURL)
+		if err != nil {
+			return
+		}
+		// Media only. Playlists also reference ad and tracker beacons
+		// (observed: p1.ipstatp.com/obj/ad-site-i18n/...), and those must
+		// not earn a place on the allowlist.
+		if !isMediaPlaylistPath(u.Path) {
+			return
+		}
+		LearnHostFromPlaylist(u.Hostname())
+	}
+
 	headersParam := ""
 	if headersJSON != "" {
 		headersParam = "&headers=" + url.QueryEscape(headersJSON)
@@ -960,6 +987,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 				}
 				uri := strings.Trim(parts[1], "\"")
 				absoluteURL := resolveURL(uri, basePrefix)
+				learnPlaylistTarget(absoluteURL)
 				if needsProxyRewrite(absoluteURL) || headersJSON != "" {
 					proxied := fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
 					return fmt.Sprintf("URI=\"%s\"", proxied)
@@ -995,6 +1023,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 		} else {
 			absoluteURL = basePrefix + "/" + original
 		}
+		learnPlaylistTarget(absoluteURL)
 
 		// If encrypted, insert per-segment KEY tag with file-number-based IV
 		// ponytail: CDN uses file number as IV (not MEDIA-SEQUENCE), and the
@@ -1031,6 +1060,23 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 	}
 
 	return result
+}
+
+// isMediaPlaylistPath reports whether p looks like an HLS media resource:
+// a nested playlist, a segment, an init section, or a decryption key. Only
+// these earn a host a place on the dynamic allowlist. Playlists routinely
+// also carry ad, analytics, and tracker URLs, which must stay blocked.
+func isMediaPlaylistPath(p string) bool {
+	p = strings.ToLower(p)
+	// CDNs sometimes serve segments under a .jpg extension to slip past
+	// Cloudflare media filtering; the proxy already corrects the
+	// Content-Type for these, so treat them as media here too.
+	for _, ext := range []string{".m3u8", ".m3u", ".ts", ".key", ".mp4", ".m4s", ".aac", ".vtt", ".jpg"} {
+		if strings.HasSuffix(p, ext) {
+			return true
+		}
+	}
+	return false
 }
 
 func needsProxyRewrite(rawURL string) bool {
