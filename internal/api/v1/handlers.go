@@ -674,6 +674,39 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, result)
 }
 
+func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
+	idStr := r.URL.Query().Get("id")
+	epStr := r.URL.Query().Get("ep")
+	lang := r.URL.Query().Get("lang")
+	if lang == "" {
+		lang = "sub"
+	}
+
+	if idStr == "" || epStr == "" {
+		h.respondError(w, http.StatusBadRequest, "id and ep are required")
+		return
+	}
+
+	animeID, err := strconv.Atoi(idStr)
+	episode, err2 := strconv.Atoi(epStr)
+	if err != nil || err2 != nil || animeID <= 0 || episode <= 0 {
+		h.respondError(w, http.StatusBadRequest, "invalid id or ep")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+
+	// Legacy endpoint: delegate to the streaming manager (currently Miruro-only).
+	result, err := h.stream.GetSourcesForProvider(ctx, "", episode, "", lang, "auto", animeID)
+	if err != nil || result == nil || len(result.Sources) == 0 {
+		h.respondError(w, http.StatusNotFound, "no streaming source found")
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, result)
+}
+
 func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("animeId")
 	epStr := r.URL.Query().Get("episode")
@@ -1096,6 +1129,7 @@ func needsProxyRewrite(rawURL string) bool {
 		strings.Contains(lower, "mewstream") ||
 		strings.Contains(lower, "megaplay") ||
 		strings.Contains(lower, "fast4speed") ||
+		strings.Contains(lower, "ans-bio-video") ||
 		strings.Contains(lower, "185.237.106.79")
 }
 

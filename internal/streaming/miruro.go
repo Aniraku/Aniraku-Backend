@@ -325,13 +325,8 @@ func (p *MiruroProvider) fetchSource(ctx context.Context, episodeID string) (*mi
 // verifySourceURL rejects URLs from CDNs known to return 403/502 or expired tokens.
 func (p *MiruroProvider) verifySourceURL(ctx context.Context, url string) error {
 	lower := strings.ToLower(url)
-	if strings.Contains(lower, "fast4speed") ||
-		strings.Contains(lower, "mp4upload") ||
-		strings.Contains(lower, "uns.bio") ||
-		strings.Contains(lower, "203.188.166.228") ||
-		strings.Contains(lower, "185.237.106.79") ||
-		strings.Contains(lower, "uwucdn") ||
-		strings.Contains(lower, "owocdn") {
+	if strings.Contains(lower, "mp4upload") ||
+		strings.Contains(lower, "uns.bio") {
 		return fmt.Errorf("unreliable source domain: %s", lower)
 	}
 	return nil
@@ -387,12 +382,7 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *So
 		}
 		lower := strings.ToLower(s.URL)
 		if strings.Contains(lower, "mp4upload") ||
-			strings.Contains(lower, "fast4speed") ||
-			strings.Contains(lower, "uns.bio") ||
-			strings.Contains(lower, "203.188.166.228") ||
-			strings.Contains(lower, "185.237.106.79") ||
-			strings.Contains(lower, "uwucdn") ||
-			strings.Contains(lower, "owocdn") {
+			strings.Contains(lower, "uns.bio") {
 			continue
 		}
 		streamType := "hls"
