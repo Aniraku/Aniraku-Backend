@@ -72,6 +72,12 @@ type probeCacheEntry struct {
 	fetchedAt time.Time
 }
 
+// Browse cache entry for in-memory caching of AniList responses
+type browseCacheEntry struct {
+	data      *anilist.BrowseResponse
+	fetchedAt time.Time
+}
+
 type Handlers struct {
 	cfg               *config.Config
 	log               zerolog.Logger
@@ -87,6 +93,9 @@ type Handlers struct {
 	probeCache        sync.Map
 	probeCacheMu      sync.Mutex
 	probeCacheCount   int
+	// Browse/trending cache with TTL
+	browseCache       sync.Map
+	browseCacheTTL    time.Duration
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -173,6 +182,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		goTLSClient:       goTLSClient,
 		miruroProxyURL:    miruroProxyURL,
 		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: netguard.NoRedirects},
+		browseCacheTTL:    5 * time.Minute, // 5 min cache for browse/trending
 	}
 
 	// ponytail: global lock, per-account locks if throughput matters
@@ -184,6 +194,14 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 				entry, ok := v.(keyCacheEntry)
 				if ok && time.Since(entry.fetchedAt) > 10*time.Minute {
 					h.keyCache.Delete(k)
+				}
+				return true
+			})
+			// Clean up browse cache
+			h.browseCache.Range(func(k, v any) bool {
+				entry, ok := v.(browseCacheEntry)
+				if ok && time.Since(entry.fetchedAt) > h.browseCacheTTL {
+					h.browseCache.Delete(k)
 				}
 				return true
 			})
@@ -1995,6 +2013,15 @@ func (h *Handlers) HasDub(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) trendingAniList(ctx context.Context, page, perPage int) (*anilist.BrowseResponse, error) {
+	cacheKey := fmt.Sprintf("trending:%d:%d", page, perPage)
+	if cached, ok := h.browseCache.Load(cacheKey); ok {
+		if entry, ok := cached.(browseCacheEntry); ok && time.Since(entry.fetchedAt) < h.browseCacheTTL {
+			h.log.Debug().Str("cache_key", cacheKey).Msg("trending cache hit")
+			return entry.data, nil
+		}
+		h.browseCache.Delete(cacheKey)
+	}
+
 	query := `query ($page: Int, $perPage: Int) {
 		Page(page: $page, perPage: $perPage) {
 			pageInfo { total lastPage hasNextPage currentPage perPage }
@@ -2032,6 +2059,9 @@ func (h *Handlers) trendingAniList(ctx context.Context, page, perPage int) (*ani
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+
+	// Cache the result
+	h.browseCache.Store(cacheKey, browseCacheEntry{data: &result, fetchedAt: time.Now()})
 	return &result, nil
 }
 
@@ -2082,6 +2112,20 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 	typeArgs = append(typeArgs, "sort: $sort")
 	variables["sort"] = sort
 
+	// Build cache key from all filter parameters
+	cacheKey := fmt.Sprintf("browse:%d:%d:%s:%s:%s:%s:%s:%d:%s",
+		page, perPage,
+		filters.Search, filters.Genre[0], filters.Format[0], filters.Status[0],
+		filters.Season, filters.Year, sort)
+
+	if cached, ok := h.browseCache.Load(cacheKey); ok {
+		if entry, ok := cached.(browseCacheEntry); ok && time.Since(entry.fetchedAt) < h.browseCacheTTL {
+			h.log.Debug().Str("cache_key", cacheKey).Msg("browse cache hit")
+			return entry.data, nil
+		}
+		h.browseCache.Delete(cacheKey)
+	}
+
 	query := fmt.Sprintf(`query ($page: Int, $perPage: Int, $search: String, $genre: String, $format: MediaFormat, $status: MediaStatus, $season: MediaSeason, $year: Int, $sort: [MediaSort]) {
 		Page(page: $page, perPage: $perPage) {
 			pageInfo { total lastPage hasNextPage currentPage perPage }
@@ -2114,6 +2158,9 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
+
+	// Cache the result
+	h.browseCache.Store(cacheKey, browseCacheEntry{data: &result, fetchedAt: time.Now()})
 	return &result, nil
 }
 
