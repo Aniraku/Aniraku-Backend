@@ -63,11 +63,7 @@ func IsPublicIP(ip net.IP) bool {
 			return false
 		}
 	} else {
-		// IPv4-mapped IPv6 (::ffff:a.b.c.d) — re-check as IPv4 so a mapped
-		// private address cannot slip through.
-		if mapped := ip.To4(); mapped != nil {
-			return IsPublicIP(mapped)
-		}
+         // IPv4-mapped IPv6 (::ffff:a.b.c.d) is already handled by ip.To4() above.
 		// NAT64 well-known prefix 64:ff9b::/96 wrapping a private v4.
 		if len(ip) == net.IPv6len && ip[0] == 0x00 && ip[1] == 0x64 &&
 			ip[2] == 0xff && ip[3] == 0x9b {
