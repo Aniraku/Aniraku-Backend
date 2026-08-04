@@ -99,6 +99,21 @@ func main() {
 			Str("commit", Commit).
 			Msg("Aniraku server starting")
 
+		// Start dynamic CDN allowlist cleanup (runs every hour)
+		go func() {
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					v1.CleanupDynamicCDNEntries()
+					log.Debug().Int("dynamic_cdn_count", v1.GetDynamicCDNCount()).Msg("cleaned up dynamic CDN entries")
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatal().Err(err).Msg("server failed")
 		}

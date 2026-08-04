@@ -26,6 +26,7 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 	"github.com/Aniraku/Aniraku-Backend/internal/metadata/anilist"
 	"github.com/Aniraku/Aniraku-Backend/internal/metadata/mal"
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 	"github.com/Aniraku/Aniraku-Backend/internal/streaming"
 )
 
@@ -35,12 +36,7 @@ var (
 	BuildDate = "unknown"
 )
 
-// noRedirects rejects every redirect at the client layer. Backing off at the
-// first hop means an upstream cannot bounce this server at an arbitrary
-// internal target, even one the dialer's IP guard would later permit.
-func noRedirects(_ *http.Request, _ []*http.Request) error {
-	return http.ErrUseLastResponse
-}
+const maxProbeCacheSize = 2000
 
 // ponytail: caps page to prevent AniList abuse from deep pagination
 func parsePageParam(r *http.Request, defaultVal int) int {
@@ -89,6 +85,8 @@ type Handlers struct {
 	miruroProxyClient *http.Client
 	keyCache          sync.Map
 	probeCache        sync.Map
+	probeCacheMu      sync.Mutex
+	probeCacheCount   int
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -105,7 +103,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		// this check on the final resolved IP. This is the authoritative
 		// boundary that defeats DNS rebinding and redirects, because any
 		// connection to a private address must eventually dial it here.
-		Control: ssrfGuardControl,
+		Control: netguard.Control,
 	}
 
 	h2Transport := &http2.Transport{
@@ -154,7 +152,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		// Never follow redirects server-side. hls.js re-requests the
 		// redirected URL through the proxy itself; following here would let
 		// an upstream bounce the server at any internal endpoint.
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+		CheckRedirect: netguard.NoRedirects,
 	}
 	goTLSClient := &http.Client{
 		Timeout: 30 * time.Second,
@@ -162,19 +160,19 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 			DialContext:         baseDialer.DialContext,
 			MaxIdleConnsPerHost: 10,
 		},
-		CheckRedirect: noRedirects,
+		CheckRedirect: netguard.NoRedirects,
 	}
 	h := &Handlers{
 		cfg:               cfg,
 		log:               log,
 		mal:               mal.NewClient(log),
 		stream:            streaming.NewManager(log, miruroProxyURL, httpClient),
-		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: noRedirects},
-		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: noRedirects},
+		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
+		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
 		httpClient:        httpClient,
 		goTLSClient:       goTLSClient,
 		miruroProxyURL:    miruroProxyURL,
-		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: noRedirects},
+		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: netguard.NoRedirects},
 	}
 
 	// ponytail: global lock, per-account locks if throughput matters
@@ -634,6 +632,8 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	if req.Refresh {
 		ctx = streaming.WithRefresh(ctx)
 	}
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
 
 	// AniList-keyed: the frontend sends AniList IDs, and Miruro sources are
 	// AniList-keyed too. MAL IDs are normalized to AniList IDs at the search
@@ -680,7 +680,8 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
 	// AniList-keyed; IDs are normalized at the search boundary.
 	anilistID := animeID
 	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang)
@@ -705,6 +706,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	parsed, err := url.Parse(decodedURL)
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
+		return
+	}
+	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
+		h.respondError(w, http.StatusForbidden, "proxy target port not allowed")
 		return
 	}
 	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
@@ -819,6 +824,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadGateway, errStr)
 		return
 	}
+
+	// Record successful proxy host for dynamic allowlist learning
+	RecordSuccessfulProxyHost(parsed.Hostname())
 
 	if isKey && resp.StatusCode == http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -1890,6 +1898,16 @@ func (h *Handlers) GetMiruroProbe(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	sub, dub, playable := h.stream.ProbePlayable(ctx, anilistID)
 	e := probeCacheEntry{subCount: sub, dubCount: dub, playable: playable, fetchedAt: time.Now()}
+	h.probeCacheMu.Lock()
+	if h.probeCacheCount >= maxProbeCacheSize {
+		h.probeCache.Range(func(k, _ any) bool {
+			h.probeCache.Delete(k)
+			return false
+		})
+		h.probeCacheCount--
+	}
+	h.probeCacheCount++
+	h.probeCacheMu.Unlock()
 	h.probeCache.Store(anilistID, e)
 	h.writeProbeResponse(w, anilistID, e)
 }
@@ -2136,6 +2154,7 @@ func (h *Handlers) browseAdult(ctx context.Context, page, perPage int) (*anilist
 
 // ponytail: simple AniList GraphQL proxy with 429 retry + backoff
 func (h *Handlers) AniListProxy(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		h.respondError(w, http.StatusBadRequest, "failed to read body")

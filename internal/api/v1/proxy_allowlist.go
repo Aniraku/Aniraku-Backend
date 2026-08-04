@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 )
 
 // defaultCDNSuffixes are media-CDN host suffixes the media proxy may fetch.
@@ -27,6 +28,10 @@ var defaultCDNSuffixes = []string{
 	"bunnycdn.com", "fastly.net", "fastlylb.net",
 	// Gogo-family CDN hosts
 	"gogocdn.net", "streamani.net",
+	// Additional observed CDN hosts
+	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
+	"vidcloud.net", "vidstreaming.io", "streamtape.net",
+	"rapidvideo.com", "mp4upload.com", "vidhide.net",
 	// kwik.cx media servers (referenced by IP in the referer logic)
 	"185.237.106.79", "203.188.166.228",
 }
@@ -34,6 +39,14 @@ var defaultCDNSuffixes = []string{
 var (
 	proxyCDNList     []string
 	proxyCDNListOnce sync.Once
+	proxyCDNMu       sync.RWMutex
+	// Dynamic allowlist: hosts that have been successfully proxied
+	dynamicCDNSuffixes = make(map[string]time.Time)
+	dynamicCDNMu       sync.RWMutex
+	// Max dynamic entries to prevent unbounded growth
+	maxDynamicEntries = 500
+	// TTL for dynamic entries (24 hours)
+	dynamicEntryTTL = 24 * time.Hour
 )
 
 func proxyCDNSuffixes() []string {
@@ -79,12 +92,79 @@ func isAllowedProxyHost(host string) bool {
 				return true
 			}
 		}
-		return false
+		// Also check dynamic entries for IPs
+		dynamicCDNMu.RLock()
+		_, ok := dynamicCDNSuffixes[host]
+		dynamicCDNMu.RUnlock()
+		return ok
 	}
 	for _, s := range suffixes {
 		if host == s || strings.HasSuffix(host, "."+s) {
 			return true
 		}
 	}
+	// Check dynamic allowlist (exact match or subdomain)
+	dynamicCDNMu.RLock()
+	for dynHost := range dynamicCDNSuffixes {
+		if host == dynHost || strings.HasSuffix(host, "."+dynHost) {
+			dynamicCDNMu.RUnlock()
+			return true
+		}
+	}
+	dynamicCDNMu.RUnlock()
 	return false
+}
+
+// RecordSuccessfulProxyHost adds a host to the dynamic allowlist after a successful proxy request.
+// This allows the proxy to automatically learn new CDN hosts from streaming providers.
+func RecordSuccessfulProxyHost(host string) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return
+	}
+	// Already in static list?
+	if isAllowedProxyHost(host) {
+		return
+	}
+	dynamicCDNMu.Lock()
+	defer dynamicCDNMu.Unlock()
+	// Enforce max entries with LRU-style eviction
+	if len(dynamicCDNSuffixes) >= maxDynamicEntries {
+		// Remove oldest entry
+		var oldestHost string
+		var oldestTime time.Time
+		first := true
+		for h, t := range dynamicCDNSuffixes {
+			if first || t.Before(oldestTime) {
+				oldestHost = h
+				oldestTime = t
+				first = false
+			}
+		}
+		if oldestHost != "" {
+			delete(dynamicCDNSuffixes, oldestHost)
+		}
+	}
+	dynamicCDNSuffixes[host] = time.Now()
+}
+
+// CleanupDynamicCDNEntries removes expired entries from the dynamic allowlist.
+// Call periodically (e.g., via a background goroutine) to prevent stale entries.
+func CleanupDynamicCDNEntries() {
+	dynamicCDNMu.Lock()
+	defer dynamicCDNMu.Unlock()
+	now := time.Now()
+	for host, addedAt := range dynamicCDNSuffixes {
+		if now.Sub(addedAt) > dynamicEntryTTL {
+			delete(dynamicCDNSuffixes, host)
+		}
+	}
+}
+
+// GetDynamicCDNCount returns the number of dynamically learned CDN hosts (for monitoring).
+func GetDynamicCDNCount() int {
+	dynamicCDNMu.RLock()
+	defer dynamicCDNMu.RUnlock()
+	return len(dynamicCDNSuffixes)
 }
