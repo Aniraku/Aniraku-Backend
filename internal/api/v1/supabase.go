@@ -30,16 +30,24 @@ func (h *Handlers) supabaseRequest(ctx context.Context, method, path string, bod
 	if token == "" {
 		return nil, fmt.Errorf("no user token in request context")
 	}
+	// The gateway validates apikey against the project's own keys, so it must
+	// be the anon key; a user JWT is not a project key and is rejected with
+	// "Invalid API key" before RLS is ever consulted.
+	apiKey := h.cfg.Supabase.AnonKey
+	if apiKey == "" {
+		return nil, fmt.Errorf("supabase anon key not configured")
+	}
 
 	req, err := http.NewRequestWithContext(ctx, method, supabaseURL+path, body)
 	if err != nil {
 		return nil, err
 	}
-	// apikey identifies the project to the gateway; the Authorization bearer
-	// is the JWT that PostgREST resolves to the 'authenticated' role, so RLS
-	// applies. Sending the user's JWT in place of the anon key avoids leaking
-	// a real project key here and still satisfies the gateway handshake.
-	req.Header.Set("apikey", token)
+	// These two headers do different jobs and cannot share a value. apikey
+	// identifies the project to the gateway; the Authorization bearer is the
+	// user's JWT, which PostgREST resolves to the 'authenticated' role so RLS
+	// applies per-user. The anon key grants no data access on its own — it
+	// only gets the request past the gateway.
+	req.Header.Set("apikey", apiKey)
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
