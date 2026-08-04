@@ -1245,23 +1245,23 @@ func (h *Handlers) SaveMangaProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 type watchHistoryEntry struct {
-	AnimeID    int    `json:"anime_id"`
-	AnimeTitle string `json:"anime_title"`
-	AnimeImage string `json:"anime_image"`
-	Episode    int    `json:"episode_number"`
-	Progress   int    `json:"progress"`
-	Duration   int    `json:"duration"`
-	Timestamp  int64  `json:"timestamp"`
+	AnimeID    int     `json:"anime_id"`
+	AnimeTitle string  `json:"anime_title"`
+	AnimeImage string  `json:"anime_image"`
+	Episode    int     `json:"episode_number"`
+	Progress   float64 `json:"progress"`
+	Duration   float64 `json:"duration"`
+	Timestamp  int64   `json:"timestamp"`
 }
 
 type continueWatchingItem struct {
-	AnimeID   int    `json:"animeId"`
-	Title     string `json:"title"`
-	Image     string `json:"image"`
-	Episode   int    `json:"episode"`
-	Time      int    `json:"time"`
-	Duration  int    `json:"duration"`
-	Timestamp int64  `json:"timestamp"`
+	AnimeID   int     `json:"animeId"`
+	Title     string  `json:"title"`
+	Image     string  `json:"image"`
+	Episode   int     `json:"episode"`
+	Time      float64 `json:"time"`
+	Duration  float64 `json:"duration"`
+	Timestamp int64   `json:"timestamp"`
 }
 
 func (h *Handlers) GetContinueWatching(w http.ResponseWriter, r *http.Request) {
@@ -1306,6 +1306,33 @@ func (h *Handlers) GetContinueWatching(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondJSON(w, http.StatusOK, items)
+}
+
+// AdminStats relays the server-gated admin dashboard stats. The route is
+// protected by auth.RequireAdmin (server-side is_admin() check against
+// Supabase); this handler then calls Supabase's admin_stats() RPC with the
+// caller's JWT, which raises unless the caller's role is admin. Belt and
+// suspenders: even if middleware regresses, the RPC still enforces it.
+func (h *Handlers) AdminStats(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.supabaseRequest(r.Context(), "POST", "/rest/v1/rpc/admin_stats", nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("admin_stats rpc failed")
+		h.respondError(w, http.StatusInternalServerError, "failed to load admin stats")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusForbidden, "insufficient privileges")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		h.log.Warn().Err(err).Msg("admin_stats read failed")
+		h.respondError(w, http.StatusInternalServerError, "failed to load admin stats")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, json.RawMessage(body))
 }
 
 func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {

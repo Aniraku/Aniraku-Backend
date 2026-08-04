@@ -97,6 +97,16 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Put("/api/v1/notifications/read-all", h.MarkAllNotificationsRead)
 	})
 
+	// Admin-only endpoints. RequireAdmin re-verifies the user's role against
+	// Supabase server-side — the client can never gate itself into /admin.
+	r.Group(func(r chi.Router) {
+		r.Use(rl.Middleware)
+		r.Use(authMiddleware)
+		r.Use(auth.RequireAdmin(cfg.Supabase.URL, log))
+
+		r.Get("/api/v1/admin/stats", h.AdminStats)
+	})
+
 	uiFS := embed.FS()
 	if uiFS != nil {
 		r.Handle("/*", embed.Handler())
