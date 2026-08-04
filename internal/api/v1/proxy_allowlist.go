@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // defaultCDNSuffixes are media-CDN host suffixes the media proxy may fetch.
@@ -78,6 +80,13 @@ func resetProxyCDNList() {
 	proxyCDNList = nil
 }
 
+// resetDynamicCDNEntries clears all learned hosts (test hook).
+func resetDynamicCDNEntries() {
+	dynamicCDNMu.Lock()
+	defer dynamicCDNMu.Unlock()
+	dynamicCDNSuffixes = make(map[string]time.Time)
+}
+
 // isAllowedProxyHost reports whether host is a CDN the media proxy may fetch.
 // Hostnames match on exact host or any subdomain of a listed suffix; IP
 // literals match exactly. Hostnames fail closed when the allowlist is empty.
@@ -95,38 +104,60 @@ func isAllowedProxyHost(host string) bool {
 			}
 		}
 		// Also check dynamic entries for IPs
-		dynamicCDNMu.RLock()
-		_, ok := dynamicCDNSuffixes[host]
-		dynamicCDNMu.RUnlock()
-		return ok
+		return dynamicEntryLive(host)
 	}
 	for _, s := range suffixes {
 		if host == s || strings.HasSuffix(host, "."+s) {
 			return true
 		}
 	}
-	// Check dynamic allowlist (exact match or subdomain)
-	dynamicCDNMu.RLock()
-	for dynHost := range dynamicCDNSuffixes {
-		if host == dynHost || strings.HasSuffix(host, "."+dynHost) {
-			dynamicCDNMu.RUnlock()
-			return true
-		}
-	}
-	dynamicCDNMu.RUnlock()
-	return false
+	// Check dynamic allowlist. Unlike the static list, learned hosts match
+	// exactly and never as a suffix: a learned host is vouched for only by
+	// the playlist that named it, which says nothing about its subdomains.
+	// Suffix-matching a learned host would let one rotated CDN name widen
+	// the boundary to every subdomain beneath it.
+	return dynamicEntryLive(host)
 }
 
-// RecordSuccessfulProxyHost adds a host to the dynamic allowlist after a successful proxy request.
-// This allows the proxy to automatically learn new CDN hosts from streaming providers.
-func RecordSuccessfulProxyHost(host string) {
+// dynamicEntryLive reports whether host has an unexpired dynamic entry.
+// Expiry is enforced on read rather than relying on CleanupDynamicCDNEntries,
+// so a host stops being allowed the moment its TTL lapses instead of
+// lingering until the next sweep.
+func dynamicEntryLive(host string) bool {
+	dynamicCDNMu.RLock()
+	addedAt, ok := dynamicCDNSuffixes[host]
+	dynamicCDNMu.RUnlock()
+	return ok && time.Since(addedAt) <= dynamicEntryTTL
+}
+
+// LearnHostFromPlaylist adds host to the dynamic allowlist because it was
+// referenced by a playlist we fetched from an already-trusted host.
+//
+// The trust chain matters. An earlier version recorded any host that returned
+// a successful response, but that call site was only reachable *after* the
+// allowlist gate had already passed, so it could never learn anything new —
+// it was dead code. Removing the gate instead would have made the proxy a
+// general relay again: any host returning 200 (including the ad and tracker
+// beacons embedded in provider pages) would allowlist itself.
+//
+// Learning from playlist contents avoids both problems. A provider that
+// rotates its CDN hostname still serves a playlist from a host we already
+// trust, and that playlist names the new segment host. So the new host is
+// vouched for by a trusted one, and is reachable without ever letting an
+// unknown host be fetched first.
+func LearnHostFromPlaylist(host string) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	host = strings.Trim(host, "[]")
 	if host == "" {
 		return
 	}
-	// Already in static list?
+	// Never learn a host that is already covered, and never learn a
+	// non-public address — the dialer guard would reject it at connect
+	// time anyway, so storing it only wastes an entry.
 	if isAllowedProxyHost(host) {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && !netguard.IsPublicIP(ip) {
 		return
 	}
 	dynamicCDNMu.Lock()

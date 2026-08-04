@@ -7,8 +7,13 @@ import (
 	"testing"
 )
 
-func TestRealIPRightmostEntry(t *testing.T) {
+// TestRealIPIgnoresXFFWithoutTrustedProxies verifies fail-closed behavior:
+// with no ANIRAKU_TRUSTED_PROXY_CIDRS configured, X-Forwarded-For is ignored
+// entirely and the socket peer is used, so a client cannot forge its identity
+// or mint a fresh rate-limit bucket.
+func TestRealIPIgnoresXFFWithoutTrustedProxies(t *testing.T) {
 	os.Unsetenv("ANIRAKU_TRUSTED_PROXY_CIDRS")
+	t.Cleanup(func() { os.Unsetenv("ANIRAKU_TRUSTED_PROXY_CIDRS") })
 
 	cases := []struct {
 		name       string
@@ -17,10 +22,10 @@ func TestRealIPRightmostEntry(t *testing.T) {
 		want       string
 	}{
 		{"no xff uses peer", "1.2.3.4:5678", "", "1.2.3.4"},
-		{"single xff entry", "100.20.1.1:1234", "9.9.9.9", "9.9.9.9"},
-		{"spoofed chain, render appends peer", "100.20.1.1:1234", "1.1.1.1, 2.2.2.2, 9.9.9.9", "9.9.9.9"},
-		{"malformed entries skipped", "100.20.1.1:1234", "not-an-ip, 9.9.9.9", "9.9.9.9"},
-		{"blank entries skipped", "100.20.1.1:1234", " , 9.9.9.9, ", "9.9.9.9"},
+		{"single xff entry ignored", "100.20.1.1:1234", "9.9.9.9", "100.20.1.1"},
+		{"spoofed chain ignored", "100.20.1.1:1234", "1.1.1.1, 2.2.2.2, 9.9.9.9", "100.20.1.1"},
+		{"malformed entries ignored", "100.20.1.1:1234", "not-an-ip, 9.9.9.9", "100.20.1.1"},
+		{"blank entries ignored", "100.20.1.1:1234", " , 9.9.9.9, ", "100.20.1.1"},
 	}
 
 	for _, c := range cases {

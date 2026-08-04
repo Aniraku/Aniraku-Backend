@@ -5,8 +5,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 func TestIsPublicIP(t *testing.T) {
@@ -62,8 +65,8 @@ func TestIsPublicIP(t *testing.T) {
 		if ip == nil {
 			t.Fatalf("ParseIP(%q) failed", c.ip)
 		}
-		if got := isPublicIP(ip); got != c.public {
-			t.Errorf("isPublicIP(%s) = %v, want %v", c.ip, got, c.public)
+		if got := netguard.IsPublicIP(ip); got != c.public {
+			t.Errorf("IsPublicIP(%s) = %v, want %v", c.ip, got, c.public)
 		}
 	}
 }
@@ -89,9 +92,9 @@ func TestSSRFGuardControl(t *testing.T) {
 	}
 
 	for _, c := range cases {
-		err := ssrfGuardControl("tcp", c.address, nil)
+		err := netguard.Control("tcp", c.address, nil)
 		if (err != nil) != c.wantErr {
-			t.Errorf("ssrfGuardControl(%q) err = %v, wantErr %v", c.address, err, c.wantErr)
+			t.Errorf("Control(%q) err = %v, wantErr %v", c.address, err, c.wantErr)
 		}
 	}
 }
@@ -144,7 +147,7 @@ func TestProxyRejectsPrivateTargets(t *testing.T) {
 	// The httptest server listens on loopback (or private), so a proxy request
 	// to it must be rejected outright by the fast-fail hostname check when the
 	// host is an IP literal, and by the dialer when it is a hostname.
-	if ip := net.ParseIP(host); ip != nil && !isPublicIP(ip) {
+	if ip := net.ParseIP(host); ip != nil && !netguard.IsPublicIP(ip) {
 		h := &Handlers{}
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/proxy?url="+upstream.URL, nil)
 		rec := httptest.NewRecorder()
@@ -154,6 +157,30 @@ func TestProxyRejectsPrivateTargets(t *testing.T) {
 		}
 	} else {
 		t.Skipf("test upstream resolved to non-IP-literal host %q; dialer guard not exercised", host)
+	}
+}
+
+// TestProxyRejectsNonStandardPort verifies the Proxy handler rejects targets
+// on any port other than 80/443 before any network activity.
+func TestProxyRejectsNonStandardPort(t *testing.T) {
+	t.Parallel()
+	h := &Handlers{}
+
+	for _, target := range []string{
+		"https://cdn.miruro.tv:8443/video.m3u8",
+		"http://cdn.miruro.tv:8080/video.ts",
+		"https://8.8.8.8:4433/video.mp4",
+		"http://[2001:4860:4860::8888]:9000/video.mp4",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/proxy?url="+url.QueryEscape(target), nil)
+		rec := httptest.NewRecorder()
+		h.Proxy(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("Proxy(%s) status = %d, want 403", target, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "port not allowed") {
+			t.Fatalf("Proxy(%s) body = %q, want port rejection", target, rec.Body.String())
+		}
 	}
 }
 

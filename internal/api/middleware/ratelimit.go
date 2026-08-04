@@ -13,19 +13,21 @@ type visitor struct {
 }
 
 type RateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*visitor
-	rate     int           // tokens per interval
-	burst    int           // max tokens
-	interval time.Duration // refill interval
+	mu          sync.Mutex
+	visitors    map[string]*visitor
+	rate        int           // tokens per interval
+	burst       int           // max tokens
+	interval    time.Duration // refill interval
+	maxVisitors int
 }
 
 func NewRateLimiter(rate, burst int, interval time.Duration) *RateLimiter {
 	rl := &RateLimiter{
-		visitors: make(map[string]*visitor),
-		rate:     rate,
-		burst:    burst,
-		interval: interval,
+		visitors:    make(map[string]*visitor),
+		rate:        rate,
+		burst:       burst,
+		interval:    interval,
+		maxVisitors: 10000,
 	}
 	go rl.cleanup()
 	return rl
@@ -35,12 +37,20 @@ func (rl *RateLimiter) cleanup() {
 	for {
 		time.Sleep(10 * time.Minute)
 		rl.mu.Lock()
+		stale := make([]string, 0)
 		for ip, v := range rl.visitors {
 			if time.Since(v.lastSeen) > 10*time.Minute {
-				delete(rl.visitors, ip)
+				stale = append(stale, ip)
 			}
 		}
 		rl.mu.Unlock()
+		if len(stale) > 0 {
+			rl.mu.Lock()
+			for _, ip := range stale {
+				delete(rl.visitors, ip)
+			}
+			rl.mu.Unlock()
+		}
 	}
 }
 
@@ -52,6 +62,21 @@ func (rl *RateLimiter) allow(ip string) bool {
 	now := time.Now()
 
 	if !exists {
+		if len(rl.visitors) >= rl.maxVisitors {
+			var oldestIP string
+			var oldest time.Time
+			first := true
+			for k, v := range rl.visitors {
+				if first || v.lastSeen.Before(oldest) {
+					oldestIP = k
+					oldest = v.lastSeen
+					first = false
+				}
+			}
+			if oldestIP != "" {
+				delete(rl.visitors, oldestIP)
+			}
+		}
 		rl.visitors[ip] = &visitor{tokens: rl.burst - 1, lastSeen: now}
 		return true
 	}
