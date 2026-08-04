@@ -78,6 +78,92 @@ type browseCacheEntry struct {
 	fetchedAt time.Time
 }
 
+// anilistClient provides retry logic, caching, and rate limiting for AniList API calls
+type anilistClient struct {
+	h          *Handlers
+	client     *http.Client
+	cache      sync.Map
+	cacheTTL   time.Duration
+	maxRetries int
+	baseDelay  time.Duration
+}
+
+type anilistCacheEntry struct {
+	data      []byte
+	fetchedAt time.Time
+}
+
+func newAnilistClient(h *Handlers) *anilistClient {
+	return &anilistClient{
+		h:          h,
+		client:     h.h2Client,
+		cacheTTL:   5 * time.Minute,
+		maxRetries: 3,
+		baseDelay:  1 * time.Second,
+	}
+}
+
+func (c *anilistClient) getCacheKey(query string, variables map[string]any) string {
+	v, _ := json.Marshal(variables)
+	return fmt.Sprintf("%s:%s", query, string(v))
+}
+
+func (c *anilistClient) do(ctx context.Context, query string, variables map[string]any) ([]byte, error) {
+	cacheKey := c.getCacheKey(query, variables)
+
+	// Check cache first
+	if cached, ok := c.cache.Load(cacheKey); ok {
+		if entry, ok := cached.(anilistCacheEntry); ok && time.Since(entry.fetchedAt) < c.cacheTTL {
+			return entry.data, nil
+		}
+		c.cache.Delete(cacheKey)
+	}
+
+	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
+
+	var lastErr error
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
+		if err != nil {
+			return nil, fmt.Errorf("build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			if attempt < c.maxRetries {
+				time.Sleep(c.baseDelay * time.Duration(attempt+1))
+				continue
+			}
+			return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
+		}
+
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			if attempt < c.maxRetries {
+				delay := c.baseDelay * time.Duration(attempt+1)
+				time.Sleep(delay)
+				continue
+			}
+			return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("anilist %d: %s", resp.StatusCode, string(respBody))
+		}
+
+		// Cache successful response
+		c.cache.Store(cacheKey, anilistCacheEntry{data: respBody, fetchedAt: time.Now()})
+		return respBody, nil
+	}
+
+	return nil, lastErr
+}
+
 type Handlers struct {
 	cfg               *config.Config
 	log               zerolog.Logger
@@ -96,6 +182,7 @@ type Handlers struct {
 	// Browse/trending cache with TTL
 	browseCache       sync.Map
 	browseCacheTTL    time.Duration
+	anilistClient     *anilistClient
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -184,6 +271,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: netguard.NoRedirects},
 		browseCacheTTL:    5 * time.Minute, // 5 min cache for browse/trending
 	}
+	h.anilistClient = newAnilistClient(h)
 
 	// ponytail: global lock, per-account locks if throughput matters
 	go func() {
@@ -2301,36 +2389,27 @@ func (h *Handlers) AniListProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	var resp *http.Response
-	for attempt := range 3 {
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-		if err != nil {
-			h.respondError(w, http.StatusInternalServerError, "failed to build request")
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
-
-		resp, err = h.h2Client.Do(req)
-		if err != nil {
-			h.respondError(w, http.StatusBadGateway, "AniList unreachable")
-			return
-		}
-		if resp.StatusCode != http.StatusTooManyRequests {
-			break
-		}
-		resp.Body.Close()
-		if attempt < 2 {
-			time.Sleep(time.Duration(attempt+1) * time.Second)
-		}
-	}
-	if resp == nil {
-		h.respondError(w, http.StatusTooManyRequests, "AniList rate limited after retries")
+	// Parse the incoming request to extract query/variables for caching
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
-	defer resp.Body.Close()
+	query, _ := payload["query"].(string)
+	variables, _ := payload["variables"].(map[string]any)
+
+	// Use anilistClient with retry logic and caching
+	respBody, err := h.anilistClient.do(r.Context(), query, variables)
+	if err != nil {
+		if strings.Contains(err.Error(), "rate limited") {
+			h.respondError(w, http.StatusTooManyRequests, err.Error())
+			return
+		}
+		h.respondError(w, http.StatusBadGateway, err.Error())
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	w.WriteHeader(http.StatusOK)
+	w.Write(respBody)
 }
