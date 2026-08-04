@@ -697,7 +697,7 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
-	// ponytail: try all providers and pick the best one (Miruro primary)
+	// Legacy endpoint: delegate to the streaming manager (currently Miruro-only).
 	result, err := h.stream.GetSourcesForProvider(ctx, "", episode, "", lang, "auto", animeID)
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.respondError(w, http.StatusNotFound, "no streaming source found")
