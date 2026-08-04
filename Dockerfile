@@ -20,8 +20,8 @@ ENV VIPERTLS_HOME=/app/vipertls
 COPY --from=pybase /app/vipertls /app/vipertls
 COPY --from=pybase /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=gobuild /aniraku-server /app/aniraku-server
-COPY Aniraku\ Backend/cmd/miruro-proxy/proxy.py /app/proxy.py
-COPY Aniraku\ Backend/start.sh /start.sh
+COPY cmd/miruro-proxy/proxy.py /app/proxy.py
+COPY start.sh /start.sh
 RUN chmod +x /start.sh
 EXPOSE 43211
 CMD ["/start.sh"]
