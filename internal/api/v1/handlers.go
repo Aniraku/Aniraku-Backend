@@ -69,6 +69,13 @@ type keyCacheEntry struct {
 	fetchedAt time.Time
 }
 
+type probeCacheEntry struct {
+	subCount  int
+	dubCount  int
+	playable  bool
+	fetchedAt time.Time
+}
+
 type Handlers struct {
 	cfg               *config.Config
 	log               zerolog.Logger
@@ -81,6 +88,7 @@ type Handlers struct {
 	miruroProxyURL    string
 	miruroProxyClient *http.Client
 	keyCache          sync.Map
+	probeCache        sync.Map
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -1818,6 +1826,50 @@ func (h *Handlers) GetMiruroEpisodes(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	w.Write(body)
+}
+
+// GetMiruroProbe reports whether an anime has actually playable Miruro
+// streams. Unlike the raw episodes endpoint (which only lists provider
+// metadata), this resolves and reachability-verifies a real source, so the
+// frontend's hentai filter never surfaces titles whose first episode cannot
+// play. Results are cached for 6 hours in-process.
+func (h *Handlers) GetMiruroProbe(w http.ResponseWriter, r *http.Request) {
+	idStr := chi.URLParam(r, "id")
+	if idStr == "" {
+		h.respondError(w, http.StatusBadRequest, "anime ID is required")
+		return
+	}
+	anilistID, err := strconv.Atoi(idStr)
+	if err != nil || anilistID <= 0 {
+		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
+		return
+	}
+
+	if v, ok := h.probeCache.Load(anilistID); ok {
+		e := v.(probeCacheEntry)
+		if time.Since(e.fetchedAt) < 6*time.Hour {
+			h.writeProbeResponse(w, anilistID, e)
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+	sub, dub, playable := h.stream.ProbePlayable(ctx, anilistID)
+	e := probeCacheEntry{subCount: sub, dubCount: dub, playable: playable, fetchedAt: time.Now()}
+	h.probeCache.Store(anilistID, e)
+	h.writeProbeResponse(w, anilistID, e)
+}
+
+func (h *Handlers) writeProbeResponse(w http.ResponseWriter, id int, e probeCacheEntry) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=21600")
+	json.NewEncoder(w).Encode(map[string]any{
+		"id":       id,
+		"playable": e.playable,
+		"subCount": e.subCount,
+		"dubCount": e.dubCount,
+	})
 }
 
 func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {

@@ -175,6 +175,18 @@ func (m *Manager) HasAnime(ctx context.Context, animeID int) bool {
 	return miruro.HasAnime(ctx, fmt.Sprintf("%d", animeID))
 }
 
+// ProbePlayable reports whether the anime has at least one actually playable
+// Miruro stream (source fetched and reachability-verified), plus the total
+// sub/dub episode counts advertised in the catalog. Used by the hentai
+// streamability filter so titles without playable streams never surface.
+func (m *Manager) ProbePlayable(ctx context.Context, animeID int) (subCount, dubCount int, playable bool) {
+	miruro, ok := m.providers[0].(*MiruroProvider)
+	if !ok {
+		return 0, 0, false
+	}
+	return miruro.ProbePlayable(ctx, fmt.Sprintf("%d", animeID))
+}
+
 func filterByQuality(sources []core.Source, quality string) []core.Source {
 	var filtered []core.Source
 	q := strings.ToLower(quality)

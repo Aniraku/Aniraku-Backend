@@ -676,6 +676,46 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 	return serverMap
 }
 
+// ProbePlayable reports whether this anime has at least one actually playable
+// Miruro stream (source fetched and reachability-verified), plus the total
+// sub/dub episode counts advertised in the catalog. Cheap when the source
+// cache is warm; bounded by the caller's context when it is not.
+func (p *MiruroProvider) ProbePlayable(ctx context.Context, anilistID string) (subCount, dubCount int, playable bool) {
+	data, err := p.fetchEpisodes(ctx, anilistID)
+	if err != nil {
+		p.log.Warn().Err(err).Str("anilistId", anilistID).Msg("probe: episodes fetch failed")
+		return 0, 0, false
+	}
+
+	var firstSub, firstDub float64
+	for _, prov := range data.Providers {
+		for _, e := range prov.Episodes.Sub {
+			if int(e.Number) > subCount {
+				subCount = int(e.Number)
+			}
+			if firstSub == 0 || e.Number < firstSub {
+				firstSub = e.Number
+			}
+		}
+		for _, e := range prov.Episodes.Dub {
+			if int(e.Number) > dubCount {
+				dubCount = int(e.Number)
+			}
+			if firstDub == 0 || e.Number < firstDub {
+				firstDub = e.Number
+			}
+		}
+	}
+
+	if subCount > 0 && len(p.FindAllSources(ctx, anilistID, int(firstSub), "sub")) > 0 {
+		return subCount, dubCount, true
+	}
+	if dubCount > 0 && len(p.FindAllSources(ctx, anilistID, int(firstDub), "dub")) > 0 {
+		return subCount, dubCount, true
+	}
+	return subCount, dubCount, false
+}
+
 func (p *MiruroProvider) miruroFallback(embedURL string, lastErr error, episode int, lang, providerID string) (*SourceResult, error) {
 	if embedURL != "" {
 		p.log.Warn().Str("url", embedURL).Str("lang", lang).Int("episode", episode).Msg("miruro pipe blocked, returning direct provider URL as embed")
