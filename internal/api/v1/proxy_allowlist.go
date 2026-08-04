@@ -32,6 +32,8 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
+	// TikTok/ByteDance CDN (observed for thumbnails)
+	"ipstatp.com",
 	// kwik.cx media servers (referenced by IP in the referer logic)
 	"185.237.106.79", "203.188.166.228",
 }
