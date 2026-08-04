@@ -322,11 +322,12 @@ func (p *MiruroProvider) fetchSource(ctx context.Context, episodeID string) (*mi
 	return &sourceResp, nil
 }
 
-// verifySourceURL rejects URLs from CDNs known to return 403/502 or expired tokens.
+// verifySourceURL only rejects IPs known to block datacenter ranges.
 func (p *MiruroProvider) verifySourceURL(ctx context.Context, url string) error {
 	lower := strings.ToLower(url)
-	if strings.Contains(lower, "mp4upload") ||
-		strings.Contains(lower, "uns.bio") {
+	if strings.Contains(lower, "uns.bio") ||
+		strings.Contains(lower, "203.188.166.228") ||
+		strings.Contains(lower, "185.237.106.79") {
 		return fmt.Errorf("unreliable source domain: %s", lower)
 	}
 	return nil
@@ -373,31 +374,25 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *So
 	}
 
 	var coreSources []core.Source
-	for _, s := range sourceResp.Streams {
-		if s.Type == "embed" {
-			continue
+for _, s := range sourceResp.Streams {
+			if s.Type == "embed" {
+				continue
+			}
+			if s.URL == "" {
+				continue
+			}
+			streamType := "hls"
+			if strings.Contains(s.URL, ".mp4") {
+				streamType = "mp4"
+			}
+			coreSources = append(coreSources, core.Source{
+				URL:       s.URL,
+				Type:      streamType,
+				Quality:   s.Quality,
+				Subtitles: subtitles,
+			})
 		}
-		if s.URL == "" {
-			continue
-		}
-		lower := strings.ToLower(s.URL)
-		if strings.Contains(lower, "mp4upload") ||
-			strings.Contains(lower, "uns.bio") {
-			continue
-		}
-		streamType := "hls"
-		if strings.Contains(s.URL, ".mp4") {
-			streamType = "mp4"
-		}
-		coreSources = append(coreSources, core.Source{
-			URL:       s.URL,
-			Type:      streamType,
-			Quality:   s.Quality,
-			Subtitles: subtitles,
-		})
-	}
-
-	qualityOrder := map[string]int{"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "auto": 4}
+		qualityOrder := map[string]int{"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "auto": 4}
 	sort.Slice(coreSources, func(i, j int) bool {
 		oi, oki := qualityOrder[coreSources[i].Quality]
 		oj, okj := qualityOrder[coreSources[j].Quality]
