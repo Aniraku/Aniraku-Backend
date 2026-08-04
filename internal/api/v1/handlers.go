@@ -682,11 +682,15 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 		lang = "sub"
 	}
 
-	animeID, _ := strconv.Atoi(idStr)
-	episode, _ := strconv.Atoi(epStr)
-
-	if animeID == 0 || episode == 0 {
+	if idStr == "" || epStr == "" {
 		h.respondError(w, http.StatusBadRequest, "id and ep are required")
+		return
+	}
+
+	animeID, err := strconv.Atoi(idStr)
+	episode, err2 := strconv.Atoi(epStr)
+	if err != nil || err2 != nil || animeID <= 0 || episode <= 0 {
+		h.respondError(w, http.StatusBadRequest, "invalid id or ep")
 		return
 	}
 
