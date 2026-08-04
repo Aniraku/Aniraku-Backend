@@ -1068,7 +1068,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 				// hls.js indexes LevelKey by URI — same URI skips IV update.
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
-				if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+				if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
 					lines[i] = keyTag + "\n" + fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
@@ -1077,7 +1077,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 			}
 		}
 
-		if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+		if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
 			lines[i] = fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
 		} else {
 			lines[i] = absoluteURL
