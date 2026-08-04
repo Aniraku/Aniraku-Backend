@@ -18,7 +18,7 @@ import (
 func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	r := chi.NewRouter()
 
-	r.Use(chimw.RealIP)
+	r.Use(middleware.RealIP)
 	r.Use(chimw.CleanPath)
 	r.Use(middleware.RequestID)
 	r.Use(middleware.Recover(log))
@@ -29,6 +29,12 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	// ponytail: 30 req/s per IP with burst of 60 — enough for normal browsing,
 	// prevents abuse that causes AniList 502s
 	rl := middleware.NewRateLimiter(30, 60, time.Second)
+
+	// The media proxy streams many small requests (playlists, segments, keys)
+	// per playback, but far fewer than the general limit allows for abuse.
+	// 10 req/s with burst 20 is comfortable for adaptive HLS while ~3x tighter
+	// than the global limiter.
+	proxyRL := middleware.NewRateLimiter(10, 20, time.Second)
 
 	// Supabase publishes JWKS under /auth/v1, not the project root.
 	// The previous default (`/.well-known/jwks.json`) 404s, which made
@@ -66,7 +72,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Get("/api/v1/schedule", h.GetSchedule)
 		r.Post("/api/v1/stream", h.Stream)
 		r.Get("/api/v1/servers", h.GetServers)
-		r.Get("/api/v1/proxy", h.Proxy)
+		r.With(proxyRL.Middleware).Get("/api/v1/proxy", h.Proxy)
 		r.Get("/api/v1/miruro/episodes/{id}", h.GetMiruroEpisodes)
 		r.Get("/api/v1/miruro/has-dub/{id}", h.HasDub)
 		r.Get("/api/v1/miruro/probe/{id}", h.GetMiruroProbe)

@@ -710,6 +710,12 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
 		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
 		return
+	} else if !isAllowedProxyHost(host) {
+		// The dialer SSRF guard keeps private targets out; the CDN suffix
+		// allowlist keeps the proxy from being a general public relay.
+		h.log.Warn().Str("proxy_host", host).Msg("proxy host not on CDN allowlist")
+		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
+		return
 	}
 
 	// Create request with proper headers
