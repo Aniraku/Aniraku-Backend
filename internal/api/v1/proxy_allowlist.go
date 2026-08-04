@@ -33,9 +33,9 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
-	"kotocdn.net", "vivibebe.com", "nekostream.com", "watching.onl",
-	"krussdomi.com", "mewstream.com", "megaplay.cc", "fast4speed.com",
-	"ans-bio-video.s3.amazonaws.com", "ans-bio-video.s3.us-east-1.amazonaws.com",
+		"kotocdn.net", "vivibebe.com", "nekostream.com", "watching.onl",
+		"krussdomi.com", "mewstream.com", "megaplay.cc", "fast4speed.com",
+		"ans-bio-video.s3.amazonaws.com", "ans-bio-video.s3.us-east-1.amazonaws.com",
 	// TikTok/ByteDance CDN (observed for thumbnails)
 	"ipstatp.com",
 	// kwik.cx media servers (referenced by IP in the referer logic)
