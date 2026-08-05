@@ -103,13 +103,139 @@ func newAnilistClient(h *Handlers) *anilistClient {
 	}
 }
 
+// circuitBreaker implements a simple circuit breaker pattern for AniList
+type circuitBreaker struct {
+	failures       int
+	successes      int
+	lastFailure    time.Time
+	state          int // 0=closed, 1=open, 2=half-open
+	mu             sync.Mutex
+	failureThreshold int
+	successThreshold int
+	timeout        time.Duration
+}
+
+func newCircuitBreaker() *circuitBreaker {
+	return &circuitBreaker{
+		failureThreshold: 5,
+		successThreshold: 2,
+		timeout:          30 * time.Second,
+	}
+}
+
+func (cb *circuitBreaker) allow() bool {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	switch cb.state {
+	case 0: // closed
+		return true
+	case 1: // open
+		if time.Since(cb.lastFailure) > cb.timeout {
+			cb.state = 2 // half-open
+			return true
+		}
+		return false
+	case 2: // half-open
+		return true
+	}
+	return false
+}
+
+func (cb *circuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.successes++
+	cb.failures = 0
+	if cb.state == 2 && cb.successes >= cb.successThreshold {
+		cb.state = 0
+		cb.successes = 0
+	}
+}
+
+func (cb *circuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
+	cb.successes = 0
+	if cb.failures >= cb.failureThreshold {
+		cb.state = 1 // open
+	}
+}
+
+func (cb *circuitBreaker) getState() int {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	return cb.state
+}
+
+// providerHealth tracks per-provider health
+type providerHealth struct {
+	consecutiveFailures int
+	lastSuccess         time.Time
+	lastFailure         time.Time
+	mu                  sync.Mutex
+}
+
+func (ph *providerHealth) recordSuccess() {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	ph.consecutiveFailures = 0
+	ph.lastSuccess = time.Now()
+}
+
+func (ph *providerHealth) recordFailure() {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	ph.consecutiveFailures++
+	ph.lastFailure = time.Now()
+}
+
+func (ph *providerHealth) isHealthy() bool {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	// Unhealthy after 3 consecutive failures
+	return ph.consecutiveFailures < 3
+}
+
+func (ph *providerHealth) getConsecutiveFailures() int {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	return ph.consecutiveFailures
+}
+
 func (c *anilistClient) getCacheKey(query string, variables map[string]any) string {
 	v, _ := json.Marshal(variables)
 	return fmt.Sprintf("%s:%s", query, string(v))
 }
 
 func (c *anilistClient) do(ctx context.Context, query string, variables map[string]any) ([]byte, error) {
+	// Check circuit breaker
+	if c.h.anilistCircuit != nil && !c.h.anilistCircuit.allow() {
+		// Circuit open - try to serve stale cache
+		cacheKey := c.getCacheKey(query, variables)
+		if cached, ok := c.cache.Load(cacheKey); ok {
+			if entry, ok := cached.(anilistCacheEntry); ok {
+				c.h.log.Warn().Str("cache_key", cacheKey).Msg("circuit open, serving stale cache")
+				return entry.data, nil
+			}
+		}
+		return nil, fmt.Errorf("anilist circuit open, rate limited")
+	}
+
 	cacheKey := c.getCacheKey(query, variables)
+
+	// Request deduplication: check if same query is in-flight
+	if inFlight, ok := c.h.anilistInflight.Load(cacheKey); ok {
+		if ch, ok := inFlight.(chan struct{}); ok {
+			select {
+			case <-ch:
+				// Original request finished; fall through to the cache lookup below.
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
 
 	// Check cache first
 	if cached, ok := c.cache.Load(cacheKey); ok {
@@ -118,6 +244,16 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 		}
 		c.cache.Delete(cacheKey)
 	}
+
+	// Create in-flight channel for deduplication. On completion we cache the
+	// result first, then close the channel so all waiters wake up and serve
+	// from cache (or retry themselves if the original request failed).
+	inFlightChan := make(chan struct{})
+	c.h.anilistInflight.Store(cacheKey, inFlightChan)
+	defer func() {
+		c.h.anilistInflight.Delete(cacheKey)
+		close(inFlightChan)
+	}()
 
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
 
@@ -137,6 +273,9 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 				time.Sleep(c.baseDelay * time.Duration(attempt+1))
 				continue
 			}
+			if c.h.anilistCircuit != nil {
+				c.h.anilistCircuit.recordFailure()
+			}
 			return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
 		}
 
@@ -149,18 +288,32 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 				time.Sleep(delay)
 				continue
 			}
+			if c.h.anilistCircuit != nil {
+				c.h.anilistCircuit.recordFailure()
+			}
 			return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			if c.h.anilistCircuit != nil {
+				c.h.anilistCircuit.recordFailure()
+			}
 			return nil, fmt.Errorf("anilist %d: %s", resp.StatusCode, string(respBody))
 		}
 
-		// Cache successful response
+		// Success - record circuit breaker success and cache.
+		// Waiters are released via the deferred close once we return.
+		if c.h.anilistCircuit != nil {
+			c.h.anilistCircuit.recordSuccess()
+		}
 		c.cache.Store(cacheKey, anilistCacheEntry{data: respBody, fetchedAt: time.Now()})
+
 		return respBody, nil
 	}
 
+	if c.h.anilistCircuit != nil {
+		c.h.anilistCircuit.recordFailure()
+	}
 	return nil, lastErr
 }
 
@@ -183,6 +336,11 @@ type Handlers struct {
 	browseCache       sync.Map
 	browseCacheTTL    time.Duration
 	anilistClient     *anilistClient
+
+	// --- Resilience layer ---
+	anilistCircuit    *circuitBreaker
+	anilistInflight   sync.Map // request deduplication
+	providerHealth    sync.Map // provider -> *providerHealth
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -272,8 +430,13 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		browseCacheTTL:    5 * time.Minute, // 5 min cache for browse/trending
 	}
 	h.anilistClient = newAnilistClient(h)
+	h.anilistCircuit = newCircuitBreaker()
 
 	// ponytail: global lock, per-account locks if throughput matters
+	// Provider-vouched hosts feed the media-proxy CDN allowlist as they
+	// surface, so rotated CDN hostnames never 403 at the proxy gate.
+	h.stream.SetHostLearner(func(host string) { LearnHostFromPlaylist(host) })
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -821,10 +984,26 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
+	if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
+		ctx = streaming.WithRefresh(ctx)
+	}
 	// AniList-keyed; IDs are normalized at the search boundary.
 	anilistID := animeID
 	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang)
 	h.respondJSON(w, http.StatusOK, servers)
+}
+
+// blockedProxyPorts are well-known non-HTTP service ports the media proxy
+// refuses to dial. Everything else is allowed: CDNs legitimately serve video
+// on other ports (observed: a1.mp4upload.com:183). The authoritative SSRF
+// boundary stays in the dialer's resolved-IP control hook; the port list
+// only stops accidental fetches of SSH/database/mail daemons.
+var blockedProxyPorts = map[string]bool{
+	"21": true, "22": true, "23": true, "25": true, "53": true,
+	"110": true, "143": true, "389": true, "445": true, "465": true, "587": true,
+	"993": true, "995": true, "1433": true, "1521": true, "2049": true,
+	"2375": true, "3306": true, "3389": true, "5432": true, "5900": true,
+	"6379": true, "9200": true, "11211": true, "27017": true,
 }
 
 func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
@@ -847,7 +1026,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
 		return
 	}
-	if port := parsed.Port(); port != "" && port != "80" && port != "443" {
+	if port := parsed.Port(); port != "" && blockedProxyPorts[port] {
 		h.respondError(w, http.StatusForbidden, "proxy target port not allowed")
 		return
 	}

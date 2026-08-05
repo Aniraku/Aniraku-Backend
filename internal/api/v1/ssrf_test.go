@@ -160,17 +160,40 @@ func TestProxyRejectsPrivateTargets(t *testing.T) {
 	}
 }
 
-// TestProxyRejectsNonStandardPort verifies the Proxy handler rejects targets
-// on any port other than 80/443 before any network activity.
-func TestProxyRejectsNonStandardPort(t *testing.T) {
+// TestProxyPortPolicy verifies the Proxy handler's port gate: non-standard
+// HTTP ports that CDNs legitimately use (e.g. a1.mp4upload.com:183) are no
+// longer blanket-rejected — the host allowlist gate handles those targets —
+// while well-known non-HTTP service ports (SSH, databases, mail) are
+// rejected before any network activity.
+func TestProxyPortPolicy(t *testing.T) {
 	t.Parallel()
 	h := &Handlers{}
 
+	// Non-blocked non-standard port on a NON-allowlisted host: rejected by
+	// the host allowlist gate, not the port gate. Port 183 must not be
+	// blocked wholesale (mp4upload serves video on it).
 	for _, target := range []string{
-		"https://cdn.miruro.tv:8443/video.m3u8",
-		"http://cdn.miruro.tv:8080/video.ts",
-		"https://8.8.8.8:4433/video.mp4",
+		"https://cdn.evil-example.org:183/video.mp4",
+		"https://cdn.evil-example.org:8080/video.ts",
 		"http://[2001:4860:4860::8888]:9000/video.mp4",
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/proxy?url="+url.QueryEscape(target), nil)
+		rec := httptest.NewRecorder()
+		h.Proxy(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("Proxy(%s) status = %d, want 403", target, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "proxy target not allowed") {
+			t.Fatalf("Proxy(%s) body = %q, want host allowlist rejection", target, rec.Body.String())
+		}
+	}
+
+	// Blocked service ports on an ALLOWLISTED host: rejected by the port gate.
+	for _, target := range []string{
+		"https://cdn.miruro.tv:22/video.ts",
+		"http://cdn.miruro.tv:3306/video.ts",
+		"https://hls.anidb.app:5432/video.ts",
+		"http://vidtub.kotocdn.site:6379/video.ts",
 	} {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/proxy?url="+url.QueryEscape(target), nil)
 		rec := httptest.NewRecorder()

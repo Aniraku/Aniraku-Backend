@@ -28,6 +28,18 @@ type Manager struct {
 	log       zerolog.Logger
 	providers []Provider
 	client    *http.Client
+	// LearnHost, when set, is forwarded to providers so that hosts vouched
+	// for by the trusted provider chain (verified, reachable source URLs)
+	// are fed to the media-proxy allowlist as they surface.
+	LearnHost func(host string)
+}
+
+// SetHostLearner registers the callback that receives provider-vouched hosts.
+func (m *Manager) SetHostLearner(fn func(host string)) {
+	m.LearnHost = fn
+	if miruro, ok := m.providers[0].(*MiruroProvider); ok {
+		miruro.SetHostLearner(fn)
+	}
 }
 
 type Provider interface {
@@ -71,7 +83,7 @@ func (m *Manager) GetSources(ctx context.Context, title string, episode int, lan
 
 func (m *Manager) GetSourcesForProvider(ctx context.Context, title string, episode int, provider, lang, quality string, animeID int) (*core.StreamResult, error) {
 	// Miruro-only: test all sub-providers, return working ones as servers
-	result, err := m.tryMiruro(ctx, animeID, episode, lang, quality)
+	result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
 	if err == nil && result != nil && len(result.Sources) > 0 {
 		return result, nil
 	}
@@ -106,17 +118,17 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	return servers
 }
 
-func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, provider, lang, quality string) (*core.StreamResult, error) {
 	miruro, ok := m.providers[0].(*MiruroProvider)
 	if !ok {
 		return nil, fmt.Errorf("miruro provider not available")
 	}
 
-	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying miruro")
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Str("provider", provider).Msg("trying miruro")
 
 	// FindEpisodeSource uses the anilist ID string
 	anilistID := fmt.Sprintf("%d", animeID)
-	source, err := miruro.FindEpisodeSource(ctx, anilistID, episode, lang)
+	source, err := miruro.findEpisodeSource(ctx, anilistID, episode, lang, provider)
 	if err != nil {
 		return nil, fmt.Errorf("miruro failed: %w", err)
 	}
