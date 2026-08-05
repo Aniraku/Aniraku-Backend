@@ -85,6 +85,13 @@ var defaultCDNSuffixes = []string{
 	"mikora.site",
 	"mikora.buzz",
 	"vidtub.mikora.top",
+	// Observed live 2026-08-05: vault-10.uwucdn.top (HLS), CF workers front
+	// for rotated CDNs (morning-credit-3bcc.vibevibe.workers.dev), and
+	// a1.mp4upload.com:183 direct mp4 (non-standard port handled in Proxy).
+	"uwucdn.top",
+	"uwucdn.site",
+	"workers.dev",
+	"pages.dev",
 	// kwik.cx media servers (referenced by IP in the referer logic)
 	"185.237.106.79", "203.188.166.228",
 }

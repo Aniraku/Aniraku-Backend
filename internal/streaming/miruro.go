@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +31,16 @@ type MiruroProvider struct {
 	apiBase string
 	client  *http.Client
 	log     zerolog.Logger
+	// learnHost, when set, is called with hosts that the trusted provider
+	// vouches for (verified, reachable source URLs). The HTTP layer
+	// registers it to feed the media-proxy CDN allowlist so rotated CDN
+	// hostnames are allowed the moment they surface instead of 403ing.
+	learnHost func(host string)
+	// health tracks consecutive failures per Miruro sub-provider so that
+	// CDN-blocked providers are skipped automatically instead of being
+	// re-probed on every request.
+	health   map[string]*providerHealth
+	healthMu sync.Mutex
 }
 
 func NewMiruroProvider(log zerolog.Logger, apiBase string) *MiruroProvider {
@@ -40,6 +51,109 @@ func NewMiruroProvider(log zerolog.Logger, apiBase string) *MiruroProvider {
 		apiBase: apiBase,
 		client:  &http.Client{Timeout: 60 * time.Second},
 		log:     log,
+	}
+}
+
+// SetHostLearner registers the callback that receives provider-vouched hosts.
+func (p *MiruroProvider) SetHostLearner(fn func(host string)) {
+	p.learnHost = fn
+}
+
+// providerHealth tracks consecutive failures for a Miruro sub-provider.
+// A provider is auto-blocked after providerFailureThreshold consecutive
+// failures (source pipe 444s, unreachable/bot-blocked CDNs) and is retried
+// once after providerCoolOff, so transient outages recover on their own.
+type providerHealth struct {
+	consecutiveFailures int
+	lastFailure         time.Time
+	mu                  sync.Mutex
+}
+
+const (
+	providerFailureThreshold = 3
+	providerCoolOff          = 15 * time.Minute
+)
+
+func (ph *providerHealth) recordFailure() {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	ph.consecutiveFailures++
+	ph.lastFailure = time.Now()
+}
+
+func (ph *providerHealth) recordSuccess() {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	ph.consecutiveFailures = 0
+}
+
+func (ph *providerHealth) isBlocked() bool {
+	ph.mu.Lock()
+	defer ph.mu.Unlock()
+	if ph.consecutiveFailures < providerFailureThreshold {
+		return false
+	}
+	return time.Since(ph.lastFailure) < providerCoolOff
+}
+
+func (p *MiruroProvider) healthFor(name string) *providerHealth {
+	p.healthMu.Lock()
+	defer p.healthMu.Unlock()
+	if p.health == nil {
+		p.health = map[string]*providerHealth{}
+	}
+	h, ok := p.health[name]
+	if !ok {
+		h = &providerHealth{}
+		p.health[name] = h
+	}
+	return h
+}
+
+// providerBlocked reports whether a sub-provider is currently auto-blocked.
+func (p *MiruroProvider) providerBlocked(name string) bool {
+	h := p.healthFor(name)
+	return h != nil && h.isBlocked()
+}
+
+func (p *MiruroProvider) recordProviderFailure(name string) {
+	if name != "" {
+		p.healthFor(name).recordFailure()
+	}
+}
+
+func (p *MiruroProvider) recordProviderSuccess(name string) {
+	if name != "" {
+		p.healthFor(name).recordSuccess()
+	}
+}
+
+// learnResultHosts feeds every host referenced by a verified, reachable
+// source result to the allowlist learner. Only call this for results that
+// passed verifySourceURL and testSourceReachability — the provider chain
+// plus our own probes are the trust boundary that vouches for the host.
+func (p *MiruroProvider) learnResultHosts(result *SourceResult) {
+	if p.learnHost == nil || result == nil {
+		return
+	}
+	seen := map[string]bool{}
+	learn := func(raw string) {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return
+		}
+		host := strings.ToLower(u.Hostname())
+		if host == "" || seen[host] {
+			return
+		}
+		seen[host] = true
+		p.learnHost(host)
+	}
+	for _, s := range result.Sources {
+		learn(s.URL)
+		for _, sub := range s.Subtitles {
+			learn(sub.URL)
+		}
 	}
 }
 
@@ -245,16 +359,12 @@ type miruroCandidate struct {
 }
 
 // sortedCandidates returns all providers that have episodes for lang.
-// Filters out known-bad providers for sub and dub.
+// Known-bad providers are NOT pre-skipped here: the reachability probe and
+// the per-provider auto-block decide what actually works, so every provider
+// (sub and dub) gets a fair shot.
 func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderData, lang string) []miruroCandidate {
 	var candidates []miruroCandidate
 	for _, name := range miruroAllProviders {
-		if lang == "sub" && subBadProviders[name] {
-			continue
-		}
-		if lang == "dub" && dubBadProviders[name] {
-			continue
-		}
 		prov, ok := providers[name]
 		if !ok {
 			continue
@@ -274,12 +384,6 @@ func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderDat
 	// Fallback: any provider with episodes for this lang (in case not in miruroAllProviders)
 	if len(candidates) == 0 {
 		for name, prov := range providers {
-			if lang == "sub" && subBadProviders[name] {
-				continue
-			}
-			if lang == "dub" && dubBadProviders[name] {
-				continue
-			}
 			var eps []miruroEpisode
 			if lang == "dub" {
 				eps = prov.Episodes.Dub
@@ -419,6 +523,10 @@ for _, s := range sourceResp.Streams {
 }
 
 func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
+	return p.findEpisodeSource(ctx, providerID, episode, lang, "")
+}
+
+func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID string, episode int, lang, preferred string) (*SourceResult, error) {
 	data, err := p.fetchEpisodes(ctx, providerID)
 	if err != nil {
 		return nil, err
@@ -427,6 +535,19 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 	candidates := p.sortedCandidates(data.Providers, lang)
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no %s provider available for %s", lang, providerID)
+	}
+
+	// When the caller asks for a specific server, try it first (it is likely
+	// cached from FindAllServers) and fall back to the rest if it is blocked.
+	if preferred != "" {
+		for i := range candidates {
+			if candidates[i].name == preferred {
+				preferredCandidate := candidates[i]
+				candidates = append(candidates[:i], candidates[i+1:]...)
+				candidates = append([]miruroCandidate{preferredCandidate}, candidates...)
+				break
+			}
+		}
 	}
 
 	var lastErr error
@@ -463,9 +584,15 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		}
 		miruroSourceMu.RUnlock()
 
+		if p.providerBlocked(c.name) {
+			p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("provider auto-blocked, skipping")
+			continue
+		}
+
 		sourceResp, err := p.fetchSource(ctx, episodeID)
 		if err != nil {
 			p.log.Warn().Err(err).Str("provider", c.name).Str("lang", lang).Int("episode", episode).Msg("miruro provider failed, trying next")
+			p.recordProviderFailure(c.name)
 			lastErr = err
 			if embedURL == "" && episodeURL != "" {
 				embedURL = episodeURL
@@ -477,12 +604,14 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 
 		if len(result.Sources) == 0 {
 			p.log.Warn().Str("provider", c.name).Msg("miruro source filtered to 0 sources, skipping")
+			p.recordProviderFailure(c.name)
 			lastErr = fmt.Errorf("all sources filtered for provider %s", c.name)
 			continue
 		}
 
 		if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
 			p.log.Warn().Err(err).Str("provider", c.name).Msg("miruro source domain blocked, skipping")
+			p.recordProviderFailure(c.name)
 			lastErr = err
 			continue
 		}
@@ -511,6 +640,8 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 				case resultCh <- v.result:
 				case <-ctx.Done():
 				}
+			} else {
+				p.recordProviderFailure(v.name)
 			}
 		}()
 	}
@@ -524,9 +655,12 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 	// Wait for first successful result or all failures
 	select {
 	case result := <-resultCh:
+		// The winning source is verified and reachable — vouch for its hosts.
+		p.learnResultHosts(result)
 		// Cache the result under the provider name that won
 		for _, v := range verifiedSet {
 			if v.result == result {
+				p.recordProviderSuccess(v.name)
 				sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
 				miruroSourceMu.Lock()
 				miruroSourceCache[sk] = &miruroSourceCacheEntry{result: result, fetchedAt: time.Now()}
@@ -593,20 +727,28 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 			}
 			miruroSourceMu.RUnlock()
 
+			if p.providerBlocked(c.name) {
+				p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("FindAllSources: provider auto-blocked, skipping")
+				return
+			}
+
 			// ponytail: fetchSource already uses its own timeout context
 			sourceResp, err := p.fetchSource(ctx, episodeID)
 			if err != nil {
 				p.log.Warn().Err(err).Str("provider", c.name).Msg("FindAllSources: fetchSource failed")
+				p.recordProviderFailure(c.name)
 				return
 			}
 
 			result := p.buildSourceResult(sourceResp)
 			if len(result.Sources) == 0 {
+				p.recordProviderFailure(c.name)
 				return
 			}
 
 			if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
 				p.log.Warn().Err(err).Str("provider", c.name).Msg("FindAllSources: domain blocked")
+				p.recordProviderFailure(c.name)
 				return
 			}
 
@@ -637,6 +779,10 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 		go func() {
 			defer resultsWg.Done()
 			if err := testSourceReachability(ctx, v.result.Sources[0].URL, v.result.Headers, p.client); err == nil {
+				// Verified and reachable — vouch for the source's hosts so the
+				// media proxy accepts them without a static allowlist entry.
+				p.recordProviderSuccess(v.name)
+				p.learnResultHosts(v.result)
 				// Cache the result
 				sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
 				miruroSourceMu.Lock()
@@ -646,6 +792,8 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 				resultsMu.Lock()
 				results = append(results, serverResult{name: v.name, result: v.result})
 				resultsMu.Unlock()
+			} else {
+				p.recordProviderFailure(v.name)
 			}
 		}()
 	}
