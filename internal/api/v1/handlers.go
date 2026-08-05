@@ -487,6 +487,11 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 	// surface, so rotated CDN hostnames never 403 at the proxy gate.
 	h.stream.SetHostLearner(func(host string) { LearnHostFromPlaylist(host) })
 
+	// The media proxy is the single playback gate: providers only serve
+	// sources that pass its exact request path (uTLS transport, no redirects,
+	// header filtering), so "URL served" always means "URL plays".
+	h.stream.SetMediaProbe(h)
+
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
@@ -1070,41 +1075,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Disable compression — our utls/http2 transport doesn't auto-decompress like
-	// a default http.Transport does. Upstream gzipped bytes would arrive
-	// garbled, corrupting AES-128 keys and segment data.
-	req.Header.Set("Accept-Encoding", "identity")
-
 	// Set headers from query param
 	headersJSON := r.URL.Query().Get("headers")
-	if headersJSON != "" {
-		var headers map[string]string
-		if json.Unmarshal([]byte(headersJSON), &headers) == nil {
-			for k, v := range headers {
-				// ponytail: strip dangerous headers to prevent injection
-				lower := strings.ToLower(k)
-				if lower == "host" || lower == "transfer-encoding" || lower == "connection" ||
-					lower == "proxy-connection" || lower == "upgrade" || lower == "te" ||
-					strings.HasPrefix(lower, "x-") {
-					continue
-				}
-				req.Header.Set(k, v)
-			}
-		}
-	}
-
-	// Set referer for CDNs that require it — client headers take priority where provided
-	if req.Header.Get("Referer") == "" {
-		if strings.Contains(decodedURL, "uwucdn") || strings.Contains(decodedURL, "owocdn") || strings.Contains(decodedURL, "185.237.106.79") {
-			req.Header.Set("Referer", "https://kwik.cx/")
-			req.Header.Set("Origin", "https://kwik.cx")
-		} else if strings.Contains(decodedURL, "senshi") || strings.Contains(decodedURL, "ninstream") {
-			req.Header.Set("Referer", "https://senshi.live")
-		}
-	}
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	}
+	applyProxyQueryHeaders(req, headersJSON)
 
 	// Forward the client's Range header for media/segment requests so the
 	// video element can seek through the proxy. Without it every seek turns
@@ -1282,6 +1255,164 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 	// ponytail: standard Go TLS fallback — utls Chrome fingerprint triggers
 	// bot detection on some CDNs (nekostream, watching.onl). Native Go TLS works fine.
 	return h.goTLSClient.Do(req)
+}
+
+// applyProxyQueryHeaders applies the ?headers= JSON to a proxy upstream
+// request exactly as the media proxy does: filter dangerous headers, add
+// the referer/UA defaults for known CDN classes, and disable compression
+// (the uTLS transports don't auto-decompress; gzipped upstream bytes would
+// corrupt AES-128 keys and segment data).
+func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
+	// Disable compression — the uTLS/http2 transport doesn't auto-decompress
+	// like a default http.Transport does. Upstream gzipped bytes would arrive
+	// garbled, corrupting AES-128 keys and segment data.
+	req.Header.Set("Accept-Encoding", "identity")
+
+	if headersJSON != "" {
+		var headers map[string]string
+		if json.Unmarshal([]byte(headersJSON), &headers) == nil {
+			for k, v := range headers {
+				// ponytail: strip dangerous headers to prevent injection
+				lower := strings.ToLower(k)
+				if lower == "host" || lower == "transfer-encoding" || lower == "connection" ||
+					lower == "proxy-connection" || lower == "upgrade" || lower == "te" ||
+					strings.HasPrefix(lower, "x-") {
+					continue
+				}
+				req.Header.Set(k, v)
+			}
+		}
+	}
+
+	// Set referer for CDNs that require it — client headers take priority where provided
+	if req.Header.Get("Referer") == "" {
+		u := strings.ToLower(req.URL.String())
+		if strings.Contains(u, "uwucdn") || strings.Contains(u, "owocdn") || strings.Contains(u, "185.237.106.79") {
+			req.Header.Set("Referer", "https://kwik.cx/")
+			req.Header.Set("Origin", "https://kwik.cx")
+		} else if strings.Contains(u, "senshi") || strings.Contains(u, "ninstream") {
+			req.Header.Set("Referer", "https://senshi.live")
+		}
+	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	}
+}
+
+// ProbePlayback validates that a source would actually play through the
+// media proxy, using the exact same request path (uTLS transport chain, no
+// redirects, filtered headers, Accept-Encoding: identity).
+//
+// HLS: the manifest must fetch 200 and parse as a playlist (#EXTM3U), and
+// the first referenced media playlist must also fetch 200 — this is what
+// separates alive CDNs (vivibebe) from dead ones (vidtub 403s the manifest,
+// some CDNs serve an empty master then 403 the media playlist).
+//
+// MP4: a ranged GET must return 200/206 with a media Content-Type — this
+// is what kills fast4speed (404 on the full body) and HTML error pages.
+func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	headersJSON, _ := json.Marshal(headers)
+	if srcType == "mp4" {
+		req, err := http.NewRequestWithContext(probeCtx, "GET", rawURL, nil)
+		if err != nil {
+			return false
+		}
+		applyProxyQueryHeaders(req, string(headersJSON))
+		req.Header.Set("Range", "bytes=0-1023")
+		resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			return false
+		}
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if strings.Contains(ct, "text/html") {
+			return false
+		}
+		return strings.Contains(ct, "video") || strings.Contains(ct, "audio") ||
+			strings.Contains(ct, "octet-stream") || strings.Contains(ct, "binary")
+	}
+
+	// HLS: manifest, then the first media playlist it references.
+	manifest, err := h.probePlaylist(probeCtx, rawURL, string(headersJSON))
+	if err != nil {
+		return false
+	}
+	firstChild := firstPlaylistURI(manifest)
+	if firstChild == "" {
+		return false
+	}
+	childURL, err := resolvePlaylistURL(rawURL, firstChild)
+	if err != nil {
+		return false
+	}
+	child, err := h.probePlaylist(probeCtx, childURL, string(headersJSON))
+	if err != nil {
+		return false
+	}
+	// A media playlist is only playable if it names at least one segment.
+	return firstPlaylistURI(child) != ""
+}
+
+// probePlaylist fetches a playlist exactly like the proxy would and returns
+// its body when the fetch is a genuine, parseable playlist.
+func (h *Handlers) probePlaylist(ctx context.Context, rawURL, headersJSON string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	applyProxyQueryHeaders(req, headersJSON)
+	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("playlist fetch returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	if err != nil {
+		return "", err
+	}
+	text := string(body)
+	if !strings.HasPrefix(strings.TrimSpace(text), "#EXTM3U") {
+		return "", fmt.Errorf("body is not an HLS playlist")
+	}
+	return text, nil
+}
+
+// firstPlaylistURI returns the first non-comment URI line in a playlist.
+func firstPlaylistURI(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+// resolvePlaylistURL resolves a URI line from a playlist against the
+// playlist's own URL (relative or absolute).
+func resolvePlaylistURL(baseURL, ref string) (string, error) {
+	if u, err := url.Parse(ref); err == nil && u.IsAbs() {
+		return ref, nil
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return "", err
+	}
+	rel, err := url.Parse(ref)
+	if err != nil {
+		return "", err
+	}
+	return base.ResolveReference(rel).String(), nil
 }
 
 func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase string) string {

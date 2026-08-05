@@ -27,6 +27,20 @@ var subBadProviders = map[string]bool{"kiwi": true, "hop": true}
 // dubBadProviders are known to fail for dub (404/429)
 var dubBadProviders = map[string]bool{"ally": true, "kiwi": true, "pewe": true, "hop": true}
 
+// MediaProbe validates that a source actually plays through the media proxy.
+// The proxy uses uTLS browser fingerprints, never follows redirects, filters
+// headers and sends Accept-Encoding: identity — CDNs routinely treat that
+// traffic differently from a plain Go client (a naive Range probe passes for
+// hosts that then 403/404 the real playback path). So playability must be
+// decided through the exact path the player will use, not a generic check.
+type MediaProbe interface {
+	// ProbePlayback reports whether the source would play through the proxy.
+	// For HLS the manifest must fetch 200 and parse as a playlist whose first
+	// media playlist also loads; for MP4 a ranged GET must return a media
+	// body. Redirects, HTML error pages, 403/404/502 are all unplayable.
+	ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) bool
+}
+
 type MiruroProvider struct {
 	apiBase string
 	client  *http.Client
@@ -36,6 +50,10 @@ type MiruroProvider struct {
 	// registers it to feed the media-proxy CDN allowlist so rotated CDN
 	// hostnames are allowed the moment they surface instead of 403ing.
 	learnHost func(host string)
+	// probe, when set, is the authoritative playability gate (the media
+	// proxy's transport). Without it (unit tests) a plain reachability
+	// check is used instead.
+	probe MediaProbe
 	// health tracks consecutive failures per Miruro sub-provider so that
 	// CDN-blocked providers are skipped automatically instead of being
 	// re-probed on every request.
@@ -57,6 +75,27 @@ func NewMiruroProvider(log zerolog.Logger, apiBase string) *MiruroProvider {
 // SetHostLearner registers the callback that receives provider-vouched hosts.
 func (p *MiruroProvider) SetHostLearner(fn func(host string)) {
 	p.learnHost = fn
+}
+
+// SetMediaProbe registers the playback-path gate used to decide whether a
+// source is served to players. Without one, sources pass a plain
+// reachability check instead.
+func (p *MiruroProvider) SetMediaProbe(probe MediaProbe) {
+	p.probe = probe
+}
+
+// sourcePlayable validates a source through the registered probe. When no
+// probe is registered (unit tests), it falls back to the plain
+// reachability check.
+func (p *MiruroProvider) sourcePlayable(ctx context.Context, result *SourceResult) bool {
+	if result == nil || len(result.Sources) == 0 {
+		return false
+	}
+	if p.probe != nil {
+		src := result.Sources[0]
+		return p.probe.ProbePlayback(ctx, src.Type, src.URL, result.Headers)
+	}
+	return testSourceReachability(ctx, result.Sources[0].URL, result.Headers, p.client) == nil
 }
 
 // providerHealth tracks consecutive failures for a Miruro sub-provider.
@@ -628,11 +667,20 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		return p.miruroFallback(embedURL, lastErr, episode, lang, providerID)
 	}
 
-	// Stage 2: Test ALL verified CDN URLs IN PARALLEL — first one that responds wins
-	ctx, cancel := context.WithCancel(ctx)
+	// Stage 2: Validate ALL verified CDN URLs IN PARALLEL through the real
+	// playback path (the media proxy transport). Unlike the old
+	// first-response-wins race — which served dead URLs whenever a CDN that
+	// passes a naive probe beat the working one — every source that passes
+	// here is actually playable, so any choice is a good one.
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
-	resultCh := make(chan *SourceResult, len(verifiedSet))
+	type pass struct {
+		name   string
+		result *SourceResult
+	}
+	var passing []pass
+	var passMu sync.Mutex
 	var wg sync.WaitGroup
 
 	for _, v := range verifiedSet {
@@ -640,43 +688,55 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		v := v
 		go func() {
 			defer wg.Done()
-			if err := testSourceReachability(ctx, v.result.Sources[0].URL, v.result.Headers, p.client); err == nil {
-				select {
-				case resultCh <- v.result:
-				case <-ctx.Done():
-				}
-			} else {
+			if !p.sourcePlayable(ctx, v.result) {
+				p.log.Warn().Str("provider", v.name).Str("lang", lang).Int("episode", episode).Msg("miruro source not playable through proxy, skipping")
 				p.recordProviderFailure(v.name)
+				return
 			}
+			passMu.Lock()
+			passing = append(passing, pass{name: v.name, result: v.result})
+			passMu.Unlock()
 		}()
 	}
+	wg.Wait()
 
-	// Close resultCh when all goroutines finish (all failed)
-	go func() {
-		wg.Wait()
-		close(resultCh)
-	}()
+	if len(passing) == 0 {
+		return p.miruroFallback(embedURL, lastErr, episode, lang, providerID)
+	}
 
-	// Wait for first successful result or all failures
-	select {
-	case result := <-resultCh:
-		// The winning source is verified and reachable — vouch for its hosts.
-		p.learnResultHosts(result)
-		// Cache the result under the provider name that won
-		for _, v := range verifiedSet {
-			if v.result == result {
-				p.recordProviderSuccess(v.name)
-				sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
-				miruroSourceMu.Lock()
-				miruroSourceCache[sk] = &miruroSourceCacheEntry{result: result, fetchedAt: time.Now()}
-				miruroSourceMu.Unlock()
-				break
+	// Deterministic winner: the caller's requested provider if it validated,
+	// otherwise the first playable provider in provider order. This makes a
+	// "switch server" request actually return that server instead of a
+	// random other provider's URL.
+	idxOf := func(name string) int {
+		for i, n := range miruroAllProviders {
+			if n == name {
+				return i
 			}
 		}
-		return result, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+		return len(miruroAllProviders)
 	}
+	sort.SliceStable(passing, func(i, j int) bool {
+		if passing[i].name == preferred && passing[j].name != preferred {
+			return true
+		}
+		if passing[j].name == preferred && passing[i].name != preferred {
+			return false
+		}
+		return idxOf(passing[i].name) < idxOf(passing[j].name)
+	})
+	winner := passing[0]
+
+	// The winning source is verified playable — vouch for its hosts and
+	// cache it under the provider name that won.
+	p.learnResultHosts(winner.result)
+	p.recordProviderSuccess(winner.name)
+	sk := sourceCacheKey(providerID+":"+winner.name, episode, lang)
+	miruroSourceMu.Lock()
+	miruroSourceCache[sk] = &miruroSourceCacheEntry{result: winner.result, fetchedAt: time.Now()}
+	miruroSourceMu.Unlock()
+
+	return winner.result, nil
 }
 
 // FindAllSources tests ALL Miruro sub-providers for the given episode and lang.
@@ -768,7 +828,11 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 		return nil
 	}
 
-	// Test reachability of ALL verified sources in parallel
+	// Validate ALL verified sources in parallel through the real playback
+	// path. Only sources that would actually play make the server list —
+	// a dead CDN that passes a plain reachability probe (vidtub 403s the
+	// proxy's manifest GET, fast4speed 404s the full MP4) must never be
+	// offered to the player as a selectable server.
 	type serverResult struct {
 		name   string
 		result *SourceResult
@@ -783,23 +847,24 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 		v := v
 		go func() {
 			defer resultsWg.Done()
-			if err := testSourceReachability(ctx, v.result.Sources[0].URL, v.result.Headers, p.client); err == nil {
-				// Verified and reachable — vouch for the source's hosts so the
-				// media proxy accepts them without a static allowlist entry.
-				p.recordProviderSuccess(v.name)
-				p.learnResultHosts(v.result)
-				// Cache the result
-				sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
-				miruroSourceMu.Lock()
-				miruroSourceCache[sk] = &miruroSourceCacheEntry{result: v.result, fetchedAt: time.Now()}
-				miruroSourceMu.Unlock()
-
-				resultsMu.Lock()
-				results = append(results, serverResult{name: v.name, result: v.result})
-				resultsMu.Unlock()
-			} else {
+			if !p.sourcePlayable(ctx, v.result) {
+				p.log.Warn().Str("provider", v.name).Str("lang", lang).Int("episode", episode).Msg("FindAllSources: source not playable through proxy, dropping")
 				p.recordProviderFailure(v.name)
+				return
 			}
+			// Verified and playable — vouch for the source's hosts so the
+			// media proxy accepts them without a static allowlist entry.
+			p.recordProviderSuccess(v.name)
+			p.learnResultHosts(v.result)
+			// Cache the result
+			sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
+			miruroSourceMu.Lock()
+			miruroSourceCache[sk] = &miruroSourceCacheEntry{result: v.result, fetchedAt: time.Now()}
+			miruroSourceMu.Unlock()
+
+			resultsMu.Lock()
+			results = append(results, serverResult{name: v.name, result: v.result})
+			resultsMu.Unlock()
 		}()
 	}
 	resultsWg.Wait()
