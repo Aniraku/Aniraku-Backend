@@ -485,8 +485,11 @@ for _, s := range sourceResp.Streams {
 			if s.URL == "" {
 				continue
 			}
-			streamType := "hls"
-			if strings.Contains(s.URL, ".mp4") {
+			streamType := s.Type
+			if streamType != "mp4" && streamType != "hls" {
+				streamType = "hls"
+			}
+			if streamType == "hls" && strings.Contains(s.URL, ".mp4") {
 				streamType = "mp4"
 			}
 			coreSources = append(coreSources, core.Source{
