@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -78,6 +79,46 @@ type browseCacheEntry struct {
 	fetchedAt time.Time
 }
 
+// tokenBucket is a simple client-side rate limiter. We hold ourselves to
+// ~60 req/min (AniList's documented limit is 90/min per IP) so bursts from
+// parallel page-load requests never trigger upstream 429s in the first place.
+type tokenBucket struct {
+	mu       sync.Mutex
+	capacity float64
+	tokens   float64
+	refill   float64 // tokens per second
+	last     time.Time
+}
+
+func newTokenBucket(capacity, refillPerSec float64) *tokenBucket {
+	return &tokenBucket{capacity: capacity, tokens: capacity, refill: refillPerSec, last: time.Now()}
+}
+
+// wait blocks until a token is available or the context is cancelled,
+// smoothing bursts into the configured sustained rate.
+func (tb *tokenBucket) wait(ctx context.Context) error {
+	for {
+		tb.mu.Lock()
+		now := time.Now()
+		tb.tokens = math.Min(tb.capacity, tb.tokens+now.Sub(tb.last).Seconds()*tb.refill)
+		tb.last = now
+		if tb.tokens >= 1 {
+			tb.tokens--
+			tb.mu.Unlock()
+			return nil
+		}
+		need := (1 - tb.tokens) / tb.refill
+		tb.mu.Unlock()
+		timer := time.NewTimer(time.Duration(need*float64(time.Second)) + 10*time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
 // anilistClient provides retry logic, caching, and rate limiting for AniList API calls
 type anilistClient struct {
 	h          *Handlers
@@ -86,6 +127,7 @@ type anilistClient struct {
 	cacheTTL   time.Duration
 	maxRetries int
 	baseDelay  time.Duration
+	limiter    *tokenBucket
 }
 
 type anilistCacheEntry struct {
@@ -100,6 +142,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,
+		limiter:    newTokenBucket(40, 1.0),
 	}
 }
 
@@ -256,6 +299,10 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 	}()
 
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
+
+	if err := c.limiter.wait(ctx); err != nil {
+		return nil, err
+	}
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
@@ -483,19 +530,9 @@ func (h *Handlers) resolveMalIDsToAniList(ctx context.Context, malIDs []int) (ma
 		return mapped, nil
 	}
 	query := `query ($ids: [Int]) { Page(perPage: 50) { media(idMal_in: $ids, type: ANIME) { id idMal } } }`
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]any{"ids": malIDs}})
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
+	raw, err := h.anilistClient.do(ctx, query, map[string]any{"ids": malIDs})
 	if err != nil {
 		return nil, fmt.Errorf("resolve mal ids: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("resolve mal ids: upstream %s", resp.Status)
 	}
 
 	var out struct {
@@ -508,7 +545,7 @@ func (h *Handlers) resolveMalIDsToAniList(ctx context.Context, malIDs []int) (ma
 			} `json:"Page"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("resolve mal ids: decode: %w", err)
 	}
 	for _, m := range out.Data.Page.Media {
@@ -558,24 +595,13 @@ func (h *Handlers) Version(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handlers) getAnimeFromAniList(ctx context.Context, id int) (*anilist.Anime, error) {
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english native userPreferred } coverImage { extraLarge large medium color } bannerImage format status episodes duration genres averageScore popularity description season seasonYear nextAiringEpisode { episode airingAt } isAdult } }`
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": id}})
-
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
+	raw, err := h.anilistClient.do(ctx, query, map[string]any{"id": id})
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("anilist %d", resp.StatusCode)
-	}
 
 	var result map[string]any
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(raw, &result)
 	data, _ := result["data"].(map[string]any)
 	media, _ := data["Media"].(map[string]any)
 	if media == nil {
@@ -622,21 +648,14 @@ func (h *Handlers) GetAnime(w http.ResponseWriter, r *http.Request) {
 
 	// Use AniList GraphQL proxy (avoids Jikan 504s)
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english native userPreferred } coverImage { extraLarge large medium color } bannerImage format status episodes duration genres averageScore popularity description season seasonYear nextAiringEpisode { episode airingAt } isAdult } }`
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": id}})
-
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
-	if err != nil || resp.StatusCode != 200 {
+	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": id})
+	if err != nil {
 		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
 		return
 	}
-	defer resp.Body.Close()
 
 	var result map[string]any
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(raw, &result)
 	data, _ := result["data"].(map[string]any)
 	media, _ := data["Media"].(map[string]any)
 	if media == nil {
@@ -676,21 +695,14 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// Use AniList GraphQL
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english userPreferred } coverImage { extraLarge large medium } episodes format status nextAiringEpisode { episode airingAt } } }`
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": id}})
-
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
-	if err != nil || resp.StatusCode != 200 {
+	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": id})
+	if err != nil {
 		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
 		return
 	}
-	defer resp.Body.Close()
 
 	var result map[string]any
-	json.NewDecoder(resp.Body).Decode(&result)
+	json.Unmarshal(raw, &result)
 	data, _ := result["data"].(map[string]any)
 	media, _ := data["Media"].(map[string]any)
 	if media == nil {
@@ -1175,7 +1187,12 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Rewrite HLS playlist to route through proxy, passing custom headers
-		rewritten := h.rewriteHLSPlaylist(string(body), decodedURL, headersJSON)
+		scheme := "https"
+		if r.TLS == nil && !strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https") {
+			scheme = "http"
+		}
+		proxyBase := scheme + "://" + r.Host
+		rewritten := h.rewriteHLSPlaylist(string(body), decodedURL, headersJSON, proxyBase)
 		if len(rewritten) < 1500 {
 			h.log.Debug().Str("playlist_body", rewritten).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist")
 		} else {
@@ -1230,7 +1247,7 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 	return h.goTLSClient.Do(req)
 }
 
-func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) string {
+func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase string) string {
 	lines := strings.Split(content, "\n")
 	baseParts := strings.Split(baseURL, "/")
 	var basePrefix string
@@ -1289,7 +1306,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 				absoluteURL := resolveURL(uri, basePrefix)
 				learnPlaylistTarget(absoluteURL)
 				if needsProxyRewrite(absoluteURL) || headersJSON != "" {
-					proxied := fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
+					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
 					return fmt.Sprintf("URI=\"%s\"", proxied)
 				}
 				return match
@@ -1336,7 +1353,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
 				if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
-					lines[i] = keyTag + "\n" + fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
+					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
 				}
@@ -1345,7 +1362,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON string) stri
 		}
 
 		if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
-			lines[i] = fmt.Sprintf("/api/v1/proxy?url=%s%s", url.QueryEscape(absoluteURL), headersParam)
+			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
 		} else {
 			lines[i] = absoluteURL
 		}
@@ -2311,21 +2328,9 @@ func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 	// Relations come from AniList directly so node IDs stay AniList-keyed,
 	// matching the shape the frontend consumes on the anime detail page.
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { relations { edges { relationType node { id idMal title { romaji english native userPreferred } coverImage { extraLarge large medium } format type status } } } } }`
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": map[string]int{"id": anilistID}})
-
-	req, _ := http.NewRequestWithContext(r.Context(), http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
+	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": anilistID})
 	if err != nil {
 		h.log.Warn().Err(err).Int("id", anilistID).Msg("failed to fetch relations from AniList")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		h.log.Warn().Int("status", resp.StatusCode).Msg("anilist relations request failed")
 		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
 		return
 	}
@@ -2340,7 +2345,7 @@ func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 			Message string `json:"message"`
 		} `json:"errors"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
 		return
 	}
@@ -2392,30 +2397,16 @@ func (h *Handlers) trendingAniList(ctx context.Context, page, perPage int) (*ani
 			}
 		}
 	}`
-	body, _ := json.Marshal(map[string]any{
-		"query": query,
-		"variables": map[string]int{
-			"page":    page,
-			"perPage": perPage,
-		},
+	raw, err := h.anilistClient.do(ctx, query, map[string]any{
+		"page":    page,
+		"perPage": perPage,
 	})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("anilist %d: %s", resp.StatusCode, string(respBody))
-	}
 
 	var result anilist.BrowseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
 
@@ -2497,24 +2488,13 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 		}
 	}`, strings.Join(typeArgs, ", "))
 
-	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
+	raw, err := h.anilistClient.do(ctx, query, variables)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("anilist %d: %s", resp.StatusCode, string(respBody))
-	}
 
 	var result anilist.BrowseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
 
@@ -2534,25 +2514,16 @@ func (h *Handlers) browseAdult(ctx context.Context, page, perPage int) (*anilist
 			}
 		}
 	}`
-	body, _ := json.Marshal(map[string]any{
-		"query": query,
-		"variables": map[string]int{
-			"page":    page,
-			"perPage": perPage,
-		},
+	raw, err := h.anilistClient.do(ctx, query, map[string]any{
+		"page":    page,
+		"perPage": perPage,
 	})
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	var result anilist.BrowseResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}
 	return &result, nil

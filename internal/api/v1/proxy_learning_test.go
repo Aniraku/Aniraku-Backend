@@ -27,7 +27,7 @@ func TestPlaylistVouchesForRotatedCDNHost(t *testing.T) {
 
 	h := &Handlers{}
 	// Base URL is on the static allowlist, so this playlist may vouch.
-	h.rewriteHLSPlaylist(playlist, "https://hls.anidb.app/media/index.m3u8", "")
+	h.rewriteHLSPlaylist(playlist, "https://hls.anidb.app/media/index.m3u8", "", "https://backend.test")
 
 	if !isAllowedProxyHost(rotated) {
 		t.Errorf("host %q named by a trusted playlist was not learned", rotated)
@@ -44,7 +44,7 @@ func TestUntrustedPlaylistCannotVouch(t *testing.T) {
 	playlist := "#EXTM3U\n#EXTINF:10.0,\nhttps://" + target + "/segment-1-.ts\n"
 
 	h := &Handlers{}
-	h.rewriteHLSPlaylist(playlist, "https://evil.example.com/index.m3u8", "")
+	h.rewriteHLSPlaylist(playlist, "https://evil.example.com/index.m3u8", "", "https://backend.test")
 
 	if isAllowedProxyHost(target) {
 		t.Errorf("host %q was learned from an untrusted playlist", target)
@@ -70,7 +70,7 @@ func TestAdBeaconNotLearnedFromTrustedPlaylist(t *testing.T) {
 	}, "\n")
 
 	h := &Handlers{}
-	h.rewriteHLSPlaylist(playlist, "https://hls.anidb.app/media/index.m3u8", "")
+	h.rewriteHLSPlaylist(playlist, "https://hls.anidb.app/media/index.m3u8", "", "https://backend.test")
 
 	if isAllowedProxyHost(adHost) {
 		t.Errorf("ad host %q was learned; it has no media extension", adHost)
