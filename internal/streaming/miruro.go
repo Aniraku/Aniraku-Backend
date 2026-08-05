@@ -18,8 +18,18 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// All seven Miruro sub-providers. No priority ordering — all are tested equally.
-var miruroAllProviders = []string{"bee", "bonk", "ally", "moo", "pewe", "kiwi", "hop"}
+// Active Miruro sub-providers. No priority ordering — all are tested equally.
+var miruroAllProviders = []string{"bonk", "ally", "moo", "pewe", "kiwi"}
+
+// Removed providers (bee/vidtube, hop/kaa.lt): their streams are embed-only
+// player pages that refuse framing or demand site sessions, so they can never
+// play reliably. They are excluded everywhere — never listed, never probed,
+// never picked as fallback.
+var miruroRemovedProviders = map[string]bool{
+	"bee": true,
+	"hop": true,
+	"moo": true,
+}
 
 // PlaybackVerdict ranks how a source can reach a player. Verdicts are soft
 // signals used for ordering and metadata only — they never filter providers,
@@ -386,6 +396,9 @@ func (p *MiruroProvider) fetchEpisodes(ctx context.Context, anilistID string) (*
 // bestProvider picks the first provider that has episodes for the given lang (no priority ordering).
 func (p *MiruroProvider) bestProvider(providers map[string]miruroProviderData, lang string) (string, *miruroProviderData, []miruroEpisode) {
 	for _, name := range miruroAllProviders {
+		if miruroRemovedProviders[name] {
+			continue
+		}
 		prov, ok := providers[name]
 		if !ok {
 			continue
@@ -405,6 +418,9 @@ func (p *MiruroProvider) bestProvider(providers map[string]miruroProviderData, l
 
 func (p *MiruroProvider) fallbackProvider(providers map[string]miruroProviderData, lang string) (string, *miruroProviderData, []miruroEpisode) {
 	for name, prov := range providers {
+		if miruroRemovedProviders[name] {
+			continue
+		}
 		var eps []miruroEpisode
 		if lang == "dub" {
 			eps = prov.Episodes.Dub
@@ -464,6 +480,9 @@ func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderDat
 	var candidates []miruroCandidate
 	seen := map[string]bool{}
 	for _, name := range miruroAllProviders {
+		if miruroRemovedProviders[name] {
+			continue
+		}
 		prov, ok := providers[name]
 		if !ok {
 			continue
@@ -484,7 +503,7 @@ func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderDat
 	// Any provider with episodes for this lang that is not in the known
 	// list, in API order (unknown names must surface, not be dropped).
 	for name, prov := range providers {
-		if seen[name] {
+		if seen[name] || miruroRemovedProviders[name] {
 			continue
 		}
 		var eps []miruroEpisode
@@ -1195,13 +1214,16 @@ func (p *MiruroProvider) GetProviders(ctx context.Context, anilistID string) []s
 	seen := map[string]bool{}
 	var available []string
 	for _, name := range miruroAllProviders {
+		if miruroRemovedProviders[name] {
+			continue
+		}
 		if _, ok := data.Providers[name]; ok {
 			seen[name] = true
 			available = append(available, name)
 		}
 	}
 	for name := range data.Providers {
-		if !seen[name] {
+		if !seen[name] && !miruroRemovedProviders[name] {
 			available = append(available, name)
 		}
 	}
