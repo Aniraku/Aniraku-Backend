@@ -14,7 +14,6 @@ supabase:
 providers:
   primary: miruro
   fallback: senshi
-  zen_api_base: https://api.anizen.tr
 
 logging:
   level: info

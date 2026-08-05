@@ -106,12 +106,10 @@ type PageList struct {
 type StreamRequest struct {
 	AnimeID  int    `json:"animeId"`
 	Episode  int    `json:"episode"`
-	Provider string `json:"provider"` // "miruro" or "zen"
+	Provider string `json:"provider"` // "miruro"
 	Lang     string `json:"lang"`    // "sub" or "dub"
 	Quality  string `json:"quality"` // "auto", "1080p", "720p", etc.
 	Refresh  bool   `json:"refresh"` // bypass provider cache, try next internal provider
-	Title    string `json:"title"`   // anime title; drives ZEN API fallback matching
-	MalID    int    `json:"malId"`   // MAL ID; drives ZEN API fallback matching
 }
 
 type StreamResult struct {
