@@ -28,19 +28,19 @@ func loadEnv(path string) {
 }
 
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Supabase SupabaseConfig `mapstructure:"supabase"`
+	Server    ServerConfig   `mapstructure:"server"`
+	Supabase  SupabaseConfig `mapstructure:"supabase"`
 	Providers ProviderConfig `mapstructure:"providers"`
-	Logging  LoggingConfig  `mapstructure:"logging"`
-	Update   UpdateConfig   `mapstructure:"update"`
+	Logging   LoggingConfig  `mapstructure:"logging"`
+	Update    UpdateConfig   `mapstructure:"update"`
 }
 
 type ServerConfig struct {
-	Host            string `mapstructure:"host"`
-	Port            int    `mapstructure:"port"`
-	UIDist          string `mapstructure:"ui_dist"`
-	Debug           bool   `mapstructure:"debug"`
-	MiruroProxyURL  string `mapstructure:"miruro_proxy_url"`
+	Host           string `mapstructure:"host"`
+	Port           int    `mapstructure:"port"`
+	UIDist         string `mapstructure:"ui_dist"`
+	Debug          bool   `mapstructure:"debug"`
+	MiruroProxyURL string `mapstructure:"miruro_proxy_url"`
 }
 
 type SupabaseConfig struct {
@@ -52,8 +52,9 @@ type SupabaseConfig struct {
 }
 
 type ProviderConfig struct {
-	Primary  string         `mapstructure:"primary"`
-	Fallback string         `mapstructure:"fallback"`
+	Primary    string `mapstructure:"primary"`
+	Fallback   string `mapstructure:"fallback"`
+	ZenAPIBase string `mapstructure:"zen_api_base"`
 }
 
 type LoggingConfig struct {
