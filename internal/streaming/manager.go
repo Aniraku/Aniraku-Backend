@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -66,32 +67,71 @@ type SourceResult struct {
 	Headers map[string]string
 }
 
-func NewManager(log zerolog.Logger, miruroAPIBase string, httpClient *http.Client) *Manager {
+func NewManager(log zerolog.Logger, miruroAPIBase, zenAPIBase string, httpClient *http.Client) *Manager {
 	m := &Manager{
 		log:    log,
 		client: httpClient,
 	}
 	m.providers = []Provider{
 		NewMiruroProvider(log, miruroAPIBase),
+		NewZenProvider(log, zenAPIBase, httpClient),
 	}
 	return m
 }
 
 func (m *Manager) GetSources(ctx context.Context, title string, episode int, lang, quality string) (*core.StreamResult, error) {
-	return m.GetSourcesForProvider(ctx, title, episode, "", lang, quality, 0)
+	return m.GetSourcesForProvider(ctx, title, episode, "", lang, quality, 0, 0)
 }
 
-func (m *Manager) GetSourcesForProvider(ctx context.Context, title string, episode int, provider, lang, quality string, animeID int) (*core.StreamResult, error) {
-	// Miruro-only: test all sub-providers, return working ones as servers
+// GetSourcesForProvider resolves sources for the requested provider/lang.
+// Fallback chain: Miruro sub-providers first; when they yield nothing, the
+// ZEN API embed player (title + malID are used to match the anime there).
+// An explicit provider == "zen" (user picked a "zein" server) resolves the
+// ZEN API player first and only falls back to Miruro when Zen has nothing.
+func (m *Manager) GetSourcesForProvider(ctx context.Context, title string, episode int, provider, lang, quality string, animeID, malID int) (*core.StreamResult, error) {
+	zen, _ := m.providers[1].(*ZenProvider)
+	if provider == "zen" {
+		zenResult, zenErr := zen.Resolve(ctx, animeID, title, malID, episode, lang)
+		if zenErr == nil && zenResult != nil && len(zenResult.Sources) > 0 {
+			return m.applyQualityFilter(zenResult, quality), nil
+		}
+		result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
+		if err == nil && result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		if zenErr != nil {
+			return nil, zenErr
+		}
+		return nil, err
+	}
+
 	result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
 	if err == nil && result != nil && len(result.Sources) > 0 {
 		return result, nil
 	}
-	return nil, err
+
+	if zen == nil {
+		return nil, err
+	}
+	zenResult, zenErr := zen.Resolve(ctx, animeID, title, malID, episode, lang)
+	if zenErr == nil && zenResult != nil && len(zenResult.Sources) > 0 {
+		m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("miruro empty, falling back to zen")
+		return m.applyQualityFilter(zenResult, quality), nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, zenErr
 }
 
-// FindAllServers tests ALL Miruro sub-providers for the requested lang, returns every working one as a server.
-func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string) []core.Server {
+// zenServerLimit is the cap of "zein" servers shown per lang.
+const zenServerLimit = 2
+
+// FindAllServers lists up to 4 selectable servers per lang: 2 Miruro servers
+// (quality selection preserved) + up to 2 "zein" servers from the ZEN API.
+// When Zen has nothing for the anime/lang, up to 4 working Miruro servers are
+// listed instead. Miruro servers are sorted for deterministic selection.
+func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang, title string, malID int) []core.Server {
 	miruro, ok := m.providers[0].(*MiruroProvider)
 	if !ok {
 		return nil
@@ -104,9 +144,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	anilistID := fmt.Sprintf("%d", animeID)
 	serverMap := miruro.FindAllSources(ctx, anilistID, episode, lang)
 
-	var servers []core.Server
+	var miruroServers []core.Server
 	for name, sr := range serverMap {
-		servers = append(servers, core.Server{
+		miruroServers = append(miruroServers, core.Server{
 			Name:     name,
 			Provider: "miruro",
 			Lang:     lang,
@@ -114,8 +154,41 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			Headers:  sr.Headers,
 		})
 	}
+	sort.Slice(miruroServers, func(i, j int) bool {
+		return miruroServers[i].Name < miruroServers[j].Name
+	})
 
-	return servers
+	var zenServers []core.Server
+	if zen, ok := m.providers[1].(*ZenProvider); ok {
+		zenResult, zenErr := zen.Resolve(ctx, animeID, title, malID, episode, lang)
+		if zenErr == nil && zenResult != nil && len(zenResult.Sources) > 0 {
+			for i, src := range zenResult.Sources {
+				if i >= zenServerLimit {
+					break
+				}
+				name := "zein"
+				if i > 0 {
+					name = fmt.Sprintf("zein %d", i+1)
+				}
+				zenServers = append(zenServers, core.Server{
+					Name:     name,
+					Provider: "zen",
+					Lang:     lang,
+					Sources:  []core.Source{src},
+				})
+			}
+		}
+	}
+
+	miruroLimit := 2
+	if len(zenServers) == 0 {
+		miruroLimit = 4
+	}
+	if len(miruroServers) > miruroLimit {
+		miruroServers = miruroServers[:miruroLimit]
+	}
+
+	return append(miruroServers, zenServers...)
 }
 
 func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, provider, lang, quality string) (*core.StreamResult, error) {
