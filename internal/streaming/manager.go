@@ -43,6 +43,14 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 	}
 }
 
+// SetMediaProbe registers the playback-path gate (the media proxy) so
+// providers only serve sources that would actually play through it.
+func (m *Manager) SetMediaProbe(probe MediaProbe) {
+	if miruro, ok := m.providers[0].(*MiruroProvider); ok {
+		miruro.SetMediaProbe(probe)
+	}
+}
+
 type Provider interface {
 	Name() string
 	Search(ctx context.Context, title string) ([]SearchResult, error)
