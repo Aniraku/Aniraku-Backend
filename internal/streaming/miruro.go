@@ -438,7 +438,9 @@ func (p *MiruroProvider) verifySourceURL(ctx context.Context, url string) error 
 }
 
 // testSourceReachability probes the upstream CDN with a short-range GET to verify it's reachable
-// from this server's IP range. CDNs that block datacenter IPs return 502 or connection refused.
+// from this server's IP range. CDNs that block datacenter IPs return 502 or connection refused,
+// and expired tokenized URLs (miruro reuses CDN tokens for months) return 401 — both must be
+// treated as dead so the player never mounts against a stream that cannot load.
 func testSourceReachability(ctx context.Context, url string, headers map[string]string, client *http.Client) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -458,7 +460,7 @@ func testSourceReachability(ctx context.Context, url string, headers map[string]
 	}
 	resp.Body.Close()
 
-	if resp.StatusCode == 502 || resp.StatusCode == 403 {
+	if resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 || resp.StatusCode == 502 {
 		return fmt.Errorf("source blocked by CDN (HTTP %d)", resp.StatusCode)
 	}
 	return nil
