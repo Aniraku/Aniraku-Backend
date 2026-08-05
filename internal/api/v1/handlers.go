@@ -66,54 +66,6 @@ type keyCacheEntry struct {
 	fetchedAt time.Time
 }
 
-type animeCacheEntry struct {
-	anime     *anilist.Anime
-	fetchedAt time.Time
-}
-
-// animeMeta returns the title and MAL ID for an AniList ID, cached for 30
-// minutes. Errors are swallowed: title/malID are only hints for the ZEN API
-// fallback matching, never required for Miruro playback.
-func (h *Handlers) animeMeta(ctx context.Context, id int) (string, int) {
-	h.animeCacheMu.Lock()
-	entry, ok := h.animeCache[id]
-	h.animeCacheMu.Unlock()
-	if ok && time.Since(entry.fetchedAt) < 30*time.Minute {
-		return animeTitle(entry.anime), malIDOf(entry.anime)
-	}
-	anime, err := h.getAnimeFromAniList(ctx, id)
-	if err != nil || anime == nil {
-		return "", 0
-	}
-	h.animeCacheMu.Lock()
-	h.animeCache[id] = animeCacheEntry{anime: anime, fetchedAt: time.Now()}
-	h.animeCacheMu.Unlock()
-	return animeTitle(anime), malIDOf(anime)
-}
-
-func animeTitle(a *anilist.Anime) string {
-	if a == nil {
-		return ""
-	}
-	if a.Title.UserPreferred != nil && *a.Title.UserPreferred != "" {
-		return *a.Title.UserPreferred
-	}
-	if a.Title.Romaji != nil {
-		return *a.Title.Romaji
-	}
-	if a.Title.English != nil {
-		return *a.Title.English
-	}
-	return ""
-}
-
-func malIDOf(a *anilist.Anime) int {
-	if a == nil || a.IDMal == nil {
-		return 0
-	}
-	return *a.IDMal
-}
-
 type probeCacheEntry struct {
 	subCount  int
 	dubCount  int
@@ -429,8 +381,6 @@ type Handlers struct {
 	keyCache          sync.Map
 	probeCache        sync.Map
 	probeCacheMu      sync.Mutex
-	animeCache        map[int]animeCacheEntry
-	animeCacheMu      sync.Mutex
 	probeCacheCount   int
 	// Browse/trending cache with TTL
 	browseCache       sync.Map
@@ -520,14 +470,13 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		cfg:               cfg,
 		log:               log,
 		mal:               mal.NewClient(log),
-		stream:            streaming.NewManager(log, miruroProxyURL, cfg.Providers.ZenAPIBase, httpClient),
+		stream:            streaming.NewManager(log, miruroProxyURL, httpClient),
 		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
 		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
 		httpClient:        httpClient,
 		goTLSClient:       goTLSClient,
 		miruroProxyURL:    miruroProxyURL,
 		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: netguard.NoRedirects},
-		animeCache:        map[int]animeCacheEntry{},
 		browseCacheTTL:    5 * time.Minute, // 5 min cache for browse/trending
 	}
 	h.anilistClient = newAnilistClient(h)
@@ -979,23 +928,8 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	// boundary, never here.
 	anilistID := req.AnimeID
 
-	// Title + MAL ID drive the ZEN API fallback matching (ZenAPI keys by
-	// malId; anilistId is usually null there). The frontend sends them with
-	// the request; AniList is only consulted as a fallback so rate limits
-	// never gate the streaming path.
-	title, malID := req.Title, req.MalID
-	if title == "" || malID == 0 {
-		t, m := h.animeMeta(ctx, anilistID)
-		if title == "" {
-			title = t
-		}
-		if malID == 0 {
-			malID = m
-		}
-	}
-
 	// Find best source for the requested provider/lang only
-	result, err := h.stream.GetSourcesForProvider(ctx, title, req.Episode, req.Provider, req.Lang, req.Quality, anilistID, malID)
+	result, err := h.stream.GetSourcesForProvider(ctx, req.Episode, req.Provider, req.Lang, req.Quality, anilistID)
 
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.log.Warn().Err(err).Int("animeId", req.AnimeID).Str("lang", req.Lang).Str("provider", req.Provider).Msg("streaming failed")
@@ -1033,9 +967,8 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
-	// Legacy endpoint: delegate to the streaming manager (Miruro + ZEN API fallback).
-	title, malID := h.animeMeta(ctx, animeID)
-	result, err := h.stream.GetSourcesForProvider(ctx, title, episode, "", lang, "auto", animeID, malID)
+	// Legacy endpoint: delegate to the streaming manager (Miruro).
+	result, err := h.stream.GetSourcesForProvider(ctx, episode, "", lang, "auto", animeID)
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.respondError(w, http.StatusNotFound, "no streaming source found")
 		return
@@ -1076,21 +1009,7 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	// AniList-keyed; IDs are normalized at the search boundary.
 	anilistID := animeID
 
-	// Title + MAL ID come from the client when available (frontend has the
-	// anime data); AniList is only a fallback so its rate limits never gate
-	// the ZEN API fallback.
-	title := r.URL.Query().Get("title")
-	malID, _ := strconv.Atoi(r.URL.Query().Get("malId"))
-	if title == "" || malID == 0 {
-		t, m := h.animeMeta(ctx, anilistID)
-		if title == "" {
-			title = t
-		}
-		if malID == 0 {
-			malID = m
-		}
-	}
-	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang, title, malID)
+	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang)
 	h.respondJSON(w, http.StatusOK, servers)
 }
 

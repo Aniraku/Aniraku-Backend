@@ -52,9 +52,8 @@ type SupabaseConfig struct {
 }
 
 type ProviderConfig struct {
-	Primary    string `mapstructure:"primary"`
-	Fallback   string `mapstructure:"fallback"`
-	ZenAPIBase string `mapstructure:"zen_api_base"`
+	Primary  string `mapstructure:"primary"`
+	Fallback string `mapstructure:"fallback"`
 }
 
 type LoggingConfig struct {
