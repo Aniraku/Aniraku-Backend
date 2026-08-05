@@ -1273,12 +1273,10 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 		if err != nil {
 			return
 		}
-		// Media only. Playlists also reference ad and tracker beacons
-		// (observed: p1.ipstatp.com/obj/ad-site-i18n/...), and those must
-		// not earn a place on the allowlist.
-		if !isMediaPlaylistPath(u.Path) {
-			return
-		}
+		// A trusted playlist may name any media host — including extension-less
+		// segment URLs (observed: p1.ipstatp.com/obj/ad-site-i18n/...). The
+		// dialer SSRF guard plus static allowlist gate remain the boundary;
+		// the media-path filter was dropping real segment hosts.
 		LearnHostFromPlaylist(u.Hostname())
 	}
 
@@ -1352,7 +1350,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 				// hls.js indexes LevelKey by URI — same URI skips IV update.
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
-				if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
+				if headersJSON != "" || needsProxyRewrite(absoluteURL) {
 					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
@@ -1361,7 +1359,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 			}
 		}
 
-		if (headersJSON != "" || needsProxyRewrite(absoluteURL)) && isMediaPlaylistPath(absoluteURL) {
+		if headersJSON != "" || needsProxyRewrite(absoluteURL) {
 			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
 		} else {
 			lines[i] = absoluteURL
@@ -1377,23 +1375,6 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 	}
 
 	return result
-}
-
-// isMediaPlaylistPath reports whether p looks like an HLS media resource:
-// a nested playlist, a segment, an init section, or a decryption key. Only
-// these earn a host a place on the dynamic allowlist. Playlists routinely
-// also carry ad, analytics, and tracker URLs, which must stay blocked.
-func isMediaPlaylistPath(p string) bool {
-	p = strings.ToLower(p)
-	// CDNs sometimes serve segments under a .jpg extension to slip past
-	// Cloudflare media filtering; the proxy already corrects the
-	// Content-Type for these, so treat them as media here too.
-	for _, ext := range []string{".m3u8", ".m3u", ".ts", ".key", ".mp4", ".m4s", ".aac", ".vtt", ".jpg"} {
-		if strings.HasSuffix(p, ext) {
-			return true
-		}
-	}
-	return false
 }
 
 func needsProxyRewrite(rawURL string) bool {

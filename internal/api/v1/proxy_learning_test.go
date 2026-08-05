@@ -54,26 +54,30 @@ func TestUntrustedPlaylistCannotVouch(t *testing.T) {
 	}
 }
 
-// The ad beacon from the production logs must never be learned, even when it
-// appears inside an otherwise-trusted playlist.
-func TestAdBeaconNotLearnedFromTrustedPlaylist(t *testing.T) {
+// The segment CDN from the production logs (extension-less URLs on a
+// Bytedance host) must be learnable — those are real video segments, not
+// ads, despite the "ad-site-i18n" path segment.
+func TestExtensionLessSegmentHostLearnedFromTrustedPlaylist(t *testing.T) {
 	t.Cleanup(resetDynamicCDNEntries)
 	resetDynamicCDNEntries()
 
-	const adHost = "p1.ipstatp.com"
+	const segmentHost = "p1.ipstatp.com"
+	if isAllowedProxyHost(segmentHost) {
+		t.Fatalf("precondition: %q should not be allowed yet", segmentHost)
+	}
+
 	playlist := strings.Join([]string{
 		"#EXTM3U",
-		"#EXT-X-KEY:METHOD=AES-128,URI=\"https://" + adHost + "/obj/ad-site-i18n/beacon\"",
 		"#EXTINF:10.0,",
-		"https://" + adHost + "/obj/ad-site-i18n/202603305d0d5c515be3279c4b3db830",
+		"https://" + segmentHost + "/obj/ad-site-i18n/202604075d0d5bea89a6f3b6459c98bc",
 		"#EXT-X-ENDLIST",
 	}, "\n")
 
 	h := &Handlers{}
 	h.rewriteHLSPlaylist(playlist, "https://hls.anidb.app/media/index.m3u8", "", "https://backend.test")
 
-	if isAllowedProxyHost(adHost) {
-		t.Errorf("ad host %q was learned; it has no media extension", adHost)
+	if !isAllowedProxyHost(segmentHost) {
+		t.Errorf("extension-less segment host %q was not learned", segmentHost)
 	}
 }
 
