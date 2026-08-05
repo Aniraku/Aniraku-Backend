@@ -1185,6 +1185,18 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	}
 
+	// Forward the client's Range header for media/segment requests so the
+	// video element can seek through the proxy. Without it every seek turns
+	// into a fresh full-body download and playback restarts from the start.
+	// Playlists and keys are excluded — their paths need full bodies (HLS
+	// rewrite / key cache), and neither hls.js nor native HLS ranges them.
+	if rng := r.Header.Get("Range"); rng != "" {
+		p := strings.ToLower(parsed.Path)
+		if !strings.HasSuffix(p, ".m3u8") && !strings.HasSuffix(p, ".m3u") && !strings.HasSuffix(p, ".key") {
+			req.Header.Set("Range", rng)
+		}
+	}
+
 	// Cache key responses — hls.js makes one request per unique KEY URI
 	// (we append &sn=N to each per-segment KEY tag). The backend strips sn
 	// from the upstream URL, so every request fetches the same CDN key URL.
@@ -1306,6 +1318,21 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.HasSuffix(pathLower, ".key") {
 		ct = "application/octet-stream"
+	}
+
+	// Partial-content responses (206) from a forwarded Range: pass through
+	// Content-Range and advertise Accept-Ranges so the video element knows it
+	// can seek. Content-Length is echoed to keep the response non-chunked.
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
+		w.Header().Set("Accept-Ranges", ar)
+	} else if resp.StatusCode == http.StatusPartialContent {
+		w.Header().Set("Accept-Ranges", "bytes")
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
 	}
 
 	w.Header().Set("Content-Type", ct)
