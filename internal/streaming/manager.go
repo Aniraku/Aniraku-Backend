@@ -99,8 +99,10 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 	return nil, err
 }
 
-// FindAllServers lists up to 4 selectable Miruro servers per lang (quality
-// selection preserved), sorted for deterministic selection.
+// FindAllServers lists every selectable Miruro server per lang (quality
+// selection preserved). Ordering is deterministic: best playback verdict
+// first (proxy > direct > embed > dead), then provider order. No server is
+// hidden — datacenter verdicts are hints, not filters.
 func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string) []core.Server {
 	miruro, ok := m.providers[0].(*MiruroProvider)
 	if !ok {
@@ -114,6 +116,17 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	anilistID := fmt.Sprintf("%d", animeID)
 	serverMap := miruro.FindAllSources(ctx, anilistID, episode, lang)
 
+	// Deterministic provider order: best verdict first, then known-provider
+	// order, then unknown providers in API order.
+	idxOf := func(name string) int {
+		for i, n := range miruroAllProviders {
+			if n == name {
+				return i
+			}
+		}
+		return len(miruroAllProviders)
+	}
+
 	var miruroServers []core.Server
 	for name, sr := range serverMap {
 		miruroServers = append(miruroServers, core.Server{
@@ -124,15 +137,37 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			Headers:  sr.Headers,
 		})
 	}
-	sort.Slice(miruroServers, func(i, j int) bool {
-		return miruroServers[i].Name < miruroServers[j].Name
+	sort.SliceStable(miruroServers, func(i, j int) bool {
+		bi := serverVerdictRank(miruroServers[i])
+		bj := serverVerdictRank(miruroServers[j])
+		if bi != bj {
+			return bi > bj
+		}
+		return idxOf(miruroServers[i].Name) < idxOf(miruroServers[j].Name)
 	})
 
-	if len(miruroServers) > 4 {
-		miruroServers = miruroServers[:4]
-	}
-
 	return miruroServers
+}
+
+// serverVerdictRank maps a server's best per-source verification tag to a
+// comparable rank (proxy > direct > embed > dead).
+func serverVerdictRank(s core.Server) int {
+	best := 0
+	for _, src := range s.Sources {
+		switch src.Verification {
+		case "proxy":
+			return 3
+		case "direct":
+			if best < 2 {
+				best = 2
+			}
+		case "embed":
+			if best < 1 {
+				best = 1
+			}
+		}
+	}
+	return best
 }
 
 func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, provider, lang, quality string) (*core.StreamResult, error) {
