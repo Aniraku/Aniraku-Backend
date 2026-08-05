@@ -21,24 +21,44 @@ import (
 // All seven Miruro sub-providers. No priority ordering — all are tested equally.
 var miruroAllProviders = []string{"bee", "bonk", "ally", "moo", "pewe", "kiwi", "hop"}
 
-// subBadProviders are known to fail for sub (444 or filtered to 0)
-var subBadProviders = map[string]bool{"kiwi": true, "hop": true}
+// PlaybackVerdict ranks how a source can reach a player. Verdicts are soft
+// signals used for ordering and metadata only — they never filter providers,
+// because CDNs routinely serve datacenter and residential IPs differently.
+type PlaybackVerdict int
 
-// dubBadProviders are known to fail for dub (404/429)
-var dubBadProviders = map[string]bool{"ally": true, "kiwi": true, "pewe": true, "hop": true}
+const (
+	VerdictDead PlaybackVerdict = iota // unplayable via any path we know of
+	VerdictEmbed                       // works only as an iframe/embed player
+	VerdictDirect                      // reachable with a plain browser-like client
+	VerdictProxy                       // verified playable through the media proxy
+)
 
-// MediaProbe validates that a source actually plays through the media proxy.
-// The proxy uses uTLS browser fingerprints, never follows redirects, filters
-// headers and sends Accept-Encoding: identity — CDNs routinely treat that
-// traffic differently from a plain Go client (a naive Range probe passes for
-// hosts that then 403/404 the real playback path). So playability must be
-// decided through the exact path the player will use, not a generic check.
+func (v PlaybackVerdict) String() string {
+	switch v {
+	case VerdictProxy:
+		return "proxy"
+	case VerdictDirect:
+		return "direct"
+	case VerdictEmbed:
+		return "embed"
+	}
+	return "dead"
+}
+
+// MediaProbe validates how a source can reach a player. The proxy path uses
+// uTLS browser fingerprints, never follows redirects, filters headers and
+// sends Accept-Encoding: identity — CDNs routinely treat that traffic
+// differently from a plain Go client (a naive Range probe passes for hosts
+// that then 403/404 the real playback path). A "direct" verdict means the
+// source is reachable with a plain browser-like client instead.
 type MediaProbe interface {
-	// ProbePlayback reports whether the source would play through the proxy.
-	// For HLS the manifest must fetch 200 and parse as a playlist whose first
-	// media playlist also loads; for MP4 a ranged GET must return a media
-	// body. Redirects, HTML error pages, 403/404/502 are all unplayable.
-	ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) bool
+	// ProbePlayback reports how the source would play: VerdictProxy if the
+	// media-proxy path works, VerdictDirect if only a plain browser-like
+	// client works, VerdictDead otherwise. For HLS the manifest must fetch
+	// 200 and parse as a playlist whose first media playlist also loads;
+	// for MP4 a ranged GET must return a media body. Redirects, HTML error
+	// pages, 403/404/502 are unplayable.
+	ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) PlaybackVerdict
 }
 
 type MiruroProvider struct {
@@ -84,24 +104,62 @@ func (p *MiruroProvider) SetMediaProbe(probe MediaProbe) {
 	p.probe = probe
 }
 
-// sourcePlayable validates a source through the registered probe. When no
-// probe is registered (unit tests), it falls back to the plain
-// reachability check.
-func (p *MiruroProvider) sourcePlayable(ctx context.Context, result *SourceResult) bool {
+// verdictResult ranks every source in a result through the registered probe
+// (or a plain reachability check when no probe is registered) and returns a
+// shallow copy with Verification tags filled in, plus the provider's best
+// verdict. It never drops sources — the verdict is an ordering hint surfaced
+// to clients so the player can pick the most reliable path first.
+func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult) (*SourceResult, PlaybackVerdict) {
 	if result == nil || len(result.Sources) == 0 {
-		return false
+		return nil, VerdictDead
 	}
-	if p.probe != nil {
-		src := result.Sources[0]
-		return p.probe.ProbePlayback(ctx, src.Type, src.URL, result.Headers)
+	best := VerdictDead
+	sources := make([]core.Source, len(result.Sources))
+	for i, src := range result.Sources {
+		var v PlaybackVerdict
+		if src.Type == "embed" {
+			v = VerdictEmbed
+		} else if p.probe != nil {
+			v = p.probe.ProbePlayback(ctx, src.Type, src.URL, result.Headers)
+		} else if testSourceReachability(ctx, src.URL, result.Headers, p.client) == nil {
+			v = VerdictDirect
+		}
+		sources[i] = src
+		sources[i].Verification = v.String()
+		if v > best {
+			best = v
+		}
 	}
-	return testSourceReachability(ctx, result.Sources[0].URL, result.Headers, p.client) == nil
+	// Order sources by verdict (proxy > direct > embed > dead) so
+	// Sources[0] is always the most reliable path; ties keep the original
+	// quality ordering.
+	sort.SliceStable(sources, func(i, j int) bool {
+		vi := playbackVerdictRank(sources[i].Verification)
+		vj := playbackVerdictRank(sources[j].Verification)
+		return vi > vj
+	})
+	return &SourceResult{Sources: sources, Headers: result.Headers}, best
+}
+
+// playbackVerdictRank maps a verification tag to a comparable rank.
+func playbackVerdictRank(verification string) int {
+	switch verification {
+	case "proxy":
+		return 3
+	case "direct":
+		return 2
+	case "embed":
+		return 1
+	}
+	return 0
 }
 
 // providerHealth tracks consecutive failures for a Miruro sub-provider.
 // A provider is auto-blocked after providerFailureThreshold consecutive
-// failures (source pipe 444s, unreachable/bot-blocked CDNs) and is retried
-// once after providerCoolOff, so transient outages recover on their own.
+// pipe failures (Miruro API 444s/5xx/transport errors) and is retried once
+// after providerCoolOff, so transient outages recover on their own. CDN
+// playback verdicts never count — datacenter reachability differs from the
+// player's and must never hide a provider from the server list.
 type providerHealth struct {
 	consecutiveFailures int
 	lastFailure         time.Time
@@ -288,7 +346,7 @@ func sourceCacheKey(aid string, ep int, lang string) string {
 func (p *MiruroProvider) fetchEpisodes(ctx context.Context, anilistID string) (*miruroEpisodesResponse, error) {
 	key := cacheKey(anilistID)
 	miruroCacheMu.RLock()
-	if c, ok := miruroCache[key]; ok && time.Since(c.fetchedAt) < 5*time.Minute {
+	if c, ok := miruroCache[key]; ok && time.Since(c.fetchedAt) < 5*time.Minute && !IsRefresh(ctx) {
 		miruroCacheMu.RUnlock()
 		return &miruroEpisodesResponse{Providers: c.providers}, nil
 	}
@@ -397,12 +455,14 @@ type miruroCandidate struct {
 	priority int
 }
 
-// sortedCandidates returns all providers that have episodes for lang.
-// Known-bad providers are NOT pre-skipped here: the reachability probe and
-// the per-provider auto-block decide what actually works, so every provider
-// (sub and dub) gets a fair shot.
+// sortedCandidates returns all providers that have episodes for lang:
+// the known providers in canonical order first, then any additional
+// providers Miruro advertises (e.g. ANIMEDUNYA), in API order. Known-bad
+// providers are NOT pre-skipped: verdicts and the per-provider auto-block
+// decide what actually works, so every provider gets a fair shot.
 func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderData, lang string) []miruroCandidate {
 	var candidates []miruroCandidate
+	seen := map[string]bool{}
 	for _, name := range miruroAllProviders {
 		prov, ok := providers[name]
 		if !ok {
@@ -417,21 +477,25 @@ func (p *MiruroProvider) sortedCandidates(providers map[string]miruroProviderDat
 		if len(eps) == 0 {
 			continue
 		}
+		seen[name] = true
 		candidates = append(candidates, miruroCandidate{name: name, prov: &prov, episodes: eps})
 	}
 
-	// Fallback: any provider with episodes for this lang (in case not in miruroAllProviders)
-	if len(candidates) == 0 {
-		for name, prov := range providers {
-			var eps []miruroEpisode
-			if lang == "dub" {
-				eps = prov.Episodes.Dub
-			} else {
-				eps = prov.Episodes.Sub
-			}
-			if len(eps) > 0 {
-				candidates = append(candidates, miruroCandidate{name: name, prov: &prov, episodes: eps})
-			}
+	// Any provider with episodes for this lang that is not in the known
+	// list, in API order (unknown names must surface, not be dropped).
+	for name, prov := range providers {
+		if seen[name] {
+			continue
+		}
+		var eps []miruroEpisode
+		if lang == "dub" {
+			eps = prov.Episodes.Dub
+		} else {
+			eps = prov.Episodes.Sub
+		}
+		if len(eps) > 0 {
+			seen[name] = true
+			candidates = append(candidates, miruroCandidate{name: name, prov: &prov, episodes: eps})
 		}
 	}
 	return candidates
@@ -519,27 +583,24 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *So
 	}
 
 	var coreSources []core.Source
-for _, s := range sourceResp.Streams {
-			if s.Type == "embed" {
-				continue
-			}
-			if s.URL == "" {
-				continue
-			}
-			streamType := s.Type
-			if streamType != "mp4" && streamType != "hls" {
-				streamType = "hls"
-			}
-			if streamType == "hls" && strings.Contains(s.URL, ".mp4") {
-				streamType = "mp4"
-			}
-			coreSources = append(coreSources, core.Source{
-				URL:       s.URL,
-				Type:      streamType,
-				Quality:   s.Quality,
-				Subtitles: subtitles,
-			})
+	for _, s := range sourceResp.Streams {
+		if s.URL == "" {
+			continue
 		}
+		streamType := s.Type
+		if streamType != "mp4" && streamType != "hls" && streamType != "embed" {
+			streamType = "hls"
+		}
+		if streamType == "hls" && strings.Contains(s.URL, ".mp4") {
+			streamType = "mp4"
+		}
+		coreSources = append(coreSources, core.Source{
+			URL:       s.URL,
+			Type:      streamType,
+			Quality:   s.Quality,
+			Subtitles: subtitles,
+		})
+	}
 		qualityOrder := map[string]int{"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "auto": 4}
 	sort.Slice(coreSources, func(i, j int) bool {
 		oi, oki := qualityOrder[coreSources[i].Quality]
@@ -570,6 +631,42 @@ func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID strin
 	return p.findEpisodeSource(ctx, providerID, episode, lang, "")
 }
 
+// isPipeFailure reports whether the Miruro API itself refused the pipe
+// (444/5xx/transport). Only these count toward provider auto-blocking —
+// CDN playback verdicts never block a provider.
+func isPipeFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "miruro source request failed") {
+		return true
+	}
+	return strings.Contains(msg, "returned 444") || strings.Contains(msg, "returned 5")
+}
+
+// defaultMiruroHeaders are the headers sent with every source result.
+func defaultMiruroHeaders() map[string]string {
+	return map[string]string{
+		"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	}
+}
+
+// embedFromPage builds a last-resort embed source from the provider's
+// episode page (used when the Miruro pipe is blocked and the API returns no
+// streams). The embed player can attempt it as an iframe.
+func embedFromPage(episodeURL string) *SourceResult {
+	return &SourceResult{
+		Sources: []core.Source{{
+			URL:          episodeURL,
+			Type:         "embed",
+			Quality:      "auto",
+			Verification: "embed",
+		}},
+		Headers: defaultMiruroHeaders(),
+	}
+}
+
 func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID string, episode int, lang, preferred string) (*SourceResult, error) {
 	data, err := p.fetchEpisodes(ctx, providerID)
 	if err != nil {
@@ -595,7 +692,6 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	}
 
 	var lastErr error
-	var embedURL string
 
 	// Stage 1: Fetch sources from ALL providers sequentially (fast Miruro API calls)
 	type verified struct {
@@ -636,10 +732,14 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		sourceResp, err := p.fetchSource(ctx, episodeID)
 		if err != nil {
 			p.log.Warn().Err(err).Str("provider", c.name).Str("lang", lang).Int("episode", episode).Msg("miruro provider failed, trying next")
-			p.recordProviderFailure(c.name)
+			if isPipeFailure(err) {
+				p.recordProviderFailure(c.name)
+			}
 			lastErr = err
-			if embedURL == "" && episodeURL != "" {
-				embedURL = episodeURL
+			// Pipe blocked: keep the provider's episode page as an embed
+			// option so the second (iframe) player can still try it.
+			if episodeURL != "" {
+				verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
 			}
 			continue
 		}
@@ -647,15 +747,15 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		result := p.buildSourceResult(sourceResp)
 
 		if len(result.Sources) == 0 {
-			p.log.Warn().Str("provider", c.name).Msg("miruro source filtered to 0 sources, skipping")
-			p.recordProviderFailure(c.name)
-			lastErr = fmt.Errorf("all sources filtered for provider %s", c.name)
+			// API returned no usable streams — offer the episode page embed.
+			if episodeURL != "" {
+				verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
+			}
 			continue
 		}
 
 		if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
 			p.log.Warn().Err(err).Str("provider", c.name).Msg("miruro source domain blocked, skipping")
-			p.recordProviderFailure(c.name)
 			lastErr = err
 			continue
 		}
@@ -664,22 +764,25 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	}
 
 	if len(verifiedSet) == 0 {
-		return p.miruroFallback(embedURL, lastErr, episode, lang, providerID)
+		return p.miruroFallback("", lastErr, episode, lang, providerID)
 	}
 
-	// Stage 2: Validate ALL verified CDN URLs IN PARALLEL through the real
-	// playback path (the media proxy transport). Unlike the old
-	// first-response-wins race — which served dead URLs whenever a CDN that
-	// passes a naive probe beat the working one — every source that passes
-	// here is actually playable, so any choice is a good one.
+	// Stage 2: Rank ALL verified results IN PARALLEL through the real
+	// playback path (the media proxy transport, then a plain browser-like
+	// client). Verdicts are soft: every provider is kept, and the winner is
+	// the one with the best path (proxy > direct > embed), falling back to
+	// the preferred provider if verdicts tie. When everything is dead the
+	// preferred provider still wins — CDNs serve different clients
+	// differently, so the player's own fallback chain is the final judge.
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
 
-	type pass struct {
-		name   string
-		result *SourceResult
+	type verdict struct {
+		name    string
+		result  *SourceResult
+		best    PlaybackVerdict
 	}
-	var passing []pass
+	var passing []verdict
 	var passMu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -688,26 +791,26 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		v := v
 		go func() {
 			defer wg.Done()
-			if !p.sourcePlayable(ctx, v.result) {
-				p.log.Warn().Str("provider", v.name).Str("lang", lang).Int("episode", episode).Msg("miruro source not playable through proxy, skipping")
-				p.recordProviderFailure(v.name)
+			ranked, best := p.verdictResult(ctx, v.result)
+			if ranked == nil {
 				return
 			}
 			passMu.Lock()
-			passing = append(passing, pass{name: v.name, result: v.result})
+			passing = append(passing, verdict{name: v.name, result: ranked, best: best})
 			passMu.Unlock()
 		}()
 	}
 	wg.Wait()
 
 	if len(passing) == 0 {
-		return p.miruroFallback(embedURL, lastErr, episode, lang, providerID)
+		return p.miruroFallback("", lastErr, episode, lang, providerID)
 	}
 
-	// Deterministic winner: the caller's requested provider if it validated,
-	// otherwise the first playable provider in provider order. This makes a
-	// "switch server" request actually return that server instead of a
-	// random other provider's URL.
+	// Deterministic winner: when the caller named a provider, that provider
+	// wins if it has any sources at all — its verdict is a soft hint, and the
+	// browser's own fallback chain (proxy → direct → next server) is the
+	// final judge. Without a named provider, the best verdict wins, with
+	// provider order breaking ties.
 	idxOf := func(name string) int {
 		for i, n := range miruroAllProviders {
 			if n == name {
@@ -716,7 +819,28 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		}
 		return len(miruroAllProviders)
 	}
+	if preferred != "" {
+		for _, v := range passing {
+			if v.name == preferred {
+				winner := v
+				// vouch for the winning source's hosts and cache it under
+				// the provider name that won (best-effort allowance).
+				p.learnResultHosts(winner.result)
+				if winner.best > VerdictDead {
+					p.recordProviderSuccess(winner.name)
+				}
+				sk := sourceCacheKey(providerID+":"+winner.name, episode, lang)
+				miruroSourceMu.Lock()
+				miruroSourceCache[sk] = &miruroSourceCacheEntry{result: winner.result, fetchedAt: time.Now()}
+				miruroSourceMu.Unlock()
+				return winner.result, nil
+			}
+		}
+	}
 	sort.SliceStable(passing, func(i, j int) bool {
+		if passing[i].best != passing[j].best {
+			return passing[i].best > passing[j].best
+		}
 		if passing[i].name == preferred && passing[j].name != preferred {
 			return true
 		}
@@ -727,10 +851,13 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	})
 	winner := passing[0]
 
-	// The winning source is verified playable — vouch for its hosts and
-	// cache it under the provider name that won.
+	// Vouch for the winning source's hosts and cache it under the provider
+	// name that won (a best-effort allowance; dead-but-listable providers
+	// never block).
 	p.learnResultHosts(winner.result)
-	p.recordProviderSuccess(winner.name)
+	if winner.best > VerdictDead {
+		p.recordProviderSuccess(winner.name)
+	}
 	sk := sourceCacheKey(providerID+":"+winner.name, episode, lang)
 	miruroSourceMu.Lock()
 	miruroSourceCache[sk] = &miruroSourceCacheEntry{result: winner.result, fetchedAt: time.Now()}
@@ -739,8 +866,40 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	return winner.result, nil
 }
 
-// FindAllSources tests ALL Miruro sub-providers for the given episode and lang.
-// Returns a map of provider name → SourceResult for every provider that passed reachability.
+type serverResult struct {
+	name   string
+	result *SourceResult
+}
+
+// bestVerdict returns the highest per-source verdict stored in a ranked
+// result (read from the Verification tags written by verdictResult).
+func (r *SourceResult) bestVerdict() PlaybackVerdict {
+	if r == nil {
+		return VerdictDead
+	}
+	best := VerdictDead
+	for _, s := range r.Sources {
+		switch s.Verification {
+		case "proxy":
+			return VerdictProxy
+		case "direct":
+			if best < VerdictDirect {
+				best = VerdictDirect
+			}
+		case "embed":
+			if best < VerdictEmbed {
+				best = VerdictEmbed
+			}
+		}
+	}
+	return best
+}
+
+// FindAllSources tests ALL Miruro sub-providers for the given episode and
+// lang. Returns a map of provider name → SourceResult for every provider
+// that has any source (stream or embed). Verdicts are soft ordering hints
+// ("proxy"/"direct"/"embed"/"dead" per source) — nothing is dropped, because
+// datacenter reachability is not the player's reachability.
 func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, episode int, lang string) map[string]*SourceResult {
 	data, err := p.fetchEpisodes(ctx, providerID)
 	if err != nil {
@@ -765,9 +924,11 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 
 	for _, c := range candidates {
 		var episodeID string
+		var episodeURL string
 		for _, e := range c.episodes {
 			if int(e.Number) == episode {
 				episodeID = e.ID
+				episodeURL = e.URL
 				break
 			}
 		}
@@ -801,19 +962,30 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 			sourceResp, err := p.fetchSource(ctx, episodeID)
 			if err != nil {
 				p.log.Warn().Err(err).Str("provider", c.name).Msg("FindAllSources: fetchSource failed")
-				p.recordProviderFailure(c.name)
+				if isPipeFailure(err) {
+					p.recordProviderFailure(c.name)
+				}
+				// Pipe blocked — keep the episode page as an embed option.
+				if episodeURL != "" {
+					mu.Lock()
+					verified = append(verified, candidateResult{name: c.name, result: embedFromPage(episodeURL)})
+					mu.Unlock()
+				}
 				return
 			}
 
 			result := p.buildSourceResult(sourceResp)
 			if len(result.Sources) == 0 {
-				p.recordProviderFailure(c.name)
+				if episodeURL != "" {
+					mu.Lock()
+					verified = append(verified, candidateResult{name: c.name, result: embedFromPage(episodeURL)})
+					mu.Unlock()
+				}
 				return
 			}
 
 			if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
 				p.log.Warn().Err(err).Str("provider", c.name).Msg("FindAllSources: domain blocked")
-				p.recordProviderFailure(c.name)
 				return
 			}
 
@@ -828,54 +1000,64 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 		return nil
 	}
 
-	// Validate ALL verified sources in parallel through the real playback
-	// path. Only sources that would actually play make the server list —
-	// a dead CDN that passes a plain reachability probe (vidtub 403s the
-	// proxy's manifest GET, fast4speed 404s the full MP4) must never be
-	// offered to the player as a selectable server.
-	type serverResult struct {
-		name   string
-		result *SourceResult
-	}
-
+	// Rank ALL verified results in parallel through the real playback path.
+	// Nothing is dropped: every provider with sources is offered, ordered by
+	// verdict so the client can try the most reliable path first.
+	serverMap := make(map[string]*SourceResult, len(verified))
 	var resultsMu sync.Mutex
 	var resultsWg sync.WaitGroup
-	results := []serverResult{}
+	results := make([]serverResult, 0, len(verified))
 
 	for _, v := range verified {
 		resultsWg.Add(1)
 		v := v
 		go func() {
 			defer resultsWg.Done()
-			if !p.sourcePlayable(ctx, v.result) {
-				p.log.Warn().Str("provider", v.name).Str("lang", lang).Int("episode", episode).Msg("FindAllSources: source not playable through proxy, dropping")
-				p.recordProviderFailure(v.name)
+			ranked, best := p.verdictResult(ctx, v.result)
+			if ranked == nil {
 				return
 			}
-			// Verified and playable — vouch for the source's hosts so the
-			// media proxy accepts them without a static allowlist entry.
-			p.recordProviderSuccess(v.name)
-			p.learnResultHosts(v.result)
-			// Cache the result
+			if best > VerdictDead {
+				p.recordProviderSuccess(v.name)
+			}
+			// Vouch for the source's hosts so the media proxy accepts them
+			// without a static allowlist entry (best-effort).
+			p.learnResultHosts(ranked)
+			// Cache the result under the provider name
 			sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
 			miruroSourceMu.Lock()
-			miruroSourceCache[sk] = &miruroSourceCacheEntry{result: v.result, fetchedAt: time.Now()}
+			miruroSourceCache[sk] = &miruroSourceCacheEntry{result: ranked, fetchedAt: time.Now()}
 			miruroSourceMu.Unlock()
 
 			resultsMu.Lock()
-			results = append(results, serverResult{name: v.name, result: v.result})
+			results = append(results, serverResult{name: v.name, result: ranked})
 			resultsMu.Unlock()
 		}()
 	}
 	resultsWg.Wait()
 
-	// Build map of working providers
-	serverMap := make(map[string]*SourceResult, len(results))
+	// Deterministic provider order: best verdict first, then known-provider
+	// order, then unknown providers in API order.
+	idxOf := func(name string) int {
+		for i, n := range miruroAllProviders {
+			if n == name {
+				return i
+			}
+		}
+		return len(miruroAllProviders)
+	}
+	sort.SliceStable(results, func(i, j int) bool {
+		bi, bj := results[i].result.bestVerdict(), results[j].result.bestVerdict()
+		if bi != bj {
+			return bi > bj
+		}
+		return idxOf(results[i].name) < idxOf(results[j].name)
+	})
 	for _, r := range results {
 		serverMap[r.name] = r.result
 	}
 
-	p.log.Info().Int("total", len(candidates)).Int("working", len(serverMap)).Str("lang", lang).Int("episode", episode).Msg("FindAllSources completed")
+	p.log.Info().Int("total", len(candidates)).Int("listed", len(serverMap)).Str("lang", lang).Int("episode", episode).Msg("FindAllSources completed")
 	return serverMap
 }
 
@@ -920,19 +1102,6 @@ func (p *MiruroProvider) ProbePlayable(ctx context.Context, anilistID string) (s
 }
 
 func (p *MiruroProvider) miruroFallback(embedURL string, lastErr error, episode int, lang, providerID string) (*SourceResult, error) {
-	if embedURL != "" {
-		p.log.Warn().Str("url", embedURL).Str("lang", lang).Int("episode", episode).Msg("miruro pipe blocked, returning direct provider URL as embed")
-		return &SourceResult{
-			Sources: []core.Source{{
-				URL:  embedURL,
-				Type: "embed",
-			}},
-			Headers: map[string]string{
-				"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-			},
-		}, nil
-	}
-
 	if lastErr != nil {
 		return nil, fmt.Errorf("all miruro providers failed for ep %d %s: %w", episode, lang, lastErr)
 	}
@@ -1015,16 +1184,24 @@ func (p *MiruroProvider) GetEpisodeTitles(ctx context.Context, anilistID string)
 	return titles
 }
 
-// GetProviders returns the list of available provider names for an anime.
+// GetProviders returns the list of available provider names for an anime
+// (known providers in canonical order, then any unknown ones Miruro lists).
 func (p *MiruroProvider) GetProviders(ctx context.Context, anilistID string) []string {
 	data, err := p.fetchEpisodes(ctx, anilistID)
 	if err != nil {
 		return nil
 	}
 
+	seen := map[string]bool{}
 	var available []string
 	for _, name := range miruroAllProviders {
 		if _, ok := data.Providers[name]; ok {
+			seen[name] = true
+			available = append(available, name)
+		}
+	}
+	for name := range data.Providers {
+		if !seen[name] {
 			available = append(available, name)
 		}
 	}

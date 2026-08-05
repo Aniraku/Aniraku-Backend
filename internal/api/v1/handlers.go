@@ -382,6 +382,7 @@ type Handlers struct {
 	probeCache        sync.Map
 	probeCacheMu      sync.Mutex
 	probeCacheCount   int
+	sourceProbeMemo   sync.Map // srcType|url|headers -> sourceProbeMemoEntry (90s TTL)
 	// Browse/trending cache with TTL
 	browseCache       sync.Map
 	browseCacheTTL    time.Duration
@@ -1299,28 +1300,68 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 	}
 }
 
-// ProbePlayback validates that a source would actually play through the
-// media proxy, using the exact same request path (uTLS transport chain, no
-// redirects, filtered headers, Accept-Encoding: identity).
+// directProbeClient mimics a real browser client (follows redirects, no
+// forced Accept-Encoding) for the direct-path verdict.
+var directProbeClient = &http.Client{Timeout: 20 * time.Second}
+
+// sourceProbeMemo short-circuits repeated playback probes of the same URL
+// within a short window (a /servers call followed by /stream probes the
+// same sources). Verdicts are TTL'd because CDN reachability drifts.
+type sourceProbeMemoEntry struct {
+	verdict streaming.PlaybackVerdict
+	at      time.Time
+}
+
+// ProbePlayback ranks how a source can reach a player — a soft verdict that
+// orders server lists but never filters them (CDNs serve datacenter and
+// residential IPs differently, so "dead" here does not mean dead in the
+// browser).
 //
-// HLS: the manifest must fetch 200 and parse as a playlist (#EXTM3U), the
-// first referenced media playlist must fetch 200, and the first media
-// segment must not be a canary (some CDNs serve real playlists but 1x1 PNG
-// bytes in place of every segment — observed on vidtub/vivibebe).
-//
+// Proxy path: the exact same request path the media proxy uses (uTLS
+// transport chain, no redirects, filtered headers, Accept-Encoding:
+// identity). HLS: the manifest must fetch 200 and parse as a playlist
+// (#EXTM3U), the first referenced media playlist must fetch 200, and the
+// first media segment must not be a canary (some CDNs serve real playlists
+// but 1x1 PNG bytes in place of every segment — observed on vidtub/vivibebe).
 // MP4: a ranged GET must return 200/206 with real media bytes, not an HTML
 // error page and not image bytes (fast4speed 404s on the full body).
-func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) bool {
+//
+// Direct path: a plain browser-like client (redirects followed, standard
+// Accept-Encoding). Image-magic rejection is intentionally NOT applied here
+// — some CDNs (vidtub/vivibebe) serve image canaries only to datacenter
+// fingerprints and real segments to residential ones.
+func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) streaming.PlaybackVerdict {
+	headersJSON, _ := json.Marshal(headers)
+	probeKey := srcType + "|" + rawURL + "|" + string(headersJSON)
+	if v, ok := h.sourceProbeMemo.Load(probeKey); ok {
+		e := v.(sourceProbeMemoEntry)
+		if time.Since(e.at) < 90*time.Second {
+			return e.verdict
+		}
+	}
+
+	verdict := streaming.VerdictDead
+	if h.probeViaProxy(ctx, srcType, rawURL, string(headersJSON)) {
+		verdict = streaming.VerdictProxy
+	} else if h.probeDirect(ctx, srcType, rawURL, headers) {
+		verdict = streaming.VerdictDirect
+	}
+
+	h.sourceProbeMemo.Store(probeKey, sourceProbeMemoEntry{verdict: verdict, at: time.Now()})
+	return verdict
+}
+
+// probeViaProxy is the media-proxy-path playback check (see ProbePlayback).
+func (h *Handlers) probeViaProxy(ctx context.Context, srcType, rawURL, headersJSON string) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	headersJSON, _ := json.Marshal(headers)
 	if srcType == "mp4" {
 		req, err := http.NewRequestWithContext(probeCtx, "GET", rawURL, nil)
 		if err != nil {
 			return false
 		}
-		applyProxyQueryHeaders(req, string(headersJSON))
+		applyProxyQueryHeaders(req, headersJSON)
 		req.Header.Set("Range", "bytes=0-1023")
 		resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
 		if err != nil {
@@ -1347,7 +1388,7 @@ func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, he
 
 	// HLS: manifest, then the first media playlist it references, then the
 	// first segment — fake sources pass the first two but serve image bytes.
-	manifest, err := h.probePlaylist(probeCtx, rawURL, string(headersJSON))
+	manifest, err := h.probePlaylist(probeCtx, rawURL, headersJSON)
 	if err != nil {
 		return false
 	}
@@ -1359,7 +1400,7 @@ func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, he
 	if err != nil {
 		return false
 	}
-	child, err := h.probePlaylist(probeCtx, childURL, string(headersJSON))
+	child, err := h.probePlaylist(probeCtx, childURL, headersJSON)
 	if err != nil {
 		return false
 	}
@@ -1371,7 +1412,130 @@ func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, he
 	if err != nil {
 		return false
 	}
-	return h.probeSegment(probeCtx, segURL, string(headersJSON))
+	return h.probeSegment(probeCtx, segURL, headersJSON)
+}
+
+// probeDirect checks the same source with a plain browser-like client
+// (redirects followed, standard headers). Verdict is intentionally laxer
+// than the proxy path: any CDN that serves real media to a generic client
+// counts as directly playable, and image canaries are ignored because some
+// CDNs serve them only to datacenter fingerprints.
+func (h *Handlers) probeDirect(ctx context.Context, srcType, rawURL string, headers map[string]string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, "GET", rawURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	for k, v := range headers {
+		if strings.EqualFold(k, "User-Agent") {
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+
+	if srcType == "mp4" {
+		req.Header.Set("Range", "bytes=0-1023")
+		resp, err := directProbeClient.Do(req)
+		if err != nil {
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			return false
+		}
+		ct := strings.ToLower(resp.Header.Get("Content-Type"))
+		if strings.Contains(ct, "text/html") {
+			return false
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if err != nil {
+			return false
+		}
+		return len(body) >= 100
+	}
+
+	// HLS: manifest, first media playlist, first segment — HTML is dead.
+	manifest, err := h.probeDirectPlaylist(probeCtx, req, rawURL)
+	if err != nil {
+		return false
+	}
+	firstChild := firstPlaylistURI(manifest)
+	if firstChild == "" {
+		return false
+	}
+	childURL, err := resolvePlaylistURL(rawURL, firstChild)
+	if err != nil {
+		return false
+	}
+	childReq, err := http.NewRequestWithContext(probeCtx, "GET", childURL, nil)
+	if err != nil {
+		return false
+	}
+	childReq.Header = req.Header.Clone()
+	child, err := h.probeDirectPlaylist(probeCtx, childReq, childURL)
+	if err != nil {
+		return false
+	}
+	firstSegment := firstPlaylistURI(child)
+	if firstSegment == "" {
+		return false
+	}
+	segURL, err := resolvePlaylistURL(childURL, firstSegment)
+	if err != nil {
+		return false
+	}
+	segReq, err := http.NewRequestWithContext(probeCtx, "GET", segURL, nil)
+	if err != nil {
+		return false
+	}
+	segReq.Header = req.Header.Clone()
+	segResp, err := directProbeClient.Do(segReq)
+	if err != nil {
+		return false
+	}
+	defer segResp.Body.Close()
+	if segResp.StatusCode != http.StatusOK && segResp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	ct := strings.ToLower(segResp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(segResp.Body, 512))
+	if err != nil {
+		return false
+	}
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	lower := bytes.ToLower(trimmed)
+	if bytes.HasPrefix(lower, []byte("<html")) || bytes.HasPrefix(lower, []byte("<!doctype")) {
+		return false
+	}
+	return len(body) >= 2
+}
+
+// probeDirectPlaylist fetches a playlist with the plain client and returns
+// its body when it is a genuine, parseable playlist.
+func (h *Handlers) probeDirectPlaylist(ctx context.Context, req *http.Request, rawURL string) (string, error) {
+	resp, err := directProbeClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("playlist fetch returned %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
+	if err != nil {
+		return "", err
+	}
+	text := string(body)
+	if !strings.HasPrefix(strings.TrimSpace(text), "#EXTM3U") {
+		return "", fmt.Errorf("body is not an HLS playlist")
+	}
+	return text, nil
 }
 
 // probeSegment fetches the first media segment exactly like the proxy would
