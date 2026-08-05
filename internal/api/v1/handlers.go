@@ -190,7 +190,10 @@ func newAnilistClient(h *Handlers) *anilistClient {
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,
-		limiter:    newTokenBucket(40, 1.0),
+		// Burst 15, 0.9/s refill (~54/min sustained): a page load fires
+		// ~10-15 parallel queries (home/catalog), and the old burst of 40
+		// tripped AniList's shared-per-IP 429s on every fast scroll.
+		limiter: newTokenBucket(15, 0.9),
 	}
 }
 
@@ -977,8 +980,19 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	anilistID := req.AnimeID
 
 	// Title + MAL ID drive the ZEN API fallback matching (ZenAPI keys by
-	// malId; anilistId is usually null there).
-	title, malID := h.animeMeta(ctx, anilistID)
+	// malId; anilistId is usually null there). The frontend sends them with
+	// the request; AniList is only consulted as a fallback so rate limits
+	// never gate the streaming path.
+	title, malID := req.Title, req.MalID
+	if title == "" || malID == 0 {
+		t, m := h.animeMeta(ctx, anilistID)
+		if title == "" {
+			title = t
+		}
+		if malID == 0 {
+			malID = m
+		}
+	}
 
 	// Find best source for the requested provider/lang only
 	result, err := h.stream.GetSourcesForProvider(ctx, title, req.Episode, req.Provider, req.Lang, req.Quality, anilistID, malID)
@@ -1061,7 +1075,21 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	}
 	// AniList-keyed; IDs are normalized at the search boundary.
 	anilistID := animeID
-	title, malID := h.animeMeta(ctx, anilistID)
+
+	// Title + MAL ID come from the client when available (frontend has the
+	// anime data); AniList is only a fallback so its rate limits never gate
+	// the ZEN API fallback.
+	title := r.URL.Query().Get("title")
+	malID, _ := strconv.Atoi(r.URL.Query().Get("malId"))
+	if title == "" || malID == 0 {
+		t, m := h.animeMeta(ctx, anilistID)
+		if title == "" {
+			title = t
+		}
+		if malID == 0 {
+			malID = m
+		}
+	}
 	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang, title, malID)
 	h.respondJSON(w, http.StatusOK, servers)
 }
