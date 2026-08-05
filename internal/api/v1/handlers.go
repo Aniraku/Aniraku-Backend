@@ -1303,13 +1303,13 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 // media proxy, using the exact same request path (uTLS transport chain, no
 // redirects, filtered headers, Accept-Encoding: identity).
 //
-// HLS: the manifest must fetch 200 and parse as a playlist (#EXTM3U), and
-// the first referenced media playlist must also fetch 200 — this is what
-// separates alive CDNs (vivibebe) from dead ones (vidtub 403s the manifest,
-// some CDNs serve an empty master then 403 the media playlist).
+// HLS: the manifest must fetch 200 and parse as a playlist (#EXTM3U), the
+// first referenced media playlist must fetch 200, and the first media
+// segment must not be a canary (some CDNs serve real playlists but 1x1 PNG
+// bytes in place of every segment — observed on vidtub/vivibebe).
 //
-// MP4: a ranged GET must return 200/206 with a media Content-Type — this
-// is what kills fast4speed (404 on the full body) and HTML error pages.
+// MP4: a ranged GET must return 200/206 with real media bytes, not an HTML
+// error page and not image bytes (fast4speed 404s on the full body).
 func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
@@ -1334,11 +1334,19 @@ func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, he
 		if strings.Contains(ct, "text/html") {
 			return false
 		}
-		return strings.Contains(ct, "video") || strings.Contains(ct, "audio") ||
-			strings.Contains(ct, "octet-stream") || strings.Contains(ct, "binary")
+		if !strings.Contains(ct, "video") && !strings.Contains(ct, "audio") &&
+			!strings.Contains(ct, "octet-stream") && !strings.Contains(ct, "binary") {
+			return false
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		if err != nil {
+			return false
+		}
+		return len(body) >= 100 && !mediaMagicImage(body)
 	}
 
-	// HLS: manifest, then the first media playlist it references.
+	// HLS: manifest, then the first media playlist it references, then the
+	// first segment — fake sources pass the first two but serve image bytes.
 	manifest, err := h.probePlaylist(probeCtx, rawURL, string(headersJSON))
 	if err != nil {
 		return false
@@ -1355,8 +1363,71 @@ func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, he
 	if err != nil {
 		return false
 	}
-	// A media playlist is only playable if it names at least one segment.
-	return firstPlaylistURI(child) != ""
+	firstSegment := firstPlaylistURI(child)
+	if firstSegment == "" {
+		return false
+	}
+	segURL, err := resolvePlaylistURL(childURL, firstSegment)
+	if err != nil {
+		return false
+	}
+	return h.probeSegment(probeCtx, segURL, string(headersJSON))
+}
+
+// probeSegment fetches the first media segment exactly like the proxy would
+// and rejects canary sources that serve image bytes or HTML in place of video.
+func (h *Handlers) probeSegment(ctx context.Context, rawURL, headersJSON string) bool {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return false
+	}
+	applyProxyQueryHeaders(req, headersJSON)
+	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
+	if err != nil {
+		return false
+	}
+	if len(body) < 2 {
+		return false
+	}
+	trimmed := bytes.TrimLeft(body, " \t\r\n")
+	lower := bytes.ToLower(trimmed)
+	if bytes.HasPrefix(lower, []byte("<html")) || bytes.HasPrefix(lower, []byte("<!doctype")) {
+		return false
+	}
+	return !mediaMagicImage(body)
+}
+
+// mediaMagicImage reports whether b starts with a known image signature.
+// Dead CDNs serve 1x1 PNGs (or other image bytes) in place of video segments.
+func mediaMagicImage(b []byte) bool {
+	if len(b) < 8 {
+		return false
+	}
+	if bytes.HasPrefix(b, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) {
+		return true
+	}
+	if b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
+		return true // JPEG
+	}
+	if len(b) >= 4 && bytes.HasPrefix(b, []byte("GIF8")) {
+		return true
+	}
+	if len(b) >= 12 && bytes.HasPrefix(b, []byte("RIFF")) && bytes.HasPrefix(b[8:12], []byte("WEBP")) {
+		return true
+	}
+	return false
 }
 
 // probePlaylist fetches a playlist exactly like the proxy would and returns
