@@ -1155,50 +1155,54 @@ func (p *MiruroProvider) HasDub(ctx context.Context, anilistID string) bool {
 	return false
 }
 
-// GetEpisodeThumbnails returns episode number → thumbnail URL mapping from the best provider.
+// GetEpisodeThumbnails returns episode number → thumbnail URL mapping,
+// merging from all providers so missing thumbnails in one provider are
+// filled by another.
 func (p *MiruroProvider) GetEpisodeThumbnails(ctx context.Context, anilistID string) map[int]string {
 	data, err := p.fetchEpisodes(ctx, anilistID)
 	if err != nil {
 		return nil
 	}
 
-	_, _, eps := p.bestProvider(data.Providers, "sub")
-	if eps == nil {
-		_, _, eps = p.bestProvider(data.Providers, "dub")
-	}
-	if eps == nil {
-		return nil
-	}
-
-	thumbs := make(map[int]string, len(eps))
-	for _, e := range eps {
-		if e.Image != "" {
-			thumbs[int(e.Number)] = e.Image
+	thumbs := make(map[int]string)
+	for _, pdata := range data.Providers {
+		for _, eps := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
+			for _, e := range eps {
+				n := int(e.Number)
+				if e.Image != "" && thumbs[n] == "" {
+					thumbs[n] = e.Image
+				}
+			}
 		}
+	}
+	if len(thumbs) == 0 {
+		return nil
 	}
 	return thumbs
 }
 
-// GetEpisodeTitles returns episode number → title mapping from the best provider.
+// GetEpisodeTitles returns episode number → title mapping,
+// merging from all providers so missing titles in one provider are
+// filled by another.
 func (p *MiruroProvider) GetEpisodeTitles(ctx context.Context, anilistID string) map[int]string {
 	data, err := p.fetchEpisodes(ctx, anilistID)
 	if err != nil {
 		return nil
 	}
 
-	_, _, eps := p.bestProvider(data.Providers, "sub")
-	if eps == nil {
-		_, _, eps = p.bestProvider(data.Providers, "dub")
-	}
-	if eps == nil {
-		return nil
-	}
-
-	titles := make(map[int]string, len(eps))
-	for _, e := range eps {
-		if e.Title != "" {
-			titles[int(e.Number)] = e.Title
+	titles := make(map[int]string)
+	for _, pdata := range data.Providers {
+		for _, eps := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
+			for _, e := range eps {
+				n := int(e.Number)
+				if e.Title != "" && titles[n] == "" {
+					titles[n] = e.Title
+				}
+			}
 		}
+	}
+	if len(titles) == 0 {
+		return nil
 	}
 	return titles
 }
