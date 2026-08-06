@@ -1155,38 +1155,19 @@ func (p *MiruroProvider) HasDub(ctx context.Context, anilistID string) bool {
 	return false
 }
 
-// buildEpisodeMaps returns thumbnails and titles, picking the best provider
-// that has data for episode 1 (bonk often skips ep1). Missing fields are
-// filled from other providers.
+// buildEpisodeMaps returns thumbnails and titles from ally (most complete
+// episode metadata), filling missing fields from other providers.
 func (p *MiruroProvider) buildEpisodeMaps(data *miruroEpisodesResponse) (map[int]string, map[int]string) {
-	// Pick the best provider that actually has ep1 data
+	// Ally has the most complete episode titles and thumbnails
+	ally, ok := data.Providers["ally"]
 	var bestEps []miruroEpisode
-	for _, name := range miruroAllProviders {
-		if miruroRemovedProviders[name] {
-			continue
-		}
-		prov, ok := data.Providers[name]
-		if !ok {
-			continue
-		}
-		for _, eps := range [][]miruroEpisode{prov.Episodes.Sub, prov.Episodes.Dub} {
-			if len(eps) > 0 {
-				for _, e := range eps {
-					if int(e.Number) == 1 && (e.Title != "" || e.Image != "") {
-						bestEps = eps
-						break
-					}
-				}
-				if bestEps != nil {
-					break
-				}
-			}
-		}
-		if bestEps != nil {
-			break
+	if ok {
+		if len(ally.Episodes.Sub) > 0 {
+			bestEps = ally.Episodes.Sub
+		} else if len(ally.Episodes.Dub) > 0 {
+			bestEps = ally.Episodes.Dub
 		}
 	}
-	// Fallback: just use the first provider with episodes
 	if bestEps == nil {
 		_, _, bestEps = p.bestProvider(data.Providers, "sub")
 		if bestEps == nil {
