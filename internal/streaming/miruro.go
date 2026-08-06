@@ -1155,52 +1155,97 @@ func (p *MiruroProvider) HasDub(ctx context.Context, anilistID string) bool {
 	return false
 }
 
-// GetEpisodeThumbnails returns episode number → thumbnail URL mapping,
-// merging from all providers so missing thumbnails in one provider are
-// filled by another.
+// buildEpisodeMaps returns thumbnails and titles, picking the best provider
+// that has data for episode 1 (bonk often skips ep1). Missing fields are
+// filled from other providers.
+func (p *MiruroProvider) buildEpisodeMaps(data *miruroEpisodesResponse) (map[int]string, map[int]string) {
+	// Pick the best provider that actually has ep1 data
+	var bestEps []miruroEpisode
+	for _, name := range miruroAllProviders {
+		if miruroRemovedProviders[name] {
+			continue
+		}
+		prov, ok := data.Providers[name]
+		if !ok {
+			continue
+		}
+		for _, eps := range [][]miruroEpisode{prov.Episodes.Sub, prov.Episodes.Dub} {
+			if len(eps) > 0 {
+				for _, e := range eps {
+					if int(e.Number) == 1 && (e.Title != "" || e.Image != "") {
+						bestEps = eps
+						break
+					}
+				}
+				if bestEps != nil {
+					break
+				}
+			}
+		}
+		if bestEps != nil {
+			break
+		}
+	}
+	// Fallback: just use the first provider with episodes
+	if bestEps == nil {
+		_, _, bestEps = p.bestProvider(data.Providers, "sub")
+		if bestEps == nil {
+			_, _, bestEps = p.bestProvider(data.Providers, "dub")
+		}
+	}
+	if bestEps == nil {
+		return nil, nil
+	}
+
+	thumbs := make(map[int]string, len(bestEps))
+	titles := make(map[int]string, len(bestEps))
+	for _, e := range bestEps {
+		n := int(e.Number)
+		if e.Image != "" {
+			thumbs[n] = e.Image
+		}
+		if e.Title != "" {
+			titles[n] = e.Title
+		}
+	}
+
+	// Fill missing from other providers
+	for _, pdata := range data.Providers {
+		for _, extra := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
+			for _, e := range extra {
+				n := int(e.Number)
+				if thumbs[n] == "" && e.Image != "" {
+					thumbs[n] = e.Image
+				}
+				if titles[n] == "" && e.Title != "" {
+					titles[n] = e.Title
+				}
+			}
+		}
+	}
+	return thumbs, titles
+}
+
+// GetEpisodeThumbnails returns episode number → thumbnail URL mapping.
 func (p *MiruroProvider) GetEpisodeThumbnails(ctx context.Context, anilistID string) map[int]string {
 	data, err := p.fetchEpisodes(ctx, anilistID)
 	if err != nil {
 		return nil
 	}
-
-	thumbs := make(map[int]string)
-	for _, pdata := range data.Providers {
-		for _, eps := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
-			for _, e := range eps {
-				n := int(e.Number)
-				if e.Image != "" && thumbs[n] == "" {
-					thumbs[n] = e.Image
-				}
-			}
-		}
-	}
+	thumbs, _ := p.buildEpisodeMaps(data)
 	if len(thumbs) == 0 {
 		return nil
 	}
 	return thumbs
 }
 
-// GetEpisodeTitles returns episode number → title mapping,
-// merging from all providers so missing titles in one provider are
-// filled by another.
+// GetEpisodeTitles returns episode number → title mapping.
 func (p *MiruroProvider) GetEpisodeTitles(ctx context.Context, anilistID string) map[int]string {
 	data, err := p.fetchEpisodes(ctx, anilistID)
 	if err != nil {
 		return nil
 	}
-
-	titles := make(map[int]string)
-	for _, pdata := range data.Providers {
-		for _, eps := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
-			for _, e := range eps {
-				n := int(e.Number)
-				if e.Title != "" && titles[n] == "" {
-					titles[n] = e.Title
-				}
-			}
-		}
-	}
+	_, titles := p.buildEpisodeMaps(data)
 	if len(titles) == 0 {
 		return nil
 	}
