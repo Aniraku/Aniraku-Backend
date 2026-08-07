@@ -1080,6 +1080,25 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 	return serverMap
 }
 
+// hasPlayableMediaSource reports whether any provider result contains a
+// source the in-app player can actually play. Embed-only results (episode-
+// page iframes) can't drive the player, so a probe must never call an anime
+// "playable" on the strength of embeds alone — that would surface hentai
+// titles (or any anime) in listings that then fail to play.
+func hasPlayableMediaSource(serverMap map[string]*SourceResult) bool {
+	for _, sr := range serverMap {
+		if sr == nil {
+			continue
+		}
+		for _, s := range sr.Sources {
+			if s.Type == "hls" || s.Type == "mp4" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ProbePlayable reports whether this anime has at least one actually playable
 // Miruro stream (source fetched and reachability-verified), plus the total
 // sub/dub episode counts advertised in the catalog. Cheap when the source
@@ -1111,10 +1130,10 @@ func (p *MiruroProvider) ProbePlayable(ctx context.Context, anilistID string) (s
 		}
 	}
 
-	if subCount > 0 && len(p.FindAllSources(ctx, anilistID, int(firstSub), "sub")) > 0 {
+	if subCount > 0 && hasPlayableMediaSource(p.FindAllSources(ctx, anilistID, int(firstSub), "sub")) {
 		return subCount, dubCount, true
 	}
-	if dubCount > 0 && len(p.FindAllSources(ctx, anilistID, int(firstDub), "dub")) > 0 {
+	if dubCount > 0 && hasPlayableMediaSource(p.FindAllSources(ctx, anilistID, int(firstDub), "dub")) {
 		return subCount, dubCount, true
 	}
 	return subCount, dubCount, false

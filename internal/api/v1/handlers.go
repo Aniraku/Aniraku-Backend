@@ -2664,9 +2664,18 @@ func (h *Handlers) GetMiruroProbe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Positive results are stable — 6h. Negative results are cached much
+	// shorter (15m) because they usually mean Miruro was momentarily down
+	// (Cloudflare challenge, 502) rather than that the anime truly has no
+	// stream. Short TTLs let hentai listings recover quickly once upstream
+	// comes back, instead of hiding titles for 6 hours off one bad probe.
 	if v, ok := h.probeCache.Load(anilistID); ok {
 		e := v.(probeCacheEntry)
-		if time.Since(e.fetchedAt) < 6*time.Hour {
+		ttl := 6 * time.Hour
+		if !e.playable {
+			ttl = 15 * time.Minute
+		}
+		if time.Since(e.fetchedAt) < ttl {
 			h.writeProbeResponse(w, anilistID, e)
 			return
 		}
@@ -2846,10 +2855,19 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 	typeArgs = append(typeArgs, "sort: $sort")
 	variables["sort"] = sort
 
-	// Build cache key from all filter parameters
+	// Build cache key from all filter parameters. The filter slices are
+	// optional (a bare /browse call has none) — never index them without a
+	// length check, or the request panics into a 500 on every filter-less
+	// page load.
+	first := func(s []string) string {
+		if len(s) > 0 {
+			return s[0]
+		}
+		return ""
+	}
 	cacheKey := fmt.Sprintf("browse:%d:%d:%s:%s:%s:%s:%s:%d:%s",
 		page, perPage,
-		filters.Search, filters.Genre[0], filters.Format[0], filters.Status[0],
+		filters.Search, first(filters.Genre), first(filters.Format), first(filters.Status),
 		filters.Season, filters.Year, sort)
 
 	if cached, ok := h.browseCache.Load(cacheKey); ok {
