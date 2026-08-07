@@ -29,9 +29,11 @@ func main() {
 	log := zerolog.New(output).With().Timestamp().Logger()
 
 	configPath := ""
-	for i, arg := range os.Args[1:] {
-		if arg == "--config" && i+1 < len(os.Args)-1 {
-			configPath = os.Args[i+2]
+	args := os.Args[1:]
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "--config" {
+			configPath = args[i+1]
+			break
 		}
 	}
 
