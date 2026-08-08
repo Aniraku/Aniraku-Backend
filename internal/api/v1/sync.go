@@ -192,7 +192,57 @@ func (h *Handlers) SyncCallback(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusNotImplemented, fmt.Sprintf("%s sync is not configured on this server", provider))
 		return
 	}
+	h.completeOAuthExchange(w, r, userID, provider)
+}
 
+// SyncCallbackGeneric is like SyncCallback but resolves the provider from
+// the pending OAuth state instead of the URL path. MAL / AniList redirect
+// back to the registered URI with only ?code= and ?state= — there is no
+// provider in the URL — so the callback page cannot know which provider
+// it came from. The pending-state map (keyed by state, bound to a user)
+// already stores the provider, making the path parameter redundant.
+func (h *Handlers) SyncCallbackGeneric(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	r.Body.Close()
+	var input struct {
+		Code  string `json:"code"`
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(body, &input); err != nil || input.Code == "" || input.State == "" {
+		h.respondError(w, http.StatusBadRequest, "code and state are required")
+		return
+	}
+
+	pendingRaw, ok := h.syncPending.Load(input.State)
+	if !ok {
+		h.respondError(w, http.StatusBadRequest, "invalid or expired OAuth state — start over")
+		return
+	}
+	pending, ok := pendingRaw.(*pendingOAuth)
+	if !ok || pending.userID != userID {
+		h.respondError(w, http.StatusBadRequest, "invalid OAuth state")
+		return
+	}
+	if !h.syncConfigured(pending.provider) {
+		h.respondError(w, http.StatusNotImplemented, fmt.Sprintf("%s sync is not configured on this server", pending.provider))
+		return
+	}
+	// Restore the body for the shared exchange path.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	h.completeOAuthExchange(w, r, userID, pending.provider)
+}
+
+// completeOAuthExchange validates the pending state and performs the code
+// exchange for a user + provider, storing the tokens on success. The
+// state's ownership and expiry checks run first so both entry points
+// behave identically.
+func (h *Handlers) completeOAuthExchange(w http.ResponseWriter, r *http.Request, userID, provider string) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
 	r.Body.Close()
 	var input struct {
