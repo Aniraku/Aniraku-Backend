@@ -102,6 +102,13 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Get("/api/v1/notifications", h.GetNotifications)
 		r.Put("/api/v1/notifications/{id}/read", h.MarkNotificationRead)
 		r.Put("/api/v1/notifications/read-all", h.MarkAllNotificationsRead)
+
+		// MAL / AniList watch-progress sync
+		r.Get("/api/v1/sync", h.SyncStatus)
+		r.Get("/api/v1/sync/{provider}/authorize", h.SyncAuthorize)
+		r.Post("/api/v1/sync/{provider}/callback", h.SyncCallback)
+		r.Delete("/api/v1/sync/{provider}", h.SyncDisconnect)
+		r.Post("/api/v1/sync/update", h.SyncUpdate)
 	})
 
 	// Admin-only endpoints. RequireAdmin re-verifies the user's role against

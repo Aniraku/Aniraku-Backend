@@ -643,7 +643,18 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *So
 	return &SourceResult{
 		Sources: coreSources,
 		Headers: headers,
+		Intro:   skipTimestamp(sourceResp.Intro),
+		Outro:   skipTimestamp(sourceResp.Outro),
 	}
+}
+
+// skipTimestamp converts a Miruro intro/outro segment to the public model,
+// ignoring degenerate zero-length segments.
+func skipTimestamp(t *miruroTimestamp) *core.SkipTimestamp {
+	if t == nil || t.End <= t.Start || t.Start < 0 {
+		return nil
+	}
+	return &core.SkipTimestamp{Start: t.Start, End: t.End}
 }
 
 func (p *MiruroProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
@@ -1250,6 +1261,61 @@ func (p *MiruroProvider) GetEpisodeTitles(ctx context.Context, anilistID string)
 		return nil
 	}
 	return titles
+}
+
+// GetEpisodeFlags returns episode number → (filler, recap) flags, taken from
+// the best sub provider (dub fallback), with gaps filled from other providers.
+func (p *MiruroProvider) GetEpisodeFlags(ctx context.Context, anilistID string) (filler, recap map[int]bool) {
+	data, err := p.fetchEpisodes(ctx, anilistID)
+	if err != nil {
+		return nil, nil
+	}
+
+	var bestEps []miruroEpisode
+	// Prefer the same providers the episode list is built from.
+	if prov, ok := data.Providers["ally"]; ok && len(prov.Episodes.Sub) > 0 {
+		bestEps = prov.Episodes.Sub
+	} else if prov, ok := data.Providers["ally"]; ok && len(prov.Episodes.Dub) > 0 {
+		bestEps = prov.Episodes.Dub
+	}
+	if bestEps == nil {
+		_, _, bestEps = p.bestProvider(data.Providers, "sub")
+		if bestEps == nil {
+			_, _, bestEps = p.bestProvider(data.Providers, "dub")
+		}
+	}
+	if bestEps == nil {
+		return nil, nil
+	}
+
+	filler = make(map[int]bool, len(bestEps))
+	recap = make(map[int]bool, len(bestEps))
+	mark := func(e miruroEpisode) {
+		n := int(e.Number)
+		if e.Filler {
+			filler[n] = true
+		}
+		// Miruro marks recap episodes via a title marker when the flag
+		// itself is absent — catch both spellings.
+		title := strings.ToLower(e.Title)
+		if strings.Contains(title, "recap") || strings.Contains(title, "(recap)") {
+			recap[n] = true
+		}
+	}
+	for _, e := range bestEps {
+		mark(e)
+	}
+	// Fill missing from other providers
+	for _, pdata := range data.Providers {
+		for _, extra := range [][]miruroEpisode{pdata.Episodes.Sub, pdata.Episodes.Dub} {
+			for _, e := range extra {
+				if !filler[int(e.Number)] && !recap[int(e.Number)] {
+					mark(e)
+				}
+			}
+		}
+	}
+	return filler, recap
 }
 
 // GetProviders returns the list of available provider names for an anime

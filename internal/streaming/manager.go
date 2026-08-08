@@ -73,6 +73,10 @@ type Episode struct {
 type SourceResult struct {
 	Sources []core.Source
 	Headers map[string]string
+	// Intro/Outro are Miruro-provided skip segments, passed through to the
+	// client so it can offer manual skip buttons.
+	Intro *core.SkipTimestamp
+	Outro *core.SkipTimestamp
 }
 
 func NewManager(log zerolog.Logger, miruroAPIBase string, httpClient *http.Client) *Manager {
@@ -204,6 +208,8 @@ func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core
 	return &core.StreamResult{
 		Sources: sources,
 		Headers: result.Headers,
+		Intro:   result.Intro,
+		Outro:   result.Outro,
 	}
 }
 
@@ -229,6 +235,15 @@ func (m *Manager) GetEpisodeTitles(ctx context.Context, animeID int) map[int]str
 		return nil
 	}
 	return miruro.GetEpisodeTitles(ctx, fmt.Sprintf("%d", animeID))
+}
+
+// GetEpisodeFlags returns filler/recap flags per episode number.
+func (m *Manager) GetEpisodeFlags(ctx context.Context, animeID int) (map[int]bool, map[int]bool) {
+	miruro, ok := m.providers[0].(*MiruroProvider)
+	if !ok {
+		return nil, nil
+	}
+	return miruro.GetEpisodeFlags(ctx, fmt.Sprintf("%d", animeID))
 }
 
 func (m *Manager) HasAnime(ctx context.Context, animeID int) bool {
