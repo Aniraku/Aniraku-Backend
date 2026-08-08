@@ -91,6 +91,8 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Post("/api/v1/import/mal", h.ImportMAL)
 		r.Post("/api/v1/import/anilist", h.ImportAniList)
 		r.Get("/api/v1/import/{jobId}", h.ImportStatus)
+		r.Post("/api/v1/export/mal", h.ExportMAL)
+		r.Post("/api/v1/export/anilist", h.ExportAniList)
 		r.Get("/api/v1/profile/{username}", h.GetProfile)
 		r.Put("/api/v1/profile", h.UpdateProfile)
 		r.Post("/api/v1/favorites", h.AddFavorite)

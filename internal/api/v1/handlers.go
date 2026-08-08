@@ -2238,14 +2238,9 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
-	h.respondError(w, http.StatusNotImplemented, "MAL import not yet implemented")
-}
-
-func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
-	h.respondError(w, http.StatusNotImplemented, "AniList import not yet implemented")
-}
-
+// ImportMAL and ImportAniList are implemented in importexport.go.
+// ImportStatus reports on an import/export job; jobs run synchronously
+// today, so this is a compatibility stub.
 func (h *Handlers) ImportStatus(w http.ResponseWriter, r *http.Request) {
 	jobID := chi.URLParam(r, "jobId")
 	h.respondJSON(w, http.StatusOK, map[string]string{"jobId": jobID, "status": "pending"})
