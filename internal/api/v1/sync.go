@@ -542,7 +542,7 @@ func (h *Handlers) malTokenRequest(ctx context.Context, form url.Values) (*oauth
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -567,7 +567,7 @@ func (h *Handlers) fetchMALUsername(ctx context.Context, accessToken string) (st
 		return "", err
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -600,7 +600,7 @@ func (h *Handlers) updateMALProgress(ctx context.Context, accessToken string, ma
 	}
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -666,7 +666,7 @@ func (h *Handlers) anilistTokenRequest(ctx context.Context, form url.Values) (*o
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -694,7 +694,7 @@ func (h *Handlers) fetchAniListUsername(ctx context.Context, accessToken string)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -732,7 +732,7 @@ func (h *Handlers) updateAniListProgress(ctx context.Context, accessToken string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return err
 	}

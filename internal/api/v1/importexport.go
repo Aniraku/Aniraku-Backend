@@ -153,7 +153,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
-		resp, err := h.h1Client.Do(req)
+		resp, err := h.h2Client.Do(req)
 		if err != nil {
 			h.respondError(w, http.StatusBadGateway, "could not reach MyAnimeList — try again")
 			return
@@ -347,7 +347,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		resp, err := h.h1Client.Do(req)
+		resp, err := h.h2Client.Do(req)
 		if err != nil {
 			continue
 		}
@@ -476,7 +476,7 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
-	resp, err := h.h1Client.Do(req)
+	resp, err := h.h2Client.Do(req)
 	if err != nil {
 		return nil, err
 	}
