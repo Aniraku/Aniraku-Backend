@@ -387,6 +387,8 @@ type Handlers struct {
 	browseCache       sync.Map
 	browseCacheTTL    time.Duration
 	anilistClient     *anilistClient
+	// In-flight OAuth handshakes for MAL/AniList sync: state -> pendingOAuth.
+	syncPending       sync.Map
 
 	// --- Resilience layer ---
 	anilistCircuit    *circuitBreaker
@@ -737,6 +739,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	anilistID := id
 	thumbs := h.stream.GetEpisodeThumbnails(r.Context(), anilistID)
 	titles := h.stream.GetEpisodeTitles(r.Context(), anilistID)
+	fillerFlags, recapFlags := h.stream.GetEpisodeFlags(r.Context(), anilistID)
 
 	coverFallback := ""
 	if img, ok := media["coverImage"].(map[string]any); ok {
@@ -763,6 +766,12 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 		if title, ok := titles[epNum]; ok {
 			ep["title"] = title
+		}
+		if fillerFlags[epNum] {
+			ep["filler"] = true
+		}
+		if recapFlags[epNum] {
+			ep["recap"] = true
 		}
 		episodes[i] = ep
 	}

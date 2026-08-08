@@ -117,6 +117,15 @@ type StreamResult struct {
 	Headers   map[string]string `json:"headers,omitempty"`
 	Qualities []string          `json:"qualities,omitempty"`
 	Servers   []Server          `json:"servers,omitempty"` // working Miruro sub-providers
+	// Intro/Outro are Miruro-provided skip segments (seconds). The client
+	// shows manual "Skip Intro / Skip Credits" buttons — never auto-skips.
+	Intro *SkipTimestamp `json:"intro,omitempty"`
+	Outro *SkipTimestamp `json:"outro,omitempty"`
+}
+
+type SkipTimestamp struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
 }
 
 type Server struct {

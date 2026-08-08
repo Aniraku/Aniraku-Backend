@@ -33,7 +33,26 @@ type Config struct {
 	Providers ProviderConfig `mapstructure:"providers"`
 	Logging   LoggingConfig  `mapstructure:"logging"`
 	Update    UpdateConfig   `mapstructure:"update"`
+	Sync      SyncConfig     `mapstructure:"sync"`
 }
+
+type SyncConfig struct {
+	// OAuth credentials for MAL / AniList watch-progress sync. Leave
+	// empty to disable the feature — the UI shows "not configured".
+	MALClientID       string `mapstructure:"mal_client_id"`
+	MALClientSecret   string `mapstructure:"mal_client_secret"`
+	AniListClientID   string `mapstructure:"anilist_client_id"`
+	AniListClientSecret string `mapstructure:"anilist_client_secret"`
+	// RedirectURL is the registered OAuth redirect URI — the frontend's
+	// /sync/callback route (e.g. https://aniraku.app/sync/callback).
+	RedirectURL string `mapstructure:"oauth_redirect_url"`
+	// StateSecret signs OAuth state so callbacks can be validated
+	// statelessly. Generate a random long string and keep it secret.
+	StateSecret string `mapstructure:"oauth_state_secret"`
+}
+
+func (s *SyncConfig) MALConfigured() bool  { return s.MALClientID != "" }
+func (s *SyncConfig) AniListConfigured() bool { return s.AniListClientID != "" }
 
 type ServerConfig struct {
 	Host           string `mapstructure:"host"`
@@ -126,6 +145,26 @@ func Load(configPath string) (*Config, error) {
 	}
 	if mpu := os.Getenv("ANIRAKU_MIRURO_PROXY_URL"); mpu != "" {
 		v.Set("server.miruro_proxy_url", mpu)
+	}
+
+	// OAuth sync credentials (optional — feature disabled when absent)
+	if val := os.Getenv("ANIRAKU_MAL_CLIENT_ID"); val != "" {
+		v.Set("sync.mal_client_id", val)
+	}
+	if val := os.Getenv("ANIRAKU_MAL_CLIENT_SECRET"); val != "" {
+		v.Set("sync.mal_client_secret", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANILIST_CLIENT_ID"); val != "" {
+		v.Set("sync.anilist_client_id", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANILIST_CLIENT_SECRET"); val != "" {
+		v.Set("sync.anilist_client_secret", val)
+	}
+	if val := os.Getenv("ANIRAKU_OAUTH_REDIRECT_URL"); val != "" {
+		v.Set("sync.oauth_redirect_url", val)
+	}
+	if val := os.Getenv("ANIRAKU_OAUTH_STATE_SECRET"); val != "" {
+		v.Set("sync.oauth_state_secret", val)
 	}
 
 	var cfg Config
