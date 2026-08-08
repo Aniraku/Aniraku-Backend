@@ -569,7 +569,9 @@ func (h *Handlers) exchangeAniListCode(ctx context.Context, code, verifier strin
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
 	form.Set("client_id", h.cfg.Sync.AniListClientID)
-	form.Set("client_secret", h.cfg.Sync.AniListClientSecret)
+	if h.cfg.Sync.AniListClientSecret != "" {
+		form.Set("client_secret", h.cfg.Sync.AniListClientSecret)
+	}
 	form.Set("code", code)
 	form.Set("code_verifier", verifier)
 	form.Set("redirect_uri", h.cfg.Sync.RedirectURL)
@@ -589,7 +591,9 @@ func (h *Handlers) refreshAniListToken(ctx context.Context, token syncProviderTo
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("client_id", h.cfg.Sync.AniListClientID)
-	form.Set("client_secret", h.cfg.Sync.AniListClientSecret)
+	if h.cfg.Sync.AniListClientSecret != "" {
+		form.Set("client_secret", h.cfg.Sync.AniListClientSecret)
+	}
 	form.Set("refresh_token", token.RefreshToken)
 
 	tok, err := h.anilistTokenRequest(ctx, form)

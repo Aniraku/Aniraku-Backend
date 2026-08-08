@@ -274,9 +274,21 @@ type miruroEpisodesResponse struct {
 }
 
 type miruroMappings struct {
-	AnilistID int    `json:"aniId"`
-	MalID     int    `json:"malId"`
-	Title     string `json:"title"`
+	AnilistID int             `json:"aniId"`
+	MalID     int             `json:"malId"`
+	Title     string          `json:"title"`
+	// Aniskip holds per-episode skip segments (op/ed/recap) sourced from
+	// the AniSkip dataset — the Miruro source endpoint does not return
+	// intro/outro itself, so this is where Skip Intro/Credits data lives.
+	Aniskip []miruroAniskip `json:"aniskip"`
+}
+
+type miruroAniskip struct {
+	Episode int     `json:"episode"`
+	Type    string  `json:"type"`
+	Start   float64 `json:"start"`
+	End     float64 `json:"end"`
+	Votes   int     `json:"votes"`
 }
 
 type miruroProviderData struct {
@@ -588,7 +600,16 @@ func testSourceReachability(ctx context.Context, url string, headers map[string]
 	return nil
 }
 
-func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *SourceResult {
+func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse, aniskip []miruroAniskip, episode int) *SourceResult {
+	// AniSkip timestamps are authoritative when present; fall back to any
+	// intro/outro the source API itself provides.
+	intro, outro := skipFromAniskip(aniskip, episode)
+	if intro == nil {
+		intro = skipTimestamp(sourceResp.Intro)
+	}
+	if outro == nil {
+		outro = skipTimestamp(sourceResp.Outro)
+	}
 	var subtitles []core.Subtitle
 	for _, sub := range sourceResp.Subtitles {
 		if sub.URL == "" {
@@ -643,9 +664,51 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse) *So
 	return &SourceResult{
 		Sources: coreSources,
 		Headers: headers,
-		Intro:   skipTimestamp(sourceResp.Intro),
-		Outro:   skipTimestamp(sourceResp.Outro),
+		Intro:   intro,
+		Outro:   outro,
 	}
+}
+
+// skipFromAniskip picks the best intro ("op") and outro ("ed") segment for
+// an episode from Miruro's mappings.aniskip. Multiple providers report the
+// same segment; positive-voted entries win over mixed/negative ones, then
+// votes break ties. Degenerate zero-length segments are dropped.
+func skipFromAniskip(entries []miruroAniskip, episode int) (intro, outro *core.SkipTimestamp) {
+	var bestIntro, bestOutro *miruroAniskip
+	better := func(candidate, current *miruroAniskip) bool {
+		if current == nil {
+			return true
+		}
+		if (candidate.Votes >= 0) != (current.Votes >= 0) {
+			return candidate.Votes >= 0
+		}
+		return candidate.Votes > current.Votes
+	}
+	for i := range entries {
+		e := &entries[i]
+		// Zero-start segments are bogus (they'd mark the whole episode as
+		// skip); the Miruro source path already rejects start < 0.
+		if e.Episode != episode || e.End <= e.Start || e.Start <= 0 {
+			continue
+		}
+		switch e.Type {
+		case "op":
+			if better(e, bestIntro) {
+				bestIntro = e
+			}
+		case "ed":
+			if better(e, bestOutro) {
+				bestOutro = e
+			}
+		}
+	}
+	conv := func(e *miruroAniskip) *core.SkipTimestamp {
+		if e == nil {
+			return nil
+		}
+		return &core.SkipTimestamp{Start: e.Start, End: e.End}
+	}
+	return conv(bestIntro), conv(bestOutro)
 }
 
 // skipTimestamp converts a Miruro intro/outro segment to the public model,
@@ -774,7 +837,7 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 			continue
 		}
 
-		result := p.buildSourceResult(sourceResp)
+		result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 
 		if len(result.Sources) == 0 {
 			// API returned no usable streams — offer the episode page embed.
@@ -1004,7 +1067,7 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 				return
 			}
 
-			result := p.buildSourceResult(sourceResp)
+		result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 			if len(result.Sources) == 0 {
 				if episodeURL != "" {
 					mu.Lock()
