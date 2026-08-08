@@ -109,14 +109,17 @@ func (h *Handlers) SyncStatus(w http.ResponseWriter, r *http.Request) {
 	statusOf := func(provider string) map[string]any {
 		connected := false
 		username := ""
+		expiresAt := int64(0)
 		if t, ok := tokens[provider]; ok && t.AccessToken != "" {
 			connected = true
 			username = t.Username
+			expiresAt = t.ExpiresAt
 		}
 		return map[string]any{
 			"configured": h.syncConfigured(provider),
 			"connected":  connected,
 			"username":   username,
+			"expires_at": expiresAt,
 		}
 	}
 
