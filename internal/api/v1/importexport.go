@@ -61,6 +61,37 @@ func (h *Handlers) requireProviderToken(ctx context.Context, userID, provider st
 	return token, nil
 }
 
+// importFavoriteDiff inserts only the ids not already in the user's
+// favorites, returning (newly inserted, already present). Import stays
+// idempotent while the UI can show what actually changed.
+func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int) (int, int, error) {
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+	existing, err := h.loadUserFavorites(ctx, userID)
+	if err != nil {
+		return 0, 0, err
+	}
+	have := make(map[int]bool, len(existing))
+	for _, id := range existing {
+		have[id] = true
+	}
+	fresh := make([]int, 0, len(ids))
+	already := 0
+	for _, id := range ids {
+		if have[id] {
+			already++
+		} else {
+			fresh = append(fresh, id)
+		}
+	}
+	inserted, err := h.insertFavoriteIDs(ctx, userID, fresh)
+	if err != nil {
+		return 0, already, err
+	}
+	return inserted, already, nil
+}
+
 func (h *Handlers) insertFavoriteIDs(ctx context.Context, userID string, ids []int) (int, error) {
 	inserted := 0
 	for start := 0; start < len(ids); start += importBatchSize {
@@ -199,7 +230,8 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 			ids = append(ids, anID)
 		}
 	}
-	inserted, err := h.insertFavoriteIDs(r.Context(), userID, ids)
+
+	inserted, already, err := h.importFavoriteDiff(r.Context(), userID, ids)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("mal import: favorites insert failed")
 		h.respondError(w, http.StatusBadGateway, "could not save your imported list")
@@ -209,6 +241,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		"status":   "ok",
 		"provider": "mal",
 		"imported": inserted,
+		"already":  already,
 		"total":    len(ids),
 	})
 }
@@ -274,7 +307,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 		return
 	}
-	inserted, err := h.insertFavoriteIDs(r.Context(), userID, ids)
+	inserted, already, err := h.importFavoriteDiff(r.Context(), userID, ids)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("anilist import: favorites insert failed")
 		h.respondError(w, http.StatusBadGateway, "could not save your imported list")
@@ -284,6 +317,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		"status":   "ok",
 		"provider": "anilist",
 		"imported": inserted,
+		"already":  already,
 		"total":    len(ids),
 	})
 }
@@ -315,6 +349,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadGateway, "could not read your favorites")
 		return
 	}
+	favoriteCount := len(anilistIDs)
 	if len(anilistIDs) > importExportCap {
 		anilistIDs = anilistIDs[:importExportCap]
 	}
@@ -327,15 +362,26 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exported := 0
-	for _, malID := range malIDs {
-		if exported > 0 && exported%3 == 0 {
+	// Skip titles already marked completed on MAL — no pointless writes.
+	completed, err := h.fetchMALCompletedSet(r.Context(), token.AccessToken)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("mal export: completed set fetch failed, exporting all")
+	}
+
+	exported, skipped, failed := 0, 0, 0
+	limited := favoriteCount > importExportCap
+	for i, malID := range malIDs {
+		if i > 0 && i%3 == 0 {
 			select {
 			case <-time.After(1100 * time.Millisecond):
 			case <-r.Context().Done():
 				h.respondError(w, http.StatusGatewayTimeout, "export interrupted")
 				return
 			}
+		}
+		if completed[malID] {
+			skipped++
+			continue
 		}
 		form := url.Values{}
 		form.Set("status", "completed")
@@ -349,19 +395,25 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		resp, err := h.h2Client.Do(req)
 		if err != nil {
+			failed++
 			continue
 		}
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			exported++
+		} else {
+			failed++
 		}
 	}
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"provider": "mal",
 		"exported": exported,
+		"skipped":  skipped,
+		"failed":   failed,
 		"total":    len(anilistIDs),
+		"limited":  limited,
 	})
 }
 
@@ -394,7 +446,14 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	query := `mutation ($id: Int) {
 		SaveMediaListEntry(mediaId: $id, status: COMPLETED) { id }
 	}`
-	exported := 0
+	// Skip titles already marked completed on AniList — no pointless writes.
+	completed, err := h.fetchAniListCompletedSet(r.Context(), token.AccessToken)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("anilist export: completed set fetch failed, exporting all")
+	}
+
+	exported, skipped, failed := 0, 0, 0
+	limited := len(ids) > importExportCap
 	for i, id := range ids {
 		if i > 0 && i%3 == 0 {
 			select {
@@ -404,8 +463,13 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		if completed[id] {
+			skipped++
+			continue
+		}
 		raw, err := h.anilistAuthed(r.Context(), token.AccessToken, query, map[string]any{"id": id})
 		if err != nil {
+			failed++
 			continue
 		}
 		var out struct {
@@ -415,14 +479,60 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 		if json.Unmarshal(raw, &out) == nil && len(out.Errors) == 0 {
 			exported++
+		} else {
+			failed++
 		}
 	}
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"provider": "anilist",
 		"exported": exported,
+		"skipped":  skipped,
+		"failed":   failed,
 		"total":    len(ids),
+		"limited":  limited,
 	})
+}
+
+// fetchAniListCompletedSet returns the set of AniList ids the user has
+// already marked completed.
+func (h *Handlers) fetchAniListCompletedSet(ctx context.Context, accessToken string) (map[int]bool, error) {
+	query := `query ($status: MediaListStatus) {
+		Viewer {
+			mediaListCollection(type: ANIME, status: $status) {
+				lists { entries { mediaId } }
+			}
+		}
+	}`
+	raw, err := h.anilistAuthed(ctx, accessToken, query, map[string]any{"status": "COMPLETED"})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Data struct {
+			Viewer struct {
+				MediaListCollection struct {
+					Lists []struct {
+						Entries []struct {
+							MediaID int `json:"mediaId"`
+						} `json:"entries"`
+					} `json:"lists"`
+				} `json:"mediaListCollection"`
+			} `json:"Viewer"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	completed := map[int]bool{}
+	for _, list := range out.Data.Viewer.MediaListCollection.Lists {
+		for _, e := range list.Entries {
+			if e.MediaID > 0 {
+				completed[e.MediaID] = true
+			}
+		}
+	}
+	return completed, nil
 }
 
 // resolveAniListIDsToMAL maps a batch of AniList IDs to MAL IDs in a single
@@ -465,6 +575,50 @@ func (h *Handlers) resolveAniListIDsToMAL(ctx context.Context, anilistIDs []int)
 		}
 	}
 	return malIDs, nil
+}
+
+// fetchMALCompletedSet returns the set of MAL anime ids the user has
+// already marked completed, paginated by offset (status filter + fields).
+func (h *Handlers) fetchMALCompletedSet(ctx context.Context, accessToken string) (map[int]bool, error) {
+	completed := map[int]bool{}
+	offset := 0
+	for offset < 1000 {
+		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&status=completed&fields=list_status", offset)
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			break
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		resp, err := h.h2Client.Do(req)
+		if err != nil {
+			return completed, err
+		}
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return completed, fmt.Errorf("mal list fetch returned %s", resp.Status)
+		}
+		var page struct {
+			Data []struct {
+				Node struct {
+					ID int `json:"id"`
+				} `json:"node"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &page); err != nil {
+			return completed, err
+		}
+		if len(page.Data) == 0 {
+			break
+		}
+		for _, e := range page.Data {
+			if e.Node.ID > 0 {
+				completed[e.Node.ID] = true
+			}
+		}
+		offset += len(page.Data)
+	}
+	return completed, nil
 }
 
 // anilistAuthed POSTs a GraphQL request to AniList with a user token.
