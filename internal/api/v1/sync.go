@@ -17,6 +17,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/auth"
+	"github.com/Aniraku/Aniraku-Backend/internal/config"
 )
 
 // ────────────────────────────────────────────────────────────────
@@ -283,7 +284,7 @@ func (h *Handlers) completeOAuthExchange(w http.ResponseWriter, r *http.Request,
 	}
 	if err != nil {
 		h.log.Warn().Err(err).Str("provider", provider).Msg("sync token exchange failed")
-		h.respondError(w, http.StatusBadGateway, "authorization failed — the provider rejected the code")
+		h.respondError(w, http.StatusBadGateway, fmt.Sprintf("%s rejected the authorization code — %s", strings.ToUpper(provider), scrubSensitive(err.Error(), h.cfg)))
 		return
 	}
 
@@ -800,6 +801,23 @@ func truncate(b []byte, n int) string {
 	s := string(b)
 	if len(s) > n {
 		return s[:n] + "…"
+	}
+	return s
+}
+
+// scrubSensitive strips configured credentials from an error string before
+// it is surfaced to the client, in case a provider echoes them back.
+func scrubSensitive(s string, cfg *config.Config) string {
+	secrets := []string{
+		cfg.Sync.MALClientID,
+		cfg.Sync.MALClientSecret,
+		cfg.Sync.AniListClientID,
+		cfg.Sync.AniListClientSecret,
+	}
+	for _, secret := range secrets {
+		if secret != "" {
+			s = strings.ReplaceAll(s, secret, "[redacted]")
+		}
 	}
 	return s
 }
