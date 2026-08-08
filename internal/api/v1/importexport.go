@@ -62,7 +62,7 @@ func (h *Handlers) requireProviderToken(ctx context.Context, userID, provider st
 }
 
 // importFavoriteDiff inserts only the ids not already in the user's
-// favorites, returning (newly inserted, already present). Import stays
+// bookmarks, returning (newly inserted, already present). Import stays
 // idempotent while the UI can show what actually changed.
 func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int) (int, int, error) {
 	if len(ids) == 0 {
@@ -85,14 +85,82 @@ func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []
 			fresh = append(fresh, id)
 		}
 	}
-	inserted, err := h.insertFavoriteIDs(ctx, userID, fresh)
+	meta, err := h.fetchMediaMeta(ctx, fresh)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("import: media metadata fetch failed, importing with fallback titles")
+	}
+	inserted, err := h.insertBookmarks(ctx, userID, fresh, meta)
 	if err != nil {
 		return 0, already, err
 	}
 	return inserted, already, nil
 }
 
-func (h *Handlers) insertFavoriteIDs(ctx context.Context, userID string, ids []int) (int, error) {
+// mediaMeta holds the display fields the UI needs for a bookmarked title.
+type mediaMeta struct {
+	title string
+	image string
+}
+
+// fetchMediaMeta resolves AniList IDs to title + cover image in batched
+// GraphQL round trips so imported rows render properly in the UI.
+func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[int]mediaMeta, error) {
+	meta := make(map[int]mediaMeta, len(anilistIDs))
+	for start := 0; start < len(anilistIDs); start += 50 {
+		end := start + 50
+		if end > len(anilistIDs) {
+			end = len(anilistIDs)
+		}
+		query := `query ($ids: [Int]) {
+			Page(perPage: 50) {
+				media(id_in: $ids, type: ANIME) {
+					id
+					title { romaji english }
+					coverImage { medium }
+				}
+			}
+		}`
+		raw, err := h.anilistClient.do(ctx, query, map[string]any{"ids": anilistIDs[start:end]})
+		if err != nil {
+			return nil, err
+		}
+		var out struct {
+			Data struct {
+				Page struct {
+					Media []struct {
+						ID    int `json:"id"`
+						Title struct {
+							Romaji  string `json:"romaji"`
+							English string `json:"english"`
+						} `json:"title"`
+						CoverImage struct {
+							Medium string `json:"medium"`
+						} `json:"coverImage"`
+					} `json:"media"`
+				} `json:"Page"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, err
+		}
+		for _, m := range out.Data.Page.Media {
+			if m.ID <= 0 {
+				continue
+			}
+			title := m.Title.English
+			if title == "" {
+				title = m.Title.Romaji
+			}
+			if title == "" {
+				title = fmt.Sprintf("Anime %d", m.ID)
+			}
+			meta[m.ID] = mediaMeta{title: title, image: m.CoverImage.Medium}
+		}
+	}
+	return meta, nil
+}
+
+func (h *Handlers) insertBookmarks(ctx context.Context, userID string, ids []int, meta map[int]mediaMeta) (int, error) {
 	inserted := 0
 	for start := 0; start < len(ids); start += importBatchSize {
 		end := start + importBatchSize
@@ -101,15 +169,22 @@ func (h *Handlers) insertFavoriteIDs(ctx context.Context, userID string, ids []i
 		}
 		rows := make([]map[string]any, 0, end-start)
 		for _, id := range ids[start:end] {
+			m := meta[id]
+			title := m.title
+			if title == "" {
+				title = fmt.Sprintf("Anime %d", id)
+			}
 			rows = append(rows, map[string]any{
-				"user_id":    userID,
-				"media_id":   id,
-				"media_type": "anime",
+				"user_id":  userID,
+				"anime_id": id,
+				"title":    title,
+				"image":    m.image,
+				"added_at": time.Now().UnixMilli(),
 			})
 		}
 		raw, _ := json.Marshal(rows)
 		resp, err := h.supabaseRequest(ctx, "POST",
-			"/rest/v1/favorites?on_conflict=user_id,media_id,media_type",
+			"/rest/v1/bookmarks?on_conflict=user_id,anime_id",
 			bytes.NewReader(raw),
 			map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
 		if err != nil {
@@ -117,7 +192,7 @@ func (h *Handlers) insertFavoriteIDs(ctx context.Context, userID string, ids []i
 		}
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			return inserted, fmt.Errorf("favorites insert returned %s", resp.Status)
+			return inserted, fmt.Errorf("bookmarks insert returned %s", resp.Status)
 		}
 		inserted += end - start
 	}
@@ -126,17 +201,17 @@ func (h *Handlers) insertFavoriteIDs(ctx context.Context, userID string, ids []i
 
 func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int, error) {
 	resp, err := h.supabaseRequest(ctx, "GET",
-		"/rest/v1/favorites?select=media_id&user_id=eq."+encodePath(userID)+"&media_type=eq.anime&limit=500",
+		"/rest/v1/bookmarks?select=anime_id&user_id=eq."+encodePath(userID)+"&limit=500",
 		nil, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("favorites fetch returned %s", resp.Status)
+		return nil, fmt.Errorf("bookmarks fetch returned %s", resp.Status)
 	}
 	var rows []struct {
-		MediaID int `json:"media_id"`
+		AnimeID int `json:"anime_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
 		return nil, err
@@ -144,9 +219,9 @@ func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int,
 	ids := make([]int, 0, len(rows))
 	seen := map[int]bool{}
 	for _, r := range rows {
-		if r.MediaID > 0 && !seen[r.MediaID] {
-			seen[r.MediaID] = true
-			ids = append(ids, r.MediaID)
+		if r.AnimeID > 0 && !seen[r.AnimeID] {
+			seen[r.AnimeID] = true
+			ids = append(ids, r.AnimeID)
 		}
 	}
 	return ids, nil
