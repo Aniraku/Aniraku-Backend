@@ -357,6 +357,7 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 		Provider string `json:"provider"`
 		AnimeID  int    `json:"animeId"` // AniList ID
 		Episode  int    `json:"episode"`
+		Progress int    `json:"progress"` // seconds of media played
 	}
 	if err := json.Unmarshal(body, &input); err != nil {
 		h.respondError(w, http.StatusBadRequest, "invalid payload")
@@ -368,6 +369,12 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.AnimeID <= 0 || input.Episode <= 0 {
 		h.respondError(w, http.StatusBadRequest, "animeId and episode are required")
+		return
+	}
+	// Guard against marking episodes watched without playback: an empty or
+	// not-yet-aired stream has no playable duration, so progress is 0.
+	if input.Progress <= 0 {
+		h.respondError(w, http.StatusBadRequest, "episode not watched")
 		return
 	}
 
