@@ -1070,6 +1070,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		decodedURL = targetURL
 	}
+	// Drop the cache-busting nonce (see rewriteHLSPlaylist) so the upstream
+	// CDN never sees it.
+	decodedURL = stripProxyNonce(decodedURL)
 
 	// SSRF guard: cheap fast-fail on obviously bad hostnames. The dialer
 	// Control hook (ssrfGuardControl) remains the authoritative boundary for
@@ -1258,6 +1261,25 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// stripProxyNonce removes the cache-busting "rn" query parameter from a
+// proxied URL. The playlist rewrite adds it so every playback session uses
+// fresh edge-cache keys; it must never reach the upstream CDN.
+func stripProxyNonce(u string) string {
+	idx := strings.IndexByte(u, '?')
+	if idx < 0 {
+		return u
+	}
+	q, err := url.ParseQuery(u[idx+1:])
+	if err != nil {
+		return u
+	}
+	q.Del("rn")
+	if enc := q.Encode(); enc != "" {
+		return u[:idx+1] + enc
+	}
+	return u[:idx]
 }
 
 func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, error) {
@@ -1712,6 +1734,11 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 	if headersJSON != "" {
 		headersParam = "&headers=" + url.QueryEscape(headersJSON)
 	}
+	// Per-rewrite nonce: every playlist fetch generates fresh edge-cache keys
+	// for the URLs it names, so a stale cached variant (created before the
+	// proxy always emitted CORS headers) can never be served to a browser.
+	// The Proxy handler strips "rn" before dialing upstream.
+	rnParam := fmt.Sprintf("&rn=%d", time.Now().UnixNano())
 
 	isEncrypted := false
 	encKeyURI := ""
@@ -1732,7 +1759,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 				absoluteURL := resolveURL(uri, basePrefix)
 				learnPlaylistTarget(absoluteURL)
 				if needsProxyRewrite(absoluteURL) || headersJSON != "" {
-					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
+					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 					return fmt.Sprintf("URI=\"%s\"", proxied)
 				}
 				return match
@@ -1779,7 +1806,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
 				if headersJSON != "" || needsProxyRewrite(absoluteURL) {
-					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
+					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
 				}
@@ -1788,7 +1815,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 		}
 
 		if headersJSON != "" || needsProxyRewrite(absoluteURL) {
-			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam)
+			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 		} else {
 			lines[i] = absoluteURL
 		}
