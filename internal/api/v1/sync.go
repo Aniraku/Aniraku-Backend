@@ -37,7 +37,7 @@ import (
 // ────────────────────────────────────────────────────────────────
 
 const (
-	syncStateTTL       = 10 * time.Minute
+	syncStateTTL        = 10 * time.Minute
 	syncTokenSettingKey = "sync_tokens"
 )
 
@@ -380,12 +380,12 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.loadSyncTokens(r.Context(), userID)
 	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to read sync state")
+		h.respondError(w, http.StatusBadGateway, "failed to read sync state: "+err.Error())
 		return
 	}
 	token, ok := tokens[input.Provider]
 	if !ok || token.AccessToken == "" {
-		h.respondError(w, http.StatusNotFound, "provider not connected")
+		h.respondError(w, http.StatusNotFound, "provider not connected — reconnect from Settings")
 		return
 	}
 
@@ -400,7 +400,7 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync token refresh failed")
-			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings")
+			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
 			return
 		}
 		token = refreshed
@@ -426,8 +426,8 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 		err = h.updateAniListProgress(r.Context(), token.AccessToken, input.AnimeID, input.Episode)
 	}
 	if err != nil {
-		h.log.Warn().Err(err).Str("provider", input.Provider).Int("animeId", input.AnimeID).Msg("sync progress update failed")
-		h.respondError(w, http.StatusBadGateway, "progress update failed")
+		h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync progress update failed")
+		h.respondError(w, http.StatusBadGateway, "progress update failed: "+err.Error())
 		return
 	}
 
@@ -447,6 +447,7 @@ func (h *Handlers) loadSyncTokens(ctx context.Context, userID string) (syncToken
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Int("status", resp.StatusCode).Msg("loadSyncTokens: " + supabaseErrorBody(resp))
 		return syncTokenSet{}, nil
 	}
 	var rows []struct {
@@ -795,7 +796,7 @@ func (h *Handlers) SyncScore(w http.ResponseWriter, r *http.Request) {
 
 	tokens, err := h.loadSyncTokens(r.Context(), userID)
 	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to read sync state")
+		h.respondError(w, http.StatusBadGateway, "failed to read sync state: "+err.Error())
 		return
 	}
 	token, ok := tokens[input.Provider]
@@ -813,7 +814,7 @@ func (h *Handlers) SyncScore(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync score token refresh failed")
-			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings")
+			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
 			return
 		}
 		token = refreshed
@@ -839,7 +840,7 @@ func (h *Handlers) SyncScore(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		h.log.Warn().Err(err).Str("provider", input.Provider).Int("animeId", input.AnimeID).Msg("sync score update failed")
-		h.respondError(w, http.StatusBadGateway, "score update failed")
+		h.respondError(w, http.StatusBadGateway, "score update failed: "+err.Error())
 		return
 	}
 
