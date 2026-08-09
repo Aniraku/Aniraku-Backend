@@ -763,6 +763,153 @@ func (h *Handlers) updateAniListProgress(ctx context.Context, accessToken string
 }
 
 // ────────────────────────────────────────────────────────────────
+// Score sync (aggregated episode ratings → anime score)
+// ────────────────────────────────────────────────────────────────
+
+func (h *Handlers) SyncScore(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+	r.Body.Close()
+	var input struct {
+		Provider string `json:"provider"`
+		AnimeID  int    `json:"animeId"` // AniList ID
+		Score    int    `json:"score"`   // 1-10
+	}
+	if err := json.Unmarshal(body, &input); err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid payload")
+		return
+	}
+	if input.Provider != "mal" && input.Provider != "anilist" {
+		h.respondError(w, http.StatusBadRequest, "unknown sync provider")
+		return
+	}
+	if input.AnimeID <= 0 || input.Score < 1 || input.Score > 10 {
+		h.respondError(w, http.StatusBadRequest, "animeId and a 1-10 score are required")
+		return
+	}
+
+	tokens, err := h.loadSyncTokens(r.Context(), userID)
+	if err != nil {
+		h.respondError(w, http.StatusBadGateway, "failed to read sync state")
+		return
+	}
+	token, ok := tokens[input.Provider]
+	if !ok || token.AccessToken == "" {
+		h.respondError(w, http.StatusNotFound, "provider not connected")
+		return
+	}
+
+	if token.ExpiresAt > 0 && time.Now().Unix() >= token.ExpiresAt {
+		var refreshed syncProviderToken
+		if input.Provider == "mal" {
+			refreshed, err = h.refreshMALToken(r.Context(), token)
+		} else {
+			refreshed, err = h.refreshAniListToken(r.Context(), token)
+		}
+		if err != nil {
+			h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync score token refresh failed")
+			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings")
+			return
+		}
+		token = refreshed
+		if err := h.saveSyncToken(r.Context(), userID, input.Provider, token); err != nil {
+			h.log.Warn().Err(err).Msg("sync refreshed token save failed")
+		}
+	}
+
+	var malID int
+	if input.Provider == "mal" {
+		malID, err = h.anilistToMALID(r.Context(), input.AnimeID)
+		if err != nil || malID <= 0 {
+			h.log.Warn().Err(err).Int("animeId", input.AnimeID).Msg("sync score: mal id lookup failed")
+			h.respondError(w, http.StatusNotFound, "could not map anime to MAL")
+			return
+		}
+	}
+
+	if input.Provider == "mal" {
+		err = h.updateMALScore(r.Context(), token.AccessToken, malID, input.Score)
+	} else {
+		err = h.updateAniListScore(r.Context(), token.AccessToken, input.AnimeID, input.Score)
+	}
+	if err != nil {
+		h.log.Warn().Err(err).Str("provider", input.Provider).Int("animeId", input.AnimeID).Msg("sync score update failed")
+		h.respondError(w, http.StatusBadGateway, "score update failed")
+		return
+	}
+
+	h.respondJSON(w, http.StatusOK, map[string]any{"synced": true, "provider": input.Provider, "score": input.Score})
+}
+
+// updateMALScore sets the anime score (0-10) via the MAL API.
+func (h *Handlers) updateMALScore(ctx context.Context, accessToken string, malID, score int) error {
+	form := url.Values{}
+	form.Set("score", fmt.Sprintf("%d", score))
+
+	req, err := http.NewRequestWithContext(ctx, "PUT",
+		fmt.Sprintf("https://api.myanimelist.net/v2/anime/%d/my_list_status", malID),
+		strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := h.h2Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("mal score update returned %d: %s", resp.StatusCode, truncate(raw, 300))
+	}
+	return nil
+}
+
+// updateAniListScore sets the anime score (1-10 → scoreRaw 10-100) via
+// the AniList GraphQL API.
+func (h *Handlers) updateAniListScore(ctx context.Context, accessToken string, anilistID, score int) error {
+	query := `mutation ($mediaId: Int, $scoreRaw: Float) {
+		SaveMediaListEntry(mediaId: $mediaId, scoreRaw: $scoreRaw) { id }
+	}`
+	payload, _ := json.Marshal(map[string]any{
+		"query": query,
+		"variables": map[string]any{
+			"mediaId": anilistID, "scoreRaw": float64(score) * 10,
+		},
+	})
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := h.h2Client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("anilist score update returned %d: %s", resp.StatusCode, truncate(raw, 300))
+	}
+	var out struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &out); err == nil && len(out.Errors) > 0 {
+		return fmt.Errorf("anilist rejected score update: %s", out.Errors[0].Message)
+	}
+	return nil
+}
+
+// ────────────────────────────────────────────────────────────────
 // AniList metadata helpers
 // ────────────────────────────────────────────────────────────────
 

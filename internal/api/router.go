@@ -87,6 +87,8 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 
 		r.Post("/api/v1/anime/{id}/progress", h.SaveAnimeProgress)
 		r.Post("/api/v1/manga/{id}/progress", h.SaveMangaProgress)
+		r.Post("/api/v1/anime/{animeId}/episode/{episode}/rating", h.SaveEpisodeRating)
+		r.Get("/api/v1/anime/{animeId}/ratings", h.GetEpisodeRatings)
 		r.Get("/api/v1/continue-watching", h.GetContinueWatching)
 		r.Post("/api/v1/import/mal", h.ImportMAL)
 		r.Post("/api/v1/import/anilist", h.ImportAniList)
@@ -112,6 +114,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Post("/api/v1/sync/{provider}/callback", h.SyncCallback)
 		r.Delete("/api/v1/sync/{provider}", h.SyncDisconnect)
 		r.Post("/api/v1/sync/update", h.SyncUpdate)
+		r.Put("/api/v1/sync/score", h.SyncScore)
 	})
 
 	// Admin-only endpoints. RequireAdmin re-verifies the user's role against

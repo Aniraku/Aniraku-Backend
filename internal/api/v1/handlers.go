@@ -2979,3 +2979,93 @@ func (h *Handlers) AniListProxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	w.Write(respBody)
 }
+
+// ────────────────────────────────────────────────────────────────
+// Episode ratings (per-episode score, aggregated to the anime score
+// when syncing to MAL / AniList)
+// ────────────────────────────────────────────────────────────────
+
+func (h *Handlers) SaveEpisodeRating(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	animeID, err := strconv.Atoi(chi.URLParam(r, "animeId"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid anime id")
+		return
+	}
+	episode, err := strconv.Atoi(chi.URLParam(r, "episode"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid episode number")
+		return
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+	r.Body.Close()
+	var input struct {
+		Score int `json:"score"`
+	}
+	if err := json.Unmarshal(body, &input); err != nil || input.Score < 1 || input.Score > 10 {
+		h.respondError(w, http.StatusBadRequest, "score must be between 1 and 10")
+		return
+	}
+
+	raw, _ := json.Marshal([]map[string]any{{
+		"user_id":        userID,
+		"anime_id":       animeID,
+		"episode_number": episode,
+		"score":          input.Score,
+		"created_at":     time.Now().UTC().Format(time.RFC3339),
+	}})
+	resp, err := h.supabaseRequest(r.Context(), "POST",
+		"/rest/v1/episode_ratings?on_conflict=user_id,anime_id,episode_number",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		h.log.Warn().Err(err).Msg("episode rating save failed")
+		h.respondError(w, http.StatusBadGateway, "failed to save rating")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to save rating")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]any{"status": "saved", "anime_id": animeID, "episode": episode, "score": input.Score})
+}
+
+func (h *Handlers) GetEpisodeRatings(w http.ResponseWriter, r *http.Request) {
+	userID := auth.GetUserID(r.Context())
+	if userID == "" {
+		h.respondError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	animeID, err := strconv.Atoi(chi.URLParam(r, "animeId"))
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid anime id")
+		return
+	}
+
+	resp, err := h.supabaseRequest(r.Context(), "GET",
+		"/rest/v1/episode_ratings?select=episode_number,score&user_id=eq."+encodePath(userID)+"&anime_id=eq."+strconv.Itoa(animeID)+"&order=episode_number.asc",
+		nil, nil)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("episode ratings fetch failed")
+		h.respondError(w, http.StatusBadGateway, "failed to fetch ratings")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		h.log.Warn().Msg(supabaseErrorBody(resp))
+		h.respondError(w, http.StatusBadGateway, "failed to fetch ratings")
+		return
+	}
+	var ratings []map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&ratings); err != nil {
+		h.respondError(w, http.StatusBadGateway, "failed to decode ratings")
+		return
+	}
+	h.respondJSON(w, http.StatusOK, map[string]any{"ratings": ratings})
+}
