@@ -1044,6 +1044,22 @@ var blockedProxyPorts = map[string]bool{
 }
 
 func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
+	// The media proxy must never be cached at the edge: edge caches store
+	// response variants per URL, and a variant that was created without an
+	// allowed Origin carries no Access-Control-Allow-Origin header — serving
+	// that variant to a browser then fails the CORS check and playback dies
+	// with "No 'Access-Control-Allow-Origin' header is present". Media here
+	// is public (allowlisted CDNs only), so always answer CORS ourselves:
+	// reflect any real Origin (valid with the middleware's credentials
+	// pairing), fall back to '*' when the request has none.
+	w.Header().Set("Cache-Control", "no-store, private")
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+	} else {
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+	}
+
 	targetURL := r.URL.Query().Get("url")
 	if targetURL == "" {
 		h.respondError(w, http.StatusBadRequest, "url parameter required")
