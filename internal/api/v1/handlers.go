@@ -2820,30 +2820,39 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 	}
 
 	var typeArgs []string
+	// AniList rejects queries that declare variables it doesn't use, so only
+	// declare the ones we actually pass in the media() args.
+	var varDecls []string
 	typeArgs = append(typeArgs, "type: ANIME")
 
 	if filters.Search != "" {
 		typeArgs = append(typeArgs, "search: $search")
+		varDecls = append(varDecls, "$search: String")
 		variables["search"] = filters.Search
 	}
 	if len(filters.Genre) > 0 {
 		typeArgs = append(typeArgs, "genre: $genre")
+		varDecls = append(varDecls, "$genre: String")
 		variables["genre"] = filters.Genre[0]
 	}
 	if len(filters.Format) > 0 {
 		typeArgs = append(typeArgs, "format: $format")
+		varDecls = append(varDecls, "$format: MediaFormat")
 		variables["format"] = strings.ToUpper(filters.Format[0])
 	}
 	if len(filters.Status) > 0 {
 		typeArgs = append(typeArgs, "status: $status")
+		varDecls = append(varDecls, "$status: MediaStatus")
 		variables["status"] = strings.ToUpper(filters.Status[0])
 	}
 	if filters.Season != "" {
 		typeArgs = append(typeArgs, "season: $season")
+		varDecls = append(varDecls, "$season: MediaSeason")
 		variables["season"] = strings.ToUpper(filters.Season)
 	}
 	if filters.Year > 0 {
 		typeArgs = append(typeArgs, "seasonYear: $year")
+		varDecls = append(varDecls, "$year: Int")
 		variables["year"] = filters.Year
 	}
 
@@ -2857,6 +2866,7 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 		sort = "TITLE_ROMAJI"
 	}
 	typeArgs = append(typeArgs, "sort: $sort")
+	varDecls = append(varDecls, "$sort: [MediaSort]")
 	variables["sort"] = sort
 
 	// Build cache key from all filter parameters. The filter slices are
@@ -2882,7 +2892,7 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 		h.browseCache.Delete(cacheKey)
 	}
 
-	query := fmt.Sprintf(`query ($page: Int, $perPage: Int, $search: String, $genre: String, $format: MediaFormat, $status: MediaStatus, $season: MediaSeason, $year: Int, $sort: [MediaSort]) {
+	query := fmt.Sprintf(`query ($page: Int, $perPage: Int, %s) {
 		Page(page: $page, perPage: $perPage) {
 			pageInfo { total lastPage hasNextPage currentPage perPage }
 			media(%s) {
@@ -2892,7 +2902,7 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 				nextAiringEpisode { episode airingAt }
 			}
 		}
-	}`, strings.Join(typeArgs, ", "))
+	}`, strings.Join(varDecls, ", "), strings.Join(typeArgs, ", "))
 
 	raw, err := h.anilistClient.do(ctx, query, variables)
 	if err != nil {
