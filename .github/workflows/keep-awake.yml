@@ -20,8 +20,8 @@ jobs:
           set +e   # Don't exit on first failure
 
           ENDPOINTS=(
-            "https://aniraku-backend.onrender.com/api/v1/health"
-            "https://miruro-api-v3.onrender.com/"
+            "https://api.aniraku.tech/api/v1/health"
+            "https://provider.aniraku.tech/docs"
           )
 
           ping_url() {
