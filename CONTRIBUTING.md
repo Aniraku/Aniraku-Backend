@@ -1,50 +1,30 @@
-# Contributing to Aniraku
+# Contributing to Aniraku Backend
 
-Thanks for your interest in contributing! Here's how to get started.
+Contributions should improve reliability, security, maintainability, or compatibility while preserving the service’s clear separation between API routing, authentication, configuration, network safety, and streaming providers.
 
-## Development Setup
+## Development Workflow
 
-1. Fork and clone the repo
-2. Install Go 1.24+ and Node.js 18+
-3. Copy `config.example.yaml` to `config.yaml` with your Supabase credentials
-4. Run the backend: `go run ./cmd/aniraku-server/`
-5. Run the frontend: `cd web && pnpm dev`
+Use Go 1.24 or newer. Run `go mod download`, keep local configuration outside commits, and use focused changes that are easy to review. When working on the auxiliary Python proxy, use an isolated virtual environment and the repository’s `requirements.txt`.
 
-## Project Structure
+## Validation
 
-```
-aniraku/
-├── cmd/aniraku-server/    # Server entrypoint
-├── internal/
-│   ├── api/               # HTTP handlers and routing
-│   ├── auth/              # JWT authentication
-│   ├── config/            # Configuration loading
-│   ├── core/              # Shared models
-│   ├── metadata/          # AniList client
-│   ├── streaming/         # Provider manager (Miruro, Senshi)
-└── web/                   # React frontend
+Run the relevant Go tests and build checks before opening a pull request:
+
+```bash
+go test ./...
+go build ./cmd/aniraku-server/
 ```
 
-## Guidelines
+For provider or proxy changes, exercise representative success, fallback, timeout, malformed-response, and unavailable-upstream cases. Do not weaken the network guard or authentication middleware to make a test pass.
 
-- Keep it simple. No over-engineering.
-- Follow existing code style
-- Test your changes with multiple anime (popular + old)
-- One PR per feature/fix
+## Pull Requests
 
-## Adding a Streaming Provider
+Describe the behavior changed, the affected module, validation performed, and any upstream assumptions. Include API examples when route behavior changes. Never commit credentials, cookies, service keys, generated binaries, or private user data.
 
-1. Create a new file in `internal/extensions/builtin/`
-2. Implement the `StreamingProvider` interface
-3. Register it in `cmd/aniraku-server/main.go`
+## Adding a Provider
 
-## Reporting Issues
+Keep provider-specific behavior inside `internal/streaming/`, follow the existing provider manager abstractions, and preserve cancellation, timeout, error normalization, and fallback behavior. Add tests for parsing and failure cases before requesting review.
 
-Use GitHub Issues. Include:
-- Steps to reproduce
-- Expected vs actual behavior
-- Browser and OS
+## Reporting Security Issues
 
-## License
-
-By contributing, you agree your code is licensed under MIT.
+Do not disclose sensitive vulnerabilities in a public issue. Follow the repository’s security guidance and provide the smallest reproducible description needed for maintainers to investigate safely.
