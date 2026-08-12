@@ -1,104 +1,60 @@
-# Aniraku
+# Aniraku Backend
 
-An open-source anime streaming platform built with Go and React. Features multiple streaming sources with automatic fallback and a clean modern UI.
+The Aniraku Backend is the Go service layer for the Aniraku anime application. It exposes the application API, verifies Supabase JWTs, retrieves metadata, coordinates streaming providers, and applies network-safety checks around upstream requests. The frontend is maintained separately in [Aniraku/Aniraku](https://github.com/Aniraku/Aniraku).
 
-## Features
+## Verified Technology Stack
 
-- **Multi-source streaming** — Miruro (primary) with Senshi HLS fallback
-- **SUB/DUB support** — Language selection per episode
-- **Anime metadata** — AniList integration for covers, descriptions, schedules
-- **Artplayer** — Custom video player with skip intro, playback rate, PIP, fullscreen, hotkeys
-- **Watch history** — Auto-saves progress per episode
-- **Catalog & search** — Browse by genre, format, status, season
-- **Dark mode** — Always-on dark theme
-- **Responsive** — Mobile-first design
+| Layer | Technology | Repository evidence |
+|---|---|---|
+| Runtime | Go 1.24 | `go.mod` |
+| HTTP service | Chi router and standard Go HTTP packages | `go.mod`, `internal/api/` |
+| Logging | Zerolog | `go.mod`, service configuration |
+| Authentication | Supabase JWT/JWKS verification | `internal/auth/`, `config.yaml` |
+| Application modules | API, auth, config, core, embedding, network guard, streaming | `internal/` |
+| Streaming integrations | Miruro and Senshi provider implementations | `internal/streaming/` |
+| Auxiliary proxy | Python script with declared Python requirements | `cmd/miruro-proxy/proxy.py`, `requirements.txt` |
+| Deployment | Docker and Render configuration | `Dockerfile`, `render.yaml` |
 
-## Tech Stack
+## Local Development
 
-| Layer | Technology |
-|-------|-----------|
-| Backend | Go 1.24, Chi router, zerolog |
-| Frontend | React 18, Vite, Artplayer |
-| Metadata | AniList GraphQL API |
-| Streaming | Miruro API, Senshi HLS |
-| Auth | Supabase (JWT) |
-| Database | Supabase (PostgreSQL) |
-
-## Quick Start
-
-### Prerequisites
-
-- Go 1.24+
-- Node.js 18+
-- pnpm
-
-### Backend
+Install Go 1.24 or newer, download dependencies, and run the server with a local configuration file:
 
 ```bash
-# Install dependencies
 go mod download
-
-# Build
-go build -o aniraku-server ./cmd/aniraku-server/
-
-# Run
-./aniraku-server --config config.yaml
+go run ./cmd/aniraku-server/ --config config.yaml
 ```
 
-Server starts on `http://127.0.0.1:43211`
-
-### Frontend
+The default configuration targets `127.0.0.1:43211`; confirm the current values in `config.yaml` before running. The repository also contains a Python-based auxiliary proxy. Install its requirements only when working on that component:
 
 ```bash
-cd web
-
-# Install dependencies
-pnpm install
-
-# Development
-pnpm dev
-
-# Build for production
-pnpm build
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## Configuration
+Never commit Supabase keys, service credentials, JWT material, or local configuration containing secrets.
 
-Copy `config.example.yaml` to `config.yaml` and configure:
+## API Surface
 
-```yaml
-server:
-  host: "127.0.0.1"
-  port: 43211
-  debug: true
-
-supabase:
-  url: "https://your-project.supabase.co"
-  key: "your-anon-key"
-  service_key: "your-service-key"
-  jwt_aud: "authenticated"
-```
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/api/v1/health` | Health check |
-| GET | `/api/v1/anime/{id}` | Anime details |
-| GET | `/api/v1/anime/{id}/episodes` | Episode list |
-| POST | `/api/v1/stream` | Get streaming source |
-| GET | `/api/v1/miruro/episodes/{id}` | Miruro episode list |
-| GET | `/api/v1/miruro/has-dub/{id}` | Check DUB availability |
-| GET | `/api/v1/search?q=...` | Search anime |
-| GET | `/api/v1/browse` | Browse catalog |
-| GET | `/api/v1/trending` | Trending anime |
+The service includes health, anime details, episode listing, catalog browsing, search, trending, Miruro episode availability, and streaming-source routes. The authoritative route definitions are in `internal/api/router.go`; confirm the implementation before relying on a route in a client or integration.
 
 ## Architecture
 
+```text
+Aniraku React client
+        |
+        v
+Go API service ── authentication and network guard
+        |
+        +── AniList metadata
+        +── Miruro provider
+        +── Senshi HLS provider
 ```
-Client → Miruro (primary) → Senshi HLS (fallback)
-```
+
+## Contributing and Responsible Use
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change. Preserve the existing provider boundaries, authentication checks, SSRF protections, and upstream rate-respectful behavior. Use the project only where permitted by applicable laws, service terms, and content rights.
 
 ## License
 
-MIT
+See [LICENSE](LICENSE) for the project’s license terms.
