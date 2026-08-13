@@ -137,3 +137,25 @@ func TestTestEmbedReachabilityRejectsInvalidURL(t *testing.T) {
 		t.Fatal("testEmbedReachability accepted an invalid URL")
 	}
 }
+
+func TestEmbedFrameBlockReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		headers http.Header
+		blocked bool
+	}{
+		{name: "x-frame deny", headers: http.Header{"X-Frame-Options": []string{"DENY"}}, blocked: true},
+		{name: "x-frame same origin", headers: http.Header{"X-Frame-Options": []string{"SAMEORIGIN"}}, blocked: true},
+		{name: "csp self only", headers: http.Header{"Content-Security-Policy": []string{"default-src 'self'; frame-ancestors 'self'"}}, blocked: true},
+		{name: "aniraku allowed", headers: http.Header{"Content-Security-Policy": []string{"frame-ancestors https://www.aniraku.tech"}}, blocked: false},
+		{name: "no framing policy", headers: make(http.Header), blocked: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := embedFrameBlockReason(&http.Response{Header: tt.headers}) != ""
+			if got != tt.blocked {
+				t.Fatalf("embedFrameBlockReason blocked=%v, want %v", got, tt.blocked)
+			}
+		})
+	}
+}
