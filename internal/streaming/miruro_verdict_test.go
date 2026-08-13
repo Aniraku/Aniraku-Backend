@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -84,5 +85,55 @@ func TestVerdictResultDropsAllDeadSources(t *testing.T) {
 	})
 	if ranked != nil || best != VerdictDead {
 		t.Fatalf("dead-only result = %#v, %v; want nil, dead", ranked, best)
+	}
+}
+
+func TestClassifyStreamType(t *testing.T) {
+	tests := []struct {
+		name     string
+		typeHint string
+		url      string
+		want     string
+	}{
+		{name: "hls hint", typeHint: "hls", url: "https://cdn.test/video", want: "hls"},
+		{name: "m3u8 url", typeHint: "", url: "https://cdn.test/master.m3u8?token=1", want: "hls"},
+		{name: "dash hint", typeHint: "dash", url: "https://cdn.test/manifest", want: "dash"},
+		{name: "mpd url", typeHint: "", url: "https://cdn.test/manifest.mpd", want: "dash"},
+		{name: "mp4 url", typeHint: "hls", url: "https://cdn.test/video.mp4", want: "mp4"},
+		{name: "webm", typeHint: "video/webm", url: "https://cdn.test/video", want: "webm"},
+		{name: "ogg", typeHint: "", url: "https://cdn.test/video.ogv", want: "ogg"},
+		{name: "mpeg", typeHint: "", url: "https://cdn.test/video.mpg", want: "mpeg"},
+		{name: "embed", typeHint: "embed", url: "https://player.test/watch/1", want: "embed"},
+		{name: "extensionless native", typeHint: "video/x-custom", url: "https://cdn.test/stream?id=1", want: "native"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyStreamType(tt.typeHint, tt.url); got != tt.want {
+				t.Fatalf("classifyStreamType(%q, %q) = %q, want %q", tt.typeHint, tt.url, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVerdictResultRetainsVerifiedEmbed(t *testing.T) {
+	provider := &MiruroProvider{
+		log:   zerolog.Nop(),
+		probe: verdictProbe{},
+	}
+	embedURL := "https://player.example.test/watch/1"
+	ranked, best := provider.verdictResult(context.Background(), &SourceResult{
+		Sources: []core.Source{{URL: embedURL, Type: "embed", Quality: "auto"}},
+	})
+	if ranked == nil || best != VerdictEmbed {
+		t.Fatalf("verified embed result = %#v, %v; want one embed source", ranked, best)
+	}
+	if len(ranked.Sources) != 1 || ranked.Sources[0].Verification != "embed" {
+		t.Fatalf("embed result = %#v, want verification=embed", ranked.Sources)
+	}
+}
+
+func TestTestEmbedReachabilityRejectsInvalidURL(t *testing.T) {
+	if err := testEmbedReachability(context.Background(), "not-a-url", nil, http.DefaultClient); err == nil {
+		t.Fatal("testEmbedReachability accepted an invalid URL")
 	}
 }
