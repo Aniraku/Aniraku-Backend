@@ -37,10 +37,10 @@ var miruroRemovedProviders = map[string]bool{
 type PlaybackVerdict int
 
 const (
-	VerdictDead PlaybackVerdict = iota // unplayable via any path we know of
-	VerdictEmbed                       // works only as an iframe/embed player
-	VerdictDirect                      // reachable with a plain browser-like client
-	VerdictProxy                       // verified playable through the media proxy
+	VerdictDead   PlaybackVerdict = iota // unplayable via any path we know of
+	VerdictEmbed                         // works only as an iframe/embed player
+	VerdictDirect                        // reachable with a plain browser-like client
+	VerdictProxy                         // verified playable through the media proxy
 )
 
 func (v PlaybackVerdict) String() string {
@@ -274,9 +274,9 @@ type miruroEpisodesResponse struct {
 }
 
 type miruroMappings struct {
-	AnilistID int             `json:"aniId"`
-	MalID     int             `json:"malId"`
-	Title     string          `json:"title"`
+	AnilistID int    `json:"aniId"`
+	MalID     int    `json:"malId"`
+	Title     string `json:"title"`
 	// Aniskip holds per-episode skip segments (op/ed/recap) sourced from
 	// the AniSkip dataset — the Miruro source endpoint does not return
 	// intro/outro itself, so this is where Skip Intro/Credits data lives.
@@ -348,10 +348,10 @@ type miruroAnimeCache struct {
 }
 
 var (
-	miruroCache      = map[string]*miruroAnimeCache{}
-	miruroCacheMu    sync.RWMutex
+	miruroCache       = map[string]*miruroAnimeCache{}
+	miruroCacheMu     sync.RWMutex
 	miruroSourceCache = map[string]*miruroSourceCacheEntry{}
-	miruroSourceMu   sync.RWMutex
+	miruroSourceMu    sync.RWMutex
 )
 
 // --- cached stream sources per (anilistID, episode, lang) ---
@@ -641,7 +641,7 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse, ani
 			Subtitles: subtitles,
 		})
 	}
-		qualityOrder := map[string]int{"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "auto": 4}
+	qualityOrder := map[string]int{"1080p": 0, "720p": 1, "480p": 2, "360p": 3, "auto": 4}
 	sort.Slice(coreSources, func(i, j int) bool {
 		oi, oki := qualityOrder[coreSources[i].Quality]
 		oj, okj := qualityOrder[coreSources[j].Quality]
@@ -871,9 +871,9 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	defer cancel()
 
 	type verdict struct {
-		name    string
-		result  *SourceResult
-		best    PlaybackVerdict
+		name   string
+		result *SourceResult
+		best   PlaybackVerdict
 	}
 	var passing []verdict
 	var passMu sync.Mutex
@@ -886,6 +886,13 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 			defer wg.Done()
 			ranked, best := p.verdictResult(ctx, v.result)
 			if ranked == nil {
+				return
+			}
+			// Never return or cache a media-only result whose every source
+			// failed the real proxy/direct playback probe. Keeping it here
+			// caused the browser to mount the same dead CDN URL repeatedly.
+			if best == VerdictDead {
+				p.log.Debug().Str("provider", v.name).Msg("dropping dead-only source result")
 				return
 			}
 			passMu.Lock()
@@ -1067,7 +1074,7 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 				return
 			}
 
-		result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
+			result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 			if len(result.Sources) == 0 {
 				if episodeURL != "" {
 					mu.Lock()
@@ -1108,6 +1115,13 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 			defer resultsWg.Done()
 			ranked, best := p.verdictResult(ctx, v.result)
 			if ranked == nil {
+				return
+			}
+			// Do not expose or cache a provider whose media URLs all failed
+			// the exact proxy/direct playback probe. Embed results still pass
+			// because they carry VerdictEmbed rather than VerdictDead.
+			if best == VerdictDead {
+				p.log.Debug().Str("provider", v.name).Msg("FindAllSources: dropping dead-only source result")
 				return
 			}
 			if best > VerdictDead {
