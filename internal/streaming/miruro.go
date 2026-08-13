@@ -135,7 +135,9 @@ func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult
 
 		var v PlaybackVerdict
 		if src.Type == "embed" {
-			v = VerdictEmbed
+			if p.client == nil || testEmbedReachability(ctx, src.URL, result.Headers, p.client) == nil {
+				v = VerdictEmbed
+			}
 		} else if p.probe != nil {
 			v = p.probe.ProbePlayback(ctx, src.Type, src.URL, result.Headers)
 		} else if testSourceReachability(ctx, src.URL, result.Headers, p.client) == nil {
@@ -588,6 +590,43 @@ func (p *MiruroProvider) verifySourceURL(ctx context.Context, rawURL string) err
 	return nil
 }
 
+// testEmbedReachability verifies that a fallback embed URL is a reachable HTML
+// page rather than an empty, expired, or obvious error response. It is a
+// lightweight availability check; the browser iframe remains the final player
+// compatibility check.
+func testEmbedReachability(ctx context.Context, rawURL string, headers map[string]string, client *http.Client) error {
+	probeCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("embed page returned HTTP %d", resp.StatusCode)
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	if contentType != "" && !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
+		return fmt.Errorf("embed page returned non-HTML content type %q", contentType)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return err
+	}
+	trimmed := strings.TrimSpace(strings.ToLower(string(body)))
+	if len(trimmed) < 32 || strings.Contains(trimmed, "access denied") || strings.Contains(trimmed, "cloudflare ray id") {
+		return fmt.Errorf("embed page is empty or blocked")
+	}
+	return nil
+}
+
 // testSourceReachability probes the upstream CDN with a short-range GET to verify it's reachable
 // from this server's IP range. CDNs that block datacenter IPs return 502 or connection refused,
 // and expired tokenized URLs (miruro reuses CDN tokens for months) return 401 — both must be
@@ -617,6 +656,57 @@ func testSourceReachability(ctx context.Context, url string, headers map[string]
 	return nil
 }
 
+// classifyStreamType preserves provider media hints and uses the URL only as a
+// fallback. Unknown media URLs remain "native" so the browser can negotiate
+// their Content-Type instead of receiving an incorrect HLS loader. Explicit
+// embed/page sources stay separate because they require iframe playback.
+func classifyStreamType(rawType, rawURL string) string {
+	t := strings.ToLower(strings.TrimSpace(rawType))
+	u := strings.ToLower(rawURL)
+	if strings.Contains(t, "embed") || strings.Contains(t, "iframe") || strings.Contains(t, "page") {
+		return "embed"
+	}
+	// Explicit URL extensions win over contradictory provider hints (for
+	// example type=hls with a URL ending in .mp4).
+	if strings.Contains(u, ".m3u8") {
+		return "hls"
+	}
+	if strings.Contains(u, ".mpd") {
+		return "dash"
+	}
+	if strings.Contains(u, ".mp4") || strings.Contains(u, ".m4v") {
+		return "mp4"
+	}
+	if strings.Contains(u, ".webm") {
+		return "webm"
+	}
+	if strings.Contains(u, ".ogv") || strings.Contains(u, ".ogg") {
+		return "ogg"
+	}
+	if strings.Contains(u, ".mpeg") || strings.Contains(u, ".mpg") {
+		return "mpeg"
+	}
+	if t == "hls" || t == "m3u8" || strings.Contains(t, "mpegurl") {
+		return "hls"
+	}
+	if t == "dash" || t == "mpd" || strings.Contains(t, "dash+xml") {
+		return "dash"
+	}
+	if t == "mp4" || t == "m4v" || strings.Contains(t, "video/mp4") {
+		return "mp4"
+	}
+	if t == "webm" || strings.Contains(t, "video/webm") {
+		return "webm"
+	}
+	if t == "ogg" || t == "ogv" || strings.Contains(t, "video/ogg") || strings.Contains(t, "audio/ogg") {
+		return "ogg"
+	}
+	if t == "mpeg" || t == "mpg" || strings.Contains(t, "video/mpeg") {
+		return "mpeg"
+	}
+	return "native"
+}
+
 func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse, aniskip []miruroAniskip, episode int) *SourceResult {
 	// AniSkip timestamps are authoritative when present; fall back to any
 	// intro/outro the source API itself provides.
@@ -644,13 +734,7 @@ func (p *MiruroProvider) buildSourceResult(sourceResp *miruroSourceResponse, ani
 		if s.URL == "" {
 			continue
 		}
-		streamType := s.Type
-		if streamType != "mp4" && streamType != "hls" && streamType != "embed" {
-			streamType = "hls"
-		}
-		if streamType == "hls" && strings.Contains(s.URL, ".mp4") {
-			streamType = "mp4"
-		}
+		streamType := classifyStreamType(s.Type, s.URL)
 		coreSources = append(coreSources, core.Source{
 			URL:       s.URL,
 			Type:      streamType,
@@ -802,79 +886,194 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 	}
 
 	var lastErr error
+	var lastErrMu sync.Mutex
+	preferredAttempted := false
 
-	// Stage 1: Fetch sources from ALL providers sequentially (fast Miruro API calls)
+	// The Watch page asks for one explicit provider at a time. Resolve that
+	// provider synchronously first so a live cached/source URL starts playback
+	// without waiting for every other provider's response or probe. Cap this
+	// fast path so a slow selected provider cannot block fallback indefinitely.
+	if preferred != "" {
+		preferredCtx, preferredCancel := context.WithTimeout(ctx, 10*time.Second)
+		defer preferredCancel()
+		for _, candidate := range candidates {
+			if candidate.name != preferred {
+				continue
+			}
+			preferredAttempted = true
+			var episodeID, episodeURL string
+			for _, e := range candidate.episodes {
+				if int(e.Number) == episode {
+					episodeID, episodeURL = e.ID, e.URL
+					break
+				}
+			}
+			if episodeID == "" || p.providerBlocked(candidate.name) {
+				break
+			}
+
+			var preferredResult *SourceResult
+			sk := sourceCacheKey(providerID+":"+candidate.name, episode, lang)
+			miruroSourceMu.RLock()
+			cached, cachedOK := miruroSourceCache[sk]
+			if cachedOK && time.Since(cached.fetchedAt) < 10*time.Minute && !IsRefresh(ctx) {
+				preferredResult = cached.result
+			}
+			miruroSourceMu.RUnlock()
+
+			if preferredResult == nil {
+				sourceResp, fetchErr := p.fetchSource(preferredCtx, episodeID)
+				if fetchErr == nil {
+					preferredResult = p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
+				} else {
+					lastErr = fetchErr
+					if isPipeFailure(fetchErr) {
+						p.recordProviderFailure(candidate.name)
+					}
+				}
+			}
+			if preferredResult != nil && len(preferredResult.Sources) > 0 {
+				ranked, best := p.verdictResult(preferredCtx, preferredResult)
+				if ranked != nil && best > VerdictDead {
+					p.learnResultHosts(ranked)
+					p.recordProviderSuccess(candidate.name)
+					miruroSourceMu.Lock()
+					miruroSourceCache[sk] = &miruroSourceCacheEntry{result: ranked, fetchedAt: time.Now()}
+					miruroSourceMu.Unlock()
+					return ranked, nil
+				}
+			}
+			// An episode page embed is only attempted after the preferred media
+			// source fails, and it still must pass the embed reachability probe.
+			if episodeURL != "" {
+				embed := embedFromPage(episodeURL)
+				ranked, best := p.verdictResult(preferredCtx, embed)
+				if ranked != nil && best == VerdictEmbed {
+					return ranked, nil
+				}
+			}
+			break
+		}
+	}
+
+	// Stage 1: Fetch all provider source payloads concurrently. The old
+	// sequential loop made startup time equal to the sum of every provider
+	// latency even when the first provider was already playable.
 	type verified struct {
 		name   string
 		result *SourceResult
 	}
 	var verifiedSet []verified
+	var verifiedMu sync.Mutex
+	var fetchWg sync.WaitGroup
 
 	for _, c := range candidates {
-		var episodeID string
-		var episodeURL string
-		for _, e := range c.episodes {
-			if int(e.Number) == episode {
-				episodeID = e.ID
-				episodeURL = e.URL
-				break
-			}
-		}
-		if episodeID == "" {
+		if preferredAttempted && c.name == preferred {
 			continue
 		}
+		c := c
+		fetchWg.Add(1)
+		go func() {
+			defer fetchWg.Done()
+			var episodeID string
+			var episodeURL string
+			for _, e := range c.episodes {
+				if int(e.Number) == episode {
+					episodeID = e.ID
+					episodeURL = e.URL
+					break
+				}
+			}
+			if episodeID == "" {
+				return
+			}
 
-		// Check cache first
-		sk := sourceCacheKey(providerID+":"+c.name, episode, lang)
-		miruroSourceMu.RLock()
-		if cached, ok := miruroSourceCache[sk]; ok && time.Since(cached.fetchedAt) < 10*time.Minute && !IsRefresh(ctx) {
+			// Check cache first; cached providers join the ranking phase without
+			// another upstream request.
+			sk := sourceCacheKey(providerID+":"+c.name, episode, lang)
+			miruroSourceMu.RLock()
+			if cached, ok := miruroSourceCache[sk]; ok && time.Since(cached.fetchedAt) < 10*time.Minute && !IsRefresh(ctx) {
+				miruroSourceMu.RUnlock()
+				verifiedMu.Lock()
+				verifiedSet = append(verifiedSet, verified{name: c.name, result: cached.result})
+				verifiedMu.Unlock()
+				return
+			}
 			miruroSourceMu.RUnlock()
-			verifiedSet = append(verifiedSet, verified{name: c.name, result: cached.result})
-			continue
-		}
-		miruroSourceMu.RUnlock()
 
-		if p.providerBlocked(c.name) {
-			p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("provider auto-blocked, skipping")
-			continue
-		}
-
-		sourceResp, err := p.fetchSource(ctx, episodeID)
-		if err != nil {
-			p.log.Warn().Err(err).Str("provider", c.name).Str("lang", lang).Int("episode", episode).Msg("miruro provider failed, trying next")
-			if isPipeFailure(err) {
-				p.recordProviderFailure(c.name)
+			if p.providerBlocked(c.name) {
+				p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("provider auto-blocked, skipping")
+				return
 			}
-			lastErr = err
-			// Pipe blocked: keep the provider's episode page as an embed
-			// option so the second (iframe) player can still try it.
-			if episodeURL != "" {
-				verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
+
+			sourceResp, fetchErr := p.fetchSource(ctx, episodeID)
+			if fetchErr != nil {
+				p.log.Warn().Err(fetchErr).Str("provider", c.name).Str("lang", lang).Int("episode", episode).Msg("miruro provider failed, trying next")
+				if isPipeFailure(fetchErr) {
+					p.recordProviderFailure(c.name)
+				}
+				lastErrMu.Lock()
+				lastErr = fetchErr
+				lastErrMu.Unlock()
+				if episodeURL != "" {
+					verifiedMu.Lock()
+					verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
+					verifiedMu.Unlock()
+				}
+				return
 			}
-			continue
-		}
 
-		result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
-
-		if len(result.Sources) == 0 {
-			// API returned no usable streams — offer the episode page embed.
-			if episodeURL != "" {
-				verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
+			result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
+			if len(result.Sources) == 0 {
+				if episodeURL != "" {
+					verifiedMu.Lock()
+					verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
+					verifiedMu.Unlock()
+				}
+				return
 			}
-			continue
-		}
 
-		if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
-			p.log.Warn().Err(err).Str("provider", c.name).Msg("miruro source domain blocked, skipping")
-			lastErr = err
-			continue
-		}
+			if verifyErr := p.verifySourceURL(ctx, result.Sources[0].URL); verifyErr != nil {
+				p.log.Warn().Err(verifyErr).Str("provider", c.name).Msg("miruro source domain blocked, skipping")
+				lastErrMu.Lock()
+				lastErr = verifyErr
+				lastErrMu.Unlock()
+				return
+			}
 
-		verifiedSet = append(verifiedSet, verified{name: c.name, result: result})
+			verifiedMu.Lock()
+			verifiedSet = append(verifiedSet, verified{name: c.name, result: result})
+			verifiedMu.Unlock()
+		}()
 	}
+	fetchWg.Wait()
 
 	if len(verifiedSet) == 0 {
 		return p.miruroFallback("", lastErr, episode, lang, providerID)
+	}
+
+	// Fast path for the frontend's explicit server selection: verify the
+	// requested provider first and return as soon as it is playable. Waiting for
+	// unrelated providers here made one slow/dead server delay a known-good one.
+	if preferred != "" {
+		for _, candidate := range verifiedSet {
+			if candidate.name != preferred {
+				continue
+			}
+			ranked, best := p.verdictResult(ctx, candidate.result)
+			if ranked == nil {
+				break
+			}
+			p.learnResultHosts(ranked)
+			if best > VerdictDead {
+				p.recordProviderSuccess(candidate.name)
+			}
+			sk := sourceCacheKey(providerID+":"+candidate.name, episode, lang)
+			miruroSourceMu.Lock()
+			miruroSourceCache[sk] = &miruroSourceCacheEntry{result: ranked, fetchedAt: time.Now()}
+			miruroSourceMu.Unlock()
+			return ranked, nil
+		}
 	}
 
 	// Stage 2: Rank ALL verified results IN PARALLEL through the real
@@ -1196,7 +1395,8 @@ func hasPlayableMediaSource(serverMap map[string]*SourceResult) bool {
 			continue
 		}
 		for _, s := range sr.Sources {
-			if s.Type == "hls" || s.Type == "mp4" {
+			switch s.Type {
+			case "hls", "mp4", "dash", "webm", "ogg", "mpeg", "native":
 				return true
 			}
 		}

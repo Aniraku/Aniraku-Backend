@@ -151,14 +151,14 @@ func newAnilistClient(h *Handlers) *anilistClient {
 
 // circuitBreaker implements a simple circuit breaker pattern for AniList
 type circuitBreaker struct {
-	failures       int
-	successes      int
-	lastFailure    time.Time
-	state          int // 0=closed, 1=open, 2=half-open
-	mu             sync.Mutex
+	failures         int
+	successes        int
+	lastFailure      time.Time
+	state            int // 0=closed, 1=open, 2=half-open
+	mu               sync.Mutex
 	failureThreshold int
 	successThreshold int
-	timeout        time.Duration
+	timeout          time.Duration
 }
 
 func newCircuitBreaker() *circuitBreaker {
@@ -384,16 +384,16 @@ type Handlers struct {
 	probeCacheCount   int
 	sourceProbeMemo   sync.Map // srcType|url|headers -> sourceProbeMemoEntry (90s TTL)
 	// Browse/trending cache with TTL
-	browseCache       sync.Map
-	browseCacheTTL    time.Duration
-	anilistClient     *anilistClient
+	browseCache    sync.Map
+	browseCacheTTL time.Duration
+	anilistClient  *anilistClient
 	// In-flight OAuth handshakes for MAL/AniList sync: state -> pendingOAuth.
-	syncPending       sync.Map
+	syncPending sync.Map
 
 	// --- Resilience layer ---
-	anilistCircuit    *circuitBreaker
-	anilistInflight   sync.Map // request deduplication
-	providerHealth    sync.Map // provider -> *providerHealth
+	anilistCircuit  *circuitBreaker
+	anilistInflight sync.Map // request deduplication
+	providerHealth  sync.Map // provider -> *providerHealth
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
@@ -1403,34 +1403,11 @@ func (h *Handlers) probeViaProxy(ctx context.Context, srcType, rawURL, headersJS
 	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	if srcType == "mp4" {
-		req, err := http.NewRequestWithContext(probeCtx, "GET", rawURL, nil)
-		if err != nil {
-			return false
-		}
-		applyProxyQueryHeaders(req, headersJSON)
-		req.Header.Set("Range", "bytes=0-1023")
-		resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-			return false
-		}
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if strings.Contains(ct, "text/html") {
-			return false
-		}
-		if !strings.Contains(ct, "video") && !strings.Contains(ct, "audio") &&
-			!strings.Contains(ct, "octet-stream") && !strings.Contains(ct, "binary") {
-			return false
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		if err != nil {
-			return false
-		}
-		return len(body) >= 100 && !mediaMagicImage(body)
+	if srcType == "dash" {
+		return h.probeDashManifest(probeCtx, rawURL, headersJSON)
+	}
+	if srcType != "hls" && srcType != "m3u8" && srcType != "embed" {
+		return h.probeRangedMedia(probeCtx, rawURL, headersJSON)
 	}
 
 	// HLS: manifest, then the first media playlist it references, then the
@@ -1483,7 +1460,10 @@ func (h *Handlers) probeDirect(ctx context.Context, srcType, rawURL string, head
 		req.Header.Set(k, v)
 	}
 
-	if srcType == "mp4" {
+	if srcType == "dash" {
+		return h.probeDirectDash(probeCtx, req)
+	}
+	if srcType != "hls" && srcType != "m3u8" && srcType != "embed" {
 		req.Header.Set("Range", "bytes=0-1023")
 		resp, err := directProbeClient.Do(req)
 		if err != nil {
@@ -1501,7 +1481,7 @@ func (h *Handlers) probeDirect(ctx context.Context, srcType, rawURL string, head
 		if err != nil {
 			return false
 		}
-		return len(body) >= 100
+		return len(body) >= 100 && !mediaMagicImage(body)
 	}
 
 	// HLS: manifest, first media playlist, first segment — HTML is dead.
@@ -1561,6 +1541,71 @@ func (h *Handlers) probeDirect(ctx context.Context, srcType, rawURL string, head
 		return false
 	}
 	return len(body) >= 2
+}
+
+func (h *Handlers) probeRangedMedia(ctx context.Context, rawURL, headersJSON string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	applyProxyQueryHeaders(req, headersJSON)
+	req.Header.Set("Range", "bytes=0-1023")
+	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") || strings.Contains(ct, "image/") {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return false
+	}
+	return len(body) >= 100 && !mediaMagicImage(body)
+}
+
+func (h *Handlers) probeDashManifest(ctx context.Context, rawURL, headersJSON string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	applyProxyQueryHeaders(req, headersJSON)
+	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "<mpd") && strings.Contains(text, "adaptationset")
+}
+
+func (h *Handlers) probeDirectDash(ctx context.Context, req *http.Request) bool {
+	resp, err := directProbeClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	if err != nil {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, "<mpd") && strings.Contains(text, "adaptationset")
 }
 
 // probeDirectPlaylist fetches a playlist with the plain client and returns
