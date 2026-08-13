@@ -117,15 +117,22 @@ func (p *MiruroProvider) SetMediaProbe(probe MediaProbe) {
 // verdictResult ranks every source in a result through the registered probe
 // (or a plain reachability check when no probe is registered) and returns a
 // shallow copy with Verification tags filled in, plus the provider's best
-// verdict. It never drops sources — the verdict is an ordering hint surfaced
-// to clients so the player can pick the most reliable path first.
+// verdict. Individually dead media URLs are removed before the result is
+// returned. This is important when one provider response contains a mixture
+// of a playable quality and an expired/blocked CDN URL: returning the dead URL
+// would still let the browser mount it during quality selection or fallback.
 func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult) (*SourceResult, PlaybackVerdict) {
 	if result == nil || len(result.Sources) == 0 {
 		return nil, VerdictDead
 	}
 	best := VerdictDead
-	sources := make([]core.Source, len(result.Sources))
-	for i, src := range result.Sources {
+	sources := make([]core.Source, 0, len(result.Sources))
+	for _, src := range result.Sources {
+		// Reject known dead CDN ranges before spending probe time on them.
+		if err := p.verifySourceURL(ctx, src.URL); err != nil {
+			continue
+		}
+
 		var v PlaybackVerdict
 		if src.Type == "embed" {
 			v = VerdictEmbed
@@ -134,21 +141,28 @@ func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult
 		} else if testSourceReachability(ctx, src.URL, result.Headers, p.client) == nil {
 			v = VerdictDirect
 		}
-		sources[i] = src
-		sources[i].Verification = v.String()
+		if v == VerdictDead {
+			continue
+		}
+
+		src.Verification = v.String()
+		sources = append(sources, src)
 		if v > best {
 			best = v
 		}
 	}
-	// Order sources by verdict (proxy > direct > embed > dead) so
-	// Sources[0] is always the most reliable path; ties keep the original
-	// quality ordering.
+	if len(sources) == 0 {
+		return nil, VerdictDead
+	}
+
+	// Order sources by verdict (proxy > direct > embed) so Sources[0] is
+	// always the most reliable path; ties keep the original quality ordering.
 	sort.SliceStable(sources, func(i, j int) bool {
 		vi := playbackVerdictRank(sources[i].Verification)
 		vj := playbackVerdictRank(sources[j].Verification)
 		return vi > vj
 	})
-	return &SourceResult{Sources: sources, Headers: result.Headers}, best
+	return &SourceResult{Sources: sources, Headers: result.Headers, Intro: result.Intro, Outro: result.Outro}, best
 }
 
 // playbackVerdictRank maps a verification tag to a comparable rank.
@@ -560,11 +574,14 @@ func (p *MiruroProvider) fetchSource(ctx context.Context, episodeID string) (*mi
 	return &sourceResp, nil
 }
 
-// verifySourceURL only rejects IPs known to block datacenter ranges.
-func (p *MiruroProvider) verifySourceURL(ctx context.Context, url string) error {
-	lower := strings.ToLower(url)
+// verifySourceURL only rejects hosts known to block datacenter ranges.
+func (p *MiruroProvider) verifySourceURL(ctx context.Context, rawURL string) error {
+	lower := strings.ToLower(rawURL)
+	// 203.188.166.234 is the CDN returning the repeated 502s seen in the
+	// browser. Block the observed /24 because the provider rotates addresses
+	// within the same unreliable edge range.
 	if strings.Contains(lower, "uns.bio") ||
-		strings.Contains(lower, "203.188.166.228") ||
+		strings.Contains(lower, "203.188.166.") ||
 		strings.Contains(lower, "185.237.106.79") {
 		return fmt.Errorf("unreliable source domain: %s", lower)
 	}
