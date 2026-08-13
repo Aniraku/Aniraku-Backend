@@ -612,6 +612,9 @@ func testEmbedReachability(ctx context.Context, rawURL string, headers map[strin
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusBadRequest {
 		return fmt.Errorf("embed page returned HTTP %d", resp.StatusCode)
 	}
+	if reason := embedFrameBlockReason(resp); reason != "" {
+		return fmt.Errorf("embed page cannot be framed: %s", reason)
+	}
 	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
 	if contentType != "" && !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml") {
 		return fmt.Errorf("embed page returned non-HTML content type %q", contentType)
@@ -625,6 +628,28 @@ func testEmbedReachability(ctx context.Context, rawURL string, headers map[strin
 		return fmt.Errorf("embed page is empty or blocked")
 	}
 	return nil
+}
+
+// embedFrameBlockReason rejects response policies that make a cross-origin
+// iframe impossible. The parent application's frame-src policy is configured
+// separately in vercel.json; this check handles the provider's own policy.
+func embedFrameBlockReason(resp *http.Response) string {
+	xFrame := strings.ToLower(strings.TrimSpace(resp.Header.Get("X-Frame-Options")))
+	if xFrame == "deny" || xFrame == "sameorigin" || strings.HasPrefix(xFrame, "allow-from") {
+		return "X-Frame-Options=" + xFrame
+	}
+	csp := resp.Header.Get("Content-Security-Policy")
+	for _, directive := range strings.Split(csp, ";") {
+		parts := strings.Fields(strings.TrimSpace(directive))
+		if len(parts) == 0 || parts[0] != "frame-ancestors" {
+			continue
+		}
+		policy := strings.ToLower(strings.Join(parts[1:], " "))
+		if policy == "" || strings.Contains(policy, "'none'") || strings.Contains(policy, "'self'") && !strings.Contains(policy, "*") && !strings.Contains(policy, "aniraku.tech") {
+			return "Content-Security-Policy frame-ancestors=" + policy
+		}
+	}
+	return ""
 }
 
 // testSourceReachability probes the upstream CDN with a short-range GET to verify it's reachable
