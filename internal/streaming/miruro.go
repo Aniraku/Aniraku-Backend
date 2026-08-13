@@ -871,21 +871,6 @@ func defaultMiruroHeaders() map[string]string {
 	}
 }
 
-// embedFromPage builds a last-resort embed source from the provider's
-// episode page (used when the Miruro pipe is blocked and the API returns no
-// streams). The embed player can attempt it as an iframe.
-func embedFromPage(episodeURL string) *SourceResult {
-	return &SourceResult{
-		Sources: []core.Source{{
-			URL:          episodeURL,
-			Type:         "embed",
-			Quality:      "auto",
-			Verification: "embed",
-		}},
-		Headers: defaultMiruroHeaders(),
-	}
-}
-
 func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID string, episode int, lang, preferred string) (*SourceResult, error) {
 	data, err := p.fetchEpisodes(ctx, providerID)
 	if err != nil {
@@ -926,10 +911,10 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 				continue
 			}
 			preferredAttempted = true
-			var episodeID, episodeURL string
+			var episodeID string
 			for _, e := range candidate.episodes {
 				if int(e.Number) == episode {
-					episodeID, episodeURL = e.ID, e.URL
+					episodeID = e.ID
 					break
 				}
 			}
@@ -968,15 +953,6 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 					return ranked, nil
 				}
 			}
-			// An episode page embed is only attempted after the preferred media
-			// source fails, and it still must pass the embed reachability probe.
-			if episodeURL != "" {
-				embed := embedFromPage(episodeURL)
-				ranked, best := p.verdictResult(preferredCtx, embed)
-				if ranked != nil && best == VerdictEmbed {
-					return ranked, nil
-				}
-			}
 			break
 		}
 	}
@@ -1001,11 +977,9 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 		go func() {
 			defer fetchWg.Done()
 			var episodeID string
-			var episodeURL string
 			for _, e := range c.episodes {
 				if int(e.Number) == episode {
 					episodeID = e.ID
-					episodeURL = e.URL
 					break
 				}
 			}
@@ -1040,21 +1014,11 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 				lastErrMu.Lock()
 				lastErr = fetchErr
 				lastErrMu.Unlock()
-				if episodeURL != "" {
-					verifiedMu.Lock()
-					verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
-					verifiedMu.Unlock()
-				}
 				return
 			}
 
 			result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 			if len(result.Sources) == 0 {
-				if episodeURL != "" {
-					verifiedMu.Lock()
-					verifiedSet = append(verifiedSet, verified{name: c.name, result: embedFromPage(episodeURL)})
-					verifiedMu.Unlock()
-				}
 				return
 			}
 
@@ -1265,11 +1229,9 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 
 	for _, c := range candidates {
 		var episodeID string
-		var episodeURL string
 		for _, e := range c.episodes {
 			if int(e.Number) == episode {
 				episodeID = e.ID
-				episodeURL = e.URL
 				break
 			}
 		}
@@ -1306,22 +1268,11 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 				if isPipeFailure(err) {
 					p.recordProviderFailure(c.name)
 				}
-				// Pipe blocked — keep the episode page as an embed option.
-				if episodeURL != "" {
-					mu.Lock()
-					verified = append(verified, candidateResult{name: c.name, result: embedFromPage(episodeURL)})
-					mu.Unlock()
-				}
 				return
 			}
 
 			result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 			if len(result.Sources) == 0 {
-				if episodeURL != "" {
-					mu.Lock()
-					verified = append(verified, candidateResult{name: c.name, result: embedFromPage(episodeURL)})
-					mu.Unlock()
-				}
 				return
 			}
 
