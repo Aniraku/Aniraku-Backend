@@ -17,3 +17,15 @@ services:
         sync: false
       - key: ANIRAKU_SUPABASE_SERVICE_KEY
         sync: false
+      - key: ANIRAKU_ANILIST_CLIENT_ID
+        sync: false
+      - key: ANIRAKU_ANILIST_CLIENT_SECRET
+        sync: false
+      - key: ANIRAKU_MAL_CLIENT_ID
+        sync: false
+      - key: ANIRAKU_MAL_CLIENT_SECRET
+        sync: false
+      - key: ANIRAKU_OAUTH_REDIRECT_URL
+        sync: false
+      - key: ANIRAKU_OAUTH_STATE_SECRET
+        sync: false
