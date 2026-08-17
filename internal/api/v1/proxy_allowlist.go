@@ -55,9 +55,13 @@ var defaultCDNSuffixes = []string{
 	"megaplay.pro",
 	"megaplay.club",
 	"megaplay.cc",
-	"uwucdn.net",
-	"owocdn.net",
-	"kotocdn.net",
+		"uwucdn.net",
+		"owocdn.net",
+		// Kiwi’s verified HLS media currently resolves to vault-*.owocdn.top.
+		// Keep this limited to the established owocdn suffix; arbitrary hosts
+		// remain rejected by the proxy’s allowlist and public-address guard.
+		"owocdn.top",
+		"kotocdn.net",
 	"kotocdn.site",
 	"kotocdn.top",
 	"vivibebe.net",
