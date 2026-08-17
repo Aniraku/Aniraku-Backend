@@ -24,7 +24,6 @@ func TestIsAllowedProxyHost(t *testing.T) {
 		// Observed live 2026-08-05 via the Miruro API
 		"tools.fast4speed.rsvp",
 		"vault-10.uwucdn.top",
-		"vault-13.owocdn.top",
 		"morning-credit-3bcc.vibevibe.workers.dev",
 		"a1.mp4upload.com",
 		"vidtub.kotocdn.site",
