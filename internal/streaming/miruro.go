@@ -117,10 +117,10 @@ func (p *MiruroProvider) SetMediaProbe(probe MediaProbe) {
 // verdictResult ranks every source in a result through the registered probe
 // (or a plain reachability check when no probe is registered) and returns a
 // shallow copy with Verification tags filled in, plus the provider's best
-// verdict. Individually dead media URLs are removed before the result is
-// returned. This is important when one provider response contains a mixture
-// of a playable quality and an expired/blocked CDN URL: returning the dead URL
-// would still let the browser mount it during quality selection or fallback.
+// verdict. A failed datacenter probe is advisory for media URLs: a CDN can
+// block the backend IP while accepting the viewer's browser. Such URLs are
+// retained as "unverified" after the static unsafe-host checks; only sources
+// explicitly rejected by verifySourceURL are removed.
 func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult) (*SourceResult, PlaybackVerdict) {
 	if result == nil || len(result.Sources) == 0 {
 		return nil, VerdictDead
@@ -144,6 +144,11 @@ func (p *MiruroProvider) verdictResult(ctx context.Context, result *SourceResult
 			v = VerdictDirect
 		}
 		if v == VerdictDead {
+			if src.Type == "embed" {
+				continue
+			}
+			src.Verification = "unverified"
+			sources = append(sources, src)
 			continue
 		}
 
@@ -944,9 +949,11 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 			}
 			if preferredResult != nil && len(preferredResult.Sources) > 0 {
 				ranked, best := p.verdictResult(preferredCtx, preferredResult)
-				if ranked != nil && best > VerdictDead {
-					p.learnResultHosts(ranked)
-					p.recordProviderSuccess(candidate.name)
+				if ranked != nil {
+					if best > VerdictDead {
+						p.learnResultHosts(ranked)
+						p.recordProviderSuccess(candidate.name)
+					}
 					miruroSourceMu.Lock()
 					miruroSourceCache[sk] = &miruroSourceCacheEntry{result: ranked, fetchedAt: time.Now()}
 					miruroSourceMu.Unlock()
@@ -1091,13 +1098,6 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 			defer wg.Done()
 			ranked, best := p.verdictResult(ctx, v.result)
 			if ranked == nil {
-				return
-			}
-			// Never return or cache a media-only result whose every source
-			// failed the real proxy/direct playback probe. Keeping it here
-			// caused the browser to mount the same dead CDN URL repeatedly.
-			if best == VerdictDead {
-				p.log.Debug().Str("provider", v.name).Msg("dropping dead-only source result")
 				return
 			}
 			passMu.Lock()
@@ -1309,19 +1309,13 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 			if ranked == nil {
 				return
 			}
-			// Do not expose or cache a provider whose media URLs all failed
-			// the exact proxy/direct playback probe. Embed results still pass
-			// because they carry VerdictEmbed rather than VerdictDead.
-			if best == VerdictDead {
-				p.log.Debug().Str("provider", v.name).Msg("FindAllSources: dropping dead-only source result")
-				return
-			}
 			if best > VerdictDead {
 				p.recordProviderSuccess(v.name)
+				// Vouch for hosts only after a positive playback probe. Sources
+				// retained as unverified deliberately bypass the proxy and must
+				// not expand its trusted-host allowlist.
+				p.learnResultHosts(ranked)
 			}
-			// Vouch for the source's hosts so the media proxy accepts them
-			// without a static allowlist entry (best-effort).
-			p.learnResultHosts(ranked)
 			// Cache the result under the provider name
 			sk := sourceCacheKey(providerID+":"+v.name, episode, lang)
 			miruroSourceMu.Lock()
