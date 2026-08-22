@@ -197,6 +197,7 @@ func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, provi
 }
 
 func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core.StreamResult {
+	qualities := sourceQualities(result.Sources)
 	sources := result.Sources
 	if quality != "auto" && quality != "" {
 		filtered := filterByQuality(sources, quality)
@@ -208,9 +209,28 @@ func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core
 	return &core.StreamResult{
 		Sources: sources,
 		Headers: result.Headers,
+		Qualities: qualities,
 		Intro:   result.Intro,
 		Outro:   result.Outro,
 	}
+}
+
+// sourceQualities reports only provider-returned labels. Clients must never
+// invent adaptive renditions: an Auto HLS source without explicit variants
+// remains Auto because the native Expo player does not expose a writable level
+// selector.
+func sourceQualities(sources []core.Source) []string {
+	seen := make(map[string]bool)
+	qualities := make([]string, 0, len(sources))
+	for _, source := range sources {
+		quality := strings.TrimSpace(source.Quality)
+		if quality == "" || seen[strings.ToLower(quality)] {
+			continue
+		}
+		seen[strings.ToLower(quality)] = true
+		qualities = append(qualities, quality)
+	}
+	return qualities
 }
 
 func (m *Manager) HasAnimeDub(ctx context.Context, animeID int) bool {

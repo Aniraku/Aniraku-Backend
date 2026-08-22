@@ -1193,6 +1193,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	// ponytail: debug — log upstream status for proxy issues
 	h.log.Debug().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream response")
 
+	// The media proxy is not a navigation relay. A 3xx response can direct a
+	// native embedded session to an unreviewed interstitial or popup landing
+	// page; refuse it instead of passing its Location header to the client.
+	if proxyRedirectBlocked(resp.StatusCode) {
+		h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream redirect blocked")
+		h.respondError(w, http.StatusBadGateway, "upstream media redirect blocked")
+		return
+	}
+
 	if resp.StatusCode == 403 || resp.StatusCode == 502 || resp.StatusCode == 503 {
 		errStr := fmt.Sprintf("upstream returned %d", resp.StatusCode)
 		h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream rejected")
@@ -1286,6 +1295,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func proxyRedirectBlocked(status int) bool {
+	return status >= http.StatusMultipleChoices && status < http.StatusBadRequest
 }
 
 // stripProxyNonce removes the cache-busting "rn" query parameter from a
