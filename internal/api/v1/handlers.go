@@ -1111,7 +1111,11 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusForbidden, "proxy target port not allowed")
 		return
 	}
-	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
+	if host := strings.ToLower(parsed.Hostname()); isNuisanceProxyHost(host) {
+		h.log.Warn().Str("proxy_host", host).Msg("proxy nuisance-ad host blocked")
+		h.respondError(w, http.StatusForbidden, "proxy target blocked")
+		return
+	} else if validateProxyTarget(host) != nil {
 		h.respondError(w, http.StatusForbidden, "proxy target not allowed")
 		return
 	} else if !isAllowedProxyHost(host) {

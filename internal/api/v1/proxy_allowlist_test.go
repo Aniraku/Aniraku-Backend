@@ -69,6 +69,19 @@ func TestProxyAllowlistEnvOverride(t *testing.T) {
 	}
 }
 
+func TestNuisanceProxyHostGuard(t *testing.T) {
+	for _, host := range []string{"ad.doubleclick.net", "cdn.juicyads.com", "push.house"} {
+		if !isNuisanceProxyHost(host) {
+			t.Errorf("isNuisanceProxyHost(%q) = false, want true", host)
+		}
+	}
+	for _, host := range []string{"hls.anidb.app", "vault-10.uwucdn.top", "cdn.miruro.tv"} {
+		if isNuisanceProxyHost(host) {
+			t.Errorf("isNuisanceProxyHost(%q) = true, want false", host)
+		}
+	}
+}
+
 // TestProxyRejectsNonCDNPublicHost verifies the proxy refuses a public
 // host that is not on the CDN allowlist (no longer a general relay).
 func TestProxyRejectsNonCDNPublicHost(t *testing.T) {

@@ -96,6 +96,31 @@ var defaultCDNSuffixes = []string{
 	"185.237.106.79", "203.188.166.228",
 }
 
+// nuisanceProxyHostSuffixes is deliberately narrow. The media proxy must not
+// become a relay for known popup, tracking, and advertising endpoints, while
+// valid provider pages and video CDNs remain unaffected.
+var nuisanceProxyHostSuffixes = []string{
+	"doubleclick.net", "googlesyndication.com", "googleadservices.com",
+	"adnxs.com", "adskeeper.co.uk", "adsterra.com", "exoclick.com",
+	"popads.net", "popcash.net", "propellerads.com", "trafficjunky.net",
+	"hilltopads.net", "onclicka.com", "clickadu.com", "monetag.com",
+	"ad-maven.com", "juicyads.com", "push.house", "richpush.com", "tsyndicate.com",
+}
+
+func isNuisanceProxyHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	host = strings.Trim(host, "[]")
+	if host == "" {
+		return false
+	}
+	for _, suffix := range nuisanceProxyHostSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	proxyCDNList     []string
 	proxyCDNListOnce sync.Once
@@ -192,6 +217,9 @@ func LearnHostFromPlaylist(host string) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	host = strings.Trim(host, "[]")
 	if host == "" {
+		return
+	}
+	if isNuisanceProxyHost(host) {
 		return
 	}
 	// Never learn a host that is already covered, and never learn a
