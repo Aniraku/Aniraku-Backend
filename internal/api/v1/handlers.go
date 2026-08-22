@@ -123,6 +123,7 @@ func (tb *tokenBucket) wait(ctx context.Context) error {
 type anilistClient struct {
 	h          *Handlers
 	client     *http.Client
+	endpoint   string
 	cache      sync.Map
 	cacheTTL   time.Duration
 	maxRetries int
@@ -139,6 +140,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 	return &anilistClient{
 		h:          h,
 		client:     h.h2Client,
+		endpoint:   "https://graphql.anilist.co",
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,
@@ -255,21 +257,33 @@ func (c *anilistClient) getCacheKey(query string, variables map[string]any) stri
 	return fmt.Sprintf("%s:%s", query, string(v))
 }
 
+// staleCache returns the last successful response even after its normal fresh
+// TTL. AniList metadata changes slowly compared with the cost of sending users
+// a 502 during an upstream 429; callers use this only after the fresh-cache
+// path or an upstream attempt has failed.
+func (c *anilistClient) staleCache(cacheKey string) ([]byte, bool) {
+	cached, ok := c.cache.Load(cacheKey)
+	if !ok {
+		return nil, false
+	}
+	entry, ok := cached.(anilistCacheEntry)
+	if !ok || len(entry.data) == 0 {
+		return nil, false
+	}
+	return entry.data, true
+}
+
 func (c *anilistClient) do(ctx context.Context, query string, variables map[string]any) ([]byte, error) {
+	cacheKey := c.getCacheKey(query, variables)
 	// Check circuit breaker
 	if c.h.anilistCircuit != nil && !c.h.anilistCircuit.allow() {
 		// Circuit open - try to serve stale cache
-		cacheKey := c.getCacheKey(query, variables)
-		if cached, ok := c.cache.Load(cacheKey); ok {
-			if entry, ok := cached.(anilistCacheEntry); ok {
-				c.h.log.Warn().Str("cache_key", cacheKey).Msg("circuit open, serving stale cache")
-				return entry.data, nil
-			}
+		if stale, ok := c.staleCache(cacheKey); ok {
+			c.h.log.Warn().Str("cache_key", cacheKey).Msg("circuit open, serving stale cache")
+			return stale, nil
 		}
 		return nil, fmt.Errorf("anilist circuit open, rate limited")
 	}
-
-	cacheKey := c.getCacheKey(query, variables)
 
 	// Request deduplication: check if same query is in-flight
 	if inFlight, ok := c.h.anilistInflight.Load(cacheKey); ok {
@@ -288,7 +302,6 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 		if entry, ok := cached.(anilistCacheEntry); ok && time.Since(entry.fetchedAt) < c.cacheTTL {
 			return entry.data, nil
 		}
-		c.cache.Delete(cacheKey)
 	}
 
 	// Create in-flight channel for deduplication. On completion we cache the
@@ -309,7 +322,7 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("build request: %w", err)
 		}
@@ -326,7 +339,11 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-			return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
+				if stale, ok := c.staleCache(cacheKey); ok {
+					c.h.log.Warn().Err(lastErr).Str("cache_key", cacheKey).Msg("AniList unreachable, serving stale cache")
+					return stale, nil
+				}
+				return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
@@ -341,12 +358,20 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-			return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
+				if stale, ok := c.staleCache(cacheKey); ok {
+					c.h.log.Warn().Str("cache_key", cacheKey).Msg("AniList rate limited, serving stale cache")
+					return stale, nil
+				}
+				return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
 		}
 
 		if resp.StatusCode != http.StatusOK {
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
+			}
+			if stale, ok := c.staleCache(cacheKey); ok {
+				c.h.log.Warn().Int("status", resp.StatusCode).Str("cache_key", cacheKey).Msg("AniList upstream failed, serving stale cache")
+				return stale, nil
 			}
 			return nil, fmt.Errorf("anilist %d: %s", resp.StatusCode, string(respBody))
 		}

@@ -923,7 +923,7 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 					break
 				}
 			}
-			if episodeID == "" || p.providerBlocked(candidate.name) {
+				if episodeID == "" {
 				break
 			}
 
@@ -1007,12 +1007,7 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 			}
 			miruroSourceMu.RUnlock()
 
-			if p.providerBlocked(c.name) {
-				p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("provider auto-blocked, skipping")
-				return
-			}
-
-			sourceResp, fetchErr := p.fetchSource(ctx, episodeID)
+				sourceResp, fetchErr := p.fetchSource(ctx, episodeID)
 			if fetchErr != nil {
 				p.log.Warn().Err(fetchErr).Str("provider", c.name).Str("lang", lang).Int("episode", episode).Msg("miruro provider failed, trying next")
 				if isPipeFailure(fetchErr) {
@@ -1029,15 +1024,7 @@ func (p *MiruroProvider) findEpisodeSource(ctx context.Context, providerID strin
 				return
 			}
 
-			if verifyErr := p.verifySourceURL(ctx, result.Sources[0].URL); verifyErr != nil {
-				p.log.Warn().Err(verifyErr).Str("provider", c.name).Msg("miruro source domain blocked, skipping")
-				lastErrMu.Lock()
-				lastErr = verifyErr
-				lastErrMu.Unlock()
-				return
-			}
-
-			verifiedMu.Lock()
+				verifiedMu.Lock()
 			verifiedSet = append(verifiedSet, verified{name: c.name, result: result})
 			verifiedMu.Unlock()
 		}()
@@ -1256,11 +1243,6 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 			}
 			miruroSourceMu.RUnlock()
 
-			if p.providerBlocked(c.name) {
-				p.log.Debug().Str("provider", c.name).Str("lang", lang).Msg("FindAllSources: provider auto-blocked, skipping")
-				return
-			}
-
 			// ponytail: fetchSource already uses its own timeout context
 			sourceResp, err := p.fetchSource(ctx, episodeID)
 			if err != nil {
@@ -1273,11 +1255,6 @@ func (p *MiruroProvider) FindAllSources(ctx context.Context, providerID string, 
 
 			result := p.buildSourceResult(sourceResp, data.Mappings.Aniskip, episode)
 			if len(result.Sources) == 0 {
-				return
-			}
-
-			if err := p.verifySourceURL(ctx, result.Sources[0].URL); err != nil {
-				p.log.Warn().Err(err).Str("provider", c.name).Msg("FindAllSources: domain blocked")
 				return
 			}
 
