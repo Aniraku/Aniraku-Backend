@@ -103,6 +103,10 @@ The main configuration areas are:
 
 The default local address is `127.0.0.1:43211`. The server also uses bounded read, write, and idle timeouts and shuts down on `SIGINT` or `SIGTERM`.
 
+## Embedded API interface
+
+Production container builds embed the Aniraku API interface at the service root. It provides a read-only overview of public catalog routes, a health signal, a trending sample, and upcoming airing records through the existing AniList proxy. API routes under `/api/` remain served by the Go router; the interface never exposes private account, admin, proxy, or streaming actions.
+
 ## Run locally
 
 ```bash

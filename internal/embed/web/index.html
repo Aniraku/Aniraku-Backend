@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Aniraku API — a public, read-only interface for catalog and airing data." />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>Aniraku API</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="Aniraku API home"><span class="brand-mark" aria-hidden="true">A</span><span>ANIRAKU<span class="brand-muted">/API</span></span></a>
+      <nav aria-label="Primary navigation">
+        <a href="#schedule">Schedule</a>
+        <a href="#endpoints">Endpoints</a>
+        <a href="#about">About</a>
+      </nav>
+      <a class="nav-action" href="#endpoints">Read docs <span aria-hidden="true">↗</span></a>
+    </header>
+
+    <main id="top">
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="eyebrow"><span class="status-dot" aria-hidden="true"></span>PUBLIC REST API <span aria-hidden="true">·</span> JSON <span aria-hidden="true">·</span> READ ONLY</div>
+        <h1 id="hero-title">Anime discovery, schedules<br /><span>and metadata — made clear.</span></h1>
+        <p class="hero-copy">A practical public interface for Aniraku’s catalog and schedule data. Built for browsing, prototyping, and understanding the service without touching account or playback actions.</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#endpoints">Explore endpoints <span aria-hidden="true">↓</span></a>
+          <a class="button button-secondary" href="#schedule">Live schedule</a>
+        </div>
+        <article class="request-card" aria-label="Example public API response">
+          <div class="request-bar"><div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div><span>GET /api/v1/trending?page=1&amp;perPage=8</span><button id="copy-request" type="button" aria-label="Copy sample request">COPY</button></div>
+          <pre id="example-json"><code>{
+  <span class="key">"status"</span>: <span class="string">"public"</span>,
+  <span class="key">"route"</span>: <span class="string">"/api/v1/trending"</span>,
+  <span class="key">"data"</span>: [
+    { <span class="key">"title"</span>: <span class="string">"Anime record"</span>, <span class="key">"coverImage"</span>: <span class="string">"…"</span> }
+  ]
+}</code></pre>
+        </article>
+      </section>
+
+      <section id="about" class="section intro-section" aria-labelledby="inside-title">
+        <div class="section-label">What the service offers</div>
+        <div class="capability-grid">
+          <article><span class="capability-number">01</span><h2>Catalog discovery</h2><p>Browse public anime records, covers, titles, genres, and related metadata.</p></article>
+          <article><span class="capability-number">02</span><h2>Episode context</h2><p>Retrieve available episode and relation data from a focused, versioned route set.</p></article>
+          <article><span class="capability-number">03</span><h2>Airing outlook</h2><p>Surface a compact public schedule for upcoming anime releases and episode numbers.</p></article>
+          <article><span class="capability-number">04</span><h2>Account boundary</h2><p>Keep private favorites, progress, notifications, and sync operations behind Supabase authentication.</p></article>
+        </div>
+      </section>
+
+      <section id="endpoints" class="section endpoint-section" aria-labelledby="endpoint-title">
+        <div class="section-heading">
+          <div><div class="section-label">Endpoint directory</div><h2 id="endpoint-title">Start with a public route.</h2></div>
+          <label class="endpoint-search"><span aria-hidden="true">⌕</span><input id="endpoint-filter" type="search" placeholder="Filter endpoints" autocomplete="off" /></label>
+        </div>
+        <div id="endpoint-grid" class="endpoint-grid">
+          <a class="endpoint-card" data-search="health status service" href="/api/v1/health" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/health</code><span>Service health signal</span></a>
+          <a class="endpoint-card" data-search="trending popular catalog anime" href="/api/v1/trending?page=1&amp;perPage=8" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/trending</code><span>Current public discovery list</span></a>
+          <a class="endpoint-card" data-search="search query catalog anime" href="/api/v1/search?q=cowboy" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/search?q=</code><span>Title and keyword lookup</span></a>
+          <a class="endpoint-card" data-search="anime details record information" href="/api/v1/anime/5" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id</code><span>Full public anime record</span></a>
+          <a class="endpoint-card" data-search="episodes anime episode list" href="/api/v1/anime/5/episodes" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/episodes</code><span>Episode context for a title</span></a>
+          <a class="endpoint-card" data-search="relations sequel prequel related" href="/api/v1/anime/5/relations" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/relations</code><span>Connected anime records</span></a>
+          <a class="endpoint-card" data-search="schedule airing releases calendar" href="/api/v1/schedule?page=1&amp;perPage=12" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/schedule</code><span>Upcoming public releases</span></a>
+          <a class="endpoint-card" data-search="genres catalog browse" href="/api/v1/genres" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/genres</code><span>Catalog classification data</span></a>
+        </div>
+        <p id="filter-empty" class="filter-empty" hidden>No matching public endpoint. Try <code>catalog</code>, <code>episode</code>, or <code>schedule</code>.</p>
+      </section>
+
+      <section id="schedule" class="section live-section" aria-labelledby="live-title">
+        <div class="section-heading live-heading">
+          <div><div class="section-label"><span class="status-dot" aria-hidden="true"></span> Live public data</div><h2 id="live-title">Airing schedule</h2></div>
+          <div id="service-health" class="service-health" aria-live="polite"><span class="health-pulse" aria-hidden="true"></span><span>Checking service…</span></div>
+        </div>
+        <div id="date-strip" class="date-strip" role="tablist" aria-label="Airing days"></div>
+        <div id="schedule-list" class="schedule-list" aria-live="polite"><p class="loading-message">Loading live public schedule…</p></div>
+        <div class="live-footnote"><span>Preview boundary</span><p>This concept reads only health, trending, and the established airing-data response through fixed local proxy routes. It does not expose authentication, account data, admin tools, proxies, or streaming controls.</p></div>
+      </section>
+
+      <section class="section trending-section" aria-labelledby="trending-title">
+        <div class="section-heading"><div><div class="section-label">Live catalog sample</div><h2 id="trending-title">Trending now</h2></div><span id="trending-count" class="data-count">Loading…</span></div>
+        <div id="trending-grid" class="trending-grid" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <footer class="site-footer"><a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">A</span><span>ANIRAKU<span class="brand-muted">/API</span></span></a><p>Public Aniraku API interface. Data is read-only and API contracts remain unchanged.</p><div><a href="#endpoints">Endpoints</a><a href="#schedule">Schedule</a><a href="https://www.aniraku.tech" target="_blank" rel="noreferrer">Aniraku ↗</a></div></footer>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

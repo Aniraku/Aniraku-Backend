@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /aniraku-server ./cmd/aniraku-server
+RUN CGO_ENABLED=0 go build -tags web -ldflags="-s -w" -o /aniraku-server ./cmd/aniraku-server
 
 FROM python:3.12-slim AS pybase
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
