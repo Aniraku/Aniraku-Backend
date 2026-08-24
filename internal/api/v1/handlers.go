@@ -26,7 +26,7 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/config"
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 	"github.com/Aniraku/Aniraku-Backend/internal/metadata/anilist"
-	"github.com/Aniraku/Aniraku-Backend/internal/metadata/mal"
+	"github.com/Aniraku/Aniraku-Backend/internal/metadata/kitsu"
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 	"github.com/Aniraku/Aniraku-Backend/internal/streaming"
 )
@@ -339,11 +339,11 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-				if stale, ok := c.staleCache(cacheKey); ok {
-					c.h.log.Warn().Err(lastErr).Str("cache_key", cacheKey).Msg("AniList unreachable, serving stale cache")
-					return stale, nil
-				}
-				return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
+			if stale, ok := c.staleCache(cacheKey); ok {
+				c.h.log.Warn().Err(lastErr).Str("cache_key", cacheKey).Msg("AniList unreachable, serving stale cache")
+				return stale, nil
+			}
+			return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
@@ -358,11 +358,11 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-				if stale, ok := c.staleCache(cacheKey); ok {
-					c.h.log.Warn().Str("cache_key", cacheKey).Msg("AniList rate limited, serving stale cache")
-					return stale, nil
-				}
-				return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
+			if stale, ok := c.staleCache(cacheKey); ok {
+				c.h.log.Warn().Str("cache_key", cacheKey).Msg("AniList rate limited, serving stale cache")
+				return stale, nil
+			}
+			return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -395,7 +395,7 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 type Handlers struct {
 	cfg               *config.Config
 	log               zerolog.Logger
-	mal               *mal.Client
+	kitsu             *kitsu.Client
 	stream            *streaming.Manager
 	h2Client          *http.Client
 	h1Client          *http.Client
@@ -497,7 +497,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 	h := &Handlers{
 		cfg:               cfg,
 		log:               log,
-		mal:               mal.NewClient(log),
+		kitsu:             kitsu.NewClient(log),
 		stream:            streaming.NewManager(log, miruroProxyURL, httpClient),
 		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
 		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
@@ -686,24 +686,13 @@ func (h *Handlers) GetAnime(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use AniList GraphQL proxy (avoids Jikan 504s)
-	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english native userPreferred } coverImage { extraLarge large medium color } bannerImage format status episodes duration genres averageScore popularity description season seasonYear nextAiringEpisode { episode airingAt } isAdult } }`
-	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": id})
+	anime, err := h.kitsu.GetAnime(r.Context(), id)
 	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
+		h.log.Warn().Err(err).Int("id", id).Msg("configured metadata provider failed")
+		h.respondError(w, http.StatusBadGateway, "Aniraku metadata is unavailable right now")
 		return
 	}
-
-	var result map[string]any
-	json.Unmarshal(raw, &result)
-	data, _ := result["data"].(map[string]any)
-	media, _ := data["Media"].(map[string]any)
-	if media == nil {
-		h.respondError(w, http.StatusBadGateway, "invalid anime data")
-		return
-	}
-
-	h.respondJSON(w, http.StatusOK, media)
+	h.respondJSON(w, http.StatusOK, anime)
 }
 
 func suffixTitle(t *anilist.Title, suffix string) {
@@ -808,8 +797,9 @@ func (h *Handlers) GetSchedule(w http.ResponseWriter, r *http.Request) {
 	page := parsePageParam(r, 1)
 	perPage := parsePerPageParam(r, 50)
 
-	results, err := h.mal.GetSchedule(r.Context(), page, perPage)
+	results, err := h.kitsu.GetSchedule(r.Context(), page, perPage)
 	if err != nil {
+		h.log.Warn().Err(err).Msg("configured metadata provider does not have an airing schedule")
 		h.respondJSON(w, http.StatusOK, map[string]any{"schedule": []any{}, "pageInfo": anilist.PageInfo{}})
 		return
 	}
@@ -858,39 +848,10 @@ func (h *Handlers) GetSimilar(w http.ResponseWriter, r *http.Request) {
 	page := parsePageParam(r, 1)
 	perPage := parsePerPageParam(r, 12)
 
-	// ponytail: AniList first (get genres, then search by genre), Jikan fallback
-	anime, anilistErr := h.getAnimeFromAniList(r.Context(), id)
-	if anilistErr == nil && len(anime.Genres) > 0 {
-		filters := anilist.BrowseFilters{
-			Genre: anime.Genres[:1],
-			Sort:  "SCORE_DESC",
-		}
-		results, err := h.browseAniList(r.Context(), filters, page, perPage)
-		if err == nil {
-			// filter out the original anime
-			var filtered []anilist.Anime
-			for _, m := range results.Data.Page.Media {
-				if m.ID != id {
-					filtered = append(filtered, m)
-				}
-			}
-			if len(filtered) > perPage {
-				filtered = filtered[:perPage]
-			}
-			results.Data.Page.Media = filtered
-			h.respondJSON(w, http.StatusOK, map[string]any{
-				"media":    results.Data.Page.Media,
-				"pageInfo": results.Data.Page.PageInfo,
-			})
-			return
-		}
-		h.log.Warn().Err(err).Int("id", id).Msg("anilist similar failed, falling back to jikan")
-	}
-
-	results, err := h.mal.GetSimilar(r.Context(), id, page, perPage)
+	results, err := h.kitsu.GetSimilar(r.Context(), id, page, perPage)
 	if err != nil {
-		h.log.Warn().Err(err).Int("id", id).Msg("failed to fetch similar anime")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch similar anime")
+		h.log.Warn().Err(err).Int("id", id).Msg("configured metadata provider failed to fetch similar anime")
+		h.respondError(w, http.StatusBadGateway, "similar anime are unavailable right now")
 		return
 	}
 
@@ -1966,16 +1927,11 @@ func (h *Handlers) GetTrending(w http.ResponseWriter, r *http.Request) {
 	page := parsePageParam(r, 1)
 	perPage := parsePerPageParam(r, 20)
 
-	// ponytail: AniList first, Jikan fallback
-	results, err := h.trendingAniList(r.Context(), page, perPage)
+	results, err := h.kitsu.GetTrending(r.Context(), page, perPage)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("anilist trending failed, falling back to jikan")
-		results, err = h.mal.GetTrending(r.Context(), page, perPage)
-		if err != nil {
-			h.log.Warn().Err(err).Msg("jikan trending also failed")
-			h.respondError(w, http.StatusBadGateway, "failed to fetch trending")
-			return
-		}
+		h.log.Warn().Err(err).Msg("configured metadata provider failed to fetch trending")
+		h.respondError(w, http.StatusBadGateway, "trending anime are unavailable right now")
+		return
 	}
 
 	for i := range results.Data.Page.Media {
@@ -2032,16 +1988,11 @@ func (h *Handlers) Browse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ponytail: AniList first (fast, reliable), Jikan fallback (slow, 502-prone)
-	results, err := h.browseAniList(r.Context(), filters, page, perPage)
+	results, err := h.kitsu.Browse(r.Context(), filters, page, perPage)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("anilist browse failed, falling back to jikan")
-		results, err = h.mal.Browse(r.Context(), filters, page, perPage)
-		if err != nil {
-			h.log.Warn().Err(err).Msg("jikan browse also failed")
-			h.respondError(w, http.StatusBadGateway, "browse failed")
-			return
-		}
+		h.log.Warn().Err(err).Msg("configured metadata provider failed to browse")
+		h.respondError(w, http.StatusBadGateway, "anime browsing is unavailable right now")
+		return
 	}
 
 	for i := range results.Data.Page.Media {
@@ -2057,10 +2008,10 @@ func (h *Handlers) Browse(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handlers) GetGenres(w http.ResponseWriter, r *http.Request) {
-	genres, err := h.mal.GetGenres(r.Context())
+	genres, err := h.kitsu.GetGenres(r.Context())
 	if err != nil {
-		h.log.Warn().Err(err).Msg("failed to fetch genres")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch genres")
+		h.log.Warn().Err(err).Msg("configured metadata provider failed to fetch genres")
+		h.respondError(w, http.StatusBadGateway, "genres are unavailable right now")
 		return
 	}
 	h.respondJSON(w, http.StatusOK, genres)
@@ -2294,7 +2245,7 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// If filter params are present, use Browse with the search term for richer suggestions
+	// Filtered requests use the same configured metadata provider as standard search.
 	genres := r.URL.Query()["genre"]
 	formats := r.URL.Query()["format"]
 	statuses := r.URL.Query()["status"]
@@ -2306,21 +2257,12 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 			Search: q,
 			Sort:   "SEARCH_MATCH",
 		}
-		results, err := h.browseAniList(r.Context(), filters, page, perPage)
+		results, err := h.kitsu.Browse(r.Context(), filters, page, perPage)
 		if err != nil {
-			h.log.Warn().Err(err).Str("query", q).Msg("anilist filtered search failed, falling back to jikan")
-			results, err = h.mal.Browse(r.Context(), filters, page, perPage)
-			if err == nil {
-				// Jikan results are MAL-keyed; rekey onto AniList IDs so the
-				// watch flow (stream/episodes) works unchanged.
-				if nerr := h.normalizeSearchResults(r.Context(), results.Data.Page.Media); nerr != nil {
-					h.log.Warn().Err(nerr).Msg("failed to normalize jikan browse results")
-				}
-			}
 		}
 		if err != nil {
-			h.log.Warn().Err(err).Str("query", q).Msg("filtered search failed")
-			h.respondError(w, http.StatusBadGateway, "search failed")
+			h.log.Warn().Err(err).Str("query", q).Msg("configured metadata provider filtered search failed")
+			h.respondError(w, http.StatusBadGateway, "search is unavailable right now")
 			return
 		}
 		for i := range results.Data.Page.Media {
@@ -2336,22 +2278,10 @@ func (h *Handlers) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := h.mal.Search(r.Context(), q, page, perPage)
+	results, err := h.kitsu.Search(r.Context(), q, page, perPage)
 	if err != nil {
-		h.log.Warn().Err(err).Str("query", q).Msg("jikan search failed, falling back to anilist")
-		// fallback: use AniList search via browseAniList with search term
-		fallbackFilters := anilist.BrowseFilters{Search: q, Sort: "SEARCH_MATCH"}
-		results, err = h.browseAniList(r.Context(), fallbackFilters, page, perPage)
-	} else {
-		// Jikan results are MAL-keyed; rekey onto AniList IDs so the watch
-		// flow (stream/episodes) works unchanged.
-		if nerr := h.normalizeSearchResults(r.Context(), results.Data.Page.Media); nerr != nil {
-			h.log.Warn().Err(nerr).Msg("failed to normalize jikan search results")
-		}
-	}
-	if err != nil {
-		h.log.Warn().Err(err).Str("query", q).Msg("search failed")
-		h.respondError(w, http.StatusBadGateway, "search failed")
+		h.log.Warn().Err(err).Str("query", q).Msg("configured metadata provider search failed")
+		h.respondError(w, http.StatusBadGateway, "search is unavailable right now")
 		return
 	}
 
@@ -2852,41 +2782,18 @@ func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Relations come from AniList directly so node IDs stay AniList-keyed,
-	// matching the shape the frontend consumes on the anime detail page.
-	query := `query ($id: Int) { Media(id: $id, type: ANIME) { relations { edges { relationType node { id idMal title { romaji english native userPreferred } coverImage { extraLarge large medium } format type status } } } } }`
-	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": anilistID})
+	relations, err := h.kitsu.GetRelations(r.Context(), anilistID)
 	if err != nil {
-		h.log.Warn().Err(err).Int("id", anilistID).Msg("failed to fetch relations from AniList")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
+		h.log.Warn().Err(err).Int("id", anilistID).Msg("configured metadata provider failed to fetch relations")
+		h.respondError(w, http.StatusBadGateway, "relations are unavailable right now")
 		return
 	}
-
-	var out struct {
-		Data struct {
-			Media struct {
-				Relations json.RawMessage `json:"relations"`
-			} `json:"Media"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
-		return
-	}
-	if len(out.Errors) > 0 {
-		h.log.Warn().Str("detail", out.Errors[0].Message).Int("id", anilistID).Msg("anilist relations error")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch relations")
-		return
-	}
-	if len(out.Data.Media.Relations) == 0 {
+	if len(relations.Relations) == 0 {
 		h.respondError(w, http.StatusNotFound, "relations not found")
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, out.Data.Media.Relations)
+	h.respondJSON(w, http.StatusOK, relations)
 }
 
 func (h *Handlers) HasDub(w http.ResponseWriter, r *http.Request) {
