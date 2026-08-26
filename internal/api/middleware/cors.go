@@ -14,11 +14,12 @@ func CORS(next http.Handler) http.Handler {
 			"http://127.0.0.1:3000":       true,
 			"http://127.0.0.1:43211":      true,
 			"http://localhost:3000":       true,
+			"http://localhost:3001":       true,
 			"http://localhost:43211":      true,
 			"http://localhost:5173":       true,
 			"https://aniraku.vercel.app":  true,
-			"https://aureleria.vercel.app": true,
 			"https://www.aniraku.tech":    true,
+			"https://test.aniraku.tech":    true,
 		}
 
 		// Comma-separated extra origins for production
