@@ -20,7 +20,7 @@ func CORS(next http.Handler) http.Handler {
 			"https://aniraku.vercel.app":  true,
 			"https://www.aniraku.tech":    true,
 			"https://test.aniraku.tech":    true,
-			"https://3001-ioet8mzxj57gmzxw9m7xb-bb702013.us4.manus.computer":    true, 
+			"3001-ioet8mzxj57gmzxw9m7xb-bb702013.us4.manus.computer":    true, 
 		}
 
 		// Comma-separated extra origins for production
