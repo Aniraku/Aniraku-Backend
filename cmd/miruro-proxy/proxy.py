@@ -8,7 +8,7 @@ from fastapi.responses import Response
 import vipertls
 
 PORT = int(os.getenv("MIRURO_PROXY_PORT", "8099"))
-MIRURO_API_BASE = os.getenv("MIRURO_API_BASE", "https://miruro-api-v3.onrender.com")
+MIRURO_API_BASE = os.getenv("MIRURO_API_BASE", "https://miruro.aniraku.tech")
 WARMUP_URL = os.getenv("MIRURO_WARMUP_URL", "https://www.miruro.tv/")
 
 app = FastAPI()
