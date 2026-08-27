@@ -93,7 +93,7 @@ type MiruroProvider struct {
 
 func NewMiruroProvider(log zerolog.Logger, apiBase string) *MiruroProvider {
 	if apiBase == "" {
-		apiBase = "https://miruro-api-v3.onrender.com"
+		apiBase = "https://miruro.aniraku.tech"
 	}
 	return &MiruroProvider{
 		apiBase: apiBase,
