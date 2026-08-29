@@ -234,11 +234,12 @@ func (p *FlixCloudProvider) scrapeAccessID(ctx context.Context, slug string, epi
 
 	// Detect language: AnimeX uses "sub", "dub", or "dual" in the audio field.
 	// "dual" means the source has both sub and dub audio tracks.
+	// Note: SvelteKit SSR uses unquoted keys (audio:"dual" not "audio":"dual").
 	lang = "sub"
 	lowerHTML := strings.ToLower(html)
-	if strings.Contains(lowerHTML, `"audio":"dub"`) {
+	if strings.Contains(lowerHTML, `audio:"dub"`) {
 		lang = "dub"
-	} else if strings.Contains(lowerHTML, `"audio":"dual"`) {
+	} else if strings.Contains(lowerHTML, `audio:"dual"`) {
 		lang = "dual"
 	}
 
