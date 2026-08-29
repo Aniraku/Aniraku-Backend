@@ -180,12 +180,11 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		if err != nil || sr == nil || len(sr.Sources) == 0 {
 			continue // silent skip
 		}
-		// Auto-detect: only add FlixCloud if AnimeX actually has this language.
-		// The provider returns sources regardless — we trust it resolved.
-		for _, src := range sr.Sources {
+		serverNames := []string{"Yuta", "Syota"}
+		for i, src := range sr.Sources {
 			name := "Syota"
-			if strings.Contains(src.URL, "v=1") {
-				name = "Yuta"
+			if i < len(serverNames) {
+				name = serverNames[i]
 			}
 			allServers = append(allServers, core.Server{
 				Name:     name,
