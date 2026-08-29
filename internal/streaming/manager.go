@@ -86,6 +86,7 @@ func NewManager(log zerolog.Logger, miruroAPIBase string, httpClient *http.Clien
 	}
 	m.providers = []Provider{
 		NewMiruroProvider(log, miruroAPIBase),
+		NewFlixCloudProvider(log),
 	}
 	return m
 }
@@ -96,61 +97,107 @@ func (m *Manager) GetSources(ctx context.Context, title string, episode int, lan
 
 // GetSourcesForProvider resolves sources for the requested provider/lang.
 func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provider, lang, quality string, animeID int) (*core.StreamResult, error) {
+	if provider == "flixcloud" {
+		result, err := m.tryFlixCloud(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("flixcloud: no sources for this episode")
+	}
 	result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
 	if err == nil && result != nil && len(result.Sources) > 0 {
 		return result, nil
 	}
+	// Fallback: try FlixCloud if Miruro failed
+	fcResult, fcErr := m.tryFlixCloud(ctx, animeID, episode, lang, quality)
+	if fcErr == nil && fcResult != nil && len(fcResult.Sources) > 0 {
+		return fcResult, nil
+	}
 	return nil, err
 }
 
-// FindAllServers lists every selectable Miruro server per lang (quality
-// selection preserved). Ordering is deterministic: best playback verdict
-// first (proxy > direct > embed > dead), then provider order. No server is
-// hidden — datacenter verdicts are hints, not filters.
+// FindAllServers lists every selectable server per lang (quality selection
+// preserved). Ordering is deterministic: best playback verdict first (proxy >
+// direct > embed > dead), then provider order. No server is hidden —
+// datacenter verdicts are hints, not filters.
 func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string) []core.Server {
-	miruro, ok := m.providers[0].(*MiruroProvider)
-	if !ok {
-		return nil
-	}
-
 	if lang == "" {
 		lang = "sub"
 	}
 
-	anilistID := fmt.Sprintf("%d", animeID)
-	serverMap := miruro.FindAllSources(ctx, anilistID, episode, lang)
+	var allServers []core.Server
 
-	// Deterministic provider order: best verdict first, then known-provider
-	// order, then unknown providers in API order.
-	idxOf := func(name string) int {
-		for i, n := range miruroAllProviders {
-			if n == name {
-				return i
+	// Miruro sub-providers (kiwi, bonk, ally, pewe)
+	if miruro, ok := m.providers[0].(*MiruroProvider); ok {
+		anilistID := fmt.Sprintf("%d", animeID)
+		serverMap := miruro.FindAllSources(ctx, anilistID, episode, lang)
+
+		idxOf := func(name string) int {
+			for i, n := range miruroAllProviders {
+				if n == name {
+					return i
+				}
 			}
+			return len(miruroAllProviders)
 		}
-		return len(miruroAllProviders)
-	}
 
-	var miruroServers []core.Server
-	for name, sr := range serverMap {
-		miruroServers = append(miruroServers, core.Server{
-			Name:     name,
-			Provider: "miruro",
-			Lang:     lang,
-			Sources:  sr.Sources,
-			Headers:  sr.Headers,
+		for name, sr := range serverMap {
+			allServers = append(allServers, core.Server{
+				Name:     name,
+				Provider: "miruro",
+				Lang:     lang,
+				Sources:  sr.Sources,
+				Headers:  sr.Headers,
+			})
+		}
+		sort.SliceStable(allServers, func(i, j int) bool {
+			bi := serverVerdictRank(allServers[i])
+			bj := serverVerdictRank(allServers[j])
+			if bi != bj {
+				return bi > bj
+			}
+			if allServers[i].Provider == "flixcloud" && allServers[j].Provider != "flixcloud" {
+				return false
+			}
+			if allServers[i].Provider != "flixcloud" && allServers[j].Provider == "flixcloud" {
+				return true
+			}
+			return idxOf(allServers[i].Name) < idxOf(allServers[j].Name)
 		})
 	}
-	sort.SliceStable(miruroServers, func(i, j int) bool {
-		bi := serverVerdictRank(miruroServers[i])
-		bj := serverVerdictRank(miruroServers[j])
-		if bi != bj {
-			return bi > bj
-		}
-		return idxOf(miruroServers[i].Name) < idxOf(miruroServers[j].Name)
-	})
 
-	return miruroServers
+	// FlixCloud servers (Yuta + Syota) — only when AnimeX has this episode.
+	for _, prov := range m.providers {
+		fc, ok := prov.(*FlixCloudProvider)
+		if !ok {
+			continue
+		}
+		anilistID := fmt.Sprintf("%d", animeID)
+		sr, err := fc.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			continue // silent skip
+		}
+		// Auto-detect: only add FlixCloud if AnimeX actually has this language.
+		// The provider returns sources regardless — we trust it resolved.
+		for _, src := range sr.Sources {
+			name := "Syota"
+			if strings.Contains(src.URL, "v=1") {
+				name = "Yuta"
+			}
+			allServers = append(allServers, core.Server{
+				Name:     name,
+				Provider: "flixcloud",
+				Lang:     lang,
+				Sources:  []core.Source{src},
+				Headers:  sr.Headers,
+			})
+		}
+	}
+
+	return allServers
 }
 
 // serverVerdictRank maps a server's best per-source verification tag to a
@@ -191,6 +238,35 @@ func (m *Manager) tryMiruro(ctx context.Context, animeID int, episode int, provi
 
 	if source == nil || len(source.Sources) == 0 {
 		return nil, fmt.Errorf("miruro returned no sources")
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+func (m *Manager) getFlixCloudProvider() *FlixCloudProvider {
+	for _, p := range m.providers {
+		if fc, ok := p.(*FlixCloudProvider); ok {
+			return fc
+		}
+	}
+	return nil
+}
+
+func (m *Manager) tryFlixCloud(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	fc := m.getFlixCloudProvider()
+	if fc == nil {
+		return nil, fmt.Errorf("flixcloud provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying flixcloud")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := fc.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("flixcloud failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil // silent skip, not an error
 	}
 
 	return m.applyQualityFilter(source, quality), nil

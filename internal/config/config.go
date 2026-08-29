@@ -71,8 +71,7 @@ type SupabaseConfig struct {
 }
 
 type ProviderConfig struct {
-	Primary  string `mapstructure:"primary"`
-	Fallback string `mapstructure:"fallback"`
+	Primary string `mapstructure:"primary"`
 }
 
 type LoggingConfig struct {
@@ -97,7 +96,6 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.debug", false)
 	v.SetDefault("supabase.jwt_aud", "authenticated")
 	v.SetDefault("providers.primary", "miruro")
-	v.SetDefault("providers.fallback", "miruro")
 
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")

@@ -1380,8 +1380,10 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 		if strings.Contains(u, "uwucdn") || strings.Contains(u, "owocdn") || strings.Contains(u, "185.237.106.79") {
 			req.Header.Set("Referer", "https://kwik.cx/")
 			req.Header.Set("Origin", "https://kwik.cx")
-		} else if strings.Contains(u, "senshi") || strings.Contains(u, "ninstream") {
-			req.Header.Set("Referer", "https://senshi.live")
+		} else if strings.Contains(u, "flixcloud") {
+			req.Header.Set("Referer", "https://flixcloud.cc/")
+		} else if strings.Contains(u, "ninstream") {
+			req.Header.Set("Referer", "https://ninstream.com")
 		}
 	}
 	if req.Header.Get("User-Agent") == "" {
@@ -1930,10 +1932,10 @@ func needsProxyRewrite(rawURL string) bool {
 // hasKnownRewriteKeys returns true for CDN hostnames that must be proxied even
 // if they're on the allowlist — these are hosts where the player's direct
 // request would be rejected at the CDN without custom headers or transport
-// (e.g. Senshi's TLS fingerprint filtering, uTLS-required hosts).
+// (e.g. uTLS-required hosts).
 func hasKnownRewriteKeys(rawURL string) bool {
 	lower := strings.ToLower(rawURL)
-	return strings.Contains(lower, "senshi") ||
+	return strings.Contains(lower, "flixcloud") ||
 		strings.Contains(lower, "ninstream") ||
 		strings.Contains(lower, "uwucdn") ||
 		strings.Contains(lower, "owocdn") ||
