@@ -68,6 +68,17 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 		return nil, nil // silent skip
 	}
 
+	// Only return sources if the detected language matches the requested language.
+	if lang != "" && detectedLang != lang {
+		p.log.Debug().
+			Str("requested", lang).
+			Str("detected", detectedLang).
+			Str("slug", slug).
+			Int("episode", episode).
+			Msg("flixcloud: language mismatch, skipping")
+		return nil, nil
+	}
+
 	p.log.Info().
 		Str("anilistId", anilistID).
 		Str("slug", slug).
