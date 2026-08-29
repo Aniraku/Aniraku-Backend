@@ -62,14 +62,14 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 	}
 
 	// Scrape the watch page for FlixCloud access_ids.
-	accessID, detectedLang, err := p.scrapeAccessID(ctx, slug, episode)
+	accessIDs, detectedLang, err := p.scrapeAccessID(ctx, slug, episode)
 	if err != nil {
 		p.log.Debug().Err(err).Str("slug", slug).Int("episode", episode).Msg("flixcloud: access_id not found")
 		return nil, nil // silent skip
 	}
 
-	// Only return sources if the detected language matches the requested language.
-	if lang != "" && detectedLang != lang {
+	// "dual" means both sub and dub audio tracks — available for any request.
+	if detectedLang != "dual" && lang != "" && detectedLang != lang {
 		p.log.Debug().
 			Str("requested", lang).
 			Str("detected", detectedLang).
@@ -83,24 +83,25 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 		Str("anilistId", anilistID).
 		Str("slug", slug).
 		Int("episode", episode).
-		Str("accessId", accessID).
+		Strs("accessIds", accessIDs).
 		Str("detectedLang", detectedLang).
 		Msg("flixcloud: resolved")
 
-	// Build the two servers: Yuta (v1) and Syota (v2).
-	sources := []core.Source{
-		{
-			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s?v=1", accessID),
+	// Map each access_id to a server: first → Yuta, second → Syota, rest → Syota.
+	serverNames := []string{"Yuta", "Syota"}
+	var sources []core.Source
+	for i, id := range accessIDs {
+		name := "Syota"
+		if i < len(serverNames) {
+			name = serverNames[i]
+		}
+		_ = name // name used only for logging context
+		sources = append(sources, core.Source{
+			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s", id),
 			Type:         "embed",
 			Quality:      "auto",
 			Verification: "embed",
-		},
-		{
-			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s?v=2", accessID),
-			Type:         "embed",
-			Quality:      "auto",
-			Verification: "embed",
-		},
+		})
 	}
 
 	return &SourceResult{
@@ -194,48 +195,52 @@ func slugify(title string) string {
 	return s
 }
 
-// scrapeAccessID fetches the AnimeX watch page and extracts the FlixCloud
-// access_id from the embedded SvelteKit SSR data. It also detects the
-// language (sub/dub) based on the page content.
-func (p *FlixCloudProvider) scrapeAccessID(ctx context.Context, slug string, episode int) (accessID string, lang string, err error) {
+// scrapeAccessID fetches the AnimeX watch page and extracts ALL FlixCloud
+// access_ids from the embedded SvelteKit SSR data. It also detects the
+// language (sub/dub/dual) based on the page content.
+func (p *FlixCloudProvider) scrapeAccessID(ctx context.Context, slug string, episode int) (accessIDs []string, lang string, err error) {
 	watchURL := fmt.Sprintf("https://animex.one/watch/%s-episode-%d", slug, episode)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("animeX returned %d", resp.StatusCode)
+		return nil, "", fmt.Errorf("animeX returned %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	html := string(body)
 
-	// Extract access_id from the SvelteKit SSR resolve data.
+	// Extract ALL access_ids from the SvelteKit SSR resolve data.
 	pat := regexp.MustCompile(`access_id\s*:\s*"([a-zA-Z0-9]+)"`)
-	m := pat.FindStringSubmatch(html)
-	if len(m) < 2 {
-		return "", "", fmt.Errorf("access_id not found in watch page")
+	matches := pat.FindAllStringSubmatch(html, -1)
+	if len(matches) == 0 {
+		return nil, "", fmt.Errorf("access_id not found in watch page")
 	}
-	accessID = m[1]
+	for _, m := range matches {
+		accessIDs = append(accessIDs, m[1])
+	}
 
-	// Detect language: AnimeX uses "sub" or "dub" in the episode metadata.
-	// If the page contains dub-related markers, classify as dub.
+	// Detect language: AnimeX uses "sub", "dub", or "dual" in the audio field.
+	// "dual" means the source has both sub and dub audio tracks.
 	lang = "sub"
 	lowerHTML := strings.ToLower(html)
-	if strings.Contains(lowerHTML, `"audio":"dub"`) || strings.Contains(lowerHTML, `lang=dub`) {
+	if strings.Contains(lowerHTML, `"audio":"dub"`) {
 		lang = "dub"
+	} else if strings.Contains(lowerHTML, `"audio":"dual"`) {
+		lang = "dual"
 	}
 
-	return accessID, lang, nil
+	return accessIDs, lang, nil
 }
