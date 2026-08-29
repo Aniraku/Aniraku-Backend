@@ -13,7 +13,6 @@ supabase:
 
 providers:
   primary: miruro
-  fallback: senshi
 
 logging:
   level: info

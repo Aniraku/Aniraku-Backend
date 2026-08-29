@@ -18,7 +18,9 @@ import (
 var defaultCDNSuffixes = []string{
 	// Miruro-family HLS CDNs (observed live + referenced in code)
 	"akirax.buzz", "shiora.site", "anidb.app", "uwucdn.com", "owocdn.com",
-	"kwik.cx", "senshi.live", "ninstream.com", "ninstream.co",
+	"kwik.cx", "ninstream.com", "ninstream.co",
+	// FlixCloud embed CDN
+	"flixcloud.cc", "flixcloud.com",
 	// Direct mp4 mirrors
 	"animegg.org",
 	// Wix-hosted video (repackager.wixmp.com)
