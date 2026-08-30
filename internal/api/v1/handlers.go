@@ -339,11 +339,11 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-				if stale, ok := c.staleCache(cacheKey); ok {
-					c.h.log.Warn().Err(lastErr).Str("cache_key", cacheKey).Msg("AniList unreachable, serving stale cache")
-					return stale, nil
-				}
-				return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
+			if stale, ok := c.staleCache(cacheKey); ok {
+				c.h.log.Warn().Err(lastErr).Str("cache_key", cacheKey).Msg("AniList unreachable, serving stale cache")
+				return stale, nil
+			}
+			return nil, fmt.Errorf("anilist unreachable: %w", lastErr)
 		}
 
 		respBody, _ := io.ReadAll(resp.Body)
@@ -358,11 +358,11 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 			if c.h.anilistCircuit != nil {
 				c.h.anilistCircuit.recordFailure()
 			}
-				if stale, ok := c.staleCache(cacheKey); ok {
-					c.h.log.Warn().Str("cache_key", cacheKey).Msg("AniList rate limited, serving stale cache")
-					return stale, nil
-				}
-				return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
+			if stale, ok := c.staleCache(cacheKey); ok {
+				c.h.log.Warn().Str("cache_key", cacheKey).Msg("AniList rate limited, serving stale cache")
+				return stale, nil
+			}
+			return nil, fmt.Errorf("anilist rate limited after retries: %s", string(respBody))
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -978,7 +978,7 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	anilistID := req.AnimeID
 
 	// Find best source for the requested provider/lang only
-	result, err := h.stream.GetSourcesForProvider(ctx, req.Episode, req.Provider, req.Lang, req.Quality, anilistID)
+	result, err := h.stream.GetSourcesForProviderWithSlug(ctx, req.Episode, req.Provider, req.Lang, req.Quality, anilistID, req.Slug)
 
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.log.Warn().Err(err).Int("animeId", req.AnimeID).Str("lang", req.Lang).Str("provider", req.Provider).Msg("streaming failed")
