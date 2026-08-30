@@ -510,6 +510,15 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 	h.anilistClient = newAnilistClient(h)
 	h.anilistCircuit = newCircuitBreaker()
 
+	// Load AnikotoTV AniList→slug mapping (best-effort, non-fatal)
+	if mappingPath := cfg.Server.AnikotoMappingPath; mappingPath != "" {
+		if err := streaming.LoadAnikotoMapping(mappingPath); err != nil {
+			log.Warn().Err(err).Str("path", mappingPath).Msg("anikoto: mapping file not loaded, will search dynamically")
+		} else {
+			log.Info().Str("path", mappingPath).Msg("anikoto: mapping loaded")
+		}
+	}
+
 	// ponytail: global lock, per-account locks if throughput matters
 	// Provider-vouched hosts feed the media-proxy CDN allowlist as they
 	// surface, so rotated CDN hostnames never 403 at the proxy gate.
