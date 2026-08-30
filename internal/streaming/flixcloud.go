@@ -47,19 +47,21 @@ func (p *FlixCloudProvider) FindEpisodes(ctx context.Context, providerID string)
 	return nil, fmt.Errorf("flixcloud episode listing not implemented")
 }
 
-// FindEpisodeSource scrapes the AnimeX watch page for the given anilist ID
-// and episode, extracts FlixCloud access_ids, and returns embed sources.
-// Returns nil (not an error) when the anime can't be found on AnimeX —
-// callers should fall back to other providers.
+// FindEpisodeSource retains the legacy behavior for callers that do not provide
+// the frontend watch slug.
 func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
-	anilistID := providerID
-
-	// Resolve the AnimeX slug for this AniList ID.
-	slug, err := p.resolveSlug(ctx, anilistID)
+	slug, err := p.resolveSlug(ctx, providerID)
 	if err != nil {
-		p.log.Debug().Err(err).Str("anilistId", anilistID).Msg("flixcloud: slug not found, skipping")
-		return nil, nil // silent skip — not an error
+		p.log.Debug().Err(err).Str("anilistId", providerID).Msg("flixcloud: slug not found, skipping")
+		return nil, nil
 	}
+	return p.FindEpisodeSourceWithSlug(ctx, providerID, slug, episode, lang)
+}
+
+// FindEpisodeSourceWithSlug uses the slug supplied by the frontend and avoids
+// the backend AniList title lookup.
+func (p *FlixCloudProvider) FindEpisodeSourceWithSlug(ctx context.Context, providerID, slug string, episode int, lang string) (*SourceResult, error) {
+	anilistID := providerID
 
 	// Scrape the watch page for FlixCloud access_ids.
 	accessIDs, detectedLang, err := p.scrapeAccessID(ctx, slug, episode)
@@ -90,14 +92,14 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 	// Map each access_id to a server: first → Yuta, second → Syota, rest → Syota.
 	serverNames := []string{"Yuta", "Syota"}
 	var sources []core.Source
-	for i, id := range accessIDs {
+	for i := range accessIDs {
 		name := "Syota"
 		if i < len(serverNames) {
 			name = serverNames[i]
 		}
 		_ = name // name used only for logging context
 		sources = append(sources, core.Source{
-			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s", id),
+			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s", accessIDs[i]),
 			Type:         "embed",
 			Quality:      "auto",
 			Verification: "embed",
@@ -152,7 +154,7 @@ func (p *FlixCloudProvider) fetchAniListTitle(ctx context.Context, anilistID str
 			Media struct {
 				Title struct {
 					English *string `json:"english"`
-					Romaji *string `json:"romaji"`
+					Romaji  *string `json:"romaji"`
 				} `json:"title"`
 			} `json:"Media"`
 		} `json:"data"`
