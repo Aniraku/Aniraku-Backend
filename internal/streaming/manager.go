@@ -98,8 +98,15 @@ func (m *Manager) GetSources(ctx context.Context, title string, episode int, lan
 
 // GetSourcesForProvider resolves sources for the requested provider/lang.
 func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provider, lang, quality string, animeID int) (*core.StreamResult, error) {
+	return m.GetSourcesForProviderWithSlug(ctx, episode, provider, lang, quality, animeID, "")
+}
+
+// GetSourcesForProviderWithSlug is the frontend-aware streaming entry point.
+// slug is used by FlixCloud when supplied; an empty slug preserves legacy
+// AniList-title resolution for older clients.
+func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
 	if provider == "flixcloud" {
-		result, err := m.tryFlixCloud(ctx, animeID, episode, lang, quality)
+		result, err := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		if err != nil {
 			return nil, err
 		}
@@ -123,7 +130,7 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 		return result, nil
 	}
 	// Fallback: try FlixCloud if Miruro failed
-	fcResult, fcErr := m.tryFlixCloud(ctx, animeID, episode, lang, quality)
+	fcResult, fcErr := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 	if fcErr == nil && fcResult != nil && len(fcResult.Sources) > 0 {
 		return fcResult, nil
 	}
@@ -290,6 +297,10 @@ func (m *Manager) getFlixCloudProvider() *FlixCloudProvider {
 }
 
 func (m *Manager) tryFlixCloud(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, "")
+}
+
+func (m *Manager) tryFlixCloudWithSlug(ctx context.Context, animeID int, episode int, lang, quality, slug string) (*core.StreamResult, error) {
 	fc := m.getFlixCloudProvider()
 	if fc == nil {
 		return nil, fmt.Errorf("flixcloud provider not configured")
@@ -298,7 +309,13 @@ func (m *Manager) tryFlixCloud(ctx context.Context, animeID int, episode int, la
 	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying flixcloud")
 
 	anilistID := fmt.Sprintf("%d", animeID)
-	source, err := fc.FindEpisodeSource(ctx, anilistID, episode, lang)
+	var source *SourceResult
+	var err error
+	if slug != "" {
+		source, err = fc.FindEpisodeSourceWithSlug(ctx, anilistID, slug, episode, lang)
+	} else {
+		source, err = fc.FindEpisodeSource(ctx, anilistID, episode, lang)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("flixcloud failed: %w", err)
 	}
@@ -349,11 +366,11 @@ func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core
 	}
 
 	return &core.StreamResult{
-		Sources: sources,
-		Headers: result.Headers,
+		Sources:   sources,
+		Headers:   result.Headers,
 		Qualities: qualities,
-		Intro:   result.Intro,
-		Outro:   result.Outro,
+		Intro:     result.Intro,
+		Outro:     result.Outro,
 	}
 }
 

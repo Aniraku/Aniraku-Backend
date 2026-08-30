@@ -86,9 +86,9 @@ type Name struct {
 }
 
 type Chapter struct {
-	Number    int     `json:"number"`
-	Title     *string `json:"title"`
-	AiredAt   *string `json:"airedAt"`
+	Number  int     `json:"number"`
+	Title   *string `json:"title"`
+	AiredAt *string `json:"airedAt"`
 }
 
 type ChapterList struct {
@@ -105,11 +105,12 @@ type PageList struct {
 
 type StreamRequest struct {
 	AnimeID  int    `json:"animeId"`
+	Slug     string `json:"slug,omitempty"` // frontend watch slug, e.g. one-piece-21
 	Episode  int    `json:"episode"`
 	Provider string `json:"provider"` // "miruro"
-	Lang     string `json:"lang"`    // "sub" or "dub"
-	Quality  string `json:"quality"` // "auto", "1080p", "720p", etc.
-	Refresh  bool   `json:"refresh"` // bypass provider cache, try next internal provider
+	Lang     string `json:"lang"`     // "sub" or "dub"
+	Quality  string `json:"quality"`  // "auto", "1080p", "720p", etc.
+	Refresh  bool   `json:"refresh"`  // bypass provider cache, try next internal provider
 }
 
 type StreamResult struct {
@@ -129,18 +130,18 @@ type SkipTimestamp struct {
 }
 
 type Server struct {
-	Name     string            `json:"name"`              // e.g. "kiwi", "ally", "bee"
-	Provider string            `json:"provider"`          // e.g. "miruro"
-	Lang     string            `json:"lang"`              // "sub" or "dub"
+	Name     string            `json:"name"`     // e.g. "kiwi", "ally", "bee"
+	Provider string            `json:"provider"` // e.g. "miruro"
+	Lang     string            `json:"lang"`     // "sub" or "dub"
 	Sources  []Source          `json:"sources"`
 	Headers  map[string]string `json:"headers,omitempty"`
 }
 
 type Source struct {
-	URL       string      `json:"url"`
-	Type      string      `json:"type"`
-	Quality   string      `json:"quality"`
-	Subtitles []Subtitle  `json:"subtitles"`
+	URL       string     `json:"url"`
+	Type      string     `json:"type"`
+	Quality   string     `json:"quality"`
+	Subtitles []Subtitle `json:"subtitles"`
 	// Verification is a soft verdict ("proxy", "direct", "embed", "dead")
 	// from the server-side playback probe. It is an ordering hint only —
 	// CDNs serve different clients differently, so it never filters

@@ -18,7 +18,8 @@ import (
 )
 
 const (
-	anikotoBase = "https://anikototv.to"
+	anikotoBase             = "https://anikototv.to"
+	anikotoEmbedURLTemplate = "https://anivexa-api-tu4a.onrender.com/watch/anikoto/%s/%s/anikoto-%d"
 )
 
 // anikotoServers maps API server names to display names.
@@ -97,7 +98,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		}
 
 		src := core.Source{
-			URL:          videoURL,
+			URL:          fmt.Sprintf(anikotoEmbedURLTemplate, providerID, lang, episode),
 			Type:         "embed",
 			Quality:      "auto",
 			Verification: "embed",
@@ -294,9 +295,9 @@ func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID strin
 
 // anikotoEpisode represents an episode entry from the HTML.
 type anikotoEpisode struct {
-	slug   string
+	slug    string
 	dataIDs string
-	number int
+	number  int
 }
 
 // fetchEpisodeDataIDs fetches the episode list and returns the data-ids for the target episode.
@@ -358,9 +359,9 @@ func (p *AnikotoProvider) fetchEpisodeDataIDs(ctx context.Context, showID string
 
 // anikotoServerEntry represents a server from the API.
 type anikotoServerEntry struct {
-	linkID   string
-	svID     string
-	name     string
+	linkID     string
+	svID       string
+	name       string
 	serverType string
 }
 
@@ -466,7 +467,7 @@ func (p *AnikotoProvider) fetchVideoURL(ctx context.Context, linkID string) (str
 	var result struct {
 		Status int `json:"status"`
 		Result struct {
-			URL      string              `json:"url"`
+			URL      string               `json:"url"`
 			SkipData map[string][]float64 `json:"skip_data"`
 		} `json:"result"`
 	}
