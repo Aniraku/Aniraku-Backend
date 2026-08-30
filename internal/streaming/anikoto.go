@@ -51,99 +51,65 @@ func (p *AnikotoProvider) FindEpisodes(ctx context.Context, providerID string) (
 	return nil, fmt.Errorf("anikoto episode listing not implemented")
 }
 
-// FindEpisodeSource scrapes anikototv.to for a specific episode.
-// providerID is the AniList ID as a string.
-// Returns embed sources (iframe URLs) for Niko and Momo servers.
+// FindEpisodeSource fetches Anikoto’s two embedded-player streams directly
+// from Anivexa using the AniList ID supplied by the frontend.
 func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
-	if lang == "" {
+	if lang != "dub" {
 		lang = "sub"
 	}
 
-	// Step 1: Resolve AniList ID → AnikotoTV show slug and ID
-	showSlug, showID, err := p.resolveShow(ctx, providerID)
+	endpoint := fmt.Sprintf(anikotoEmbedURLTemplate, providerID, lang, episode)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		p.log.Debug().Err(err).Str("anilistId", providerID).Msg("anikoto: show not found, skipping")
-		return nil, nil
+		return nil, err
 	}
-
-	// Step 2: Fetch episode list to get data-ids for the target episode
-	dataIDs, err := p.fetchEpisodeDataIDs(ctx, showID, episode)
+	resp, err := p.client.Do(req)
 	if err != nil {
-		p.log.Debug().Err(err).Str("slug", showSlug).Int("episode", episode).Msg("anikoto: episode not found")
-		return nil, nil
+		return nil, fmt.Errorf("anikoto anivexa request failed: %w", err)
 	}
+	defer resp.Body.Close()
 
-	// Step 3: Fetch server list for this episode + language
-	serverEntries, err := p.fetchServers(ctx, dataIDs, lang)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		p.log.Debug().Err(err).Str("slug", showSlug).Int("episode", episode).Str("lang", lang).Msg("anikoto: no servers found")
-		return nil, nil
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("anikoto anivexa returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	if len(serverEntries) == 0 {
-		p.log.Debug().Str("slug", showSlug).Int("episode", episode).Str("lang", lang).Msg("anikoto: empty server list")
-		return nil, nil
+	var payload struct {
+		Streams []struct {
+			URL       string          `json:"url"`
+			Type      string          `json:"type"`
+			EmbedURL  string          `json:"embedUrl"`
+			Subtitles []core.Subtitle `json:"subtitles"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("anikoto anivexa response decode failed: %w", err)
 	}
 
-	// Step 4: Get video URL for each server
 	var sources []core.Source
-	for i, entry := range serverEntries {
-		videoURL, skipData, err := p.fetchVideoURL(ctx, entry.linkID)
-		if err != nil {
-			p.log.Debug().Err(err).Int("server", i).Msg("anikoto: failed to get video URL")
+	for _, stream := range payload.Streams {
+		playerURL := stream.EmbedURL
+		if playerURL == "" {
+			playerURL = stream.URL
+		}
+		if playerURL == "" {
 			continue
 		}
-		if videoURL == "" {
-			continue
-		}
-
-		src := core.Source{
-			URL:          fmt.Sprintf(anikotoEmbedURLTemplate, providerID, lang, episode),
+		sources = append(sources, core.Source{
+			URL:          playerURL,
 			Type:         "embed",
 			Quality:      "auto",
+			Subtitles:    stream.Subtitles,
 			Verification: "embed",
-		}
-		sources = append(sources, src)
-
-		// Store skip data in the first source's metadata (used by frontend)
-		if skipData != nil && i == 0 {
-			// Skip data is handled via the SourceResult
-		}
+		})
 	}
-
 	if len(sources) == 0 {
 		return nil, nil
 	}
-
-	result := &SourceResult{
-		Sources: sources,
-		Headers: map[string]string{
-			"Referer": anikotoBase + "/",
-			"Origin":  anikotoBase,
-		},
-	}
-
-	// Attach skip data from first server if available
-	for _, entry := range serverEntries {
-		_, skipData, err := p.fetchVideoURL(ctx, entry.linkID)
-		if err == nil && skipData != nil {
-			if intro, ok := skipData["intro"]; ok && len(intro) == 2 {
-				result.Intro = &core.SkipTimestamp{
-					Start: intro[0],
-					End:   intro[1],
-				}
-			}
-			if outro, ok := skipData["outro"]; ok && len(outro) == 2 {
-				result.Outro = &core.SkipTimestamp{
-					Start: outro[0],
-					End:   outro[1],
-				}
-			}
-			break
-		}
-	}
-
-	return result, nil
+	return &SourceResult{Sources: sources, Headers: map[string]string{}}, nil
 }
 
 // resolveShow finds the AnikotoTV show slug and ID from an AniList ID.
