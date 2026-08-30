@@ -87,6 +87,7 @@ func NewManager(log zerolog.Logger, miruroAPIBase string, httpClient *http.Clien
 	m.providers = []Provider{
 		NewMiruroProvider(log, miruroAPIBase),
 		NewFlixCloudProvider(log),
+		NewAnikotoProvider(log),
 	}
 	return m
 }
@@ -106,6 +107,16 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 			return result, nil
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
+	}
+	if provider == "anikoto" {
+		result, err := m.tryAnikoto(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("anikoto: no sources for this episode")
 	}
 	result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
 	if err == nil && result != nil && len(result.Sources) > 0 {
@@ -196,6 +207,33 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		}
 	}
 
+	// Anikoto servers (Niko + Momo) — scrapes anikototv.to for embed sources
+	for _, prov := range m.providers {
+		ak, ok := prov.(*AnikotoProvider)
+		if !ok {
+			continue
+		}
+		anilistID := fmt.Sprintf("%d", animeID)
+		sr, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		serverNames := anikotoServers
+		for i, src := range sr.Sources {
+			name := serverNames[len(serverNames)-1]
+			if i < len(serverNames) {
+				name = serverNames[i]
+			}
+			allServers = append(allServers, core.Server{
+				Name:     name,
+				Provider: "anikoto",
+				Lang:     lang,
+				Sources:  []core.Source{src},
+				Headers:  sr.Headers,
+			})
+		}
+	}
+
 	return allServers
 }
 
@@ -265,7 +303,36 @@ func (m *Manager) tryFlixCloud(ctx context.Context, animeID int, episode int, la
 		return nil, fmt.Errorf("flixcloud failed: %w", err)
 	}
 	if source == nil || len(source.Sources) == 0 {
-		return nil, nil // silent skip, not an error
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+func (m *Manager) getAnikotoProvider() *AnikotoProvider {
+	for _, p := range m.providers {
+		if ak, ok := p.(*AnikotoProvider); ok {
+			return ak
+		}
+	}
+	return nil
+}
+
+func (m *Manager) tryAnikoto(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	ak := m.getAnikotoProvider()
+	if ak == nil {
+		return nil, fmt.Errorf("anikoto provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying anikoto")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("anikoto failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
 	}
 
 	return m.applyQualityFilter(source, quality), nil

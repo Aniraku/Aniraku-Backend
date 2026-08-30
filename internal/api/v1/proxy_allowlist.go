@@ -82,6 +82,8 @@ var defaultCDNSuffixes = []string{
 	"fast4speed.site",
 	"fast4speed.top",
 	"fast4speed.com",
+	// Anikoto provider embed CDNs
+	"anikototv.to", "megaplay.buzz",
 	// Observed Miruro provider CDN hosts (2026-08-04)
 	"mikora.top",
 	"mikora.site",

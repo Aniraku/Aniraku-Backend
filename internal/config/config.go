@@ -55,11 +55,12 @@ func (s *SyncConfig) MALConfigured() bool  { return s.MALClientID != "" }
 func (s *SyncConfig) AniListConfigured() bool { return s.AniListClientID != "" }
 
 type ServerConfig struct {
-	Host           string `mapstructure:"host"`
-	Port           int    `mapstructure:"port"`
-	UIDist         string `mapstructure:"ui_dist"`
-	Debug          bool   `mapstructure:"debug"`
-	MiruroProxyURL string `mapstructure:"miruro_proxy_url"`
+	Host               string `mapstructure:"host"`
+	Port               int    `mapstructure:"port"`
+	UIDist             string `mapstructure:"ui_dist"`
+	Debug              bool   `mapstructure:"debug"`
+	MiruroProxyURL     string `mapstructure:"miruro_proxy_url"`
+	AnikotoMappingPath string `mapstructure:"anikoto_mapping_path"`
 }
 
 type SupabaseConfig struct {
@@ -143,6 +144,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if mpu := os.Getenv("ANIRAKU_MIRURO_PROXY_URL"); mpu != "" {
 		v.Set("server.miruro_proxy_url", mpu)
+	}
+	if akp := os.Getenv("ANIRAKU_ANIKOTO_MAPPING_PATH"); akp != "" {
+		v.Set("server.anikoto_mapping_path", akp)
 	}
 
 	// OAuth sync credentials (optional — feature disabled when absent)
