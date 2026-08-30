@@ -1052,7 +1052,7 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
 		ctx = streaming.WithRefresh(ctx)
