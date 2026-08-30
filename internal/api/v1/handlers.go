@@ -1283,7 +1283,11 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 
 	// Partial-content responses (206) from a forwarded Range: pass through
 	// Content-Range and advertise Accept-Ranges so the video element knows it
-	// can seek. Content-Length is echoed to keep the response non-chunked.
+	// can seek. Content-Length is echoed only for 206 to keep the response
+	// non-chunked; for full-body (200) streaming we omit it so Go uses
+	// chunked transfer encoding — this prevents ERR_CONTENT_LENGTH_MISMATCH
+	// when the upstream CDN drops the connection or returns fewer bytes than
+	// its Content-Length promised.
 	if cr := resp.Header.Get("Content-Range"); cr != "" {
 		w.Header().Set("Content-Range", cr)
 	}
@@ -1292,8 +1296,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	} else if resp.StatusCode == http.StatusPartialContent {
 		w.Header().Set("Accept-Ranges", "bytes")
 	}
-	if cl := resp.Header.Get("Content-Length"); cl != "" {
-		w.Header().Set("Content-Length", cl)
+	if resp.StatusCode == http.StatusPartialContent {
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			w.Header().Set("Content-Length", cl)
+		}
 	}
 
 	w.Header().Set("Content-Type", ct)
