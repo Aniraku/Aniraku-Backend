@@ -34,6 +34,8 @@ type Config struct {
 	Logging   LoggingConfig  `mapstructure:"logging"`
 	Update    UpdateConfig   `mapstructure:"update"`
 	Sync      SyncConfig     `mapstructure:"sync"`
+	TMDB      TMDBConfig     `mapstructure:"tmdb"`
+	Scraping  ScrapingConfig `mapstructure:"scraping"`
 }
 
 type SyncConfig struct {
@@ -61,6 +63,19 @@ type ServerConfig struct {
 	Debug              bool   `mapstructure:"debug"`
 	MiruroProxyURL     string `mapstructure:"miruro_proxy_url"`
 	AnikotoMappingPath string `mapstructure:"anikoto_mapping_path"`
+}
+
+type TMDBConfig struct {
+	ReadAccessToken string `mapstructure:"read_access_token"`
+	APIBase         string `mapstructure:"api_base"`
+	ImageBase       string `mapstructure:"image_base"`
+	AnibridgeAPI    string `mapstructure:"anibridge_api"`
+}
+
+type ScrapingConfig struct {
+	AnimeXBase   string `mapstructure:"animex_base"`
+	FlixCloudBase string `mapstructure:"flixcloud_base"`
+	AniZipBase   string `mapstructure:"anizip_base"`
 }
 
 type SupabaseConfig struct {
@@ -102,6 +117,12 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("logging.format", "json")
 	v.SetDefault("update.channel", "stable")
 	v.SetDefault("update.url", "https://api.aniraku.app/update")
+	v.SetDefault("tmdb.api_base", "https://api.themoviedb.org/3")
+	v.SetDefault("tmdb.image_base", "https://image.tmdb.org/t/p/w780")
+	v.SetDefault("tmdb.anibridge_api", "https://mappings.anibridge.eliasbenb.dev/api/v3/mappings")
+	v.SetDefault("scraping.animex_base", "https://animex.one")
+	v.SetDefault("scraping.flixcloud_base", "https://flixcloud.cc")
+	v.SetDefault("scraping.anizip_base", "https://api.ani.zip")
 
 	// Env overrides
 	v.SetEnvPrefix("ANIRAKU")
@@ -167,6 +188,30 @@ func Load(configPath string) (*Config, error) {
 	}
 	if val := os.Getenv("ANIRAKU_OAUTH_STATE_SECRET"); val != "" {
 		v.Set("sync.oauth_state_secret", val)
+	}
+	if val := os.Getenv("TMDB_READ_ACCESS_TOKEN"); val != "" {
+		v.Set("tmdb.read_access_token", val)
+	}
+	if val := os.Getenv("ANIRAKU_TMDB_READ_ACCESS_TOKEN"); val != "" {
+		v.Set("tmdb.read_access_token", val)
+	}
+	if val := os.Getenv("ANIRAKU_TMDB_API_BASE"); val != "" {
+		v.Set("tmdb.api_base", val)
+	}
+	if val := os.Getenv("ANIRAKU_TMDB_IMAGE_BASE"); val != "" {
+		v.Set("tmdb.image_base", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANIBRIDGE_API"); val != "" {
+		v.Set("tmdb.anibridge_api", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANIMEX_BASE"); val != "" {
+		v.Set("scraping.animex_base", val)
+	}
+	if val := os.Getenv("ANIRAKU_FLIXCLOUD_BASE"); val != "" {
+		v.Set("scraping.flixcloud_base", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANIZIP_BASE"); val != "" {
+		v.Set("scraping.anizip_base", val)
 	}
 
 	var cfg Config

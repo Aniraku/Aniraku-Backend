@@ -4,10 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"runtime"
 	"syscall"
 	"time"
 
@@ -50,31 +47,6 @@ func main() {
 	v1.Version = Version
 	v1.Commit = Commit
 	v1.BuildDate = BuildDate
-
-	// Start Miruro Cloudflare bypass proxy (Python + ViperTLS)
-	var miruroProxyCmd *exec.Cmd
-	if cfg.Server.MiruroProxyURL == "" {
-		proxyScript := findMiruroProxyScript()
-		python, err := exec.LookPath("python3")
-		if err != nil {
-			python, err = exec.LookPath("python")
-			if err != nil {
-				log.Warn().Msg("python not found, Miruro Cloudflare bypass disabled")
-			}
-		}
-		if python != "" && proxyScript != "" {
-			miruroProxyCmd = exec.Command(python, proxyScript)
-			miruroProxyCmd.Stdout = os.Stderr
-			miruroProxyCmd.Stderr = os.Stderr
-			if err := miruroProxyCmd.Start(); err != nil {
-				log.Warn().Err(err).Msg("failed to start Miruro proxy, Cloudflare bypass disabled")
-				miruroProxyCmd = nil
-			} else {
-				log.Info().Int("pid", miruroProxyCmd.Process.Pid).Msg("Miruro Cloudflare bypass proxy started")
-				time.Sleep(2 * time.Second)
-			}
-		}
-	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -131,34 +103,5 @@ func main() {
 		log.Error().Err(err).Msg("server shutdown error")
 	}
 
-	if miruroProxyCmd != nil {
-		log.Info().Int("pid", miruroProxyCmd.Process.Pid).Msg("stopping Miruro proxy")
-		miruroProxyCmd.Process.Signal(os.Interrupt)
-		miruroProxyCmd.Wait()
-	}
-
 	log.Info().Msg("server stopped")
-}
-
-func findMiruroProxyScript() string {
-	candidates := []string{
-		"proxy.py",
-		"cmd/miruro-proxy/proxy.py",
-		"../cmd/miruro-proxy/proxy.py",
-	}
-	execPath, err := os.Executable()
-	if err == nil {
-		candidates = append(candidates, filepath.Join(filepath.Dir(execPath), "proxy.py"))
-	}
-	_, srcFile, _, ok := runtime.Caller(0)
-	if ok {
-		candidates = append(candidates, filepath.Join(filepath.Dir(srcFile), "../../cmd/miruro-proxy/proxy.py"))
-	}
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			abs, _ := filepath.Abs(c)
-			return abs
-		}
-	}
-	return ""
 }

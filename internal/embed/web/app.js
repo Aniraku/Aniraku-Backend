@@ -1,6 +1,6 @@
 const api = {
   health: '/api/v1/health',
-  trending: '/api/v1/trending?page=1&perPage=8',
+  episodes: '/api/v1/anime/21/episodes',
   airing: '/api/v1/anilist',
 };
 
@@ -86,14 +86,15 @@ function renderSchedule(items, requestedDate) {
 
 function renderTrending(items) {
   if (!items.length) {
-    trendingGrid.innerHTML = '<div class="trend-fallback">Public trending data is temporarily unavailable. The endpoint directory remains usable.</div>';
+    trendingGrid.innerHTML = '<div class="trend-fallback">Episode data is temporarily unavailable. The endpoint directory remains usable.</div>';
     trendingCount.textContent = 'Unavailable';
     return;
   }
-  trendingCount.textContent = `${items.length} live records`;
-  trendingGrid.innerHTML = items.map((item) => {
-    const cover = coverOf(item);
-    return `<a class="trend-card" href="/api/v1/anime/${encodeURIComponent(item.id)}" target="_blank" rel="noreferrer">${cover ? `<img src="${escapeHtml(cover)}" alt="" loading="lazy" />` : '<div class="trend-fallback">No cover available</div>'}<div><strong>${escapeHtml(titleOf(item))}</strong><small>${escapeHtml(item.format || 'ANIME')} · ID ${escapeHtml(item.id)}</small></div></a>`;
+  trendingCount.textContent = `${items.length} episodes`;
+  trendingGrid.innerHTML = items.slice(0, 8).map((item) => {
+    const thumb = item.thumbnail || coverOf(item) || '';
+    const title = item.title || `Episode ${item.number}`;
+    return `<a class="trend-card" href="/api/v1/anime/21/episodes" target="_blank" rel="noreferrer">${thumb ? `<img src="${escapeHtml(thumb)}" alt="" loading="lazy" />` : '<div class="trend-fallback">No thumbnail</div>'}<div><strong>${escapeHtml(title)}</strong><small>Episode ${escapeHtml(item.number)}${item.airdate ? ' · ' + escapeHtml(item.airdate) : ''}</small></div></a>`;
   }).join('');
 }
 
@@ -110,10 +111,11 @@ async function loadPublicData() {
   }
 
   try {
-    const response = await fetch(api.trending, { headers: { Accept: 'application/json' } });
-    if (!response.ok) throw new Error('Trending request failed');
-    const items = await response.json();
-    renderTrending(Array.isArray(items) ? items : items?.media || []);
+    const response = await fetch(api.episodes, { headers: { Accept: 'application/json' } });
+    if (!response.ok) throw new Error('Episodes request failed');
+    const data = await response.json();
+    const items = Array.isArray(data?.episodes) ? data.episodes : [];
+    renderTrending(items);
   } catch {
     renderTrending([]);
   }
@@ -144,7 +146,7 @@ endpointFilter.addEventListener('input', () => {
 document.querySelector('#copy-request').addEventListener('click', async (event) => {
   const button = event.currentTarget;
   try {
-    await navigator.clipboard.writeText('GET https://api.aniraku.tech/api/v1/trending?page=1&perPage=8');
+    await navigator.clipboard.writeText('GET https://api.aniraku.tech/api/v1/anime/21/episodes');
     button.textContent = 'COPIED';
   } catch {
     button.textContent = 'SELECT';

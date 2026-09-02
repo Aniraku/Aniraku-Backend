@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"os"
 	"strings"
 	"time"
 
@@ -15,25 +15,32 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// FlixCloudProvider scrapes AnimeX watch pages to extract FlixCloud embed
-// URLs. Two servers are offered per episode:
-//   - Yuta → flixcloud.cc/e/{id}?v=1
-//   - Syota → flixcloud.cc/e/{id}?v=2
-//
-// Language is auto-detected from what AnimeX has for the given episode.
-// If the anime slug can't be resolved, FlixCloud silently yields nothing
-// so Miruro handles it instead.
+// FlixCloudProvider fetches embed URLs from the Reanime API and returns them
+// as embed sources for the frontend's embedded player.
+// Servers are named by access ID order: Yuta (1st), Syota (2nd), Mike (3rd+).
 type FlixCloudProvider struct {
-	client *http.Client
-	log    zerolog.Logger
+	client      *http.Client
+	log         zerolog.Logger
+	reanimeBase string
+	flixBase    string
 }
 
 func NewFlixCloudProvider(log zerolog.Logger) *FlixCloudProvider {
+	reanimeBase := strings.TrimRight(os.Getenv("ANIRAKU_REANIME_BASE"), "/")
+	if reanimeBase == "" {
+		reanimeBase = "https://reanime.to"
+	}
+	flixBase := strings.TrimRight(os.Getenv("ANIRAKU_FLIXCLOUD_BASE"), "/")
+	if flixBase == "" {
+		flixBase = "https://flixcloud.cc"
+	}
 	return &FlixCloudProvider{
 		client: &http.Client{
 			Timeout: 15 * time.Second,
 		},
-		log: log,
+		log:         log,
+		reanimeBase: reanimeBase,
+		flixBase:    flixBase,
 	}
 }
 
@@ -47,203 +54,144 @@ func (p *FlixCloudProvider) FindEpisodes(ctx context.Context, providerID string)
 	return nil, fmt.Errorf("flixcloud episode listing not implemented")
 }
 
-// FindEpisodeSource retains the legacy behavior for callers that do not provide
-// the frontend watch slug.
+type reanimeServer struct {
+	ID         string `json:"$id"`
+	ServerName string `json:"serverName"`
+	DataLink   string `json:"dataLink"`
+	DataType   string `json:"dataType"`
+}
+
+type reanimeResponse struct {
+	Success bool            `json:"success"`
+	Servers []reanimeServer `json:"servers"`
+}
+
 func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
-	slug, err := p.resolveSlug(ctx, providerID)
+	reanimeURL := fmt.Sprintf("%s/api/flix/%s/%d", p.reanimeBase, providerID, episode)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reanimeURL, nil)
 	if err != nil {
-		p.log.Debug().Err(err).Str("anilistId", providerID).Msg("flixcloud: slug not found, skipping")
-		return nil, nil
-	}
-	return p.FindEpisodeSourceWithSlug(ctx, providerID, slug, episode, lang)
-}
-
-// FindEpisodeSourceWithSlug uses the slug supplied by the frontend and avoids
-// the backend AniList title lookup.
-func (p *FlixCloudProvider) FindEpisodeSourceWithSlug(ctx context.Context, providerID, slug string, episode int, lang string) (*SourceResult, error) {
-	anilistID := providerID
-
-	// Scrape the watch page for FlixCloud access_ids.
-	accessIDs, detectedLang, err := p.scrapeAccessID(ctx, slug, episode)
-	if err != nil {
-		p.log.Debug().Err(err).Str("slug", slug).Int("episode", episode).Msg("flixcloud: access_id not found")
-		return nil, nil // silent skip
-	}
-
-	// "dual" means both sub and dub audio tracks — available for any request.
-	if detectedLang != "dual" && lang != "" && detectedLang != lang {
-		p.log.Debug().
-			Str("requested", lang).
-			Str("detected", detectedLang).
-			Str("slug", slug).
-			Int("episode", episode).
-			Msg("flixcloud: language mismatch, skipping")
-		return nil, nil
-	}
-
-	p.log.Info().
-		Str("anilistId", anilistID).
-		Str("slug", slug).
-		Int("episode", episode).
-		Strs("accessIds", accessIDs).
-		Str("detectedLang", detectedLang).
-		Msg("flixcloud: resolved")
-
-	// Map each access_id to a server: first → Yuta, second → Syota, rest → Syota.
-	serverNames := []string{"Yuta", "Syota"}
-	var sources []core.Source
-	for i := range accessIDs {
-		name := "Syota"
-		if i < len(serverNames) {
-			name = serverNames[i]
-		}
-		_ = name // name used only for logging context
-		sources = append(sources, core.Source{
-			URL:          fmt.Sprintf("https://flixcloud.cc/e/%s", accessIDs[i]),
-			Type:         "embed",
-			Quality:      "auto",
-			Verification: "embed",
-		})
-	}
-
-	return &SourceResult{
-		Sources: sources,
-		Headers: map[string]string{
-			"Referer": "https://animex.one/",
-		},
-	}, nil
-}
-
-// resolveSlug builds the AnimeX watch-page slug from the AniList title.
-// AnimeX URL format: /watch/{title-slug}-{anilistId}-episode-{ep}
-func (p *FlixCloudProvider) resolveSlug(ctx context.Context, anilistID string) (string, error) {
-	title, err := p.fetchAniListTitle(ctx, anilistID)
-	if err != nil {
-		return "", fmt.Errorf("anilist title fetch failed: %w", err)
-	}
-
-	slug := slugify(title) + "-" + anilistID
-	return slug, nil
-}
-
-// fetchAniListTitle queries AniList GraphQL for the English or romaji title.
-func (p *FlixCloudProvider) fetchAniListTitle(ctx context.Context, anilistID string) (string, error) {
-	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji}} }"}`
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co",
-		strings.NewReader(query))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
-		return "", err
-	}
-
-	var result struct {
-		Data struct {
-			Media struct {
-				Title struct {
-					English *string `json:"english"`
-					Romaji  *string `json:"romaji"`
-				} `json:"title"`
-			} `json:"Media"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
-	}
-
-	t := result.Data.Media.Title
-	if t.English != nil && *t.English != "" {
-		return *t.English, nil
-	}
-	if t.Romaji != nil && *t.Romaji != "" {
-		return *t.Romaji, nil
-	}
-	return "", fmt.Errorf("no title found for anilist %s", anilistID)
-}
-
-// slugify converts a title into an AnimeX-compatible URL slug.
-func slugify(title string) string {
-	lower := strings.ToLower(title)
-	var b strings.Builder
-	prevHyphen := false
-	for _, r := range lower {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
-			b.WriteRune(r)
-			prevHyphen = false
-		} else if r == ' ' || r == '-' || r == ':' || r == '\'' || r == '.' || r == ',' || r == '&' || r == '(' || r == ')' || r == '/' {
-			if !prevHyphen && b.Len() > 0 {
-				b.WriteRune('-')
-				prevHyphen = true
-			}
-		} else {
-			b.WriteRune(r)
-			prevHyphen = false
-		}
-	}
-	s := strings.TrimRight(b.String(), "-")
-	s = strings.ReplaceAll(s, "--", "-")
-	return s
-}
-
-// scrapeAccessID fetches the AnimeX watch page and extracts ALL FlixCloud
-// access_ids from the embedded SvelteKit SSR data. It also detects the
-// language (sub/dub/dual) based on the page content.
-func (p *FlixCloudProvider) scrapeAccessID(ctx context.Context, slug string, episode int) (accessIDs []string, lang string, err error) {
-	watchURL := fmt.Sprintf("https://animex.one/watch/%s-episode-%d", slug, episode)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, watchURL, nil)
-	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, "", err
+		p.log.Debug().Err(err).Str("anilistId", providerID).Int("episode", episode).Msg("flixcloud: reanime request failed")
+		return nil, nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("animeX returned %d", resp.StatusCode)
+		p.log.Debug().Int("status", resp.StatusCode).Str("anilistId", providerID).Msg("flixcloud: reanime returned non-200")
+		return nil, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, "", err
-	}
-	html := string(body)
-
-	// Extract ALL access_ids from the SvelteKit SSR resolve data.
-	pat := regexp.MustCompile(`access_id\s*:\s*"([a-zA-Z0-9]+)"`)
-	matches := pat.FindAllStringSubmatch(html, -1)
-	if len(matches) == 0 {
-		return nil, "", fmt.Errorf("access_id not found in watch page")
-	}
-	for _, m := range matches {
-		accessIDs = append(accessIDs, m[1])
+		return nil, err
 	}
 
-	// Detect language: AnimeX uses "sub", "dub", or "dual" in the audio field.
-	// "dual" means the source has both sub and dub audio tracks.
-	// Note: SvelteKit SSR uses unquoted keys (audio:"dual" not "audio":"dual").
-	lang = "sub"
-	lowerHTML := strings.ToLower(html)
-	if strings.Contains(lowerHTML, `audio:"dub"`) {
-		lang = "dub"
-	} else if strings.Contains(lowerHTML, `audio:"dual"`) {
-		lang = "dual"
+	var apiResp reanimeResponse
+	if err := json.Unmarshal(body, &apiResp); err != nil {
+		p.log.Debug().Err(err).Str("anilistId", providerID).Msg("flixcloud: reanime parse failed")
+		return nil, nil
 	}
 
-	return accessIDs, lang, nil
+	if !apiResp.Success || len(apiResp.Servers) == 0 {
+		p.log.Debug().Str("anilistId", providerID).Msg("flixcloud: no servers from reanime")
+		return nil, nil
+	}
+
+	type accessEntry struct {
+		id     string
+		subURL string
+		dubURL string
+	}
+	seen := make(map[string]*accessEntry)
+	var order []string
+
+	for _, s := range apiResp.Servers {
+		parts := strings.SplitN(s.ID, "-", 3)
+		accessID := s.ID
+		if len(parts) >= 3 {
+			accessID = parts[1]
+		}
+
+		if lang != "" && lang != "dual" && s.DataType != lang {
+			continue
+		}
+
+		embedURL := s.DataLink
+		if embedURL == "" {
+			embedURL = fmt.Sprintf("%s/e/%s?v=2", p.flixBase, accessID)
+		}
+
+		entry, exists := seen[accessID]
+		if !exists {
+			entry = &accessEntry{id: accessID}
+			seen[accessID] = entry
+			order = append(order, accessID)
+		}
+
+		switch s.DataType {
+		case "sub":
+			if entry.subURL == "" {
+				entry.subURL = embedURL
+			}
+		case "dub":
+			if entry.dubURL == "" {
+				entry.dubURL = embedURL
+			}
+		}
+	}
+
+	if len(order) == 0 {
+		return nil, nil
+	}
+
+	serverNames := []string{"Yuta", "Syota", "Mike"}
+	var sources []core.Source
+
+	for i, accessID := range order {
+		entry := seen[accessID]
+
+		name := "Mike"
+		if i < len(serverNames) {
+			name = serverNames[i]
+		}
+
+		p.log.Info().
+			Str("anilistId", providerID).
+			Int("episode", episode).
+			Str("accessId", accessID).
+			Str("serverName", name).
+			Msg("flixcloud: resolved")
+
+		if entry.subURL != "" {
+			sources = append(sources, core.Source{
+				URL:          entry.subURL,
+				Type:         "embed",
+				Quality:      "auto",
+				Verification: "embed",
+			})
+		}
+
+		if entry.dubURL != "" {
+			sources = append(sources, core.Source{
+				URL:          entry.dubURL,
+				Type:         "embed",
+				Quality:      "auto",
+				Verification: "embed",
+			})
+		}
+	}
+
+	if len(sources) == 0 {
+		return nil, nil
+	}
+
+	return &SourceResult{
+		Sources: sources,
+		Headers: map[string]string{},
+	}, nil
 }
