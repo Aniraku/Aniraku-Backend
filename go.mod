@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/go-chi/chi/v5 v5.1.0
-	github.com/golang-jwt/jwt/v5 v5.2.1
+	github.com/golang-jwt/jwt/v5 v5.2.2
 	github.com/refraction-networking/utls v1.8.2
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/viper v1.19.0
