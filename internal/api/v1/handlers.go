@@ -29,6 +29,7 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/metadata/mal"
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 	"github.com/Aniraku/Aniraku-Backend/internal/streaming"
+	"github.com/Aniraku/Aniraku-Backend/internal/tmdb"
 )
 
 var (
@@ -771,9 +772,34 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	anilistID := id
+
+	// Fetch AniZip (fast, one call) + Miruro (already cached by provider).
+	anizipData, _ := tmdb.FetchAniZipEpisodes(r.Context(), h.httpClient, anilistID)
 	thumbs := h.stream.GetEpisodeThumbnails(r.Context(), anilistID)
 	titles := h.stream.GetEpisodeTitles(r.Context(), anilistID)
 	fillerFlags, recapFlags := h.stream.GetEpisodeFlags(r.Context(), anilistID)
+
+	// TMDB: check persistent cache first, fetch if miss.
+	token := h.cfg.TMDB.ReadAccessToken
+	episodeNumbers := make([]int, episodeCount)
+	for i := range episodeNumbers {
+		episodeNumbers[i] = i + 1
+	}
+	tmdbByNumber := tmdb.GetCachedEpisodes(anilistID, episodeNumbers)
+	if tmdbByNumber == nil {
+		// Cache miss — fetch TMDB with generous timeout (blocks until done).
+		tmdbByNumber = map[int]*tmdb.EpisodeMetadata{}
+		fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 180*time.Second)
+		defer fetchCancel()
+		result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
+		if result != nil {
+			for _, ep := range result.Episodes {
+				tmdbByNumber[ep.Number] = ep
+			}
+		}
+		// Cache for next request.
+		tmdb.CacheEpisodes(anilistID, tmdbByNumber)
+	}
 
 	coverFallback := ""
 	if img, ok := media["coverImage"].(map[string]any); ok {
@@ -793,13 +819,49 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			"number": epNum,
 			"title":  fmt.Sprintf("Episode %d", epNum),
 		}
-		if thumb, ok := thumbs[epNum]; ok {
-			ep["thumbnail"] = thumb
-		} else if coverFallback != "" {
-			ep["thumbnail"] = coverFallback
+
+		// AniZip data (title is multi-language map, image is the thumbnail).
+		anizipKey := fmt.Sprintf("%d", epNum)
+		anizipEp, hasAnizip := anizipData[anizipKey]
+
+		// Merge: AniZip title → TMDB title → Miruro title → generic.
+		if hasAnizip {
+			if t := anizipEp.BestTitle(); t != "" {
+				ep["title"] = t
+			}
+			if anizipEp.Thumbnail != "" {
+				ep["thumbnail"] = anizipEp.Thumbnail
+			}
+			if anizipEp.Airdate != "" {
+				ep["airdate"] = anizipEp.Airdate
+			}
 		}
-		if title, ok := titles[epNum]; ok {
-			ep["title"] = title
+		if tmdbMeta, ok := tmdbByNumber[epNum]; ok {
+			if tmdbMeta.Title != "" {
+				ep["title"] = tmdbMeta.Title
+			}
+			if tmdbMeta.Thumbnail != nil && *tmdbMeta.Thumbnail != "" {
+				ep["thumbnail"] = *tmdbMeta.Thumbnail
+			}
+			if tmdbMeta.Description != nil && *tmdbMeta.Description != "" {
+				ep["description"] = *tmdbMeta.Description
+			}
+			if tmdbMeta.Airdate != nil && *tmdbMeta.Airdate != "" {
+				ep["airdate"] = *tmdbMeta.Airdate
+			}
+		}
+		// Miruro fallback for any remaining gaps.
+		if _, hasThumb := ep["thumbnail"]; !hasThumb {
+			if thumb, ok := thumbs[epNum]; ok {
+				ep["thumbnail"] = thumb
+			} else if coverFallback != "" {
+				ep["thumbnail"] = coverFallback
+			}
+		}
+		if ep["title"] == fmt.Sprintf("Episode %d", epNum) {
+			if title, ok := titles[epNum]; ok {
+				ep["title"] = title
+			}
 		}
 		if fillerFlags[epNum] {
 			ep["filler"] = true
@@ -992,7 +1054,36 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	proxyStreamResult(r, result)
 	h.respondJSON(w, http.StatusOK, result)
+}
+
+// proxyStreamResult makes the API response safe for browsers. Providers return
+// CDN URLs, but those URLs commonly reject browser CORS requests or require
+// headers that only the server-side proxy can supply. Returning them directly
+// bypasses /api/v1/proxy entirely, which is why the frontend can report a CDN
+// 403 even while proxy requests succeed in the backend logs.
+func proxyStreamResult(r *http.Request, result *core.StreamResult) {
+	if result == nil {
+		return
+	}
+	proxySources(r, result.Sources, result.Headers)
+}
+
+func proxySources(r *http.Request, sources []core.Source, headers map[string]string) {
+	headersJSON, err := json.Marshal(headers)
+	if err != nil {
+		return
+	}
+	headersParam := url.QueryEscape(string(headersJSON))
+	proxyBase := requestPublicBaseURL(r)
+	for i := range sources {
+		source := &sources[i]
+		if strings.ToLower(source.Type) != "hls" || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
+			continue
+		}
+		source.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(source.URL), headersParam)
+	}
 }
 
 func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
@@ -1025,6 +1116,7 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	proxyStreamResult(r, result)
 	h.respondJSON(w, http.StatusOK, result)
 }
 
@@ -1032,6 +1124,7 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	idStr := r.URL.Query().Get("animeId")
 	epStr := r.URL.Query().Get("episode")
 	lang := r.URL.Query().Get("lang")
+	genresStr := r.URL.Query().Get("genres")
 
 	if idStr == "" || epStr == "" {
 		h.respondError(w, http.StatusBadRequest, "animeId and episode are required")
@@ -1052,6 +1145,17 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse genres from comma-separated query param (e.g. "Hentai" or "Action,Comedy").
+	var genres []string
+	if genresStr != "" {
+		for _, g := range strings.Split(genresStr, ",") {
+			g = strings.TrimSpace(g)
+			if g != "" {
+				genres = append(genres, g)
+			}
+		}
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
 	if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
@@ -1060,7 +1164,10 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	// AniList-keyed; IDs are normalized at the search boundary.
 	anilistID := animeID
 
-	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang)
+	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang, genres)
+	for i := range servers {
+		proxySources(r, servers[i].Sources, servers[i].Headers)
+	}
 	h.respondJSON(w, http.StatusOK, servers)
 }
 
@@ -1145,6 +1252,21 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	// Set headers from query param
 	headersJSON := r.URL.Query().Get("headers")
 	applyProxyQueryHeaders(req, headersJSON)
+	// FlixCloud's m3u8 JWT is bound to the IP that hit the decrypt endpoint
+	// (the `client_ip` claim), and the CDN validates the actual TCP source IP
+	// of every request. It does not honor X-Forwarded-For, X-Real-IP, or
+	// CF-Connecting-IP for this check. The previous code sent the local proxy
+	// peer (often 127.0.0.1) in those headers, which could not fix an IP
+	// mismatch and could make the request misleading to diagnose.
+	if host := strings.ToLower(parsed.Hostname()); host == "fetch8.flixcloud.cc" || strings.HasSuffix(host, ".flixcloud.cc") {
+		if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+			h.log.Debug().
+				Str("proxy_url", decodedURL).
+				Str("r_remote_addr", r.RemoteAddr).
+				Str("jwt_client_ip_guess", clientIP).
+				Msg("flixcloud proxy: IP-bound JWT; verify Go egress IP matches the client_ip claim")
+		}
+	}
 
 	// Forward the client's Range header for media/segment requests so the
 	// video element can seek through the proxy. Without it every seek turns
@@ -1257,12 +1379,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Rewrite HLS playlist to route through proxy, passing custom headers
-		scheme := "https"
-		if r.TLS == nil && !strings.HasPrefix(r.Header.Get("X-Forwarded-Proto"), "https") {
-			scheme = "http"
-		}
-		proxyBase := scheme + "://" + r.Host
+		// Rewrite HLS playlist to route through the public API origin. Behind a
+		// reverse proxy, r.Host may be the loopback bind address; emitting that
+		// address makes a remote browser request 127.0.0.1 on its own machine.
+		proxyBase := requestPublicBaseURL(r)
 		rewritten := h.rewriteHLSPlaylist(string(body), decodedURL, headersJSON, proxyBase)
 		if len(rewritten) < 1500 {
 			h.log.Debug().Str("playlist_body", rewritten).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist")
@@ -1314,6 +1434,18 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func requestPublicBaseURL(r *http.Request) string {
+	scheme := "https"
+	if r.TLS == nil && !strings.EqualFold(strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Proto"), ",")[0]), "https") {
+		scheme = "http"
+	}
+	host := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0])
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
 }
 
 func proxyRedirectBlocked(status int) bool {

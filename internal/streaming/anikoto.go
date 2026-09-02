@@ -81,35 +81,93 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		Streams []struct {
 			URL       string          `json:"url"`
 			Type      string          `json:"type"`
+			Server    string          `json:"server"`
 			EmbedURL  string          `json:"embedUrl"`
+			Referer   string          `json:"referer"`
 			Subtitles []core.Subtitle `json:"subtitles"`
+			Intro     *struct {
+				Start float64 `json:"start"`
+				End   float64 `json:"end"`
+			} `json:"intro"`
+			Outro *struct {
+				Start float64 `json:"start"`
+				End   float64 `json:"end"`
+			} `json:"outro"`
 		} `json:"streams"`
+		Downloads []struct {
+			URL   string `json:"url"`
+			Label string `json:"label"`
+		} `json:"downloads"`
+		Headers map[string]string `json:"headers"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("anikoto anivexa response decode failed: %w", err)
 	}
 
 	var sources []core.Source
+	var intro, outro *core.SkipTimestamp
 	for _, stream := range payload.Streams {
-		playerURL := stream.EmbedURL
-		if playerURL == "" {
-			playerURL = stream.URL
+		hlsURL := strings.TrimSpace(stream.URL)
+		if hlsURL == "" {
+			hlsURL = strings.TrimSpace(stream.EmbedURL)
 		}
-		if playerURL == "" {
+		if hlsURL == "" {
 			continue
 		}
+		srcType := strings.ToLower(strings.TrimSpace(stream.Type))
+		if srcType == "" {
+			if strings.Contains(strings.ToLower(hlsURL), ".m3u8") {
+				srcType = "hls"
+			} else {
+				srcType = "hls"
+			}
+		}
+		if srcType == "hls" || strings.Contains(hlsURL, ".m3u8") {
+			srcType = "hls"
+		}
 		sources = append(sources, core.Source{
-			URL:          playerURL,
-			Type:         "embed",
+			URL:          hlsURL,
+			Type:         srcType,
 			Quality:      "auto",
 			Subtitles:    stream.Subtitles,
-			Verification: "embed",
+			Verification: "proxy",
 		})
+		if intro == nil && stream.Intro != nil {
+			intro = &core.SkipTimestamp{Start: stream.Intro.Start, End: stream.Intro.End}
+		}
+		if outro == nil && stream.Outro != nil {
+			outro = &core.SkipTimestamp{Start: stream.Outro.Start, End: stream.Outro.End}
+		}
 	}
 	if len(sources) == 0 {
 		return nil, nil
 	}
-	return &SourceResult{Sources: sources, Headers: map[string]string{}}, nil
+	var downloads []core.DownloadLink
+	for _, dl := range payload.Downloads {
+		u := strings.TrimSpace(dl.URL)
+		if u == "" {
+			continue
+		}
+		downloads = append(downloads, core.DownloadLink{URL: u, Label: strings.TrimSpace(dl.Label)})
+	}
+	headers := map[string]string{}
+	if len(payload.Headers) > 0 {
+		for k, v := range payload.Headers {
+			headers[k] = v
+		}
+	}
+	if headers["Referer"] == "" {
+		for _, s := range payload.Streams {
+			if s.Referer != "" {
+				headers["Referer"] = s.Referer
+				break
+			}
+		}
+	}
+	if headers["Referer"] == "" {
+		headers["Referer"] = "https://megaplay.buzz/"
+	}
+	return &SourceResult{Sources: sources, Headers: headers, Downloads: downloads, Intro: intro, Outro: outro}, nil
 }
 
 // resolveShow finds the AnikotoTV show slug and ID from an AniList ID.

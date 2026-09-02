@@ -21,6 +21,7 @@ var defaultCDNSuffixes = []string{
 	"kwik.cx", "ninstream.com", "ninstream.co",
 	// FlixCloud embed CDN
 	"flixcloud.cc", "flixcloud.com",
+	"fetch8.flixcloud.cc", "fetch9.flixcloud.cc", "fetch10.flixcloud.cc", "vault-95.atomic4cdn.top",
 	// Direct mp4 mirrors
 	"animegg.org",
 	// Wix-hosted video (repackager.wixmp.com)
@@ -84,6 +85,9 @@ var defaultCDNSuffixes = []string{
 	"fast4speed.com",
 	// Anikoto provider embed CDNs
 	"anikototv.to", "megaplay.buzz",
+	// Anikoto HLS CDNs (Anivexa - kryntal, atomic4cdn)
+	"kryntal.top", "cdn.kryntal.top",
+	"atomic4cdn.top", "vault-97.atomic4cdn.top", "vault-98.atomic4cdn.top",
 	// Observed Miruro provider CDN hosts (2026-08-04)
 	"mikora.top",
 	"mikora.site",

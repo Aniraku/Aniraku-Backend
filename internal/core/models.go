@@ -16,6 +16,7 @@ type Anime struct {
 	Season       *string  `json:"season"`
 	SeasonYear   *int     `json:"seasonYear"`
 	Genres       []string `json:"genres"`
+	IsAdult      bool     `json:"isAdult"`
 	Studios      []Studio `json:"studios"`
 	Trailer      *Trailer `json:"trailer"`
 	AverageScore *int     `json:"averageScore"`
@@ -113,11 +114,17 @@ type StreamRequest struct {
 	Refresh  bool   `json:"refresh"`  // bypass provider cache, try next internal provider
 }
 
+type DownloadLink struct {
+	URL   string `json:"url"`
+	Label string `json:"label"`
+}
+
 type StreamResult struct {
 	Sources   []Source          `json:"sources"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	Qualities []string          `json:"qualities,omitempty"`
 	Servers   []Server          `json:"servers,omitempty"` // working Miruro sub-providers
+	Downloads []DownloadLink    `json:"downloads,omitempty"`
 	// Intro/Outro are Miruro-provided skip segments (seconds). The client
 	// shows manual "Skip Intro / Skip Credits" buttons — never auto-skips.
 	Intro *SkipTimestamp `json:"intro,omitempty"`
@@ -130,11 +137,12 @@ type SkipTimestamp struct {
 }
 
 type Server struct {
-	Name     string            `json:"name"`     // e.g. "kiwi", "ally", "bee"
-	Provider string            `json:"provider"` // e.g. "miruro"
-	Lang     string            `json:"lang"`     // "sub" or "dub"
-	Sources  []Source          `json:"sources"`
-	Headers  map[string]string `json:"headers,omitempty"`
+	Name      string            `json:"name"`     // e.g. "kiwi", "ally", "bee"
+	Provider  string            `json:"provider"` // e.g. "miruro"
+	Lang      string            `json:"lang"`     // "sub" or "dub"
+	Sources   []Source          `json:"sources"`
+	Headers   map[string]string `json:"headers,omitempty"`
+	Downloads []DownloadLink    `json:"downloads,omitempty"`
 }
 
 type Source struct {

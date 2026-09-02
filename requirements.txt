@@ -1,3 +1,4 @@
-fastapi
-uvicorn
-vipertls
+# No Python required for backend runtime.
+# Former Miruro ViperTLS proxy (fastapi/uvicorn/vipertls) is disabled.
+# FlixCloud decrypt uses Node.js (see internal/streaming/decrypt.mjs).
+# Kept for reference; Docker no longer installs Python deps.

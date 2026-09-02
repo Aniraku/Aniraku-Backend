@@ -38,16 +38,20 @@ type Manager struct {
 // SetHostLearner registers the callback that receives provider-vouched hosts.
 func (m *Manager) SetHostLearner(fn func(host string)) {
 	m.LearnHost = fn
-	if miruro, ok := m.providers[0].(*MiruroProvider); ok {
-		miruro.SetHostLearner(fn)
+	for _, p := range m.providers {
+		if miruro, ok := p.(*MiruroProvider); ok {
+			miruro.SetHostLearner(fn)
+		}
 	}
 }
 
 // SetMediaProbe registers the playback-path gate (the media proxy) so
 // providers only serve sources that would actually play through it.
 func (m *Manager) SetMediaProbe(probe MediaProbe) {
-	if miruro, ok := m.providers[0].(*MiruroProvider); ok {
-		miruro.SetMediaProbe(probe)
+	for _, p := range m.providers {
+		if miruro, ok := p.(*MiruroProvider); ok {
+			miruro.SetMediaProbe(probe)
+		}
 	}
 }
 
@@ -71,8 +75,9 @@ type Episode struct {
 }
 
 type SourceResult struct {
-	Sources []core.Source
-	Headers map[string]string
+	Sources   []core.Source
+	Headers   map[string]string
+	Downloads []core.DownloadLink
 	// Intro/Outro are Miruro-provided skip segments, passed through to the
 	// client so it can offer manual skip buttons.
 	Intro *core.SkipTimestamp
@@ -84,8 +89,8 @@ func NewManager(log zerolog.Logger, miruroAPIBase string, httpClient *http.Clien
 		log:    log,
 		client: httpClient,
 	}
+	_ = miruroAPIBase
 	m.providers = []Provider{
-		NewMiruroProvider(log, miruroAPIBase),
 		NewFlixCloudProvider(log),
 		NewAnikotoProvider(log),
 	}
@@ -125,23 +130,51 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		return nil, fmt.Errorf("anikoto: no sources for this episode")
 	}
-	result, err := m.tryMiruro(ctx, animeID, episode, provider, lang, quality)
-	if err == nil && result != nil && len(result.Sources) > 0 {
-		return result, nil
+if provider == "miruro" {
+		return nil, fmt.Errorf("miruro provider is disabled - use flixcloud or anikoto")
 	}
-	// Fallback: try FlixCloud if Miruro failed
-	fcResult, fcErr := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
-	if fcErr == nil && fcResult != nil && len(fcResult.Sources) > 0 {
-		return fcResult, nil
+	if provider == "mimi" {
+		return nil, fmt.Errorf("mimi provider is disabled - use flixcloud or anikoto")
 	}
-	return nil, err
+	var lastErr error
+	candidates := []func() (*core.StreamResult, error){
+		func() (*core.StreamResult, error) { return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug) },
+		func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
+	}
+	for _, try := range candidates {
+		res, err := try()
+		if err == nil && res != nil && len(res.Sources) > 0 {
+			return res, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else if lastErr == nil {
+			lastErr = fmt.Errorf("no sources from provider")
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("no streaming source found for this episode")
+}
+
+// containsHentai returns true if the genre list contains the Hentai genre.
+func containsHentai(genres []string) bool {
+	for _, g := range genres {
+		if strings.EqualFold(g, "hentai") {
+			return true
+		}
+	}
+	return false
 }
 
 // FindAllServers lists every selectable server per lang (quality selection
 // preserved). Ordering is deterministic: best playback verdict first (proxy >
 // direct > embed > dead), then provider order. No server is hidden —
 // datacenter verdicts are hints, not filters.
-func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string) []core.Server {
+// genres is used to skip providers that should not serve certain content
+// (e.g. Anikoto is skipped for Hentai titles).
+func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) []core.Server {
 	if lang == "" {
 		lang = "sub"
 	}
@@ -187,7 +220,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		})
 	}
 
-	// FlixCloud servers (Yuta + Syota) — only when AnimeX has this episode.
+	// FlixCloud servers (Yuta, Syota, Mike) — embed URLs from Reanime API.
 	for _, prov := range m.providers {
 		fc, ok := prov.(*FlixCloudProvider)
 		if !ok {
@@ -198,9 +231,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		if err != nil || sr == nil || len(sr.Sources) == 0 {
 			continue // silent skip
 		}
-		serverNames := []string{"Yuta", "Syota"}
+		serverNames := []string{"Yuta", "Syota", "Mike"}
 		for i, src := range sr.Sources {
-			name := "Syota"
+			name := "Mike"
 			if i < len(serverNames) {
 				name = serverNames[i]
 			}
@@ -214,30 +247,33 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		}
 	}
 
-	// Anikoto servers (Niko + Momo) — scrapes anikototv.to for embed sources
-	for _, prov := range m.providers {
-		ak, ok := prov.(*AnikotoProvider)
-		if !ok {
-			continue
-		}
-		anilistID := fmt.Sprintf("%d", animeID)
-		sr, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
-			continue
-		}
-		serverNames := anikotoServers
-		for i, src := range sr.Sources {
-			name := serverNames[len(serverNames)-1]
-			if i < len(serverNames) {
-				name = serverNames[i]
+	// Anikoto servers (Niko + Momo) — skipped for Hentai titles.
+	if !containsHentai(genres) {
+		for _, prov := range m.providers {
+			ak, ok := prov.(*AnikotoProvider)
+			if !ok {
+				continue
 			}
-			allServers = append(allServers, core.Server{
-				Name:     name,
-				Provider: "anikoto",
-				Lang:     lang,
-				Sources:  []core.Source{src},
-				Headers:  sr.Headers,
-			})
+			anilistID := fmt.Sprintf("%d", animeID)
+			sr, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
+			if err != nil || sr == nil || len(sr.Sources) == 0 {
+				continue
+			}
+			serverNames := anikotoServers
+			for i, src := range sr.Sources {
+				name := serverNames[len(serverNames)-1]
+				if i < len(serverNames) {
+					name = serverNames[i]
+				}
+				allServers = append(allServers, core.Server{
+					Name:      name,
+					Provider:  "anikoto",
+					Lang:      lang,
+					Sources:   []core.Source{src},
+					Headers:   sr.Headers,
+					Downloads: sr.Downloads,
+				})
+			}
 		}
 	}
 
@@ -309,13 +345,7 @@ func (m *Manager) tryFlixCloudWithSlug(ctx context.Context, animeID int, episode
 	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying flixcloud")
 
 	anilistID := fmt.Sprintf("%d", animeID)
-	var source *SourceResult
-	var err error
-	if slug != "" {
-		source, err = fc.FindEpisodeSourceWithSlug(ctx, anilistID, slug, episode, lang)
-	} else {
-		source, err = fc.FindEpisodeSource(ctx, anilistID, episode, lang)
-	}
+	source, err := fc.FindEpisodeSource(ctx, anilistID, episode, lang)
 	if err != nil {
 		return nil, fmt.Errorf("flixcloud failed: %w", err)
 	}
@@ -369,6 +399,7 @@ func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core
 		Sources:   sources,
 		Headers:   result.Headers,
 		Qualities: qualities,
+		Downloads: result.Downloads,
 		Intro:     result.Intro,
 		Outro:     result.Outro,
 	}

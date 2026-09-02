@@ -31,12 +31,11 @@
           <a class="button button-secondary" href="#schedule">Live schedule</a>
         </div>
         <article class="request-card" aria-label="Example public API response">
-          <div class="request-bar"><div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div><span>GET /api/v1/trending?page=1&amp;perPage=8</span><button id="copy-request" type="button" aria-label="Copy sample request">COPY</button></div>
+          <div class="request-bar"><div class="window-dots" aria-hidden="true"><i></i><i></i><i></i></div><span>GET /api/v1/anime/21/episodes</span><button id="copy-request" type="button" aria-label="Copy sample request">COPY</button></div>
           <pre id="example-json"><code>{
-  <span class="key">"status"</span>: <span class="string">"public"</span>,
-  <span class="key">"route"</span>: <span class="string">"/api/v1/trending"</span>,
-  <span class="key">"data"</span>: [
-    { <span class="key">"title"</span>: <span class="string">"Anime record"</span>, <span class="key">"coverImage"</span>: <span class="string">"…"</span> }
+  <span class="key">"episodes"</span>: [
+    { <span class="key">"number"</span>: <span class="number">1</span>, <span class="key">"title"</span>: <span class="string">"I'm Luffy! The Man Who Will Become the Pirate King!"</span>, <span class="key">"thumbnail"</span>: <span class="string">"https://…"</span> },
+    { <span class="key">"number"</span>: <span class="number">2</span>, <span class="key">"title"</span>: <span class="string">"Enter the Great Swordsman!"</span> }
   ]
 }</code></pre>
         </article>
@@ -45,10 +44,10 @@
       <section id="about" class="section intro-section" aria-labelledby="inside-title">
         <div class="section-label">What the service offers</div>
         <div class="capability-grid">
-          <article><span class="capability-number">01</span><h2>Catalog discovery</h2><p>Browse public anime records, covers, titles, genres, and related metadata.</p></article>
-          <article><span class="capability-number">02</span><h2>Episode context</h2><p>Retrieve available episode and relation data from a focused, versioned route set.</p></article>
-          <article><span class="capability-number">03</span><h2>Airing outlook</h2><p>Surface a compact public schedule for upcoming anime releases and episode numbers.</p></article>
-          <article><span class="capability-number">04</span><h2>Account boundary</h2><p>Keep private favorites, progress, notifications, and sync operations behind Supabase authentication.</p></article>
+          <article><span class="capability-number">01</span><h2>Episode metadata</h2><p>Unlimited AniZip + TMDB (AniBridge verified + Fribb fallback, bidirectional) for titles/thumbnails per episode.</p></article>
+          <article><span class="capability-number">02</span><h2>Streaming</h2><p>FlixCloud (Node decrypt → hls + subtitles) + Anikoto, proxied via uTLS + SSRF guard.</p></article>
+          <article><span class="capability-number">03</span><h2>Airing outlook</h2><p>Public schedule via AniList proxy; catalog browse/search/trending are frontend-direct via AniList.</p></article>
+          <article><span class="capability-number">04</span><h2>Account boundary</h2><p>Private favorites, progress, notifications, and sync behind Supabase JWT/JWKS.</p></article>
         </div>
       </section>
 
@@ -59,13 +58,15 @@
         </div>
         <div id="endpoint-grid" class="endpoint-grid">
           <a class="endpoint-card" data-search="health status service" href="/api/v1/health" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/health</code><span>Service health signal</span></a>
-          <a class="endpoint-card" data-search="trending popular catalog anime" href="/api/v1/trending?page=1&amp;perPage=8" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/trending</code><span>Current public discovery list</span></a>
-          <a class="endpoint-card" data-search="search query catalog anime" href="/api/v1/search?q=cowboy" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/search?q=</code><span>Title and keyword lookup</span></a>
-          <a class="endpoint-card" data-search="anime details record information" href="/api/v1/anime/5" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id</code><span>Full public anime record</span></a>
-          <a class="endpoint-card" data-search="episodes anime episode list" href="/api/v1/anime/5/episodes" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/episodes</code><span>Episode context for a title</span></a>
+          <a class="endpoint-card" data-search="version build commit" href="/api/v1/version" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/version</code><span>Build version & commit</span></a>
+          <a class="endpoint-card" data-search="anime details record information" href="/api/v1/anime/5" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id</code><span>Full public anime record (AniList)</span></a>
+          <a class="endpoint-card" data-search="episodes anime episode list anizip tmdb" href="/api/v1/anime/21/episodes" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/episodes</code><span>Unlimited AniZip ↔ TMDB titles/thumbnails</span></a>
+          <a class="endpoint-card" data-search="similar recommendations" href="/api/v1/anime/21/similar" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/similar</code><span>Similar via AniList genre</span></a>
           <a class="endpoint-card" data-search="relations sequel prequel related" href="/api/v1/anime/5/relations" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/anime/:id/relations</code><span>Connected anime records</span></a>
-          <a class="endpoint-card" data-search="schedule airing releases calendar" href="/api/v1/schedule?page=1&amp;perPage=12" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/schedule</code><span>Upcoming public releases</span></a>
-          <a class="endpoint-card" data-search="genres catalog browse" href="/api/v1/genres" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/genres</code><span>Catalog classification data</span></a>
+          <a class="endpoint-card" data-search="stream playback hls flixcloud anikoto" href="/api/v1/stream" target="_blank" rel="noreferrer"><b>POST</b><code>/api/v1/stream</code><span>Stream + subtitles (hls)</span></a>
+          <a class="endpoint-card" data-search="servers available playback" href="/api/v1/servers?animeId=21&episode=1&lang=sub" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/servers</code><span>All servers per episode</span></a>
+          <a class="endpoint-card" data-search="proxy hls segment decrypt" href="/api/v1/proxy?url=" target="_blank" rel="noreferrer"><b>GET</b><code>/api/v1/proxy?url=</code><span>uTLS HLS proxy</span></a>
+          <a class="endpoint-card" data-search="anilist proxy graphql" href="/api/v1/anilist" target="_blank" rel="noreferrer"><b>POST</b><code>/api/v1/anilist</code><span>AniList GraphQL proxy</span></a>
         </div>
         <p id="filter-empty" class="filter-empty" hidden>No matching public endpoint. Try <code>catalog</code>, <code>episode</code>, or <code>schedule</code>.</p>
       </section>
@@ -77,11 +78,11 @@
         </div>
         <div id="date-strip" class="date-strip" role="tablist" aria-label="Airing days"></div>
         <div id="schedule-list" class="schedule-list" aria-live="polite"><p class="loading-message">Loading live public schedule…</p></div>
-        <div class="live-footnote"><span>Preview boundary</span><p>This concept reads only health, trending, and the established airing-data response through fixed local proxy routes. It does not expose authentication, account data, admin tools, proxies, or streaming controls.</p></div>
+        <div class="live-footnote"><span>Preview boundary</span><p>This preview reads only health, episodes (AniZip↔TMDB), and airing via AniList proxy. Catalog <code>search/trending/browse/genres/schedule</code> are now frontend-direct via AniList. No auth/stream/admin exposed.</p></div>
       </section>
 
       <section class="section trending-section" aria-labelledby="trending-title">
-        <div class="section-heading"><div><div class="section-label">Live catalog sample</div><h2 id="trending-title">Trending now</h2></div><span id="trending-count" class="data-count">Loading…</span></div>
+        <div class="section-heading"><div><div class="section-label">Live episode sample</div><h2 id="trending-title">Episodes — AniZip↔TMDB</h2></div><span id="trending-count" class="data-count">Loading…</span></div>
         <div id="trending-grid" class="trending-grid" aria-live="polite"></div>
       </section>
     </main>
