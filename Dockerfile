@@ -9,7 +9,6 @@ FROM node:22-alpine
 RUN apk add --no-cache ca-certificates curl
 WORKDIR /app
 COPY --from=gobuild /aniraku-server /app/aniraku-server
-COPY internal/streaming/decrypt.mjs /app/internal/streaming/decrypt.mjs
 COPY start.sh /start.sh
 RUN chmod +x /start.sh
 EXPOSE 43211
