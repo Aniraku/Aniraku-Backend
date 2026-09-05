@@ -86,7 +86,7 @@ var defaultCDNSuffixes = []string{
 	// Anikoto provider embed CDNs
 	"anikototv.to", "megaplay.buzz",
 	// Anikoto HLS CDNs (Anivexa - kryntal, atomic4cdn)
-	"kryntal.top", "cdn.kryntal.top",
+	"kryntal.top", "cdn.kryntal.top"," cdn.imgnex.top",
 	"atomic4cdn.top", "vault-97.atomic4cdn.top", "vault-98.atomic4cdn.top",
 	// Observed Miruro provider CDN hosts (2026-08-04)
 	"mikora.top",
