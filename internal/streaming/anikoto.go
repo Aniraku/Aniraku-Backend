@@ -20,6 +20,7 @@ import (
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
+	"github.com/Aniraku/Aniraku-Backend/internal/tmdb"
 )
 
 const (
@@ -912,9 +913,36 @@ func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID strin
 	return "", fmt.Errorf("no title found for anilistId=%s", anilistID)
 }
 
-// fetchAniListMeta queries AniList GraphQL for titles + synonyms (Anivexa
-// searches english, romaji and synonyms as separate keywords).
+// fetchAniListMeta resolves titles + synonyms (Anivexa searches english,
+// romaji and synonyms as separate keywords). Primary source is AniList
+// GraphQL; when AniList is down — it has recurring global outages (403
+// "temporarily disabled", 429 rate limits) — it falls back to AniZip, which
+// mirrors the same mappings keyed by AniList ID.
 func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string) (anilistMeta, error) {
+	meta, err := p.fetchAniListMetaUpstream(ctx, anilistID)
+	if err == nil {
+		return meta, nil
+	}
+	id, idErr := strconv.Atoi(anilistID)
+	if idErr != nil {
+		return meta, fmt.Errorf("anilist meta failed (%v); anizip fallback skipped (invalid id)", err)
+	}
+	az, azErr := tmdb.FetchAniZipMediaMeta(ctx, p.client, id)
+	if azErr != nil {
+		return meta, fmt.Errorf("anilist meta failed (%v) and anizip fallback failed (%v)", err, azErr)
+	}
+	return anilistMeta{
+		english:  az.English,
+		romaji:   az.Romaji,
+		synonyms: az.Synonyms,
+		episodes: az.EpisodeCount,
+	}, nil
+}
+
+// fetchAniListMetaUpstream is the direct AniList GraphQL lookup. It reports
+// real upstream failures (HTTP status, GraphQL error payload) instead of
+// misreporting them as "no title".
+func (p *AnikotoProvider) fetchAniListMetaUpstream(ctx context.Context, anilistID string) (anilistMeta, error) {
 	var out anilistMeta
 	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji} synonyms episodes format} }"}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co",
@@ -937,6 +965,10 @@ func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string
 	}
 
 	var result struct {
+		Errors []struct {
+			Message string `json:"message"`
+			Status  int    `json:"status"`
+		} `json:"errors"`
 		Data struct {
 			Media struct {
 				Title struct {
@@ -950,7 +982,13 @@ func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return out, err
+		return out, fmt.Errorf("anilist returned undecodable body (HTTP %d): %w", resp.StatusCode, err)
+	}
+	if len(result.Errors) > 0 {
+		return out, fmt.Errorf("anilist graphql error (HTTP %d): %s", resp.StatusCode, result.Errors[0].Message)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return out, fmt.Errorf("anilist returned HTTP %d", resp.StatusCode)
 	}
 
 	if result.Data.Media.Title.English != nil {

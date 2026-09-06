@@ -239,6 +239,88 @@ type AniZipResponse struct {
 	Episodes map[string]AniZipEpisode `json:"episodes"`
 }
 
+// AniZipMediaMeta carries show-level metadata from the AniZip mappings
+// endpoint: the title block (english/romaji/synonyms) and episode count.
+// Used as a fallback title source when AniList GraphQL is down.
+type AniZipMediaMeta struct {
+	English      string
+	Romaji       string
+	Synonyms     []string
+	EpisodeCount int
+}
+
+// FetchAniZipMediaMeta fetches show-level titles + episode count from AniZip
+// (same /mappings endpoint the episode fetch uses).
+func FetchAniZipMediaMeta(ctx context.Context, client *http.Client, anilistID int) (*AniZipMediaMeta, error) {
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	u := fmt.Sprintf("%s/mappings?anilist_id=%d", AniZipBase, anilistID)
+	key := cacheKey("anizip-meta", anilistID)
+	val, err := cached(key, EpisodeTTL, func() (any, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("anizip request failed: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			return nil, fmt.Errorf("anizip returned %d: %s", resp.StatusCode, string(body))
+		}
+		var raw struct {
+			Titles       map[string]json.RawMessage `json:"titles"`
+			EpisodeCount int                        `json:"episodeCount"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			return nil, fmt.Errorf("failed to decode anizip meta: %w", err)
+		}
+		out := &AniZipMediaMeta{EpisodeCount: raw.EpisodeCount}
+		for k, v := range raw.Titles {
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil && s != "" {
+				switch k {
+				case "english", "en":
+					if out.English == "" {
+						out.English = strings.TrimSpace(s)
+					}
+				case "romaji", "x-jat":
+					if out.Romaji == "" {
+						out.Romaji = strings.TrimSpace(s)
+					}
+				case "synonyms":
+					continue
+				}
+				continue
+			}
+			// "synonyms" is a list of strings.
+			if k == "synonyms" {
+				var list []string
+				if err := json.Unmarshal(v, &list); err == nil {
+					for _, s := range list {
+						if s = strings.TrimSpace(s); s != "" {
+							out.Synonyms = append(out.Synonyms, s)
+						}
+					}
+				}
+			}
+		}
+		if out.English == "" && out.Romaji == "" {
+			return nil, fmt.Errorf("anizip has no titles for anilist_id=%d", anilistID)
+		}
+		return out, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	meta, _ := val.(*AniZipMediaMeta)
+	return meta, nil
+}
+
 func FetchAniZipEpisodes(ctx context.Context, client *http.Client, anilistID int) (map[string]AniZipEpisode, error) {
 	if client == nil {
 		client = &http.Client{Timeout: RequestTimeout}
