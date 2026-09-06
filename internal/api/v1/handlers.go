@@ -1061,15 +1061,11 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 			continue
 		}
 		source.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(source.URL), headersParam)
-		// Proxy subtitle URLs so the client can fetch them through the same
-		// server that serves the video, avoiding CORS and CDN restrictions.
-		for j := range source.Subtitles {
-			sub := &source.Subtitles[j]
-			if sub.URL == "" || strings.Contains(sub.URL, "/api/v1/proxy?") {
-				continue
-			}
-			sub.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(sub.URL), headersParam)
-		}
+		// Subtitle URLs are delivered RAW: the web client wraps them with its
+		// own proxied() helper (which attaches headers + cache nonce). Wrapping
+		// them here too produced double-encoded URLs that 403 at the gate.
+		// Subtitle hosts are still vouched for the allowlist by the provider
+		// (learnURLHost), so the proxy accepts them.
 	}
 }
 
@@ -1660,6 +1656,15 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 	encKeyURI := ""
 	segmentNumRe := regexp.MustCompile(`segment-(\d+)-`)
 
+	// alreadyProxied reports whether a URI line is itself one of our proxy
+	// URLs. This happens when an upstream edge serves a stale cached copy of
+	// a previously rewritten playlist. Re-wrapping would double-encode the
+	// target and 403 at the proxy gate, so such URIs are passed through
+	// untouched — they already carry their own headers param.
+	alreadyProxied := func(u string) bool {
+		return strings.Contains(u, "/api/v1/proxy?")
+	}
+
 	for i, line := range lines {
 		original := strings.TrimSpace(line)
 
@@ -1673,6 +1678,9 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 				}
 				uri := strings.Trim(parts[1], "\"")
 				absoluteURL := resolveURL(uri, basePrefix)
+				if alreadyProxied(absoluteURL) {
+					return match
+				}
 				learnPlaylistTarget(absoluteURL)
 				if needsProxyRewrite(absoluteURL) || headersJSON != "" {
 					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
@@ -1708,6 +1716,10 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 			absoluteURL = "https:" + original
 		} else {
 			absoluteURL = basePrefix + "/" + original
+		}
+		if alreadyProxied(absoluteURL) {
+			lines[i] = original
+			continue
 		}
 		learnPlaylistTarget(absoluteURL)
 
