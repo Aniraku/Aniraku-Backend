@@ -206,9 +206,9 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 				outro = &core.SkipTimestamp{Start: skip["outro"][0], End: skip["outro"][1]}
 			}
 		}
-		// No cap (Anivexa parity): every verified server lists; the
-		// manager names the first two Niko/Momo, extras take Momo.
+	// No cap (Anivexa parity): every verified server lists.
 	}
+	sources = dedupeSourcesByURL(sources)
 	if len(sources) == 0 {
 		return nil, nil
 	}
@@ -222,6 +222,25 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		Intro:     intro,
 		Outro:     outro,
 	}, nil
+}
+
+// dedupeSourcesByURL collapses sources that resolved to the same file under
+// different server names, keeping the copy with the richer subtitle track
+// list so the server list never shows the same stream twice.
+func dedupeSourcesByURL(sources []core.Source) []core.Source {
+	best := make(map[string]int, len(sources))
+	out := make([]core.Source, 0, len(sources))
+	for _, s := range sources {
+		if idx, ok := best[s.URL]; ok {
+			if len(s.Subtitles) > len(out[idx].Subtitles) {
+				out[idx] = s
+			}
+			continue
+		}
+		best[s.URL] = len(out)
+		out = append(out, s)
+	}
+	return out
 }
 
 // megaplayTrack is one subtitle/caption entry from /stream/getSources.

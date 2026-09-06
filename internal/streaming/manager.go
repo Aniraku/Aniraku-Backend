@@ -218,6 +218,37 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	return allServers
 }
 
+// appendNamedServers maps a provider's source list onto display names
+// (Niko/Momo, Yuta/Syota/Mike, ...). When there are more sources than names,
+// extras collide on the last name — on a collision the source with the
+// richer subtitle track list wins, the other is dropped, so a display name
+// never appears twice in the server list.
+func appendNamedServers(out []core.Server, serverNames []string, provider, lang string, sr *SourceResult) []core.Server {
+	nameIndex := make(map[string]int, len(serverNames))
+	for i, src := range sr.Sources {
+		name := serverNames[len(serverNames)-1]
+		if i < len(serverNames) {
+			name = serverNames[i]
+		}
+		if idx, ok := nameIndex[name]; ok {
+			if len(src.Subtitles) > len(out[idx].Sources[0].Subtitles) {
+				out[idx].Sources = []core.Source{src}
+			}
+			continue
+		}
+		nameIndex[name] = len(out)
+		out = append(out, core.Server{
+			Name:      name,
+			Provider:  provider,
+			Lang:      lang,
+			Sources:   []core.Source{src},
+			Headers:   sr.Headers,
+			Downloads: sr.Downloads,
+		})
+	}
+	return out
+}
+
 // collectFlixServers maps FlixCloud sources to Yuta/Syota/Mike servers.
 func (m *Manager) collectFlixServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
@@ -230,20 +261,7 @@ func (m *Manager) collectFlixServers(ctx context.Context, anilistID string, epis
 		if err != nil || sr == nil || len(sr.Sources) == 0 {
 			continue // silent skip
 		}
-		serverNames := []string{"Yuta", "Syota", "Mike"}
-		for i, src := range sr.Sources {
-			name := "Mike"
-			if i < len(serverNames) {
-				name = serverNames[i]
-			}
-			out = append(out, core.Server{
-				Name:     name,
-				Provider: "flixcloud",
-				Lang:     lang,
-				Sources:  []core.Source{src},
-				Headers:  sr.Headers,
-			})
-		}
+		out = appendNamedServers(out, []string{"Yuta", "Syota", "Mike"}, "flixcloud", lang, sr)
 	}
 	return out
 }
@@ -260,21 +278,7 @@ func (m *Manager) collectAnikotoServers(ctx context.Context, anilistID string, e
 		if err != nil || sr == nil || len(sr.Sources) == 0 {
 			continue
 		}
-		serverNames := anikotoServers
-		for i, src := range sr.Sources {
-			name := serverNames[len(serverNames)-1]
-			if i < len(serverNames) {
-				name = serverNames[i]
-			}
-			out = append(out, core.Server{
-				Name:      name,
-				Provider:  "anikoto",
-				Lang:      lang,
-				Sources:   []core.Source{src},
-				Headers:   sr.Headers,
-				Downloads: sr.Downloads,
-			})
-		}
+		out = appendNamedServers(out, anikotoServers[:], "anikoto", lang, sr)
 	}
 	return out
 }
