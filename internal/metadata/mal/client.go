@@ -133,11 +133,11 @@ func (c *Client) do(ctx context.Context, path string, out any) error {
 // --- Jikan response types ---
 
 type jikanAnime struct {
-	MALID       int    `json:"mal_id"`
-	Title       string `json:"title"`
-	TitleEnglish string `json:"title_english"`
+	MALID         int    `json:"mal_id"`
+	Title         string `json:"title"`
+	TitleEnglish  string `json:"title_english"`
 	TitleJapanese string `json:"title_japanese"`
-	Images      struct {
+	Images        struct {
 		JPG struct {
 			ImageURL      string `json:"image_url"`
 			SmallImageURL string `json:"small_image_url"`
@@ -149,20 +149,20 @@ type jikanAnime struct {
 			LargeImageURL string `json:"large_image_url"`
 		} `json:"webp"`
 	} `json:"images"`
-	Type        string  `json:"type"`
-	Source      string  `json:"source"`
-	Episodes    *int    `json:"episodes"`
-	Status      string  `json:"status"`
-	Airing      bool    `json:"airing"`
-	Score       float64 `json:"score"`
-	ScoredBy    int     `json:"scored_by"`
-	Rank        int     `json:"rank"`
-	Popularity  int     `json:"popularity"`
-	Members     int     `json:"members"`
-	Synopsis    string  `json:"synopsis"`
-	Season      string  `json:"season"`
-	Year        *int    `json:"year"`
-	Genres      []struct {
+	Type       string  `json:"type"`
+	Source     string  `json:"source"`
+	Episodes   *int    `json:"episodes"`
+	Status     string  `json:"status"`
+	Airing     bool    `json:"airing"`
+	Score      float64 `json:"score"`
+	ScoredBy   int     `json:"scored_by"`
+	Rank       int     `json:"rank"`
+	Popularity int     `json:"popularity"`
+	Members    int     `json:"members"`
+	Synopsis   string  `json:"synopsis"`
+	Season     string  `json:"season"`
+	Year       *int    `json:"year"`
+	Genres     []struct {
 		MALID int    `json:"mal_id"`
 		Name  string `json:"name"`
 	} `json:"genres"`
@@ -195,13 +195,13 @@ type jikanAnime struct {
 }
 
 type jikanSearchResponse struct {
-	Data []jikanAnime `json:"data"`
+	Data       []jikanAnime `json:"data"`
 	Pagination struct {
-		LastVisiblePage int `json:"last_visible_page"`
+		LastVisiblePage int  `json:"last_visible_page"`
 		HasNextPage     bool `json:"has_next_page"`
-		Items struct {
-			Count int `json:"count"`
-			Total int `json:"total"`
+		Items           struct {
+			Count   int `json:"count"`
+			Total   int `json:"total"`
 			PerPage int `json:"per_page"`
 		} `json:"items"`
 	} `json:"pagination"`
@@ -320,21 +320,21 @@ func mapAnime(j jikanAnime) anilist.Anime {
 	}
 
 	return anilist.Anime{
-		ID:          j.MALID, // ponytail: MAL ID as primary (we map to AniList for streaming)
-		Title:       anilist.Title{Romaji: rom, English: eng, Native: nat},
-		Description: j.Synopsis,
-		CoverImage:  img,
-		BannerImage: nil,
-		Episodes:    j.Episodes,
-		Duration:    nil,
-		Status:      status,
-		Format:      format,
-		Season:      season,
-		SeasonYear:  j.Year,
-		Genres:      genres,
+		ID:           j.MALID, // ponytail: MAL ID as primary (we map to AniList for streaming)
+		Title:        anilist.Title{Romaji: rom, English: eng, Native: nat},
+		Description:  j.Synopsis,
+		CoverImage:   img,
+		BannerImage:  nil,
+		Episodes:     j.Episodes,
+		Duration:     nil,
+		Status:       status,
+		Format:       format,
+		Season:       season,
+		SeasonYear:   j.Year,
+		Genres:       genres,
 		AverageScore: avg,
-		Popularity:  j.Popularity,
-		Trailer:     trailer,
+		Popularity:   j.Popularity,
+		Trailer:      trailer,
 	}
 }
 

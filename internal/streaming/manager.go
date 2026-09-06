@@ -152,7 +152,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	// Anikoto direct first, FlixCloud embed fallback.
 	candidates := []func() (*core.StreamResult, error){
 		func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
-		func() (*core.StreamResult, error) { return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug) },
+		func() (*core.StreamResult, error) {
+			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+		},
 	}
 	for _, try := range candidates {
 		res, err := try()

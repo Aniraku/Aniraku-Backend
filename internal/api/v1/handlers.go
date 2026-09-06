@@ -483,14 +483,14 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		CheckRedirect: netguard.NoRedirects,
 	}
 	h := &Handlers{
-		cfg:            cfg,
-		log:            log,
-		mal:            mal.NewClient(log),
-		stream:         streaming.NewManager(log),
-		h2Client:       &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
-		h1Client:       &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
-		httpClient:     httpClient,
-		goTLSClient:    goTLSClient,
+		cfg:         cfg,
+		log:         log,
+		mal:         mal.NewClient(log),
+		stream:      streaming.NewManager(log),
+		h2Client:    &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
+		h1Client:    &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
+		httpClient:  httpClient,
+		goTLSClient: goTLSClient,
 		// Full-file downloads: no client timeout (the request context bounds
 		// the transfer), SSRF-guarded transport, redirects refused.
 		downloadClient: netguard.NewHTTPClient(0),
@@ -1181,10 +1181,14 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store, private")
 	origin := r.Header.Get("Origin")
 	switch {
-	case origin == "":
-		w.Header().Set("Access-Control-Allow-Origin", "*")
 	case middleware.IsAllowedOrigin(origin):
 		w.Header().Set("Access-Control-Allow-Origin", origin)
+	default:
+		// Absent or unknown origin: media here is public (allowlisted CDNs
+		// only) and the proxy is never called with credentials, so '*' is
+		// safe and keeps playback working from any origin without letting
+		// untrusted sites read credentialed responses.
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 	}
 
 	targetURL := r.URL.Query().Get("url")
@@ -2271,12 +2275,12 @@ func (h *Handlers) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 	// could otherwise carry id, email, role or any other column straight
 	// into the PostgREST PATCH.
 	allowed := map[string]bool{
-		"username":    true,
+		"username":     true,
 		"display_name": true,
-		"avatar_url":  true,
-		"bio":         true,
-		"location":    true,
-		"socials":     true,
+		"avatar_url":   true,
+		"bio":          true,
+		"location":     true,
+		"socials":      true,
 	}
 	filtered := make(map[string]any, len(input))
 	for key, value := range input {

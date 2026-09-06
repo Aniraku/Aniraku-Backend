@@ -1,21 +1,21 @@
 package anilist
 
 type Anime struct {
-	ID               int      `json:"id"`
-	IDMal            *int     `json:"idMal"`
-	IsAdult          bool     `json:"isAdult"`
-	Title            Title    `json:"title"`
-	Description      string   `json:"description"`
-	CoverImage       Image    `json:"coverImage"`
-	BannerImage      *string  `json:"bannerImage"`
-	Episodes         *int     `json:"episodes"`
-	Duration         *int     `json:"duration"`
-	Status           string   `json:"status"`
-	Format           string   `json:"format"`
-	Season           *string  `json:"season"`
-	SeasonYear       *int     `json:"seasonYear"`
-	Genres           []string `json:"genres"`
-	Studios          struct {
+	ID          int      `json:"id"`
+	IDMal       *int     `json:"idMal"`
+	IsAdult     bool     `json:"isAdult"`
+	Title       Title    `json:"title"`
+	Description string   `json:"description"`
+	CoverImage  Image    `json:"coverImage"`
+	BannerImage *string  `json:"bannerImage"`
+	Episodes    *int     `json:"episodes"`
+	Duration    *int     `json:"duration"`
+	Status      string   `json:"status"`
+	Format      string   `json:"format"`
+	Season      *string  `json:"season"`
+	SeasonYear  *int     `json:"seasonYear"`
+	Genres      []string `json:"genres"`
+	Studios     struct {
 		Edges []struct {
 			Node struct {
 				Name string `json:"name"`
@@ -26,12 +26,12 @@ type Anime struct {
 		ID   string `json:"id"`
 		Site string `json:"site"`
 	} `json:"trailer"`
-	AverageScore       *int `json:"averageScore"`
-	MeanScore          *int `json:"meanScore"`
-	Popularity         int  `json:"popularity"`
-	NextAiringEpisode  *struct {
-		Episode    int  `json:"episode"`
-		AiringAt   int  `json:"airingAt"`
+	AverageScore      *int `json:"averageScore"`
+	MeanScore         *int `json:"meanScore"`
+	Popularity        int  `json:"popularity"`
+	NextAiringEpisode *struct {
+		Episode         int `json:"episode"`
+		AiringAt        int `json:"airingAt"`
 		TimeUntilAiring int `json:"timeUntilAiring"`
 	} `json:"nextAiringEpisode"`
 }
@@ -44,9 +44,9 @@ type Title struct {
 }
 
 type Image struct {
-	ExtraLarge string `json:"extraLarge"`
-	Large      string `json:"large"`
-	Medium     string `json:"medium"`
+	ExtraLarge string  `json:"extraLarge"`
+	Large      string  `json:"large"`
+	Medium     string  `json:"medium"`
 	Color      *string `json:"color"`
 }
 
@@ -68,13 +68,13 @@ type BrowseResponse struct {
 }
 
 type BrowseFilters struct {
-	Genre    []string
-	Format   []string
-	Status   []string
-	Season   string
-	Year     int
-	Sort     string
-	Search   string
+	Genre  []string
+	Format []string
+	Status []string
+	Season string
+	Year   int
+	Sort   string
+	Search string
 }
 
 type RelationAnime struct {

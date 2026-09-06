@@ -217,7 +217,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 				outro = &core.SkipTimestamp{Start: skip["outro"][0], End: skip["outro"][1]}
 			}
 		}
-	// No cap (Anivexa parity): every verified server lists.
+		// No cap (Anivexa parity): every verified server lists.
 	}
 	sources = dedupeSourcesByURL(sources)
 	if len(sources) == 0 {
@@ -277,9 +277,9 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 			Subtitles:    subs,
 			Verification: "proxy",
 		}},
-		Headers:   map[string]string{"Referer": strings.TrimSuffix(origin, "/") + "/"},
-		Intro:     inTs,
-		Outro:     outTs,
+		Headers: map[string]string{"Referer": strings.TrimSuffix(origin, "/") + "/"},
+		Intro:   inTs,
+		Outro:   outTs,
 	}, nil
 }
 
@@ -687,13 +687,13 @@ func parseTitleAnchors(html string) []titleCand {
 				continue
 			}
 			seen[slug] = true
-		name, jp := "", ""
-		if withJp {
-			jp = strings.TrimSpace(m[2])
-			name = strings.TrimSpace(stripHTMLTags(m[3]))
-		} else {
-			name = strings.TrimSpace(stripHTMLTags(m[2]))
-		}
+			name, jp := "", ""
+			if withJp {
+				jp = strings.TrimSpace(m[2])
+				name = strings.TrimSpace(stripHTMLTags(m[3]))
+			} else {
+				name = strings.TrimSpace(stripHTMLTags(m[2]))
+			}
 			name = strings.ReplaceAll(name, "&amp;", "&")
 			if name == "" {
 				name = slug

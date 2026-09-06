@@ -15,9 +15,9 @@ var defaultMappingData []byte
 
 // AnikotoMapping maps an AniList ID to an AnikotoTV show entry.
 type AnikotoMapping struct {
-	ShowID  string `json:"show_id"`
-	Slug    string `json:"slug"`
-	Title   string `json:"title,omitempty"`
+	ShowID string `json:"show_id"`
+	Slug   string `json:"slug"`
+	Title  string `json:"title,omitempty"`
 }
 
 var (

@@ -28,21 +28,21 @@ func loadEnv(path string) {
 }
 
 type Config struct {
-	Server    ServerConfig   `mapstructure:"server"`
-	Supabase  SupabaseConfig `mapstructure:"supabase"`
-	Logging   LoggingConfig  `mapstructure:"logging"`
-	Update    UpdateConfig   `mapstructure:"update"`
-	Sync      SyncConfig     `mapstructure:"sync"`
-	TMDB      TMDBConfig     `mapstructure:"tmdb"`
-	Scraping  ScrapingConfig `mapstructure:"scraping"`
+	Server   ServerConfig   `mapstructure:"server"`
+	Supabase SupabaseConfig `mapstructure:"supabase"`
+	Logging  LoggingConfig  `mapstructure:"logging"`
+	Update   UpdateConfig   `mapstructure:"update"`
+	Sync     SyncConfig     `mapstructure:"sync"`
+	TMDB     TMDBConfig     `mapstructure:"tmdb"`
+	Scraping ScrapingConfig `mapstructure:"scraping"`
 }
 
 type SyncConfig struct {
 	// OAuth credentials for MAL / AniList watch-progress sync. Leave
 	// empty to disable the feature — the UI shows "not configured".
-	MALClientID       string `mapstructure:"mal_client_id"`
-	MALClientSecret   string `mapstructure:"mal_client_secret"`
-	AniListClientID   string `mapstructure:"anilist_client_id"`
+	MALClientID         string `mapstructure:"mal_client_id"`
+	MALClientSecret     string `mapstructure:"mal_client_secret"`
+	AniListClientID     string `mapstructure:"anilist_client_id"`
 	AniListClientSecret string `mapstructure:"anilist_client_secret"`
 	// RedirectURL is the registered OAuth redirect URI — the frontend's
 	// /sync/callback route (e.g. https://aniraku.app/sync/callback).
@@ -52,7 +52,7 @@ type SyncConfig struct {
 	StateSecret string `mapstructure:"oauth_state_secret"`
 }
 
-func (s *SyncConfig) MALConfigured() bool  { return s.MALClientID != "" }
+func (s *SyncConfig) MALConfigured() bool     { return s.MALClientID != "" }
 func (s *SyncConfig) AniListConfigured() bool { return s.AniListClientID != "" }
 
 type ServerConfig struct {
@@ -71,9 +71,9 @@ type TMDBConfig struct {
 }
 
 type ScrapingConfig struct {
-	AnimeXBase   string `mapstructure:"animex_base"`
+	AnimeXBase    string `mapstructure:"animex_base"`
 	FlixCloudBase string `mapstructure:"flixcloud_base"`
-	AniZipBase   string `mapstructure:"anizip_base"`
+	AniZipBase    string `mapstructure:"anizip_base"`
 }
 
 type SupabaseConfig struct {

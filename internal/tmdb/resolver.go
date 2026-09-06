@@ -17,14 +17,14 @@ import (
 )
 
 const (
-	TMDBAPIBase           = "https://api.themoviedb.org/3"
-	TMDBImageBase         = "https://image.tmdb.org/t/p/w780"
-	AnibridgeMappingsAPI  = "https://mappings.anibridge.eliasbenb.dev/api/v3/mappings"
-	MaxEpisodeNumbers     = 2000
-	MappingResponseLimit  = 100
-	RequestTimeout        = 30 * time.Second
-	MappingTTL            = 24 * time.Hour
-	EpisodeTTL            = 5 * time.Minute
+	TMDBAPIBase          = "https://api.themoviedb.org/3"
+	TMDBImageBase        = "https://image.tmdb.org/t/p/w780"
+	AnibridgeMappingsAPI = "https://mappings.anibridge.eliasbenb.dev/api/v3/mappings"
+	MaxEpisodeNumbers    = 2000
+	MappingResponseLimit = 100
+	RequestTimeout       = 30 * time.Second
+	MappingTTL           = 24 * time.Hour
+	EpisodeTTL           = 5 * time.Minute
 )
 
 var (
@@ -996,9 +996,9 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 	}
 	// continuation groups for open-ended
 	type contGroup struct {
-		showId           int
+		showId            int
 		afterSeasonNumber int
-		targetNumbers    map[int]bool
+		targetNumbers     map[int]bool
 	}
 	contGroups := map[string]*contGroup{}
 	for _, n := range nums {
@@ -1121,10 +1121,10 @@ var fribbCache struct {
 }
 
 type fribbEntry struct {
-	AnilistID    int `json:"anilist_id"`
+	AnilistID    int    `json:"anilist_id"`
 	Type         string `json:"type"`
 	ThemoviedbID struct {
-		TV    any `json:"tv"`    // int or null
+		TV    any   `json:"tv"` // int or null
 		Movie []int `json:"movie"`
 	} `json:"themoviedb_id"`
 	Season struct {

@@ -25,7 +25,7 @@ type Client struct {
 	log     zerolog.Logger
 
 	mu      sync.RWMutex
-	idMap   map[int]int  // anilistID -> kitsuID
+	idMap   map[int]int // anilistID -> kitsuID
 	cache   map[string]ce
 	pendMu  sync.Mutex
 	pending map[string]chan struct{}
@@ -50,17 +50,17 @@ func NewClient(log zerolog.Logger) *Client {
 // --- Kitsu JSON:API response types ---
 
 type kaDoc struct {
-	Data     kaRes        `json:"data"`
-	Included []kaRes      `json:"included,omitempty"`
-	Meta     *kaMeta      `json:"meta,omitempty"`
-	Links    *kaLinks     `json:"links,omitempty"`
+	Data     kaRes    `json:"data"`
+	Included []kaRes  `json:"included,omitempty"`
+	Meta     *kaMeta  `json:"meta,omitempty"`
+	Links    *kaLinks `json:"links,omitempty"`
 }
 
 type kaList struct {
-	Data     []kaRes      `json:"data"`
-	Included []kaRes      `json:"included,omitempty"`
-	Meta     *kaMeta      `json:"meta,omitempty"`
-	Links    *kaLinks     `json:"links,omitempty"`
+	Data     []kaRes  `json:"data"`
+	Included []kaRes  `json:"included,omitempty"`
+	Meta     *kaMeta  `json:"meta,omitempty"`
+	Links    *kaLinks `json:"links,omitempty"`
 }
 
 type kaRes struct {
@@ -83,28 +83,28 @@ type kaLinks struct {
 // --- Kitsu anime attributes ---
 
 type kaAnime struct {
-	Slug             string         `json:"slug"`
-	Synopsis         string         `json:"synopsis"`
-	CanonicalTitle   string         `json:"canonicalTitle"`
-	Titles           kaTitles       `json:"titles"`
-	AverageRating    *string        `json:"averageRating"`
-	UserCount        int            `json:"userCount"`
-	FavoritesCount   int            `json:"favoritesCount"`
-	PopularityRank   int            `json:"popularityRank"`
-	RatingRank       int            `json:"ratingRank"`
-	Subtype          string         `json:"subtype"`
-	Status           string         `json:"status"`
-	NSFW             bool           `json:"nsfw"`
-	EpisodeCount     *int           `json:"episodeCount"`
-	EpisodeLength    *int           `json:"episodeLength"`
-	TotalLength      *int           `json:"totalLength"`
-	StartDate        *string        `json:"startDate"`
-	EndDate          *string        `json:"endDate"`
-	AgeRating        string         `json:"ageRating"`
-	YoutubeVideoID   string         `json:"youtubeVideoId"`
-	PosterImage      kaImage        `json:"posterImage"`
-	CoverImage       *kaCover       `json:"coverImage"`
-	AbbreviatedTitles []string      `json:"abbreviatedTitles"`
+	Slug              string   `json:"slug"`
+	Synopsis          string   `json:"synopsis"`
+	CanonicalTitle    string   `json:"canonicalTitle"`
+	Titles            kaTitles `json:"titles"`
+	AverageRating     *string  `json:"averageRating"`
+	UserCount         int      `json:"userCount"`
+	FavoritesCount    int      `json:"favoritesCount"`
+	PopularityRank    int      `json:"popularityRank"`
+	RatingRank        int      `json:"ratingRank"`
+	Subtype           string   `json:"subtype"`
+	Status            string   `json:"status"`
+	NSFW              bool     `json:"nsfw"`
+	EpisodeCount      *int     `json:"episodeCount"`
+	EpisodeLength     *int     `json:"episodeLength"`
+	TotalLength       *int     `json:"totalLength"`
+	StartDate         *string  `json:"startDate"`
+	EndDate           *string  `json:"endDate"`
+	AgeRating         string   `json:"ageRating"`
+	YoutubeVideoID    string   `json:"youtubeVideoId"`
+	PosterImage       kaImage  `json:"posterImage"`
+	CoverImage        *kaCover `json:"coverImage"`
+	AbbreviatedTitles []string `json:"abbreviatedTitles"`
 }
 
 type kaTitles struct {
@@ -115,10 +115,10 @@ type kaTitles struct {
 }
 
 type kaImage struct {
-	Tiny    string `json:"tiny"`
-	Large   string `json:"large"`
-	Small   string `json:"small"`
-	Medium  string `json:"medium"`
+	Tiny     string `json:"tiny"`
+	Large    string `json:"large"`
+	Small    string `json:"small"`
+	Medium   string `json:"medium"`
 	Original string `json:"original"`
 }
 
@@ -137,10 +137,10 @@ type kaRelList struct {
 }
 
 type kaRelEdge struct {
-	ID            string               `json:"id"`
-	Type          string               `json:"type"`
-	Attributes    kaRelEdgeAttr        `json:"attributes"`
-	Relationships kaRelEdgeRel         `json:"relationships"`
+	ID            string        `json:"id"`
+	Type          string        `json:"type"`
+	Attributes    kaRelEdgeAttr `json:"attributes"`
+	Relationships kaRelEdgeRel  `json:"relationships"`
 }
 
 type kaRelEdgeAttr struct {
@@ -330,13 +330,17 @@ func mapAnime(kid string, attrs kaAnime) anilist.Anime {
 			month, _ := strconv.Atoi(parts[1])
 			switch {
 			case month >= 3 && month <= 5:
-				s := "SPRING"; season = &s
+				s := "SPRING"
+				season = &s
 			case month >= 6 && month <= 8:
-				s := "SUMMER"; season = &s
+				s := "SUMMER"
+				season = &s
 			case month >= 9 && month <= 11:
-				s := "FALL"; season = &s
+				s := "FALL"
+				season = &s
 			default:
-				s := "WINTER"; season = &s
+				s := "WINTER"
+				season = &s
 			}
 			if len(parts) >= 1 {
 				y, _ := strconv.Atoi(parts[0])
@@ -402,26 +406,26 @@ func mapAnime(kid string, attrs kaAnime) anilist.Anime {
 	}
 
 	return anilist.Anime{
-		ID:          0, // filled by caller after resolving AniList ID
-		IDMal:       nil,
-		IsAdult:     attrs.NSFW,
+		ID:      0, // filled by caller after resolving AniList ID
+		IDMal:   nil,
+		IsAdult: attrs.NSFW,
 		Title: anilist.Title{
 			Romaji:  rom,
 			English: eng,
 			Native:  nat,
 		},
-		Description: attrs.Synopsis,
-		CoverImage:  img,
-		BannerImage: banner,
-		Episodes:    ep,
-		Duration:    dur,
-		Status:      status,
-		Format:      format,
-		Season:      season,
-		SeasonYear:  seasonYear,
-		Trailer:     trailer,
+		Description:  attrs.Synopsis,
+		CoverImage:   img,
+		BannerImage:  banner,
+		Episodes:     ep,
+		Duration:     dur,
+		Status:       status,
+		Format:       format,
+		Season:       season,
+		SeasonYear:   seasonYear,
+		Trailer:      trailer,
 		AverageScore: avg,
-		Popularity:  attrs.PopularityRank,
+		Popularity:   attrs.PopularityRank,
 	}
 }
 
@@ -606,7 +610,7 @@ func (c *Client) Search(ctx context.Context, query string, page, perPage int) (*
 		return cached.(*anilist.BrowseResponse), nil
 	}
 
-		res, err := c.dedup(cachev, func() (any, error) {
+	res, err := c.dedup(cachev, func() (any, error) {
 		offset := (page - 1) * perPage
 		var list kaList
 		q := url.Values{}
@@ -792,12 +796,12 @@ func (c *Client) GetRelations(ctx context.Context, id int) (*anilist.RelationsRe
 		edges = append(edges, anilist.RelationEdge{
 			RelationType: role,
 			Node: anilist.RelationAnime{
-				ID:         destAID,
-				Title:      a.Title,
-				CoverImage: a.CoverImage,
-				Format:     a.Format,
-				Episodes:   a.Episodes,
-				Status:     a.Status,
+				ID:           destAID,
+				Title:        a.Title,
+				CoverImage:   a.CoverImage,
+				Format:       a.Format,
+				Episodes:     a.Episodes,
+				Status:       a.Status,
 				AverageScore: a.AverageScore,
 			},
 		})
