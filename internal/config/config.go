@@ -30,7 +30,6 @@ func loadEnv(path string) {
 type Config struct {
 	Server    ServerConfig   `mapstructure:"server"`
 	Supabase  SupabaseConfig `mapstructure:"supabase"`
-	Providers ProviderConfig `mapstructure:"providers"`
 	Logging   LoggingConfig  `mapstructure:"logging"`
 	Update    UpdateConfig   `mapstructure:"update"`
 	Sync      SyncConfig     `mapstructure:"sync"`
@@ -61,7 +60,6 @@ type ServerConfig struct {
 	Port               int    `mapstructure:"port"`
 	UIDist             string `mapstructure:"ui_dist"`
 	Debug              bool   `mapstructure:"debug"`
-	MiruroProxyURL     string `mapstructure:"miruro_proxy_url"`
 	AnikotoMappingPath string `mapstructure:"anikoto_mapping_path"`
 }
 
@@ -86,10 +84,6 @@ type SupabaseConfig struct {
 	JWKSURL    string `mapstructure:"jwks_url"`
 }
 
-type ProviderConfig struct {
-	Primary string `mapstructure:"primary"`
-}
-
 type LoggingConfig struct {
 	Level  string `mapstructure:"level"`
 	Format string `mapstructure:"format"`
@@ -111,7 +105,6 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.ui_dist", "embedded")
 	v.SetDefault("server.debug", false)
 	v.SetDefault("supabase.jwt_aud", "authenticated")
-	v.SetDefault("providers.primary", "miruro")
 
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
@@ -162,9 +155,6 @@ func Load(configPath string) (*Config, error) {
 	}
 	if debug := os.Getenv("ANIRAKU_SERVER_DEBUG"); debug == "true" || debug == "1" {
 		v.Set("server.debug", true)
-	}
-	if mpu := os.Getenv("ANIRAKU_MIRURO_PROXY_URL"); mpu != "" {
-		v.Set("server.miruro_proxy_url", mpu)
 	}
 	if akp := os.Getenv("ANIRAKU_ANIKOTO_MAPPING_PATH"); akp != "" {
 		v.Set("server.anikoto_mapping_path", akp)

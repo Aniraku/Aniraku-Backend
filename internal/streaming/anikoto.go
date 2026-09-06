@@ -19,6 +19,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 const (
@@ -40,10 +41,12 @@ type AnikotoProvider struct {
 
 func NewAnikotoProvider(log zerolog.Logger) *AnikotoProvider {
 	// Session cookie jar is REQUIRED: ajax/server?get= rejects cookieless
-	// requests. All chain calls share this client, hence one session.
+	// requests. All chain calls share this client, hence one session. The
+	// transport is SSRF-guarded: upstream-controlled embed URLs cannot steer
+	// this server at private addresses.
 	jar, _ := cookiejar.New(nil)
 	return &AnikotoProvider{
-		client: &http.Client{Timeout: 15 * time.Second, Jar: jar},
+		client: &http.Client{Timeout: 15 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
 		log:    log,
 	}
 }
@@ -402,7 +405,7 @@ func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (sl
 	for _, slug := range order {
 		c := seen[slug]
 		best := 0.0
-		for _, t := range titles[:minInt(len(titles), 2)] {
+		for _, t := range titles[:min(len(titles), 2)] {
 			if s := titleScoreDice(t, c.name, c.slug); s > best {
 				best = s
 			}

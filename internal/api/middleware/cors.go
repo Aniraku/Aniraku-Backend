@@ -11,16 +11,15 @@ func CORS(next http.Handler) http.Handler {
 		origin := r.Header.Get("Origin")
 
 		allowed := map[string]bool{
-			"http://127.0.0.1:3000":       true,
-			"http://127.0.0.1:43211":      true,
-			"http://localhost:3000":       true,
-			"http://localhost:3001":       true,
-			"http://localhost:43211":      true,
-			"http://localhost:5173":       true,
-			"https://aniraku.vercel.app":  true,
-			"https://www.aniraku.tech":    true,
-			"https://test.aniraku.tech":    true,
-			"https://3001-ioet8mzxj57gmzxw9m7xb-bb702013.us4.manus.computer":    true, 
+			"http://127.0.0.1:3000":      true,
+			"http://127.0.0.1:43211":     true,
+			"http://localhost:3000":      true,
+			"http://localhost:3001":      true,
+			"http://localhost:43211":     true,
+			"http://localhost:5173":      true,
+			"https://aniraku.vercel.app": true,
+			"https://www.aniraku.tech":   true,
+			"https://test.aniraku.tech":  true,
 		}
 
 		// Comma-separated extra origins for production
@@ -46,11 +45,8 @@ func CORS(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.Header().Set("Vary", "Origin")
 
-		// Security headers
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		// Security headers live in middleware.SecurityHeaders; do not
+		// duplicate them here.
 
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)

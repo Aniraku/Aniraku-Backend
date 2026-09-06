@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // FlixCloudProvider fetches embed URLs from the Reanime API and returns them
@@ -36,7 +37,8 @@ func NewFlixCloudProvider(log zerolog.Logger) *FlixCloudProvider {
 	}
 	return &FlixCloudProvider{
 		client: &http.Client{
-			Timeout: 15 * time.Second,
+			Timeout:   15 * time.Second,
+			Transport: netguard.NewTransport(),
 		},
 		log:         log,
 		reanimeBase: reanimeBase,

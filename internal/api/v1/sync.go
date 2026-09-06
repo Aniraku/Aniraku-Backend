@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -60,18 +61,28 @@ type syncProviderToken struct {
 	Username     string `json:"username"`
 }
 
-func randomString(n int) string {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		for i := range b {
-			b[i] = syncLetterRunes[i%len(syncLetterRunes)]
+// randomOAuthString returns a cryptographically random [a-zA-Z0-9] string of
+// n characters (~5.95 bits/char). It fails closed: a predictable state or
+// PKCE verifier must never be issued, so rand failure aborts the request.
+// Each byte is split with rejection sampling so no letter is overrepresented.
+func randomOAuthString(n int) (string, error) {
+	maxByte := byte(255 - (256 % len(syncLetterRunes))) // 247: reject the biased tail
+	out := make([]byte, 0, n)
+	buf := make([]byte, n+n/4)
+	for len(out) < n {
+		if _, err := rand.Read(buf); err != nil {
+			return "", fmt.Errorf("crypto/rand failed: %w", err)
 		}
-		return string(b)
+		for _, b := range buf {
+			if b <= maxByte {
+				out = append(out, syncLetterRunes[int(b)%len(syncLetterRunes)])
+				if len(out) == n {
+					break
+				}
+			}
+		}
 	}
-	for i := range b {
-		b[i] = syncLetterRunes[int(b[i])%len(syncLetterRunes)]
-	}
-	return string(b)
+	return string(out), nil
 }
 
 // pkceChallenge computes the S256 PKCE challenge for a code verifier.
@@ -88,6 +99,30 @@ func (h *Handlers) syncConfigured(provider string) bool {
 		return h.cfg.Sync.AniListConfigured()
 	}
 	return false
+}
+
+// lastSyncSweep throttles sweepSyncPending to one pass per minute.
+var lastSyncSweep time.Time
+var lastSyncSweepMu sync.Mutex
+
+// sweepSyncPending drops expired pending OAuth handshakes so abandoned
+// authorizations do not accumulate forever.
+func (h *Handlers) sweepSyncPending() {
+	lastSyncSweepMu.Lock()
+	if time.Since(lastSyncSweep) < time.Minute {
+		lastSyncSweepMu.Unlock()
+		return
+	}
+	lastSyncSweep = time.Now()
+	lastSyncSweepMu.Unlock()
+
+	now := time.Now()
+	h.syncPending.Range(func(key, value any) bool {
+		if pending, ok := value.(*pendingOAuth); ok && now.After(pending.expiresAt) {
+			h.syncPending.Delete(key)
+		}
+		return true
+	})
 }
 
 // SyncStatus reports which providers the server can sync and which the
@@ -146,14 +181,27 @@ func (h *Handlers) SyncAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	verifier := randomString(43)
-	state := randomString(43)
+	verifier, err := randomOAuthString(43)
+	if err != nil {
+		h.log.Error().Err(err).Msg("sync authorize: rand failed")
+		h.respondError(w, http.StatusInternalServerError, "could not start OAuth handshake")
+		return
+	}
+	state, err := randomOAuthString(43)
+	if err != nil {
+		h.log.Error().Err(err).Msg("sync authorize: rand failed")
+		h.respondError(w, http.StatusInternalServerError, "could not start OAuth handshake")
+		return
+	}
 	h.syncPending.Store(state, &pendingOAuth{
 		userID:    userID,
 		provider:  provider,
 		verifier:  verifier,
 		expiresAt: time.Now().Add(syncStateTTL),
 	})
+	// Abandoned handshakes are only deleted when their state is replayed, so
+	// sweep expired entries opportunistically (throttled to once a minute).
+	h.sweepSyncPending()
 
 	var authorizeURL string
 	switch provider {

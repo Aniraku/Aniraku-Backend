@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 type JWKS struct {
@@ -48,7 +50,7 @@ func NewJWKS(url string, log zerolog.Logger) *JWKS {
 	return &JWKS{
 		keys:   make(map[string]crypto.PublicKey),
 		url:    url,
-		client: &http.Client{Timeout: 10 * time.Second},
+		client: netguard.NewHTTPClient(10 * time.Second),
 		log:    log,
 		ttl:    1 * time.Hour,
 	}

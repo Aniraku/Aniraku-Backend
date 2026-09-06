@@ -48,8 +48,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	verifier := auth.NewVerifier(jwks, issuer, cfg.Supabase.JWTAud, log)
 	authMiddleware := auth.Middleware(verifier, log)
 
-	miruroProxyURL := cfg.Server.MiruroProxyURL
-	h := v1.NewHandlers(cfg, log, miruroProxyURL)
+	h := v1.NewHandlers(cfg, log)
 
 	// Public endpoints (rate limited)
 	r.Group(func(r chi.Router) {
@@ -67,9 +66,6 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.With(proxyRL.Middleware).Head("/api/v1/proxy", h.Proxy)
 		r.With(proxyRL.Middleware).Get("/api/v1/download", h.Download)
 		r.Get("/ani/v1/epsrc", h.LegacyEpsrc)
-		r.Get("/api/v1/miruro/episodes/{id}", h.GetMiruroEpisodes)
-		r.Get("/api/v1/miruro/has-dub/{id}", h.HasDub)
-		r.Get("/api/v1/miruro/probe/{id}", h.GetMiruroProbe)
 		r.Post("/api/v1/anilist", h.AniListProxy)
 	})
 

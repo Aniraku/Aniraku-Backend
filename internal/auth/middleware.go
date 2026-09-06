@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 type contextKey string
@@ -61,6 +63,11 @@ func GetUserID(ctx context.Context) string {
 	return ""
 }
 
+// adminHTTPClient is the guarded client for the server-side is_admin() RPC.
+// Package-level so the JWKS/supabase caller never builds ad-hoc unguarded
+// clients per request.
+var adminHTTPClient = netguard.NewHTTPClient(10 * time.Second)
+
 // RequireAdmin gates a route behind a server-side admin check. It verifies
 // the caller's Supabase JWT, then asks Supabase's is_admin() RPC (a SECURITY
 // DEFINER function scoped to auth.uid()) whether that user is an admin. The
@@ -91,7 +98,7 @@ func RequireAdmin(supabaseURL string, log zerolog.Logger) func(http.Handler) htt
 			req.Header.Set("Authorization", "Bearer "+rawToken)
 			req.Header.Set("Content-Type", "application/json")
 
-			client := &http.Client{Timeout: 10 * time.Second}
+			client := adminHTTPClient
 			resp, err := client.Do(req)
 			if err != nil {
 				log.Error().Err(err).Msg("admin check: supabase rpc failed")

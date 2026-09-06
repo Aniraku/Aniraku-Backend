@@ -38,8 +38,6 @@ var (
 	BuildDate = "unknown"
 )
 
-const maxProbeCacheSize = 2000
-
 // ponytail: caps page to prevent AniList abuse from deep pagination
 func parsePageParam(r *http.Request, defaultVal int) int {
 	v := defaultVal
@@ -64,13 +62,6 @@ func parsePerPageParam(r *http.Request, defaultVal int) int {
 
 type keyCacheEntry struct {
 	data      []byte
-	fetchedAt time.Time
-}
-
-type probeCacheEntry struct {
-	subCount  int
-	dubCount  int
-	playable  bool
 	fetchedAt time.Time
 }
 
@@ -394,21 +385,16 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 }
 
 type Handlers struct {
-	cfg               *config.Config
-	log               zerolog.Logger
-	mal               *mal.Client
-	stream            *streaming.Manager
-	h2Client          *http.Client
-	h1Client          *http.Client
-	httpClient        *http.Client
-	goTLSClient       *http.Client
-	miruroProxyURL    string
-	miruroProxyClient *http.Client
-	keyCache          sync.Map
-	probeCache        sync.Map
-	probeCacheMu      sync.Mutex
-	probeCacheCount   int
-	sourceProbeMemo   sync.Map // srcType|url|headers -> sourceProbeMemoEntry (90s TTL)
+	cfg            *config.Config
+	log            zerolog.Logger
+	mal            *mal.Client
+	stream         *streaming.Manager
+	h2Client       *http.Client
+	h1Client       *http.Client
+	httpClient     *http.Client
+	goTLSClient    *http.Client
+	downloadClient *http.Client
+	keyCache       sync.Map
 	// Browse/trending cache with TTL
 	browseCache    sync.Map
 	browseCacheTTL time.Duration
@@ -422,7 +408,7 @@ type Handlers struct {
 	providerHealth  sync.Map // provider -> *providerHealth
 }
 
-func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) *Handlers {
+func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 	resolver := &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -496,17 +482,18 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 		CheckRedirect: netguard.NoRedirects,
 	}
 	h := &Handlers{
-		cfg:               cfg,
-		log:               log,
-		mal:               mal.NewClient(log),
-		stream:            streaming.NewManager(log, miruroProxyURL, httpClient),
-		h2Client:          &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
-		h1Client:          &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
-		httpClient:        httpClient,
-		goTLSClient:       goTLSClient,
-		miruroProxyURL:    miruroProxyURL,
-		miruroProxyClient: &http.Client{Timeout: 60 * time.Second, CheckRedirect: netguard.NoRedirects},
-		browseCacheTTL:    5 * time.Minute, // 5 min cache for browse/trending
+		cfg:            cfg,
+		log:            log,
+		mal:            mal.NewClient(log),
+		stream:         streaming.NewManager(log),
+		h2Client:       &http.Client{Timeout: 30 * time.Second, Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
+		h1Client:       &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
+		httpClient:     httpClient,
+		goTLSClient:    goTLSClient,
+		// Full-file downloads: no client timeout (the request context bounds
+		// the transfer), SSRF-guarded transport, redirects refused.
+		downloadClient: netguard.NewHTTPClient(0),
+		browseCacheTTL: 5 * time.Minute, // 5 min cache for browse/trending
 	}
 	h.anilistClient = newAnilistClient(h)
 	h.anilistCircuit = newCircuitBreaker()
@@ -519,16 +506,6 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger, miruroProxyURL string) 
 			log.Info().Str("path", mappingPath).Msg("anikoto: mapping loaded")
 		}
 	}
-
-	// ponytail: global lock, per-account locks if throughput matters
-	// Provider-vouched hosts feed the media-proxy CDN allowlist as they
-	// surface, so rotated CDN hostnames never 403 at the proxy gate.
-	h.stream.SetHostLearner(func(host string) { LearnHostFromPlaylist(host) })
-
-	// The media proxy is the single playback gate: providers only serve
-	// sources that pass its exact request path (uTLS transport, no redirects,
-	// header filtering), so "URL served" always means "URL plays".
-	h.stream.SetMediaProbe(h)
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)
@@ -773,11 +750,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	anilistID := id
 
-	// Fetch AniZip (fast, one call) + Miruro (already cached by provider).
+	// Fetch AniZip (fast, one call); TMDB below fills remaining gaps.
 	anizipData, _ := tmdb.FetchAniZipEpisodes(r.Context(), h.httpClient, anilistID)
-	thumbs := h.stream.GetEpisodeThumbnails(r.Context(), anilistID)
-	titles := h.stream.GetEpisodeTitles(r.Context(), anilistID)
-	fillerFlags, recapFlags := h.stream.GetEpisodeFlags(r.Context(), anilistID)
 
 	// TMDB: check persistent cache first, fetch if miss.
 	token := h.cfg.TMDB.ReadAccessToken
@@ -824,7 +798,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		anizipKey := fmt.Sprintf("%d", epNum)
 		anizipEp, hasAnizip := anizipData[anizipKey]
 
-		// Merge: AniZip title → TMDB title → Miruro title → generic.
+		// Merge: AniZip title → TMDB title → generic.
 		if hasAnizip {
 			if t := anizipEp.BestTitle(); t != "" {
 				ep["title"] = t
@@ -850,24 +824,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 				ep["airdate"] = *tmdbMeta.Airdate
 			}
 		}
-		// Miruro fallback for any remaining gaps.
-		if _, hasThumb := ep["thumbnail"]; !hasThumb {
-			if thumb, ok := thumbs[epNum]; ok {
-				ep["thumbnail"] = thumb
-			} else if coverFallback != "" {
-				ep["thumbnail"] = coverFallback
-			}
-		}
-		if ep["title"] == fmt.Sprintf("Episode %d", epNum) {
-			if title, ok := titles[epNum]; ok {
-				ep["title"] = title
-			}
-		}
-		if fillerFlags[epNum] {
-			ep["filler"] = true
-		}
-		if recapFlags[epNum] {
-			ep["recap"] = true
+		if _, hasThumb := ep["thumbnail"]; !hasThumb && coverFallback != "" {
+			ep["thumbnail"] = coverFallback
 		}
 		episodes[i] = ep
 	}
@@ -1034,8 +992,8 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	// AniList-keyed: the frontend sends AniList IDs, and Miruro sources are
-	// AniList-keyed too. MAL IDs are normalized to AniList IDs at the search
+	// AniList-keyed: the frontend sends AniList IDs and the Anikoto resolver
+	// maps them directly. MAL IDs are normalized to AniList IDs at the search
 	// boundary, never here.
 	anilistID := req.AnimeID
 
@@ -1118,7 +1076,7 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
-	// Legacy endpoint: delegate to the streaming manager (Miruro).
+	// Legacy endpoint: delegate to the streaming manager (anikoto/flixcloud).
 	result, err := h.stream.GetSourcesForProvider(ctx, episode, "", lang, "auto", animeID)
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.respondError(w, http.StatusNotFound, "no streaming source found")
@@ -1440,6 +1398,12 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Media segments are small, but a slow client reading a large one can
+	// still outrun the server-wide 60s WriteTimeout; lift it for this
+	// response — the request context cancels on client disconnect anyway.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
@@ -1472,7 +1436,13 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusForbidden, "download target port not allowed")
 		return
 	}
-	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
+	if host := strings.ToLower(parsed.Hostname()); isNuisanceProxyHost(host) || validateProxyTarget(host) != nil {
+		h.respondError(w, http.StatusForbidden, "download target not allowed")
+		return
+	} else if !isAllowedProxyHost(host) {
+		// Same boundary as the media proxy: without the CDN allowlist this
+		// endpoint would be a general public relay.
+		h.log.Warn().Str("download_host", host).Msg("download host not on CDN allowlist")
 		h.respondError(w, http.StatusForbidden, "download target not allowed")
 		return
 	}
@@ -1486,7 +1456,7 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	headersJSON := r.URL.Query().Get("headers")
 	applyProxyQueryHeaders(req, headersJSON)
 
-	resp, err := h.miruroProxyClient.Do(req)
+	resp, err := h.downloadClient.Do(req)
 	if err != nil {
 		h.log.Warn().Err(err).Str("download_url", decodedURL).Msg("download proxy failed")
 		h.respondError(w, http.StatusBadGateway, "download source unreachable")
@@ -1509,6 +1479,11 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	}
 	if cr := resp.Header.Get("Content-Range"); cr != "" {
 		w.Header().Set("Content-Range", cr)
+	}
+	// Full-file downloads outrun the server-wide 60s WriteTimeout; lift the
+	// write deadline for this response (the request context still bounds it).
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", "attachment")
@@ -1616,401 +1591,6 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	}
-}
-
-// directProbeClient mimics a real browser client (follows redirects, no
-// forced Accept-Encoding) for the direct-path verdict.
-var directProbeClient = &http.Client{Timeout: 20 * time.Second}
-
-// sourceProbeMemo short-circuits repeated playback probes of the same URL
-// within a short window (a /servers call followed by /stream probes the
-// same sources). Verdicts are TTL'd because CDN reachability drifts.
-type sourceProbeMemoEntry struct {
-	verdict streaming.PlaybackVerdict
-	at      time.Time
-}
-
-// ProbePlayback ranks how a source can reach a player — a soft verdict that
-// orders server lists but never filters them (CDNs serve datacenter and
-// residential IPs differently, so "dead" here does not mean dead in the
-// browser).
-//
-// Proxy path: the exact same request path the media proxy uses (uTLS
-// transport chain, no redirects, filtered headers, Accept-Encoding:
-// identity). HLS: the manifest must fetch 200 and parse as a playlist
-// (#EXTM3U), the first referenced media playlist must fetch 200, and the
-// first media segment must not be a canary (some CDNs serve real playlists
-// but 1x1 PNG bytes in place of every segment — observed on vidtub/vivibebe).
-// MP4: a ranged GET must return 200/206 with real media bytes, not an HTML
-// error page and not image bytes (fast4speed 404s on the full body).
-//
-// Direct path: a plain browser-like client (redirects followed, standard
-// Accept-Encoding). Image-magic rejection is intentionally NOT applied here
-// — some CDNs (vidtub/vivibebe) serve image canaries only to datacenter
-// fingerprints and real segments to residential ones.
-func (h *Handlers) ProbePlayback(ctx context.Context, srcType, rawURL string, headers map[string]string) streaming.PlaybackVerdict {
-	headersJSON, _ := json.Marshal(headers)
-	probeKey := srcType + "|" + rawURL + "|" + string(headersJSON)
-	if v, ok := h.sourceProbeMemo.Load(probeKey); ok {
-		e := v.(sourceProbeMemoEntry)
-		if time.Since(e.at) < 90*time.Second {
-			return e.verdict
-		}
-	}
-
-	verdict := streaming.VerdictDead
-	if h.probeViaProxy(ctx, srcType, rawURL, string(headersJSON)) {
-		verdict = streaming.VerdictProxy
-	} else if h.probeDirect(ctx, srcType, rawURL, headers) {
-		verdict = streaming.VerdictDirect
-	}
-
-	h.sourceProbeMemo.Store(probeKey, sourceProbeMemoEntry{verdict: verdict, at: time.Now()})
-	return verdict
-}
-
-// probeViaProxy is the media-proxy-path playback check (see ProbePlayback).
-func (h *Handlers) probeViaProxy(ctx context.Context, srcType, rawURL, headersJSON string) bool {
-	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	if srcType == "dash" {
-		return h.probeDashManifest(probeCtx, rawURL, headersJSON)
-	}
-	if srcType != "hls" && srcType != "m3u8" && srcType != "embed" {
-		return h.probeRangedMedia(probeCtx, rawURL, headersJSON)
-	}
-
-	// HLS: manifest, then the first media playlist it references, then the
-	// first segment — fake sources pass the first two but serve image bytes.
-	manifest, err := h.probePlaylist(probeCtx, rawURL, headersJSON)
-	if err != nil {
-		return false
-	}
-	firstChild := firstPlaylistURI(manifest)
-	if firstChild == "" {
-		return false
-	}
-	childURL, err := resolvePlaylistURL(rawURL, firstChild)
-	if err != nil {
-		return false
-	}
-	child, err := h.probePlaylist(probeCtx, childURL, headersJSON)
-	if err != nil {
-		return false
-	}
-	firstSegment := firstPlaylistURI(child)
-	if firstSegment == "" {
-		return false
-	}
-	segURL, err := resolvePlaylistURL(childURL, firstSegment)
-	if err != nil {
-		return false
-	}
-	return h.probeSegment(probeCtx, segURL, headersJSON)
-}
-
-// probeDirect checks the same source with a plain browser-like client
-// (redirects followed, standard headers). Verdict is intentionally laxer
-// than the proxy path: any CDN that serves real media to a generic client
-// counts as directly playable, and image canaries are ignored because some
-// CDNs serve them only to datacenter fingerprints.
-func (h *Handlers) probeDirect(ctx context.Context, srcType, rawURL string, headers map[string]string) bool {
-	probeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(probeCtx, "GET", rawURL, nil)
-	if err != nil {
-		return false
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	for k, v := range headers {
-		if strings.EqualFold(k, "User-Agent") {
-			continue
-		}
-		req.Header.Set(k, v)
-	}
-
-	if srcType == "dash" {
-		return h.probeDirectDash(probeCtx, req)
-	}
-	if srcType != "hls" && srcType != "m3u8" && srcType != "embed" {
-		req.Header.Set("Range", "bytes=0-1023")
-		resp, err := directProbeClient.Do(req)
-		if err != nil {
-			return false
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-			return false
-		}
-		ct := strings.ToLower(resp.Header.Get("Content-Type"))
-		if strings.Contains(ct, "text/html") {
-			return false
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		if err != nil {
-			return false
-		}
-		return len(body) >= 100 && !mediaMagicImage(body)
-	}
-
-	// HLS: manifest, first media playlist, first segment — HTML is dead.
-	manifest, err := h.probeDirectPlaylist(probeCtx, req, rawURL)
-	if err != nil {
-		return false
-	}
-	firstChild := firstPlaylistURI(manifest)
-	if firstChild == "" {
-		return false
-	}
-	childURL, err := resolvePlaylistURL(rawURL, firstChild)
-	if err != nil {
-		return false
-	}
-	childReq, err := http.NewRequestWithContext(probeCtx, "GET", childURL, nil)
-	if err != nil {
-		return false
-	}
-	childReq.Header = req.Header.Clone()
-	child, err := h.probeDirectPlaylist(probeCtx, childReq, childURL)
-	if err != nil {
-		return false
-	}
-	firstSegment := firstPlaylistURI(child)
-	if firstSegment == "" {
-		return false
-	}
-	segURL, err := resolvePlaylistURL(childURL, firstSegment)
-	if err != nil {
-		return false
-	}
-	segReq, err := http.NewRequestWithContext(probeCtx, "GET", segURL, nil)
-	if err != nil {
-		return false
-	}
-	segReq.Header = req.Header.Clone()
-	segResp, err := directProbeClient.Do(segReq)
-	if err != nil {
-		return false
-	}
-	defer segResp.Body.Close()
-	if segResp.StatusCode != http.StatusOK && segResp.StatusCode != http.StatusPartialContent {
-		return false
-	}
-	ct := strings.ToLower(segResp.Header.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(segResp.Body, 512))
-	if err != nil {
-		return false
-	}
-	trimmed := bytes.TrimLeft(body, " \t\r\n")
-	lower := bytes.ToLower(trimmed)
-	if bytes.HasPrefix(lower, []byte("<html")) || bytes.HasPrefix(lower, []byte("<!doctype")) {
-		return false
-	}
-	return len(body) >= 2
-}
-
-func (h *Handlers) probeRangedMedia(ctx context.Context, rawURL, headersJSON string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return false
-	}
-	applyProxyQueryHeaders(req, headersJSON)
-	req.Header.Set("Range", "bytes=0-1023")
-	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return false
-	}
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") || strings.Contains(ct, "image/") {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if err != nil {
-		return false
-	}
-	return len(body) >= 100 && !mediaMagicImage(body)
-}
-
-func (h *Handlers) probeDashManifest(ctx context.Context, rawURL, headersJSON string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return false
-	}
-	applyProxyQueryHeaders(req, headersJSON)
-	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
-	if err != nil {
-		return false
-	}
-	text := strings.ToLower(string(body))
-	return strings.Contains(text, "<mpd") && strings.Contains(text, "adaptationset")
-}
-
-func (h *Handlers) probeDirectDash(ctx context.Context, req *http.Request) bool {
-	resp, err := directProbeClient.Do(req)
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
-	if err != nil {
-		return false
-	}
-	text := strings.ToLower(string(body))
-	return strings.Contains(text, "<mpd") && strings.Contains(text, "adaptationset")
-}
-
-// probeDirectPlaylist fetches a playlist with the plain client and returns
-// its body when it is a genuine, parseable playlist.
-func (h *Handlers) probeDirectPlaylist(ctx context.Context, req *http.Request, rawURL string) (string, error) {
-	resp, err := directProbeClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("playlist fetch returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	if err != nil {
-		return "", err
-	}
-	text := string(body)
-	if !strings.HasPrefix(strings.TrimSpace(text), "#EXTM3U") {
-		return "", fmt.Errorf("body is not an HLS playlist")
-	}
-	return text, nil
-}
-
-// probeSegment fetches the first media segment exactly like the proxy would
-// and rejects canary sources that serve image bytes or HTML in place of video.
-func (h *Handlers) probeSegment(ctx context.Context, rawURL, headersJSON string) bool {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return false
-	}
-	applyProxyQueryHeaders(req, headersJSON)
-	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
-	if err != nil {
-		return false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return false
-	}
-	ct := strings.ToLower(resp.Header.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") {
-		return false
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if err != nil {
-		return false
-	}
-	if len(body) < 2 {
-		return false
-	}
-	trimmed := bytes.TrimLeft(body, " \t\r\n")
-	lower := bytes.ToLower(trimmed)
-	if bytes.HasPrefix(lower, []byte("<html")) || bytes.HasPrefix(lower, []byte("<!doctype")) {
-		return false
-	}
-	return !mediaMagicImage(body)
-}
-
-// mediaMagicImage reports whether b starts with a known image signature.
-// Dead CDNs serve 1x1 PNGs (or other image bytes) in place of video segments.
-func mediaMagicImage(b []byte) bool {
-	if len(b) < 8 {
-		return false
-	}
-	if bytes.HasPrefix(b, []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}) {
-		return true
-	}
-	if b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF {
-		return true // JPEG
-	}
-	if len(b) >= 4 && bytes.HasPrefix(b, []byte("GIF8")) {
-		return true
-	}
-	if len(b) >= 12 && bytes.HasPrefix(b, []byte("RIFF")) && bytes.HasPrefix(b[8:12], []byte("WEBP")) {
-		return true
-	}
-	return false
-}
-
-// probePlaylist fetches a playlist exactly like the proxy would and returns
-// its body when the fetch is a genuine, parseable playlist.
-func (h *Handlers) probePlaylist(ctx context.Context, rawURL, headersJSON string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return "", err
-	}
-	applyProxyQueryHeaders(req, headersJSON)
-	resp, err := h.doRequest(req, strings.HasPrefix(rawURL, "https"))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("playlist fetch returned %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 8*1024))
-	if err != nil {
-		return "", err
-	}
-	text := string(body)
-	if !strings.HasPrefix(strings.TrimSpace(text), "#EXTM3U") {
-		return "", fmt.Errorf("body is not an HLS playlist")
-	}
-	return text, nil
-}
-
-// firstPlaylistURI returns the first non-comment URI line in a playlist.
-func firstPlaylistURI(content string) string {
-	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		return line
-	}
-	return ""
-}
-
-// resolvePlaylistURL resolves a URI line from a playlist against the
-// playlist's own URL (relative or absolute).
-func resolvePlaylistURL(baseURL, ref string) (string, error) {
-	if u, err := url.Parse(ref); err == nil && u.IsAbs() {
-		return ref, nil
-	}
-	base, err := url.Parse(baseURL)
-	if err != nil {
-		return "", err
-	}
-	rel, err := url.Parse(ref)
-	if err != nil {
-		return "", err
-	}
-	return base.ResolveReference(rel).String(), nil
 }
 
 func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase string) string {
@@ -2974,105 +2554,6 @@ func (h *Handlers) MarkAllNotificationsRead(w http.ResponseWriter, r *http.Reque
 	h.respondJSON(w, http.StatusOK, map[string]string{"status": "all marked"})
 }
 
-func (h *Handlers) GetMiruroEpisodes(w http.ResponseWriter, r *http.Request) {
-	idStr := chi.URLParam(r, "id")
-	if idStr == "" {
-		h.respondError(w, http.StatusBadRequest, "anime ID is required")
-		return
-	}
-
-	// The frontend is AniList-keyed; Miruro is also AniList-keyed, so the ID
-	// passes through unchanged. MAL IDs are normalized to AniList IDs at the
-	// search boundary, never here.
-	anilistID, err := strconv.Atoi(idStr)
-	if err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
-		return
-	}
-
-	miruroURL := fmt.Sprintf("%s/episodes/%d", h.miruroProxyURL, anilistID)
-	resp, err := h.miruroProxyClient.Get(miruroURL)
-	if err != nil {
-		h.log.Warn().Err(err).Str("id", idStr).Msg("miruro episodes request failed")
-		h.respondError(w, http.StatusBadGateway, "failed to fetch episodes from Miruro")
-		return
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to read miruro response")
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	w.Write(body)
-}
-
-// GetMiruroProbe reports whether an anime has actually playable Miruro
-// streams. Unlike the raw episodes endpoint (which only lists provider
-// metadata), this resolves and reachability-verifies a real source, so the
-// frontend's hentai filter never surfaces titles whose first episode cannot
-// play. Results are cached for 6 hours in-process.
-func (h *Handlers) GetMiruroProbe(w http.ResponseWriter, r *http.Request) {
-	idStr := chi.URLParam(r, "id")
-	if idStr == "" {
-		h.respondError(w, http.StatusBadRequest, "anime ID is required")
-		return
-	}
-	anilistID, err := strconv.Atoi(idStr)
-	if err != nil || anilistID <= 0 {
-		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
-		return
-	}
-
-	// Positive results are stable — 6h. Negative results are cached much
-	// shorter (15m) because they usually mean Miruro was momentarily down
-	// (Cloudflare challenge, 502) rather than that the anime truly has no
-	// stream. Short TTLs let hentai listings recover quickly once upstream
-	// comes back, instead of hiding titles for 6 hours off one bad probe.
-	if v, ok := h.probeCache.Load(anilistID); ok {
-		e := v.(probeCacheEntry)
-		ttl := 6 * time.Hour
-		if !e.playable {
-			ttl = 15 * time.Minute
-		}
-		if time.Since(e.fetchedAt) < ttl {
-			h.writeProbeResponse(w, anilistID, e)
-			return
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
-	defer cancel()
-	sub, dub, playable := h.stream.ProbePlayable(ctx, anilistID)
-	e := probeCacheEntry{subCount: sub, dubCount: dub, playable: playable, fetchedAt: time.Now()}
-	h.probeCacheMu.Lock()
-	if h.probeCacheCount >= maxProbeCacheSize {
-		h.probeCache.Range(func(k, _ any) bool {
-			h.probeCache.Delete(k)
-			return false
-		})
-		h.probeCacheCount--
-	}
-	h.probeCacheCount++
-	h.probeCacheMu.Unlock()
-	h.probeCache.Store(anilistID, e)
-	h.writeProbeResponse(w, anilistID, e)
-}
-
-func (h *Handlers) writeProbeResponse(w http.ResponseWriter, id int, e probeCacheEntry) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "public, max-age=21600")
-	json.NewEncoder(w).Encode(map[string]any{
-		"id":       id,
-		"playable": e.playable,
-		"subCount": e.subCount,
-		"dubCount": e.dubCount,
-	})
-}
-
 func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	anilistID, err := strconv.Atoi(idStr)
@@ -3116,20 +2597,6 @@ func (h *Handlers) GetRelations(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.respondJSON(w, http.StatusOK, out.Data.Media.Relations)
-}
-
-func (h *Handlers) HasDub(w http.ResponseWriter, r *http.Request) {
-	idStr := chi.URLParam(r, "id")
-	// AniList-keyed, like every other route; IDs are normalized at the search
-	// boundary.
-	anilistID, err := strconv.Atoi(idStr)
-	if err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
-		return
-	}
-
-	hasDub := h.stream.HasAnimeDub(r.Context(), anilistID)
-	h.respondJSON(w, http.StatusOK, map[string]bool{"hasDub": hasDub})
 }
 
 func (h *Handlers) trendingAniList(ctx context.Context, page, perPage int) (*anilist.BrowseResponse, error) {
