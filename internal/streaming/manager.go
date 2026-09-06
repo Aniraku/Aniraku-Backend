@@ -52,6 +52,21 @@ func (v PlaybackVerdict) String() string {
 type Manager struct {
 	log       zerolog.Logger
 	providers []Provider
+	// LearnHost, when set, receives hosts the provider chain itself verified
+	// (probed stream manifests, subtitle tracks, download links) so the HTTP
+	// layer can feed the media-proxy CDN allowlist and provider CDN rotation
+	// never 403s at the gate.
+	LearnHost func(host string)
+}
+
+// SetHostLearner registers the callback that receives provider-verified hosts.
+func (m *Manager) SetHostLearner(fn func(host string)) {
+	m.LearnHost = fn
+	for _, p := range m.providers {
+		if ak, ok := p.(*AnikotoProvider); ok {
+			ak.SetHostLearner(fn)
+		}
+	}
 }
 
 type Provider interface {

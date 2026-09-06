@@ -498,14 +498,19 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 	h.anilistClient = newAnilistClient(h)
 	h.anilistCircuit = newCircuitBreaker()
 
-	// Load AnikotoTV AniList→slug mapping (best-effort, non-fatal)
-	if mappingPath := cfg.Server.AnikotoMappingPath; mappingPath != "" {
-		if err := streaming.LoadAnikotoMapping(mappingPath); err != nil {
-			log.Warn().Err(err).Str("path", mappingPath).Msg("anikoto: mapping file not loaded, will search dynamically")
-		} else {
-			log.Info().Str("path", mappingPath).Msg("anikoto: mapping loaded")
-		}
+	// Load AnikotoTV AniList→slug mapping (bundled in the binary by default;
+	// a configured ANIRAKU_ANIKOTO_MAPPING_PATH overrides it). Best-effort,
+	// non-fatal.
+	if err := streaming.LoadAnikotoMapping(cfg.Server.AnikotoMappingPath); err != nil {
+		log.Warn().Err(err).Str("path", cfg.Server.AnikotoMappingPath).Msg("anikoto: mapping not loaded, will search dynamically")
+	} else {
+		log.Info().Msg("anikoto: mapping loaded")
 	}
+
+	// Anikoto-verified hosts (probeHLS-passed stream hosts, subtitle hosts,
+	// download hosts) feed the media-proxy CDN allowlist as they surface, so
+	// provider CDN rotation never 403s at the proxy gate.
+	h.stream.SetHostLearner(func(host string) { LearnHostFromPlaylist(host) })
 
 	go func() {
 		ticker := time.NewTicker(5 * time.Minute)

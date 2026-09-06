@@ -37,6 +37,30 @@ var anikotoServers = [2]string{"Niko", "Momo"}
 type AnikotoProvider struct {
 	client *http.Client
 	log    zerolog.Logger
+	// learnHost, when set, is called with hosts this provider itself verified:
+	// probed stream manifests, subtitle tracks, and download links. The HTTP
+	// layer registers it to feed the media-proxy CDN allowlist so rotated CDN
+	// hostnames are allowed the moment they surface instead of 403ing.
+	learnHost func(host string)
+}
+
+// SetHostLearner registers the verified-host callback.
+func (p *AnikotoProvider) SetHostLearner(fn func(host string)) {
+	p.learnHost = fn
+}
+
+// learnURLHost parses raw and, if it is a usable http(s) URL, hands its host
+// to the registered learner.
+func (p *AnikotoProvider) learnURLHost(raw string) {
+	if p.learnHost == nil {
+		return
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" ||
+		(u.Scheme != "http" && u.Scheme != "https") {
+		return
+	}
+	p.learnHost(u.Hostname())
 }
 
 func NewAnikotoProvider(log zerolog.Logger) *AnikotoProvider {
@@ -124,6 +148,9 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 					label = "Download"
 				}
 				downloads = append(downloads, core.DownloadLink{URL: embedURL, Label: label})
+				// Vouch the download host for the proxy allowlist: the URL
+				// came from the provider's own server/mapper chain.
+				p.learnURLHost(embedURL)
 			}
 			continue
 		}
@@ -138,11 +165,16 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 			continue
 		}
 		seenName[e.name] = true
+		// The manifest was fetched and parsed live, so this host is real:
+		// vouch it (and the subtitle hosts) for the proxy allowlist. This is
+		// the auto-learn path for Anikoto CDN rotation.
+		p.learnURLHost(file)
 		var subs []core.Subtitle
 		for _, t := range tracks {
 			if strings.TrimSpace(t.URL) == "" {
 				continue
 			}
+			p.learnURLHost(t.URL)
 			subs = append(subs, core.Subtitle{
 				URL:   t.URL,
 				Lang:  mapSubtitleLang(t.Label),

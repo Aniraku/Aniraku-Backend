@@ -1,10 +1,17 @@
 package streaming
 
 import (
+	_ "embed"
 	"encoding/json"
 	"os"
 	"sync"
 )
+
+// defaultMappingData ships the bundled AniList→AnikotoTV mapping so the
+// static fast path works without configuring ANIRAKU_ANIKOTO_MAPPING_PATH.
+//
+//go:embed anikoto_mapping.json
+var defaultMappingData []byte
 
 // AnikotoMapping maps an AniList ID to an AnikotoTV show entry.
 type AnikotoMapping struct {
@@ -19,11 +26,16 @@ var (
 	anikotoMappingMu   sync.RWMutex
 )
 
-// LoadAnikotoMapping loads the AniList→AnikotoTV mapping from disk.
+// LoadAnikotoMapping loads the AniList→AnikotoTV mapping from disk. An empty
+// path loads the mapping bundled in the binary.
 func LoadAnikotoMapping(path string) error {
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return err
+	raw := defaultMappingData
+	if path != "" {
+		fromDisk, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		raw = fromDisk
 	}
 	var m map[string]AnikotoMapping
 	if err := json.Unmarshal(raw, &m); err != nil {
