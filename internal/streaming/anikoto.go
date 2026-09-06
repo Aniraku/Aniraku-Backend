@@ -120,6 +120,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 	entries = append(entries, p.fetchMapperServers(ctx, epMeta, lang)...)
 
 	var sources []core.Source
+	var variants []string
 	var downloads []core.DownloadLink
 	var intro, outro *core.SkipTimestamp
 	referer := ""
@@ -200,6 +201,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 			Subtitles:    subs,
 			Verification: "proxy",
 		})
+		variants = append(variants, embedVariant(embedURL))
 		if referer == "" {
 			referer = strings.TrimSuffix(origin, "/") + "/"
 		}
@@ -219,7 +221,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		}
 		// No cap (Anivexa parity): every verified server lists.
 	}
-	sources = dedupeSourcesByURL(sources)
+	sources = dedupeSourcesByURL(sources, variants)
 	if len(sources) == 0 {
 		// The anikoto ajax/embed chain produced nothing usable (dead embeds,
 		// blocked getSources, probe failures). Megaplay hosts the same files
@@ -283,20 +285,37 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 	}, nil
 }
 
-// dedupeSourcesByURL collapses sources that resolved to the same file under
-// different server names, keeping the copy with the richer subtitle track
-// list so the server list never shows the same stream twice.
-func dedupeSourcesByURL(sources []core.Source) []core.Source {
+// embedVariant tags which anikoto server-list slot an embed came from.
+// HD-1's "?s=tcdn" variant can resolve through a different CDN edge per
+// fetch, so it is treated as a distinct server (Niko/Momo) instead of being
+// collapsed with the base embed.
+func embedVariant(embedURL string) string {
+	if strings.Contains(embedURL, "s=tcdn") {
+		return "tcdn"
+	}
+	return "base"
+}
+
+// dedupeSourcesByURL collapses sources that resolved to the same file from
+// the same embed variant, keeping the copy with the richer subtitle track
+// list so the server list never shows the same stream twice. Different
+// variants (base vs ?s=tcdn) stay distinct so both server slots fill.
+func dedupeSourcesByURL(sources []core.Source, variants []string) []core.Source {
 	best := make(map[string]int, len(sources))
 	out := make([]core.Source, 0, len(sources))
-	for _, s := range sources {
-		if idx, ok := best[s.URL]; ok {
+	for i, s := range sources {
+		variant := "base"
+		if i < len(variants) {
+			variant = variants[i]
+		}
+		key := s.URL + "|" + variant
+		if idx, ok := best[key]; ok {
 			if len(s.Subtitles) > len(out[idx].Subtitles) {
 				out[idx] = s
 			}
 			continue
 		}
-		best[s.URL] = len(out)
+		best[key] = len(out)
 		out = append(out, s)
 	}
 	return out
