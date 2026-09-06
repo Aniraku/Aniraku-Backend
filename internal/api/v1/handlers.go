@@ -1083,6 +1083,15 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 			continue
 		}
 		source.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(source.URL), headersParam)
+		// Proxy subtitle URLs so the client can fetch them through the same
+		// server that serves the video, avoiding CORS and CDN restrictions.
+		for j := range source.Subtitles {
+			sub := &source.Subtitles[j]
+			if sub.URL == "" || strings.Contains(sub.URL, "/api/v1/proxy?") {
+				continue
+			}
+			sub.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(sub.URL), headersParam)
+		}
 	}
 }
 
@@ -1432,6 +1441,77 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", ct)
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
+}
+
+// Download proxies a direct video download URL through the backend so the
+// client never needs to handle CDN headers or CORS restrictions. Unlike the
+// media Proxy endpoint, this handler streams the full file and sets
+// Content-Disposition so the client can save it locally.
+func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, private")
+
+	targetURL := r.URL.Query().Get("url")
+	if targetURL == "" {
+		h.respondError(w, http.StatusBadRequest, "url parameter required")
+		return
+	}
+
+	decodedURL, err := url.QueryUnescape(targetURL)
+	if err != nil {
+		decodedURL = targetURL
+	}
+
+	parsed, err := url.Parse(decodedURL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		h.respondError(w, http.StatusBadRequest, "invalid URL scheme")
+		return
+	}
+	if port := parsed.Port(); port != "" && blockedProxyPorts[port] {
+		h.respondError(w, http.StatusForbidden, "download target port not allowed")
+		return
+	}
+	if host := strings.ToLower(parsed.Hostname()); validateProxyTarget(host) != nil {
+		h.respondError(w, http.StatusForbidden, "download target not allowed")
+		return
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), "GET", decodedURL, nil)
+	if err != nil {
+		h.respondError(w, http.StatusBadRequest, "invalid URL")
+		return
+	}
+
+	headersJSON := r.URL.Query().Get("headers")
+	applyProxyQueryHeaders(req, headersJSON)
+
+	resp, err := h.miruroProxyClient.Do(req)
+	if err != nil {
+		h.log.Warn().Err(err).Str("download_url", decodedURL).Msg("download proxy failed")
+		h.respondError(w, http.StatusBadGateway, "download source unreachable")
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		h.respondError(w, resp.StatusCode, fmt.Sprintf("download source returned %d", resp.StatusCode))
+		return
+	}
+
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "video/mp4"
+	}
+
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if cr := resp.Header.Get("Content-Range"); cr != "" {
+		w.Header().Set("Content-Range", cr)
+	}
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("Content-Disposition", "attachment")
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }

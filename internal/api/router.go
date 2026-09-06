@@ -65,6 +65,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Get("/api/v1/servers", h.GetServers)
 		r.With(proxyRL.Middleware).Get("/api/v1/proxy", h.Proxy)
 		r.With(proxyRL.Middleware).Head("/api/v1/proxy", h.Proxy)
+		r.With(proxyRL.Middleware).Get("/api/v1/download", h.Download)
 		r.Get("/ani/v1/epsrc", h.LegacyEpsrc)
 		r.Get("/api/v1/miruro/episodes/{id}", h.GetMiruroEpisodes)
 		r.Get("/api/v1/miruro/has-dub/{id}", h.HasDub)

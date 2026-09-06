@@ -2,14 +2,18 @@ package streaming
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -35,8 +39,11 @@ type AnikotoProvider struct {
 }
 
 func NewAnikotoProvider(log zerolog.Logger) *AnikotoProvider {
+	// Session cookie jar is REQUIRED: ajax/server?get= rejects cookieless
+	// requests. All chain calls share this client, hence one session.
+	jar, _ := cookiejar.New(nil)
 	return &AnikotoProvider{
-		client: &http.Client{Timeout: 15 * time.Second},
+		client: &http.Client{Timeout: 15 * time.Second, Jar: jar},
 		log:    log,
 	}
 }
@@ -51,127 +58,295 @@ func (p *AnikotoProvider) FindEpisodes(ctx context.Context, providerID string) (
 	return nil, fmt.Errorf("anikoto episode listing not implemented")
 }
 
-// FindEpisodeSource fetches Anikoto’s two embedded-player streams directly
-// from Anivexa using the AniList ID supplied by the frontend.
+// FindEpisodeSource resolves AnikotoTV streams directly (Anivexa anikototv
+// method, in-process — no Render hop): show resolve -> episode data-ids ->
+// server list -> server?get embed -> MegaPlay decrypt -> verified m3u8.
+// Same return contract as before (Quality "auto", Verification "proxy").
 func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
 	if lang != "dub" {
 		lang = "sub"
 	}
 
-	endpoint := fmt.Sprintf(anikotoEmbedURLTemplate, providerID, lang, episode)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	slug, showID, err := p.resolveShow(ctx, providerID)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("anikoto anivexa request failed: %w", err)
-	}
-	defer resp.Body.Close()
+	_ = slug
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	dataIDs, epMeta, err := p.fetchEpisodeDataIDs(ctx, showID, episode)
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("anikoto anivexa returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	entries, err := p.fetchServers(ctx, dataIDs, "")
+	if err != nil {
+		return nil, err
 	}
-
-	var payload struct {
-		Streams []struct {
-			URL       string          `json:"url"`
-			Type      string          `json:"type"`
-			Server    string          `json:"server"`
-			EmbedURL  string          `json:"embedUrl"`
-			Referer   string          `json:"referer"`
-			Subtitles []core.Subtitle `json:"subtitles"`
-			Intro     *struct {
-				Start float64 `json:"start"`
-				End   float64 `json:"end"`
-			} `json:"intro"`
-			Outro *struct {
-				Start float64 `json:"start"`
-				End   float64 `json:"end"`
-			} `json:"outro"`
-		} `json:"streams"`
-		Downloads []struct {
-			URL   string `json:"url"`
-			Label string `json:"label"`
-		} `json:"downloads"`
-		Headers map[string]string `json:"headers"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("anikoto anivexa response decode failed: %w", err)
-	}
+	// Nekostream mapper extras (Anivexa parity): extra servers + downloads.
+	entries = append(entries, p.fetchMapperServers(ctx, epMeta, lang)...)
 
 	var sources []core.Source
+	var downloads []core.DownloadLink
 	var intro, outro *core.SkipTimestamp
-	for _, stream := range payload.Streams {
-		hlsURL := strings.TrimSpace(stream.URL)
-		if hlsURL == "" {
-			hlsURL = strings.TrimSpace(stream.EmbedURL)
-		}
-		if hlsURL == "" {
+	referer := ""
+	seenName := map[string]bool{}
+	seenDL := map[string]bool{}
+
+	for _, e := range entries {
+		// Anivexa parity: dedupe by server NAME, not file URL — the
+		// same file behind two servers (Vidstream/HD) lists twice,
+		// and ?s=tcdn variants may resolve differently per fetch.
+		if seenName[e.name] {
 			continue
 		}
-		srcType := strings.ToLower(strings.TrimSpace(stream.Type))
-		if srcType == "" {
-			if strings.Contains(strings.ToLower(hlsURL), ".m3u8") {
-				srcType = "hls"
-			} else {
-				srcType = "hls"
+		lowerName := strings.ToLower(e.name)
+		isDL := e.serverType == "dl" || strings.Contains(lowerName, "download") ||
+			strings.Contains(lowerName, "kiwi")
+		var embedURL string
+		var skip map[string][]float64
+		if strings.HasPrefix(e.linkID, "http") {
+			// Mapper-provided direct embed URL (Anivexa parity).
+			embedURL = e.linkID
+		} else {
+			var err error
+			embedURL, skip, err = p.fetchVideoURL(ctx, e.linkID)
+			if err != nil || strings.TrimSpace(embedURL) == "" {
+				continue
 			}
 		}
-		if srcType == "hls" || strings.Contains(hlsURL, ".m3u8") {
-			srcType = "hls"
+		if isDL {
+			if !seenDL[embedURL] {
+				seenDL[embedURL] = true
+				label := strings.TrimSpace(e.name)
+				if label == "" {
+					label = "Download"
+				}
+				downloads = append(downloads, core.DownloadLink{URL: embedURL, Label: label})
+			}
+			continue
+		}
+		if e.serverType != lang {
+			continue
+		}
+		file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
+		if err != nil || file == "" {
+			continue
+		}
+		if !p.probeHLS(ctx, file, origin) {
+			continue
+		}
+		seenName[e.name] = true
+		var subs []core.Subtitle
+		for _, t := range tracks {
+			if strings.TrimSpace(t.URL) == "" {
+				continue
+			}
+			subs = append(subs, core.Subtitle{
+				URL:   t.URL,
+				Lang:  mapSubtitleLang(t.Label),
+				Label: t.Label,
+			})
 		}
 		sources = append(sources, core.Source{
-			URL:          hlsURL,
-			Type:         srcType,
+			URL:          file,
+			Type:         "hls",
 			Quality:      "auto",
-			Subtitles:    stream.Subtitles,
+			Subtitles:    subs,
 			Verification: "proxy",
 		})
-		if intro == nil && stream.Intro != nil {
-			intro = &core.SkipTimestamp{Start: stream.Intro.Start, End: stream.Intro.End}
+		if referer == "" {
+			referer = strings.TrimSuffix(origin, "/") + "/"
 		}
-		if outro == nil && stream.Outro != nil {
-			outro = &core.SkipTimestamp{Start: stream.Outro.Start, End: stream.Outro.End}
+		if intro == nil {
+			if inTs != nil {
+				intro = &core.SkipTimestamp{Start: inTs.Start, End: inTs.End}
+			} else if len(skip["intro"]) == 2 {
+				intro = &core.SkipTimestamp{Start: skip["intro"][0], End: skip["intro"][1]}
+			}
 		}
+		if outro == nil {
+			if outTs != nil {
+				outro = &core.SkipTimestamp{Start: outTs.Start, End: outTs.End}
+			} else if len(skip["outro"]) == 2 {
+				outro = &core.SkipTimestamp{Start: skip["outro"][0], End: skip["outro"][1]}
+			}
+		}
+		// No cap (Anivexa parity): every verified server lists; the
+		// manager names the first two Niko/Momo, extras take Momo.
 	}
 	if len(sources) == 0 {
 		return nil, nil
 	}
-	var downloads []core.DownloadLink
-	for _, dl := range payload.Downloads {
-		u := strings.TrimSpace(dl.URL)
-		if u == "" {
-			continue
-		}
-		downloads = append(downloads, core.DownloadLink{URL: u, Label: strings.TrimSpace(dl.Label)})
+	if referer == "" {
+		referer = "https://megaplay.buzz/"
 	}
-	headers := map[string]string{}
-	if len(payload.Headers) > 0 {
-		for k, v := range payload.Headers {
-			headers[k] = v
-		}
+	return &SourceResult{
+		Sources:   sources,
+		Headers:   map[string]string{"Referer": referer},
+		Downloads: downloads,
+		Intro:     intro,
+		Outro:     outro,
+	}, nil
+}
+
+// megaplayTrack is one subtitle/caption entry from /stream/getSources.
+type megaplayTrack struct {
+	URL   string
+	Label string
+}
+
+// resolveEmbed decrypts a MegaPlay-style embed URL to a direct file URL.
+// Handles #aHR0c... base64 embeds and data-id -> /stream/getSources embeds.
+func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
+	origin = embedURL
+	if i := strings.Index(embedURL, "/stream/"); i != -1 {
+		origin = embedURL[:i]
+	} else if u, e := url.Parse(embedURL); e == nil && u.Host != "" {
+		origin = u.Scheme + "://" + u.Host
 	}
-	if headers["Referer"] == "" {
-		for _, s := range payload.Streams {
-			if s.Referer != "" {
-				headers["Referer"] = s.Referer
-				break
+	if i := strings.Index(embedURL, "#aHR0c"); i != -1 {
+		if raw, e := base64.StdEncoding.DecodeString(embedURL[i+1:]); e == nil {
+			if s := strings.TrimSpace(string(raw)); strings.Contains(s, ".m3u8") {
+				return s, nil, nil, nil, origin, nil
 			}
 		}
 	}
-	if headers["Referer"] == "" {
-		headers["Referer"] = "https://megaplay.buzz/"
+	page, err := p.fetchPage(ctx, embedURL)
+	if err != nil {
+		return "", nil, nil, nil, origin, err
 	}
-	return &SourceResult{Sources: sources, Headers: headers, Downloads: downloads, Intro: intro, Outro: outro}, nil
+	m := regexp.MustCompile(`data-id="([^"]+)"`).FindStringSubmatch(page)
+	if len(m) < 2 || m[1] == "" {
+		return "", nil, nil, nil, origin, fmt.Errorf("embed file id not found")
+	}
+	srcURL := fmt.Sprintf("%s/stream/getSources?id=%s&id=%s",
+		strings.TrimSuffix(origin, "/"), url.QueryEscape(m[1]), url.QueryEscape(m[1]))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
+	if err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	var data struct {
+		Sources struct {
+			File string `json:"file"`
+		} `json:"sources"`
+		Tracks []struct {
+			File  string `json:"file"`
+			Label string `json:"label"`
+		} `json:"tracks"`
+		Intro *core.SkipTimestamp `json:"intro"`
+		Outro *core.SkipTimestamp `json:"outro"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	if data.Sources.File == "" {
+		return "", nil, nil, nil, origin, fmt.Errorf("embed returned no file")
+	}
+	for _, t := range data.Tracks {
+		label := strings.TrimSpace(t.Label)
+		if label == "" {
+			label = "English"
+		}
+		tracks = append(tracks, megaplayTrack{URL: t.File, Label: label})
+	}
+	return data.Sources.File, tracks, data.Intro, data.Outro, origin, nil
+}
+
+// probeHLS verifies a manifest URL serves a real playlist right now.
+func (p *AnikotoProvider) probeHLS(ctx context.Context, fileURL, origin string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
+	resp, err := p.client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return false
+	}
+	defer resp.Body.Close()
+	head, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(head), "#EXTM3U")
+}
+
+// mapSubtitleLang maps a track label to a two-letter language code.
+func mapSubtitleLang(label string) string {
+	first := strings.ToLower(strings.Split(strings.TrimSpace(label), " ")[0])
+	if len(first) == 2 {
+		ok := true
+		for _, r := range first {
+			if r < 'a' || r > 'z' {
+				ok = false
+			}
+		}
+		if ok {
+			return first
+		}
+	}
+	switch first {
+	case "english", "en":
+		return "en"
+	case "spanish":
+		return "es"
+	case "french":
+		return "fr"
+	case "german":
+		return "de"
+	case "portuguese":
+		return "pt"
+	case "arabic":
+		return "ar"
+	case "hindi":
+		return "hi"
+	default:
+		return "en"
+	}
+}
+
+// anilistMeta carries the titles Anivexa searches (english, romaji, synonyms).
+type anilistMeta struct {
+	english  string
+	romaji   string
+	synonyms []string
+	episodes int
+	format   string
+}
+
+func (m anilistMeta) keywords() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, t := range append([]string{m.english, m.romaji}, m.synonyms...) {
+		if t = strings.TrimSpace(t); t != "" && !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+		if len(out) >= 5 {
+			break
+		}
+	}
+	return out
 }
 
 // resolveShow finds the AnikotoTV show slug and ID from an AniList ID.
-// Checks the static mapping first, then searches anikototv.to dynamically.
+// Anivexa parity: static mapping, then multi-keyword search (english,
+// romaji, synonyms), scored candidates, watch-page verification.
 func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (slug string, showID string, err error) {
 	// Fast path: check static mapping
 	if entry := GetAnikotoMapping(anilistID); entry != nil {
@@ -179,87 +354,502 @@ func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (sl
 		return entry.Slug, entry.ShowID, nil
 	}
 
-	// Slow path: fetch AniList title, search anikototv.to, verify on watch page
-	title, err := p.fetchAniListTitle(ctx, anilistID)
+	// Anivexa parity: multi-keyword parallel search, dice-scored shortlist,
+	// episode-count validation, watch-page verification.
+	meta, err := p.fetchAniListMeta(ctx, anilistID)
 	if err != nil {
 		return "", "", fmt.Errorf("anilist title fetch failed: %w", err)
 	}
+	titles := meta.keywords()
+	if len(titles) == 0 {
+		return "", "", fmt.Errorf("no titles for anilistId=%s", anilistID)
+	}
+	queries := map[string]bool{}
+	for _, t := range titles {
+		for _, q := range buildSearchQueries(t) {
+			queries[q] = true
+		}
+		if len(queries) >= 8 {
+			break
+		}
+	}
+	seen := map[string]*titleCand{}
+	var order []string
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for q := range queries {
+		wg.Add(1)
+		go func(q string) {
+			defer wg.Done()
+			html, err := p.searchPage(ctx, q)
+			if err != nil {
+				return
+			}
+			local := parseTitleAnchors(html)
+			mu.Lock()
+			for _, c := range local {
+				if _, ok := seen[c.slug]; !ok {
+					cp := c
+					seen[c.slug] = &cp
+					order = append(order, c.slug)
+				}
+			}
+			mu.Unlock()
+		}(q)
+	}
+	wg.Wait()
+	scored := make([]titleCand, 0, len(order))
+	for _, slug := range order {
+		c := seen[slug]
+		best := 0.0
+		for _, t := range titles[:minInt(len(titles), 2)] {
+			if s := titleScoreDice(t, c.name, c.slug); s > best {
+				best = s
+			}
+			if c.jp != "" {
+				if s := titleScoreDice(t, c.jp, c.slug); s > best {
+					best = s
+				}
+			}
+		}
+		if best >= 0.5 {
+			c.score = best
+			scored = append(scored, *c)
+		}
+	}
+	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+	if len(scored) > 6 {
+		scored = scored[:6]
+	}
+	if len(scored) == 0 {
+		return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
+	}
 
-	// Search anikototv.to — extract data-tip (show ID) and watch href
-	searchURL := fmt.Sprintf("%s/search?keyword=%s", anikotoBase, url.QueryEscape(title))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, searchURL, nil)
+	// Episode-count validation (Anivexa selectSeries): the right season has
+	// the right number of episodes. Falls back to pure title score.
+	if best, ok := p.selectSeries(ctx, scored, meta); ok {
+		if slug, id, err := p.verifyCandidate(ctx, anilistID, titles[0], best.slug, best.score, true); err == nil {
+			return slug, id, nil
+		}
+	}
+	// Watch-page verification in score order, exact-title fallback inside.
+	for _, c := range scored {
+		if slug, id, err := p.verifyCandidate(ctx, anilistID, titles[0], c.slug, c.score, false); err == nil {
+			return slug, id, nil
+		}
+	}
+	return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
+}
+
+// searchPage fetches one Anikoto filter-search page, retrying the site's
+// intermittent backend 500s ("An Internal Error Has Occurred").
+func (p *AnikotoProvider) searchPage(ctx context.Context, q string) (string, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		html, err := p.searchPageOnce(ctx, q)
+		if err == nil && looksLikeFilterPage(html) {
+			return html, nil
+		}
+		if err != nil {
+			lastErr = err
+		} else {
+			lastErr = fmt.Errorf("filter page failed validation")
+		}
+	}
+	return "", lastErr
+}
+
+func looksLikeFilterPage(html string) bool {
+	return len(html) > 20000 && strings.Contains(strings.ToLower(html), "<html")
+}
+
+func (p *AnikotoProvider) searchPageOnce(ctx context.Context, q string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		fmt.Sprintf("%s/filter?keyword=%s", anikotoBase, url.QueryEscape(q)), nil)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	p.setAjaxHeaders(req)
 	req.Header.Del("X-Requested-With")
-
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", "", fmt.Errorf("search request failed: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+type titleCand struct {
+	slug  string
+	name  string
+	jp    string
+	score float64
+}
+
+// parseTitleAnchors extracts title anchors (real names), falling back to
+// generic watch links when the page variant lacks them.
+func parseTitleAnchors(html string) []titleCand {
+	seen := map[string]bool{}
+	var out []titleCand
+	add := func(re *regexp.Regexp, withJp bool) {
+		for _, m := range re.FindAllStringSubmatch(html, -1) {
+			slug := m[1]
+			if seen[slug] || strings.HasPrefix(slug, "genre") || strings.HasPrefix(slug, "filter") {
+				continue
+			}
+			seen[slug] = true
+		name, jp := "", ""
+		if withJp {
+			jp = strings.TrimSpace(m[2])
+			name = strings.TrimSpace(stripHTMLTags(m[3]))
+		} else {
+			name = strings.TrimSpace(stripHTMLTags(m[2]))
+		}
+			name = strings.ReplaceAll(name, "&amp;", "&")
+			if name == "" {
+				name = slug
+			}
+			out = append(out, titleCand{slug: slug, name: name, jp: jp})
+		}
+	}
+	add(regexp.MustCompile(`<a\s+class="name d-title"\s+href="(?:https?://anikototv\.to)?/watch/([^"/]+?)(?:/ep-\d+)?"[^>]*data-jp="([^"]*)"[^>]*>(.*?)</a>`), true)
+	if len(out) == 0 {
+		add(regexp.MustCompile(`<a[^>]*href="(?:https?://anikototv\.to)?/watch/([^"/]+?)(?:/ep-\d+)?"[^>]*>(.*?)</a>`), false)
+	}
+	return out
+}
+
+// verifyCandidate checks the watch page (AniList banner proof, else exact
+// title fallback), caches the mapping, and returns slug + show ID.
+func (p *AnikotoProvider) verifyCandidate(ctx context.Context, anilistID, title, slug string, score float64, trust bool) (string, string, error) {
+	baseSlug := regexp.MustCompile(`/ep-\d+$`).ReplaceAllString(slug, "")
+	pageURL := fmt.Sprintf("%s/watch/%s", anikotoBase, slug)
+	pageHTML, err := p.fetchPage(ctx, pageURL)
 	if err != nil {
 		return "", "", err
 	}
-	html := string(body)
-
-	// Each search result has: <div class="ani poster tip" data-tip="SHOW_ID"> <a href="...watch/SLUG/ep-1">
-	// Extract pairs of (data-tip, watch-slug) from adjacent elements.
-	entryRe := regexp.MustCompile(`data-tip="(\d+)"[^<]*<a[^>]*href="(?:https?://anikototv\.to)?/watch/([^"]+)"`)
-	entries := entryRe.FindAllStringSubmatch(html, -1)
-	if len(entries) == 0 {
-		// Fallback: extract data-tip IDs and watch slugs separately
-		tipRe := regexp.MustCompile(`data-tip="(\d+)"`)
-		slugRe := regexp.MustCompile(`href="(?:https?://anikototv\.to)?/watch/([^"]+/ep-\d+)"`)
-		tips := tipRe.FindAllStringSubmatch(html, -1)
-		slugs := slugRe.FindAllStringSubmatch(html, -1)
-		for i := 0; i < len(tips) && i < len(slugs); i++ {
-			entries = append(entries, []string{"", tips[i][1], slugs[i][1]})
-		}
+	showID := extractShowID(pageHTML)
+	if showID == "" {
+		showID = tipNearSlug(pageHTML, baseSlug)
 	}
+	if showID == "" {
+		return "", "", fmt.Errorf("no show id")
+	}
+	pat := regexp.MustCompile(`anilist\.co/file/anilistcdn/media/anime/(?:banner|poster)/` + anilistID + `-`)
+	if pat.MatchString(pageHTML) {
+		p.log.Info().Str("slug", baseSlug).Str("showId", showID).Msg("anikoto: resolved from search")
+		AddAnikotoMapping(anilistID, AnikotoMapping{ShowID: showID, Slug: baseSlug, Title: title})
+		return baseSlug, showID, nil
+	}
+	// Trusted winners (episode-count validated) and exact title matches
+	// are accepted without banner proof; the episode list validates after.
+	if trust || score >= 0.9 {
+		p.log.Info().Str("slug", baseSlug).Str("showId", showID).Msg("anikoto: resolved by exact title (no banner proof)")
+		AddAnikotoMapping(anilistID, AnikotoMapping{ShowID: showID, Slug: baseSlug, Title: title})
+		return baseSlug, showID, nil
+	}
+	return "", "", fmt.Errorf("no banner proof for %s", slug)
+}
 
-	// For each candidate, verify the AniList ID on the watch page
-	anilistPattern := regexp.MustCompile(`anilist\.co/file/anilistcdn/media/anime/(?:banner|poster)/` + anilistID + `-`)
-	seen := make(map[string]bool)
-	for _, entry := range entries {
-		if len(entry) < 3 {
-			continue
-		}
-		tID := entry[1]
-		slugCandidate := entry[2]
-		// Strip /ep-N suffix to get the base slug
-		baseSlug := regexp.MustCompile(`/ep-\d+$`).ReplaceAllString(slugCandidate, "")
-		if seen[baseSlug] {
-			continue
-		}
-		seen[baseSlug] = true
-
-		// Fetch the watch page and verify AniList ID
-		pageURL := fmt.Sprintf("%s/watch/%s", anikotoBase, slugCandidate)
-		pageHTML, err := p.fetchPage(ctx, pageURL)
-		if err != nil {
-			continue
-		}
-		if anilistPattern.MatchString(pageHTML) {
-			showIDFromPage := extractShowID(pageHTML)
-			if showIDFromPage == "" {
-				showIDFromPage = tID
+// selectSeries validates top candidates by episode count (Anivexa parity):
+// score = title*0.7 + count*0.3, min 0.65. Returns the winner.
+func (p *AnikotoProvider) selectSeries(ctx context.Context, scored []titleCand, meta anilistMeta) (titleCand, bool) {
+	var zero titleCand
+	if meta.episodes <= 0 || len(scored) == 0 {
+		return zero, false
+	}
+	type res struct {
+		idx   int
+		count int
+		total int
+	}
+	n := len(scored)
+	if n > 3 {
+		n = 3
+	}
+	outs := make([]res, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			nums := p.fetchEpisodeNumbers(ctx, scored[i].slug)
+			inRange := 0
+			for _, num := range nums {
+				if num >= 1 && num <= meta.episodes {
+					inRange++
+				}
 			}
-			p.log.Info().Str("slug", baseSlug).Str("showId", showIDFromPage).Msg("anikoto: resolved from search")
-			// Cache the mapping for future lookups
-			AddAnikotoMapping(anilistID, AnikotoMapping{
-				ShowID: showIDFromPage,
-				Slug:   baseSlug,
-				Title:  title,
-			})
-			return baseSlug, showIDFromPage, nil
+			outs[i] = res{idx: i, count: inRange, total: len(nums)}
+		}(i)
+	}
+	wg.Wait()
+	best := -1.0
+	bestIdx := -1
+	for _, r := range outs {
+		if r.total == 0 {
+			continue
+		}
+		need := r.count
+		want := meta.episodes
+		if want >= 6 {
+			wantNeed := want - 3
+			if wantNeed < 1 {
+				wantNeed = 1
+			}
+			countScore := 1.0
+			if need < wantNeed {
+				countScore = float64(need) / float64(wantNeed)
+			}
+			final := scored[r.idx].score*0.7 + countScore*0.3
+			if final >= 0.65 && final > best {
+				best, bestIdx = final, r.idx
+			}
+		} else if float64(need) > best {
+			best, bestIdx = float64(need), r.idx
 		}
 	}
+	if bestIdx == -1 {
+		return zero, false
+	}
+	return scored[bestIdx], true
+}
 
-	return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
+// fetchEpisodeNumbers returns all episode numbers for a slug via its show ID.
+func (p *AnikotoProvider) fetchEpisodeNumbers(ctx context.Context, slug string) []int {
+	pageHTML, err := p.fetchPage(ctx, fmt.Sprintf("%s/watch/%s", anikotoBase, slug))
+	if err != nil {
+		return nil
+	}
+	showID := extractShowID(pageHTML)
+	if showID == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		fmt.Sprintf("%s/ajax/episode/list/%s", anikotoBase, showID),
+		strings.NewReader("style=&vrf="))
+	if err != nil {
+		return nil
+	}
+	p.setAjaxHeaders(req)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	if err != nil {
+		return nil
+	}
+	var data struct {
+		Result string `json:"result"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return nil
+	}
+	var nums []int
+	for _, m := range regexp.MustCompile(`data-num="(\d+)"`).FindAllStringSubmatch(data.Result, -1) {
+		var n int
+		fmt.Sscanf(m[1], "%d", &n)
+		if n > 0 {
+			nums = append(nums, n)
+		}
+	}
+	return nums
+}
+
+// ---- Anivexa-parity search/scoring utils (best-ever method) ----
+
+func normDice(s string) string {
+	return regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(s), "")
+}
+
+func diceCoeff(a, b string) float64 {
+	na, nb := normDice(a), normDice(b)
+	if na == nb {
+		return 1
+	}
+	if len(na) < 2 || len(nb) < 2 {
+		return 0
+	}
+	bg := map[string]int{}
+	for i := 0; i+1 < len(na); i++ {
+		bg[na[i:i+2]]++
+	}
+	hits := 0
+	for i := 0; i+1 < len(nb); i++ {
+		if bg[nb[i:i+2]] > 0 {
+			hits++
+			bg[nb[i:i+2]]--
+		}
+	}
+	return 2 * float64(hits) / float64(len(na)+len(nb)-2)
+}
+
+// titleScoreDice mirrors Anivexa titleScore: dice base with number,
+// movie-asymmetry and length penalties.
+func titleScoreDice(query, candidate, slug string) float64 {
+	slugSp := strings.ReplaceAll(slug, "-", " ")
+	base := diceCoeff(query, candidate)
+	if s := diceCoeff(query, slugSp); s > base {
+		base = s
+	}
+	// Trailing hash segments (fc8mq, 752db) are site IDs, not sequel
+	// numbers: exclude them from the digit/length penalties.
+	slugCore := regexp.MustCompile(`-[a-z0-9]*[0-9][a-z0-9]*$`).ReplaceAllString(slug, "")
+	if slugCore == "" {
+		slugCore = slug
+	}
+	slug = slugCore
+	numRe := regexp.MustCompile(`\d+`)
+	qn := numRe.FindString(normDice(query))
+	sn := numRe.FindString(slug)
+	if qn != "" && sn != "" && qn != sn {
+		return base * 0.65
+	}
+	if qn != "" && sn == "" {
+		return base * 0.65
+	}
+	if qn == "" && sn != "" {
+		var n int
+		fmt.Sscanf(sn, "%d", &n)
+		if n > 1 && n < 1900 {
+			return base * (1 - 0.06*float64(n-1))
+		}
+	}
+	lq := strings.ToLower(query)
+	movieQ := strings.Contains(lq, "movie") || strings.Contains(lq, "film")
+	movieM := strings.Contains(strings.ToLower(candidate), "movie") ||
+		strings.Contains(strings.ToLower(candidate), "film") ||
+		strings.Contains(slug, "movie") || strings.Contains(slug, "film")
+	if movieQ && !movieM {
+		return base * 0.4
+	}
+	ql, sl := len(normDice(query)), len(normDice(slugSp))
+	if float64(sl) > float64(ql)*1.6+4 {
+		return base * 0.8
+	}
+	return base
+}
+
+// buildSearchQueries mirrors Anivexa: full title, first-4, first-3 words,
+// season/part/ordinal-stripped variant.
+func buildSearchQueries(title string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(q string) {
+		q = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(q, " "))
+		if len(q) >= 3 && !seen[q] {
+			seen[q] = true
+			out = append(out, q)
+		}
+	}
+	add(title)
+	words := strings.Fields(title)
+	if len(words) > 4 {
+		add(strings.Join(words[:4], " "))
+	}
+	if len(words) > 3 {
+		add(strings.Join(words[:3], " "))
+	}
+	stripped := regexp.MustCompile(`(?i)\bseason\s*\d+\b|\bpart\s*\d+\b|\b\d+(rd|th|st|nd)\b`).ReplaceAllString(title, "")
+	if strings.TrimSpace(stripped) != strings.TrimSpace(title) {
+		add(stripped)
+	}
+	return out
+}
+
+// normShowTitle normalizes a title for fuzzy comparison.
+func normShowTitle(s string) string {
+	return regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(s), "")
+}
+
+// stripHTMLTags removes tags from a snippet.
+func stripHTMLTags(s string) string {
+	return regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
+}
+
+// titleScore ranks a candidate slug/name against the wanted title.
+func titleScore(cand, want string) int {
+	return titleScoreEx(cand, "", want)
+}
+
+// showModifiers penalizes sequel/movie/spinoff-tinted candidates when the
+// wanted title has none of that tint (Anivexa parity).
+var showModifiers = []string{
+	"ova", "movie", "special", "specials", "tales", "journal",
+	"part", "season", "kanwa", "spinoff", "theatre",
+}
+
+// titleScoreEx scores name + Japanese name against the wanted title.
+func titleScoreEx(cand, candJp, want string) int {
+	if want == "" {
+		return 0
+	}
+	score := 0
+	if candJp != "" && candJp == want {
+		score = 800
+	}
+	switch {
+	case cand == "" && score == 0:
+		return 0
+	case cand == want:
+		score = 1000
+	case strings.HasPrefix(cand, want) || strings.HasPrefix(want, cand):
+		if score < 80 {
+			score = 80
+		}
+	case strings.Contains(cand, want) || strings.Contains(want, cand):
+		if score < 40 {
+			score = 40
+		}
+	default:
+		if score == 0 {
+			score = 1
+		}
+	}
+	lowerWant := strings.ToLower(want)
+	lowerCand := strings.ToLower(cand)
+	for _, mod := range showModifiers {
+		if strings.Contains(lowerCand, mod) && !strings.Contains(lowerWant, mod) {
+			score -= 300
+		}
+	}
+	return score
+}
+
+// tipNearSlug finds the closest data-tip show ID before a slug occurrence.
+func tipNearSlug(html, slug string) string {
+	idx := strings.Index(html, "/watch/"+slug)
+	if idx == -1 {
+		return ""
+	}
+	window := html[maxInt(0, idx-3000):idx]
+	re := regexp.MustCompile(`data-tip="(\d+)"`)
+	matches := re.FindAllStringSubmatch(window, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return matches[len(matches)-1][1]
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // extractShowID pulls the data-id from the watch-main div.
@@ -274,24 +864,41 @@ func extractShowID(html string) string {
 
 // fetchAniListTitle queries AniList GraphQL for the English or romaji title.
 func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID string) (string, error) {
-	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji}} }"}`
+	m, err := p.fetchAniListMeta(ctx, anilistID)
+	if err != nil {
+		return "", err
+	}
+	if m.english != "" {
+		return m.english, nil
+	}
+	if m.romaji != "" {
+		return m.romaji, nil
+	}
+	return "", fmt.Errorf("no title found for anilistId=%s", anilistID)
+}
+
+// fetchAniListMeta queries AniList GraphQL for titles + synonyms (Anivexa
+// searches english, romaji and synonyms as separate keywords).
+func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string) (anilistMeta, error) {
+	var out anilistMeta
+	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji} synonyms episodes format} }"}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co",
 		strings.NewReader(query))
 	if err != nil {
-		return "", err
+		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", err
+		return out, err
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
 	if err != nil {
-		return "", err
+		return out, err
 	}
 
 	var result struct {
@@ -301,20 +908,37 @@ func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID strin
 					English *string `json:"english"`
 					Romaji  *string `json:"romaji"`
 				} `json:"title"`
+				Synonyms []string `json:"synonyms"`
+				Episodes *int     `json:"episodes"`
+				Format   *string  `json:"format"`
 			} `json:"Media"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
+		return out, err
 	}
 
-	if result.Data.Media.Title.English != nil && *result.Data.Media.Title.English != "" {
-		return *result.Data.Media.Title.English, nil
+	if result.Data.Media.Title.English != nil {
+		out.english = strings.TrimSpace(*result.Data.Media.Title.English)
 	}
-	if result.Data.Media.Title.Romaji != nil && *result.Data.Media.Title.Romaji != "" {
-		return *result.Data.Media.Title.Romaji, nil
+	if result.Data.Media.Title.Romaji != nil {
+		out.romaji = strings.TrimSpace(*result.Data.Media.Title.Romaji)
 	}
-	return "", fmt.Errorf("no title found for anilistId=%s", anilistID)
+	for _, s := range result.Data.Media.Synonyms {
+		if s = strings.TrimSpace(s); s != "" {
+			out.synonyms = append(out.synonyms, s)
+		}
+	}
+	if result.Data.Media.Episodes != nil {
+		out.episodes = *result.Data.Media.Episodes
+	}
+	if result.Data.Media.Format != nil {
+		out.format = *result.Data.Media.Format
+	}
+	if out.english == "" && out.romaji == "" {
+		return out, fmt.Errorf("no title found for anilistId=%s", anilistID)
+	}
+	return out, nil
 }
 
 // anikotoEpisode represents an episode entry from the HTML.
@@ -324,26 +948,98 @@ type anikotoEpisode struct {
 	number  int
 }
 
-// fetchEpisodeDataIDs fetches the episode list and returns the data-ids for the target episode.
-func (p *AnikotoProvider) fetchEpisodeDataIDs(ctx context.Context, showID string, episode int) (string, error) {
+// anikotoEpMeta carries episode-list attributes needed downstream
+// (mapper lookup needs mal/slug/timestamp).
+type anikotoEpMeta struct {
+	mal       string
+	slug      string
+	timestamp string
+}
+
+// fetchMapperServers queries the nekostream mapper for extra servers and
+// download links (Anivexa parity). Entries with http link IDs are direct
+// embed URLs; name suffixes are trimmed like Anivexa.
+func (p *AnikotoProvider) fetchMapperServers(ctx context.Context, meta anikotoEpMeta, lang string) []anikotoServerEntry {
+	if meta.mal == "" || meta.slug == "" || meta.timestamp == "" {
+		return nil
+	}
+	u := fmt.Sprintf("https://mapper.nekostream.site/api/mal/%s/%s/%s",
+		url.PathEscape(meta.mal), url.PathEscape(meta.slug), url.PathEscape(meta.timestamp))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Referer", anikotoBase+"/")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return nil
+	}
+	// Generic decode: keys are server names with trailing -/_ trimmed.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	var out []anikotoServerEntry
+	for key, val := range raw {
+		if key == "status" {
+			continue
+		}
+		name := strings.Trim(strings.Trim(key, "-_"), " ")
+		var s struct {
+			URL      string            `json:"url"`
+			Download map[string]string `json:"download"`
+		}
+		// pick audio branch
+		var branch map[string]json.RawMessage
+		if err := json.Unmarshal(val, &branch); err != nil {
+			continue
+		}
+		ab, ok := branch[lang]
+		if !ok {
+			continue
+		}
+		if err := json.Unmarshal(ab, &s); err != nil {
+			continue
+		}
+		if s.URL != "" {
+			out = append(out, anikotoServerEntry{linkID: s.URL, name: name, serverType: lang})
+		}
+		for label, durl := range s.Download {
+			if durl != "" {
+				out = append(out, anikotoServerEntry{linkID: durl, name: name + " " + label, serverType: "dl"})
+			}
+		}
+	}
+	return out
+}
+
+// fetchEpisodeDataIDs fetches the episode list and returns the data-ids plus
+// mapper attributes for the target episode.
+func (p *AnikotoProvider) fetchEpisodeDataIDs(ctx context.Context, showID string, episode int) (string, anikotoEpMeta, error) {
 	// POST with empty style/vrf — the site requires this body
 	episodeURL := fmt.Sprintf("%s/ajax/episode/list/%s", anikotoBase, showID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, episodeURL, strings.NewReader("style=&vrf="))
 	if err != nil {
-		return "", err
+		return "", anikotoEpMeta{}, err
 	}
 	p.setAjaxHeaders(req)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("episode list request failed: %w", err)
+		return "", anikotoEpMeta{}, fmt.Errorf("episode list request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
 	if err != nil {
-		return "", err
+		return "", anikotoEpMeta{}, err
 	}
 
 	var result struct {
@@ -351,34 +1047,52 @@ func (p *AnikotoProvider) fetchEpisodeDataIDs(ctx context.Context, showID string
 		Result string `json:"result"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", err
+		return "", anikotoEpMeta{}, err
 	}
 	if result.Status != 200 {
-		return "", fmt.Errorf("episode list returned status %d", result.Status)
+		return "", anikotoEpMeta{}, fmt.Errorf("episode list returned status %d", result.Status)
 	}
 
-	// Parse episode links: <a ... data-slug="6" data-ids="..." ...>
-	// Match by data-slug (episode number as string)
-	re := regexp.MustCompile(`<a[^>]*?data-slug="(\d+)"[^>]*?data-ids="([^"]+)"`)
-	matches := re.FindAllStringSubmatch(result.Result, -1)
-
+	// Parse episode links: <a ... data-num="6" data-ids="..." ...>.
+	// data-num is authoritative (data-slug is an internal id on some pages).
 	episodeStr := strconv.Itoa(episode)
-	for _, m := range matches {
-		if len(m) >= 3 && m[1] == episodeStr {
-			return m[2], nil
+	for _, pat := range []string{
+		`<a[^>]*?data-num="(\d+)"[^>]*?>`,
+		`<a[^>]*?data-slug="(\d+)"[^>]*?>`,
+	} {
+		re := regexp.MustCompile(pat)
+		for _, idx := range re.FindAllStringSubmatchIndex(result.Result, -1) {
+			if result.Result[idx[2]:idx[3]] != episodeStr {
+				continue
+			}
+			// Grab the whole tag for attribute extraction.
+			end := idx[1]
+			if j := indexOf(result.Result[end:], ">"); j >= 0 {
+				end += j
+			}
+			tag := result.Result[idx[0]:end]
+			ids := attrValue(tag, "data-ids")
+			if ids == "" {
+				continue
+			}
+			return ids, anikotoEpMeta{
+				mal:       attrValue(tag, "data-mal"),
+				slug:      attrValue(tag, "data-slug"),
+				timestamp: attrValue(tag, "data-timestamp"),
+			}, nil
 		}
 	}
 
-	// Fallback: try data-num attribute
-	re2 := regexp.MustCompile(`<a[^>]*?data-num="(\d+)"[^>]*?data-ids="([^"]+)"`)
-	matches2 := re2.FindAllStringSubmatch(result.Result, -1)
-	for _, m := range matches2 {
-		if len(m) >= 3 && m[1] == episodeStr {
-			return m[2], nil
+	return "", anikotoEpMeta{}, fmt.Errorf("episode %d not found in list", episode)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
 		}
 	}
-
-	return "", fmt.Errorf("episode %d not found in list", episode)
+	return -1
 }
 
 // anikotoServerEntry represents a server from the API.
@@ -420,52 +1134,47 @@ func (p *AnikotoProvider) fetchServers(ctx context.Context, dataIDs string, lang
 		return nil, fmt.Errorf("server list returned status %d", result.Status)
 	}
 
-	// Parse server HTML
-	// Pattern: <div class="type" data-type="sub"><label>...</label><ul>
-	//   <li data-link-id="..." data-sv-id="..." ...>ServerName</li>
-	// </ul></div>
-
+	// Parse server HTML. Type blocks are bounded (each block ends where the
+	// next data-type block starts) so entries never leak across languages.
+	// <li> attributes are extracted independently — attribute ORDER varies.
 	var entries []anikotoServerEntry
-
-	// Find type containers
 	typeRe := regexp.MustCompile(`<div[^>]*?class="type"[^>]*?data-type="([^"]+)"`)
-	typeMatches := typeRe.FindAllStringSubmatch(result.Result, -1)
-
-	for _, typeMatch := range typeMatches {
-		serverType := typeMatch[1]
-
-		// Filter by requested language
-		if lang != "" && serverType != lang {
-			continue
+	locs := typeRe.FindAllStringSubmatchIndex(result.Result, -1)
+	stripTags := regexp.MustCompile(`<[^>]+>`)
+	for i, loc := range locs {
+		serverType := result.Result[loc[2]:loc[3]]
+		blockEnd := len(result.Result)
+		if i+1 < len(locs) {
+			blockEnd = locs[i+1][0]
 		}
-
-		// Find servers within this type section
-		// Extract the section between this type div and the next
-		typeStart := strings.Index(result.Result, typeMatch[0])
-		if typeStart == -1 {
-			continue
-		}
-
-		liRe := regexp.MustCompile(`<li[^>]*?data-sv-id="([^"]+)"[^>]*?data-link-id="([^"]+)"[^>]*?>([^<]*(?:<b>[^<]*</b>[^<]*)?)</li>`)
-		liMatches := liRe.FindAllStringSubmatch(result.Result[typeStart:], -1)
-
-		for _, liMatch := range liMatches {
-			if len(liMatch) >= 4 {
-				name := strings.TrimSpace(liMatch[3])
-				name = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(name, "")
-				name = strings.TrimSpace(name)
-
-				entries = append(entries, anikotoServerEntry{
-					linkID:     liMatch[2],
-					svID:       liMatch[1],
-					name:       name,
-					serverType: serverType,
-				})
+		block := result.Result[loc[1]:blockEnd]
+		for _, li := range regexp.MustCompile(`(?s)<li\b(.*?)>(.*?)</li>`).FindAllStringSubmatch(block, -1) {
+			attrs, inner := li[1], li[2]
+			linkID := attrValue(attrs, "data-link-id")
+			if linkID == "" {
+				continue
 			}
+			name := strings.TrimSpace(stripTags.ReplaceAllString(inner, ""))
+			entries = append(entries, anikotoServerEntry{
+				linkID:     linkID,
+				svID:       attrValue(attrs, "data-sv-id"),
+				name:       name,
+				serverType: serverType,
+			})
 		}
+		_ = lang
 	}
 
 	return entries, nil
+}
+
+// attrValue extracts one HTML attribute value from a tag-attribute string.
+func attrValue(attrs, name string) string {
+	m := regexp.MustCompile(regexp.QuoteMeta(name) + `="([^"]*)"`).FindStringSubmatch(attrs)
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
 }
 
 // fetchVideoURL gets the actual video iframe URL for a server link.
