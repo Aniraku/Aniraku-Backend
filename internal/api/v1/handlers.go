@@ -22,6 +22,7 @@ import (
 	"github.com/rs/zerolog"
 	"golang.org/x/net/http2"
 
+	"github.com/Aniraku/Aniraku-Backend/internal/api/middleware"
 	"github.com/Aniraku/Aniraku-Backend/internal/auth"
 	"github.com/Aniraku/Aniraku-Backend/internal/config"
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
@@ -781,8 +782,10 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	tmdbByNumber := tmdb.GetCachedEpisodes(anilistID, episodeNumbers)
 	if tmdbByNumber == nil {
 		// Cache miss — fetch TMDB with generous timeout (blocks until done).
+		// Must stay under the server's 60s WriteTimeout or the connection is
+		// killed mid-request and the client gets nothing.
 		tmdbByNumber = map[int]*tmdb.EpisodeMetadata{}
-		fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 180*time.Second)
+		fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 50*time.Second)
 		defer fetchCancel()
 		result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
 		if result != nil {
@@ -1169,18 +1172,18 @@ var blockedProxyPorts = map[string]bool{
 
 func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	// The media proxy must never be cached at the edge: edge caches store
-	// response variants per URL, and a variant that was created without an
-	// allowed Origin carries no Access-Control-Allow-Origin header — serving
-	// that variant to a browser then fails the CORS check and playback dies
-	// with "No 'Access-Control-Allow-Origin' header is present". Media here
-	// is public (allowlisted CDNs only), so always answer CORS ourselves:
-	// reflect any real Origin (valid with the middleware's credentials
-	// pairing), fall back to '*' when the request has none.
+	// response variants per URL. Responses already carry Vary: Origin (set
+	// site-wide), so variants are keyed correctly. Only allowlisted origins
+	// are echoed — reflecting an arbitrary Origin would let any website
+	// read what the proxy fetches. Unknown/absent origins get '*': media
+	// here is public (allowlisted CDNs only) and no proxy request is made
+	// with credentials, so '*' never breaks playback.
 	w.Header().Set("Cache-Control", "no-store, private")
 	origin := r.Header.Get("Origin")
-	if origin == "" {
+	switch {
+	case origin == "":
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-	} else {
+	case middleware.IsAllowedOrigin(origin):
 		w.Header().Set("Access-Control-Allow-Origin", origin)
 	}
 
@@ -2264,14 +2267,29 @@ func (h *Handlers) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid profile payload")
 		return
 	}
-	// Never allow a caller to change their own role.
-	delete(input, "role")
-	if len(input) == 0 {
+	// Only known profile columns may be written — a caller-supplied map
+	// could otherwise carry id, email, role or any other column straight
+	// into the PostgREST PATCH.
+	allowed := map[string]bool{
+		"username":    true,
+		"display_name": true,
+		"avatar_url":  true,
+		"bio":         true,
+		"location":    true,
+		"socials":     true,
+	}
+	filtered := make(map[string]any, len(input))
+	for key, value := range input {
+		if allowed[key] {
+			filtered[key] = value
+		}
+	}
+	if len(filtered) == 0 {
 		h.respondError(w, http.StatusBadRequest, "no fields to update")
 		return
 	}
-	input["updated_at"] = "now()"
-	raw, _ := json.Marshal(input)
+	filtered["updated_at"] = "now()"
+	raw, _ := json.Marshal(filtered)
 
 	resp, err := h.supabaseRequest(r.Context(), "PATCH",
 		"/rest/v1/profiles?id=eq."+encodePath(userID),

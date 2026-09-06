@@ -2,6 +2,8 @@ package streaming
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -97,6 +99,11 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 
 	slug, showID, err := p.resolveShow(ctx, providerID)
 	if err != nil {
+		// Megaplay is directly AniList-keyed — resolve without anikoto's
+		// show catalog when the show itself cannot be matched.
+		if mp, mpErr := p.megaplayDirect(ctx, providerID, episode, lang); mpErr == nil {
+			return mp, nil
+		}
 		return nil, err
 	}
 	_ = slug
@@ -138,6 +145,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 			var err error
 			embedURL, skip, err = p.fetchVideoURL(ctx, e.linkID)
 			if err != nil || strings.TrimSpace(embedURL) == "" {
+				p.log.Debug().Err(err).Str("server", e.name).Str("linkId", e.linkID).Msg("anikoto: embed url fetch failed")
 				continue
 			}
 		}
@@ -156,13 +164,16 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 			continue
 		}
 		if e.serverType != lang {
+			p.log.Debug().Str("server", e.name).Str("serverType", e.serverType).Str("want", lang).Msg("anikoto: server language mismatch")
 			continue
 		}
 		file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
 		if err != nil || file == "" {
+			p.log.Debug().Err(err).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: embed resolve failed")
 			continue
 		}
 		if !p.probeHLS(ctx, file, origin) {
+			p.log.Debug().Str("server", e.name).Str("file", file).Msg("anikoto: manifest probe failed")
 			continue
 		}
 		seenName[e.name] = true
@@ -210,6 +221,12 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 	}
 	sources = dedupeSourcesByURL(sources)
 	if len(sources) == 0 {
+		// The anikoto ajax/embed chain produced nothing usable (dead embeds,
+		// blocked getSources, probe failures). Megaplay hosts the same files
+		// keyed directly by AniList ID — try it before giving up.
+		if mp, mpErr := p.megaplayDirect(ctx, providerID, episode, lang); mpErr == nil {
+			return mp, nil
+		}
 		return nil, nil
 	}
 	if referer == "" {
@@ -221,6 +238,48 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		Downloads: downloads,
 		Intro:     intro,
 		Outro:     outro,
+	}, nil
+}
+
+// megaplayDirect resolves streams straight from megaplay.buzz, which is
+// AniList-keyed: /stream/ani/{anilistId}/{episode}/{lang}. It bypasses the
+// anikoto catalog entirely and reuses the same MegaPlay decrypt chain.
+func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+	if lang != "dub" {
+		lang = "sub"
+	}
+	embedURL := fmt.Sprintf("https://megaplay.buzz/stream/ani/%s/%d/%s", anilistID, episode, lang)
+	file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
+	if err != nil || file == "" {
+		return nil, fmt.Errorf("megaplay direct: %w", err)
+	}
+	if !p.probeHLS(ctx, file, origin) {
+		return nil, fmt.Errorf("megaplay direct: manifest probe failed for %s", file)
+	}
+	p.learnURLHost(file)
+	var subs []core.Subtitle
+	for _, t := range tracks {
+		if strings.TrimSpace(t.URL) == "" {
+			continue
+		}
+		p.learnURLHost(t.URL)
+		subs = append(subs, core.Subtitle{
+			URL:   t.URL,
+			Lang:  mapSubtitleLang(t.Label),
+			Label: t.Label,
+		})
+	}
+	return &SourceResult{
+		Sources: []core.Source{{
+			URL:          file,
+			Type:         "hls",
+			Quality:      "auto",
+			Subtitles:    subs,
+			Verification: "proxy",
+		}},
+		Headers:   map[string]string{"Referer": strings.TrimSuffix(origin, "/") + "/"},
+		Intro:     inTs,
+		Outro:     outTs,
 	}, nil
 }
 
@@ -249,6 +308,51 @@ type megaplayTrack struct {
 	Label string
 }
 
+// MegaPlay encrypts the legacy getSources payload with a static AES-256-CBC
+// key/IV embedded in its own player bundle (lib/newclient.min.js, TRUST_AES_
+// KEY/TRUST_AES_IV, zero-padded to the block size). The ciphertext is
+// base64url, plaintext is {"file": "..."}.
+const (
+	megaPlayEncKey = "i?LMTAx0Q6,:}50U"
+	megaPlayEncIv  = "W0;27ToaUpl_P%'c"
+)
+
+func decryptMegaPlayEnc(enc string) (string, error) {
+	t := strings.NewReplacer("-", "+", "_", "/").Replace(enc)
+	if pad := len(t) % 4; pad != 0 {
+		t += strings.Repeat("=", 4-pad)
+	}
+	raw, err := base64.StdEncoding.DecodeString(t)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < 16 || len(raw)%aes.BlockSize != 0 {
+		return "", fmt.Errorf("enc payload length %d is not AES-CBC sized", len(raw))
+	}
+	key := []byte(megaPlayEncKey)
+	key = append(key, make([]byte, 32-len(key))...)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", err
+	}
+	pt := make([]byte, len(raw))
+	cipher.NewCBCDecrypter(block, []byte(megaPlayEncIv)).CryptBlocks(pt, raw)
+	pad := int(pt[len(pt)-1])
+	if pad > 0 && pad <= aes.BlockSize && pad <= len(pt) {
+		pt = pt[:len(pt)-pad]
+	}
+	var out struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(pt, &out); err != nil {
+		return "", err
+	}
+	if out.File == "" {
+		return "", fmt.Errorf("decrypted enc has no file")
+	}
+	return out.File, nil
+}
+
 // resolveEmbed decrypts a MegaPlay-style embed URL to a direct file URL.
 // Handles #aHR0c... base64 embeds and data-id -> /stream/getSources embeds.
 func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
@@ -273,23 +377,25 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 	if len(m) < 2 || m[1] == "" {
 		return "", nil, nil, nil, origin, fmt.Errorf("embed file id not found")
 	}
-	srcURL := fmt.Sprintf("%s/stream/getSources?id=%s&id=%s",
-		strings.TrimSuffix(origin, "/"), url.QueryEscape(m[1]), url.QueryEscape(m[1]))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
-	if err != nil {
-		return "", nil, nil, nil, origin, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", nil, nil, nil, origin, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return "", nil, nil, nil, origin, err
+	// The player rewrites stream/getSources -> stream/getSourcesNew (plain
+	// JSON); the legacy endpoint returns an AES-encrypted "enc" blob instead
+	// of sources.file. Try New first, fall back to legacy + decrypt.
+	fetchSources := func(endpoint string) ([]byte, error) {
+		srcURL := fmt.Sprintf("%s/%s?id=%s&id=%s",
+			strings.TrimSuffix(origin, "/"), endpoint, url.QueryEscape(m[1]), url.QueryEscape(m[1]))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("X-Requested-With", "XMLHttpRequest")
+		req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
+		resp, err := p.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		return io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	}
 	var data struct {
 		Sources struct {
@@ -301,9 +407,26 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 		} `json:"tracks"`
 		Intro *core.SkipTimestamp `json:"intro"`
 		Outro *core.SkipTimestamp `json:"outro"`
+		Enc   string              `json:"enc"`
 	}
-	if err := json.Unmarshal(body, &data); err != nil {
-		return "", nil, nil, nil, origin, err
+	if body, err := fetchSources("stream/getSourcesNew"); err == nil {
+		json.Unmarshal(body, &data)
+	}
+	if data.Sources.File == "" {
+		body, err := fetchSources("stream/getSources")
+		if err != nil {
+			return "", nil, nil, nil, origin, err
+		}
+		if err := json.Unmarshal(body, &data); err != nil {
+			return "", nil, nil, nil, origin, err
+		}
+		if data.Sources.File == "" && data.Enc != "" {
+			file, decErr := decryptMegaPlayEnc(data.Enc)
+			if decErr != nil {
+				return "", nil, nil, nil, origin, fmt.Errorf("embed enc decrypt failed: %w", decErr)
+			}
+			data.Sources.File = file
+		}
 	}
 	if data.Sources.File == "" {
 		return "", nil, nil, nil, origin, fmt.Errorf("embed returned no file")

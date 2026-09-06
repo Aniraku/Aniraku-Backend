@@ -31,10 +31,9 @@ async def health():
     ok = client is not None
     return {"status": "ok" if ok else "starting"}
 
-@app.api_route("/proxy")
-async def generic_proxy(url: str, request: Request):
-    r = await _do_get(url)
-    return Response(content=r.content, status_code=r.status_code, media_type=r.headers.get("content-type"))
+# NOTE: no open generic "/proxy?url=..." relay here — a user-supplied-URL
+# fetch with no allowlist is an SSRF/open-relay hole. Only the fixed
+# MIRURO_API_BASE route below is served.
 
 @app.api_route("/{path:path}", methods=["GET"])
 async def miruro_proxy(path: str, request: Request):

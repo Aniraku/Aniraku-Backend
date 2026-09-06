@@ -13,6 +13,7 @@ import (
 
 func main() {
 	output := zerolog.ConsoleWriter{Out: os.Stderr, TimeFormat: time.RFC3339}
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	log := zerolog.New(output).With().Timestamp().Logger()
 	_ = streaming.LoadAnikotoMapping("") // bundled mapping
 	p := streaming.NewAnikotoProvider(log)
