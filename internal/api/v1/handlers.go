@@ -1008,6 +1008,7 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 	if err != nil || result == nil || len(result.Sources) == 0 {
 		h.log.Warn().Err(err).Int("animeId", req.AnimeID).Str("lang", req.Lang).Str("provider", req.Provider).Msg("streaming failed")
 		if err != nil && (strings.Contains(err.Error(), "no source") || strings.Contains(err.Error(), "not found") ||
+			strings.Contains(err.Error(), "no matching show") ||
 			strings.Contains(err.Error(), "not available") || strings.Contains(err.Error(), "blocked") ||
 			strings.Contains(err.Error(), "unreachable") || strings.Contains(err.Error(), "filtered")) {
 			h.respondError(w, http.StatusNotFound, "no streaming source found")
