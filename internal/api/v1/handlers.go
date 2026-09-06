@@ -1671,6 +1671,20 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 	alreadyProxied := func(u string) bool {
 		return strings.Contains(u, "/api/v1/proxy?")
 	}
+	// megaSegmentHost matches the TikTok-CDN family megaplay hosts its video
+	// segments on. Those CDNs refuse datacenter IPs (the proxy dial gets
+	// rejected with CDN_BLOCKED) and prefix every response with a 252-byte
+	// canary the client must strip — so they only work fetched directly from
+	// the viewer's browser, exactly like megaplay's own player. Such URIs are
+	// left absolute and unproxied.
+	megaSegmentHost := func(u string) bool {
+		if p, err := url.Parse(u); err == nil {
+			h := strings.ToLower(p.Hostname())
+			return strings.HasSuffix(h, "tiktokcdn.com") || strings.HasSuffix(h, "ipstatp.com") ||
+				strings.HasSuffix(h, "ibyteimg.com") || h == "yoot.akirax.buzz"
+		}
+		return false
+	}
 
 	for i, line := range lines {
 		original := strings.TrimSpace(line)
@@ -1689,11 +1703,11 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 					return match
 				}
 				learnPlaylistTarget(absoluteURL)
-				if needsProxyRewrite(absoluteURL) || headersJSON != "" {
+				if !megaSegmentHost(absoluteURL) && (needsProxyRewrite(absoluteURL) || headersJSON != "") {
 					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 					return fmt.Sprintf("URI=\"%s\"", proxied)
 				}
-				return match
+				return fmt.Sprintf("URI=\"%s\"", absoluteURL)
 			})
 			if strings.Contains(original, "METHOD=AES-128") {
 				isEncrypted = true
@@ -1740,7 +1754,9 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 				// hls.js indexes LevelKey by URI — same URI skips IV update.
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
-				if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+				if megaSegmentHost(absoluteURL) {
+					lines[i] = keyTag + "\n" + absoluteURL
+				} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
 					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
@@ -1749,7 +1765,9 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase s
 			}
 		}
 
-		if headersJSON != "" || needsProxyRewrite(absoluteURL) {
+		if megaSegmentHost(absoluteURL) {
+			lines[i] = absoluteURL
+		} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
 			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, rnParam)
 		} else {
 			lines[i] = absoluteURL
