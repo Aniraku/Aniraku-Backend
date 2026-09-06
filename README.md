@@ -39,7 +39,12 @@ Read the full [Support Guide](./SUPPORT.md).
 
 Aniraku-Backend keeps the client-facing API separate from provider-specific work. It handles API routing, authentication, episode metadata, playback coordination, account data, sync, and the network checks needed around upstream requests.
 
-The service is written in **Go**. Episode titles/thumbnails are resolved via **AniZip + TMDB** (AniBridge verified mappings + Fribb fallback, bidirectional). Streaming is **Anikoto + FlixCloud** via a small **Node.js** `decrypt.mjs` (WASM + PBKDF2 + AES-256-CBC) that extracts direct `m3u8` + subtitles from `flixcloud.cc` embeds. No Python is required.
+The service is written entirely in **Go** — one static binary, no Node.js, no Python, no sidecars. Streaming resolution is fully in-process:
+
+- **Anikoto (primary)** — AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro.
+- **FlixCloud (fallback)** — embed URLs for the client's embedded player.
+
+Episode titles/thumbnails are resolved via **AniZip + TMDB** (AniBridge verified mappings + Fribb fallback, bidirectional).
 
 ## Request flow
 
@@ -52,14 +57,12 @@ Aniraku web / Android client
     ┌─────────┼─────────┐
     ▼         ▼         ▼
   auth    episodes   streaming
- Supabase AniZip↔TMDB FlixCloud (Node decrypt)
- JWT/JWKS  unlimited   + Anikoto
+ Supabase AniZip↔TMDB Anikoto (direct)
+ JWT/JWKS  unlimited   + FlixCloud (embed)
    │        │          │
    ▼        ▼          ▼
      normalized API response
 ```
-
-Frontend calls **AniList GraphQL directly** for `GetAnime`/`Similar`/`Relations`/`Browse`/`Search`/`Trending`/`Schedule`/`Genres`; backend only serves `GET /api/v1/anime/{id}/episodes` (AniZip + TMDB) to bypass blocked episode metadata.
 
 ## API areas
 
@@ -67,9 +70,9 @@ The current router includes playback, episodes, account, sync, and admin.
 
 | Area | Endpoints | Notes |
 |:--|:--|:--|
-| **Episodes** | `GET /api/v1/anime/{id}/episodes` | AniZip unlimited + TMDB bidirectional fallback (AniBridge + Fribb, verified `proxy` ranked first, `coverFallback` if missing) |
-| **Playback** | `POST /api/v1/stream`, `GET /api/v1/servers`, `GET /api/v1/proxy`, `GET /ani/v1/epsrc` | `FlixCloud` decrypt → `hls` `master.m3u8` + `subtitles[]`/`intro/outro`, `Anikoto` embed; `proxy` is `uTLS` + `netguard` SSRF + CDN allowlist + HLS rewrite |
-| **Catalog (frontend-direct)** | `search`, `trending`, `seasonal`, `browse`, `genres`, `schedule`, `manga` | **Removed from backend** — frontend uses AniList directly (`internal/metadata/mal` and `kitsu` unused, kept only for `ImportMAL` ID mapping) |
+| **Episodes** | `GET /api/v1/anime/{id}/episodes` | AniZip + TMDB bidirectional fallback (AniBridge + Fribb, `coverFallback` if missing) |
+| **Playback** | `POST /api/v1/stream`, `GET /api/v1/servers`, `GET /api/v1/proxy`, `GET /api/v1/download`, `GET /ani/v1/epsrc` | Anikoto decrypt → `hls` `master.m3u8` + `subtitles[]`/`intro/outro`; `proxy` is `uTLS` + `netguard` SSRF guard + CDN allowlist + HLS rewrite; `download` streams provider file links through the same allowlisted gate |
+| **Catalog** | `search`, `trending`, `seasonal`, `browse`, `genres`, `schedule` | served through the backend's rate-limited AniList client (token bucket + circuit breaker) |
 | **Account** | `profiles`, `favorites`, `settings`, `notifications`, `logs`, `progress`, `ratings`, `continue-watching` | Supabase RLS via `supabaseRequest` (`apikey=anon` + `Bearer user JWT`) |
 | **Import/export** | `POST /api/v1/import/mal`/`anilist`, `export`, `sync` (`mal`/`anilist` OAuth), `SyncScore`/`SyncUpdate` | `resolveMalIDsToAniList` via `idMal_in` |
 | **Administration** | `GET /api/v1/admin/stats` | `auth.RequireAdmin` `is_admin()` RPC |
@@ -78,7 +81,7 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 
 ## Stack
 
-`Go 1.25` · `Chi v5` · `Zerolog` · `Node 22` (FlixCloud decrypt) · `Supabase JWT/JWKS` · `Docker` · `Render`
+`Go 1.25` · `Chi v5` · `Zerolog` · `Supabase JWT/JWKS` · `Docker` · `Render`
 
 | Responsibility | Location |
 |:--|:--|
@@ -89,27 +92,24 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 | Configuration | `internal/config/` (`TMDB`, `Scraping` bases) |
 | Core models and errors | `internal/core/` |
 | Embedded UI support | `internal/embed/` |
-| Network safety | `internal/netguard/` (`SSRF` `Control` + `NoRedirects`) |
-| Streaming providers | `internal/streaming/` (`flixcloud.go` + `decrypt.mjs`, `anikoto.go`, `manager.go`) |
+| Network safety | `internal/netguard/` (SSRF `Control` + `NoRedirects` + guarded `http.Client` factory) |
+| Streaming providers | `internal/streaming/` (`anikoto.go`, `flixcloud.go`, `manager.go`) |
 | TMDB resolver | `internal/tmdb/` (`resolver.go` AniBridge+Fribb, `merge.go`) |
-
-No Python runtime is required. The former `cmd/miruro-proxy/proxy.py` and `vipertls` are disabled (Miruro/Mimi removed).
 
 ## Configuration
 
-The default configuration is in [`config.yaml`](config.yaml). Secrets are read from environment variables (see `.env.example`) rather than being committed.
+The default configuration is in [`config.yaml`](config.yaml). Secrets are read from environment variables (see `.env.example`) rather than being committed. **Never commit real keys** — and note that deleting a file from git does not remove it from history; secrets must be rotated after any leak.
 
 **Key areas:**
-- `server.host/port/debug`, `ui_dist`, `miruro_proxy_url` (deprecated), `anikoto_mapping_path`;
-- `supabase.url/anon_key/service_key/jwt_aud/jwks_url`;
+- `server.host/port/debug`, `ui_dist`, `anikoto_mapping_path`;
+- `supabase.url/anon_key/service_key/jwt_aud` — `jwks_url` is derived automatically (`{url}/auth/v1/.well-known/jwks.json`), override with `ANIRAKU_SUPABASE_JWKS_URL` only if needed;
 - `tmdb.read_access_token/api_base/image_base/anibridge_api` — `TMDB_READ_ACCESS_TOKEN` (v4) for episode fallback;
-- `scraping.animex_base/flixcloud_base/anizip_base` — override via `ANIRAKU_ANIMEX_BASE` etc or `ANIMEX_BASE`/`FLIXCLOUD_BASE`;
-- `providers.primary` (now `flixcloud`/`anikoto`);
+- `scraping.animex_base/flixcloud_base/anizip_base` — override via `ANIRAKU_*` env vars;
 - `logging.level/format`, `update.channel/url`.
 
-`TMDB`, `AniZip`, `AnimeX`, `FlixCloud` bases are configurable via `ANIRAKU_*` env vars. The default local address is `127.0.0.1:43211` with bounded `Read/Write/Idle` timeouts and `SIGINT`/`SIGTERM` shutdown.
+The default local address is `127.0.0.1:43211` with bounded `Read/Write/Idle` timeouts and `SIGINT`/`SIGTERM` shutdown.
 
-See `.env.example` for a DMCA-safe template (placeholders, no real keys).
+See `.env.example` for a template (placeholders, no real keys).
 
 ## Embedded API interface
 
@@ -118,9 +118,7 @@ Production container builds embed the Aniraku API interface at the service root.
 ## Run locally
 
 ```bash
-# Go + Node required (Node 20+ for FlixCloud decrypt)
 go mod download
-node --version  # 20+
 
 # configure
 cp .env.example .env
@@ -129,8 +127,6 @@ cp .env.example .env
 go run ./cmd/aniraku-server/ --config config.yaml
 ```
 
-FlixCloud decrypt needs `node` in `PATH` (`internal/streaming/decrypt.mjs` is invoked as `node decrypt.mjs -` with embed HTML on stdin, as in `walterwhite-69/ReAnime.to-API`). Tokens are one-time-use (`410` on reuse), `m3u8` JWTs are short-lived (`~6h`).
-
 To build the container:
 
 ```bash
@@ -138,7 +134,7 @@ docker build -t aniraku-backend .
 docker run --rm -p 43211:43211 --env-file .env aniraku-backend
 ```
 
-`render.yaml` and `Dockerfile` (multi-stage `golang:alpine` → `node:22-alpine`) describe deployment.
+`render.yaml` and `Dockerfile` (multi-stage `golang:1.25-alpine` → `alpine:3.20`, non-root) describe deployment.
 
 ## Security and upstream use
 
@@ -148,4 +144,4 @@ Upstream services have their own terms, limits, and content policies. Use the se
 
 For security concerns, follow [PRIVACY_POLICY.md](PRIVACY_POLICY.md) and the repository's contribution process rather than posting sensitive details publicly.
 
-<div align="center"><sub>Go · Chi · Supabase · AniZip↔TMDB · FlixCloud (Node) + Anikoto · Docker</sub></div>
+<div align="center"><sub>Go · Chi · Supabase · AniZip↔TMDB · Anikoto (direct) + FlixCloud · Docker</sub></div>

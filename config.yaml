@@ -9,10 +9,9 @@ supabase:
   anon_key: ${ANIRAKU_SUPABASE_ANON_KEY}
   service_key: ${ANIRAKU_SUPABASE_SERVICE_KEY}
   jwt_aud: authenticated
-  jwks_url: ${ANIRAKU_SUPABASE_URL}/.well-known/jwks.json
-
-providers:
-  primary: miruro
+  # jwks_url is derived by the server from supabase.url as
+  # {url}/auth/v1/.well-known/jwks.json — the correct Supabase path.
+  # Set ANIRAKU_SUPABASE_JWKS_URL only to override.
 
 logging:
   level: info

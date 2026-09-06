@@ -42,3 +42,8 @@ coverage/
 *.tmp
 /aniraku-server
 vipertls/
+.env
+
+# Stray env variants
+.env.*
+!.env.example
