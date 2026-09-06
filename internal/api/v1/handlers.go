@@ -725,21 +725,20 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Use AniList GraphQL
+	// AniList media metadata (episode count, cover art) is a nice-to-have:
+	// during AniList outages the episode list itself must still serve from
+	// AniZip + TMDB, so a failed lookup here is non-fatal. A nil `media` map
+	// reads as zero values below, which routes count derivation to AniZip.
+	var media map[string]any
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english userPreferred } coverImage { extraLarge large medium } episodes format status nextAiringEpisode { episode airingAt } } }`
 	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": id})
 	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "failed to fetch anime metadata")
-		return
-	}
-
-	var result map[string]any
-	json.Unmarshal(raw, &result)
-	data, _ := result["data"].(map[string]any)
-	media, _ := data["Media"].(map[string]any)
-	if media == nil {
-		h.respondError(w, http.StatusBadGateway, "invalid anime data")
-		return
+		h.log.Warn().Err(err).Int("id", id).Msg("episodes: anilist metadata unavailable, serving from anizip/tmdb only")
+	} else {
+		var result map[string]any
+		json.Unmarshal(raw, &result)
+		data, _ := result["data"].(map[string]any)
+		media, _ = data["Media"].(map[string]any)
 	}
 
 	episodeCount := 0
@@ -757,6 +756,21 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// Fetch AniZip (fast, one call); TMDB below fills remaining gaps.
 	anizipData, _ := tmdb.FetchAniZipEpisodes(r.Context(), h.httpClient, anilistID)
+
+	// AniList outages (or titles with unknown counts) leave episodeCount at
+	// 0, which collapses this response to an empty list even though AniZip
+	// carries the full episode map — derive the count from AniZip instead of
+	// returning nothing.
+	if episodeCount == 0 {
+		if azMeta, err := tmdb.FetchAniZipMediaMeta(r.Context(), h.httpClient, anilistID); err == nil && azMeta.EpisodeCount > 0 {
+			episodeCount = azMeta.EpisodeCount
+		}
+		for k := range anizipData {
+			if n, err := strconv.Atoi(k); err == nil && n > episodeCount {
+				episodeCount = n
+			}
+		}
+	}
 
 	// TMDB: check persistent cache first, fetch if miss.
 	token := h.cfg.TMDB.ReadAccessToken
