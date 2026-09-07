@@ -99,10 +99,13 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 
 	slug, showID, err := p.resolveShow(ctx, providerID)
 	if err != nil {
+		p.log.Info().Err(err).Str("anilistId", providerID).Msg("anikoto: resolveShow failed, trying megaplayDirect")
 		// Megaplay is directly AniList-keyed — resolve without anikoto's
 		// show catalog when the show itself cannot be matched.
 		if mp, mpErr := p.megaplayDirect(ctx, providerID, episode, lang); mpErr == nil {
 			return mp, nil
+		} else {
+			p.log.Info().Err(mpErr).Str("anilistId", providerID).Msg("anikoto: megaplayDirect also failed")
 		}
 		return nil, err
 	}
@@ -292,10 +295,13 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 		lang = "sub"
 	}
 	embedURL := fmt.Sprintf("https://megaplay.buzz/stream/ani/%s/%d/%s", anilistID, episode, lang)
+	p.log.Info().Str("url", embedURL).Msg("megaplayDirect: trying")
 	file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
 	if err != nil || file == "" {
+		p.log.Info().Err(err).Str("url", embedURL).Msg("megaplayDirect: resolveEmbed failed")
 		return nil, fmt.Errorf("megaplay direct: %w", err)
 	}
+	p.log.Info().Str("file", file).Str("origin", origin).Msg("megaplayDirect: resolved")
 	// Probe is best-effort: CDN edges (imgnex, norami, akirax) reject
 	// datacenter IPs with 403 — the client's HLS proxy handles real
 	// playback. Don't let a probe failure drop a valid stream.
@@ -447,9 +453,13 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 	embedReq.Header.Set("Referer", "https://hianimes.re/")
 	embedResp, err := p.client.Do(embedReq)
 	if err != nil {
-		return "", nil, nil, nil, origin, err
+		return "", nil, nil, nil, origin, fmt.Errorf("embed page fetch failed: %w", err)
 	}
 	defer embedResp.Body.Close()
+	if embedResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(embedResp.Body, 4096))
+		return "", nil, nil, nil, origin, fmt.Errorf("embed page returned HTTP %d: %s", embedResp.StatusCode, string(body[:min(len(body), 200)]))
+	}
 	pageBytes, err := io.ReadAll(io.LimitReader(embedResp.Body, 512*1024))
 	if err != nil {
 		return "", nil, nil, nil, origin, err
