@@ -168,40 +168,46 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 			p.log.Debug().Str("server", e.name).Str("serverType", e.serverType).Str("want", lang).Msg("anikoto: server language mismatch")
 			continue
 		}
-		file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
-		if err != nil || file == "" {
-			p.log.Debug().Err(err).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: embed resolve failed")
-			continue
+		// Anivexa extractEmbedSource parity, hardened: try the #aHR0c base64
+		// fragment first, then the MegaPlay decrypt chain (getSourcesNew,
+		// then legacy getSources + AES enc decrypt). When decryption yields a
+		// file we serve direct HLS; when it does not, the embed URL itself
+		// ships as a type:"embed" stream (Anivexa priority-4 fallback) so the
+		// client's embedded player can still play it — a source is ALWAYS
+		// returned for the episode, never dropped.
+		hlsURL := ""
+		var tracks []megaplayTrack
+		var inTs, outTs *core.SkipTimestamp
+		origin := embedURL
+		if i := strings.Index(embedURL, "#aHR0c"); i != -1 {
+			if raw, e := base64.StdEncoding.DecodeString(embedURL[i+1:]); e == nil {
+				if s := strings.TrimSpace(string(raw)); strings.Contains(s, ".m3u8") {
+					hlsURL = s
+				}
+			}
 		}
-		if !p.probeHLS(ctx, file, origin) {
-			p.log.Debug().Str("server", e.name).Str("file", file).Msg("anikoto: manifest probe failed")
-			continue
+		if hlsURL == "" {
+			file, tr, in, out, orig, rErr := p.resolveEmbed(ctx, embedURL)
+			if rErr == nil && file != "" {
+				hlsURL = file
+				tracks = tr
+				inTs, outTs = in, out
+				origin = orig
+			} else {
+				p.log.Debug().Err(rErr).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: embed decrypt failed, serving embed url")
+				if o, e2 := url.Parse(embedURL); e2 == nil && o.Host != "" {
+					origin = o.Scheme + "://" + o.Host
+				}
+			}
+		}
+		if strings.HasPrefix(embedURL, "http") {
+			if o, e := url.Parse(embedURL); e == nil && o.Host != "" {
+				if origin == embedURL {
+					origin = o.Scheme + "://" + o.Host
+				}
+			}
 		}
 		seenName[e.name] = true
-		// The manifest was fetched and parsed live, so this host is real:
-		// vouch it (and the subtitle hosts) for the proxy allowlist. This is
-		// the auto-learn path for Anikoto CDN rotation.
-		p.learnURLHost(file)
-		var subs []core.Subtitle
-		for _, t := range tracks {
-			if strings.TrimSpace(t.URL) == "" {
-				continue
-			}
-			p.learnURLHost(t.URL)
-			subs = append(subs, core.Subtitle{
-				URL:   t.URL,
-				Lang:  mapSubtitleLang(t.Label),
-				Label: t.Label,
-			})
-		}
-		sources = append(sources, core.Source{
-			URL:          file,
-			Type:         "hls",
-			Quality:      "auto",
-			Subtitles:    subs,
-			Verification: "proxy",
-		})
-		variants = append(variants, embedVariant(embedURL))
 		if referer == "" {
 			referer = strings.TrimSuffix(origin, "/") + "/"
 		}
@@ -219,7 +225,42 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 				outro = &core.SkipTimestamp{Start: skip["outro"][0], End: skip["outro"][1]}
 			}
 		}
-		// No cap (Anivexa parity): every verified server lists.
+
+		if hlsURL != "" {
+			// Decrypted: vouch the manifest and subtitle hosts for the proxy
+			// allowlist — the auto-learn path for Anikoto CDN rotation.
+			p.learnURLHost(hlsURL)
+			var subs []core.Subtitle
+			for _, t := range tracks {
+				if strings.TrimSpace(t.URL) == "" {
+					continue
+				}
+				p.learnURLHost(t.URL)
+				subs = append(subs, core.Subtitle{
+					URL:   t.URL,
+					Lang:  mapSubtitleLang(t.Label),
+					Label: t.Label,
+				})
+			}
+			sources = append(sources, core.Source{
+				URL:          hlsURL,
+				Type:         "hls",
+				Quality:      "auto",
+				Subtitles:    subs,
+				Verification: "proxy",
+			})
+			variants = append(variants, embedVariant(embedURL))
+		} else {
+			// Anivexa priority-4 fallback: play through the embed itself.
+			sources = append(sources, core.Source{
+				URL:          embedURL,
+				Type:         "embed",
+				Quality:      "auto",
+				Verification: "embed",
+			})
+			variants = append(variants, embedVariant(embedURL))
+		}
+		// No cap (Anivexa parity): every server lists.
 	}
 	sources = dedupeSourcesByURL(sources, variants)
 	if len(sources) == 0 {
@@ -374,6 +415,8 @@ func decryptMegaPlayEnc(enc string) (string, error) {
 
 // resolveEmbed decrypts a MegaPlay-style embed URL to a direct file URL.
 // Handles #aHR0c... base64 embeds and data-id -> /stream/getSources embeds.
+// Anivexa extractEmbedSource parity: spoofed Referer (hianimes.re) when
+// fetching the embed page, then getSources API call for the HLS manifest.
 func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
 	origin = embedURL
 	if i := strings.Index(embedURL, "/stream/"); i != -1 {
@@ -388,10 +431,27 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 			}
 		}
 	}
-	page, err := p.fetchPage(ctx, embedURL)
+	// Anivexa parity: fetch embed page with spoofed Referer (hianimes.re)
+	// and Chrome 124 UA — the embed servers validate referer and reject
+	// requests that come from anikototv.to or the embed origin itself.
+	embedReq, err := http.NewRequestWithContext(ctx, http.MethodGet, embedURL, nil)
 	if err != nil {
 		return "", nil, nil, nil, origin, err
 	}
+	embedReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	embedReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	embedReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	embedReq.Header.Set("Referer", "https://hianimes.re/")
+	embedResp, err := p.client.Do(embedReq)
+	if err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	defer embedResp.Body.Close()
+	pageBytes, err := io.ReadAll(io.LimitReader(embedResp.Body, 512*1024))
+	if err != nil {
+		return "", nil, nil, nil, origin, err
+	}
+	page := string(pageBytes)
 	m := regexp.MustCompile(`data-id="([^"]+)"`).FindStringSubmatch(page)
 	if len(m) < 2 || m[1] == "" {
 		return "", nil, nil, nil, origin, fmt.Errorf("embed file id not found")
@@ -406,7 +466,7 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
 		resp, err := p.client.Do(req)
@@ -466,7 +526,7 @@ func (p *AnikotoProvider) probeHLS(ctx context.Context, fileURL, origin string) 
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
 	resp, err := p.client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -541,9 +601,90 @@ func (m anilistMeta) keywords() []string {
 	return out
 }
 
+// showModifiers are the title words that mark an OVA/movie/spin-off entry;
+// a candidate carrying one the target title lacks is heavily penalized
+// (Anivexa scoreCandidate parity).
+var showModifiers = []string{
+	"ova", "movie", "special", "specials", "tales", "journal", "part", "season", "kanwa", "spin-off", "spinoff", "theatre",
+}
+
+// normTitle lowercases and trims a title for fuzzy comparison.
+func normTitle(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// absInt returns the absolute value of an integer.
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// scoreShowCandidate is the Anivexa additive scorer, ported exactly: exact
+// title matches dominate (+1000/+900/+800), partial matches add smaller
+// bonuses, mismatched modifiers subtract heavily, and length difference is
+// a mild tiebreaker. No threshold — the top score wins.
+func scoreShowCandidate(cand titleCand, meta anilistMeta) float64 {
+	score := 0.0
+	candName := normTitle(cand.name)
+	candJp := normTitle(cand.jp)
+	candSlug := normTitle(cand.slug)
+	normEn := normTitle(meta.english)
+	normRom := normTitle(meta.romaji)
+
+	if normEn != "" && candName == normEn {
+		score += 1000
+	}
+	if normRom != "" && candName == normRom {
+		score += 900
+	}
+	if normRom != "" && candJp == normRom {
+		score += 800
+	}
+
+	targetText := strings.ToLower(meta.english + " " + meta.romaji + " " + strings.Join(meta.synonyms, " "))
+	for _, mod := range showModifiers {
+		candHas := strings.Contains(candName, mod) || strings.Contains(candSlug, mod)
+		targetHas := strings.Contains(targetText, mod)
+		if candHas && !targetHas {
+			score -= 300
+		}
+	}
+
+	titles := append([]string{meta.english, meta.romaji}, meta.synonyms...)
+	for _, t := range titles {
+		normT := normTitle(t)
+		if len(normT) < 3 {
+			continue
+		}
+		switch {
+		case candName == normT:
+			score += 200
+		case strings.HasPrefix(candName, normT) || strings.HasPrefix(normT, candName):
+			score += 80
+		case strings.Contains(candName, normT) || strings.Contains(normT, candName):
+			score += 40
+		}
+		if candJp != "" && candJp == normT {
+			score += 100
+		}
+	}
+
+	refLen := normEn
+	if refLen == "" {
+		refLen = normRom
+	}
+	score -= float64(absInt(len(candName)-len(refLen))) * 2
+	return score
+}
+
 // resolveShow finds the AnikotoTV show slug and ID from an AniList ID.
-// Anivexa parity: static mapping, then multi-keyword search (english,
-// romaji, synonyms), scored candidates, watch-page verification.
+// Anivexa findAnikotoShow parity: static mapping fast path, then search the
+// full keywords (english, romaji, synonyms — no word splitting), score every
+// candidate additively, and take the top one with NO threshold and no extra
+// verification round. The old dice/0.5-threshold port failed shows like
+// AniList 8 that Anivexa resolves fine.
 func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (slug string, showID string, err error) {
 	// Fast path: check static mapping
 	if entry := GetAnikotoMapping(anilistID); entry != nil {
@@ -551,24 +692,13 @@ func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (sl
 		return entry.Slug, entry.ShowID, nil
 	}
 
-	// Anivexa parity: multi-keyword parallel search, dice-scored shortlist,
-	// episode-count validation, watch-page verification.
 	meta, err := p.fetchAniListMeta(ctx, anilistID)
 	if err != nil {
 		return "", "", fmt.Errorf("anilist title fetch failed: %w", err)
 	}
-	titles := meta.keywords()
-	if len(titles) == 0 {
-		return "", "", fmt.Errorf("no titles for anilistId=%s", anilistID)
-	}
 	queries := map[string]bool{}
-	for _, t := range titles {
-		for _, q := range buildSearchQueries(t) {
-			queries[q] = true
-		}
-		if len(queries) >= 8 {
-			break
-		}
+	for _, t := range meta.keywords() {
+		queries[t] = true
 	}
 	seen := map[string]*titleCand{}
 	var order []string
@@ -597,42 +727,26 @@ func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (sl
 	wg.Wait()
 	scored := make([]titleCand, 0, len(order))
 	for _, slug := range order {
-		c := seen[slug]
-		best := 0.0
-		for _, t := range titles[:min(len(titles), 2)] {
-			if s := titleScoreDice(t, c.name, c.slug); s > best {
-				best = s
-			}
-			if c.jp != "" {
-				if s := titleScoreDice(t, c.jp, c.slug); s > best {
-					best = s
-				}
-			}
-		}
-		if best >= 0.5 {
-			c.score = best
-			scored = append(scored, *c)
-		}
-	}
-	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
-	if len(scored) > 6 {
-		scored = scored[:6]
+		c := *seen[slug]
+		c.score = scoreShowCandidate(c, meta)
+		scored = append(scored, c)
 	}
 	if len(scored) == 0 {
-		return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
+		return "", "", fmt.Errorf("no search results on anikoto for anilistId=%s", anilistID)
 	}
+	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
 
-	// Episode-count validation (Anivexa selectSeries): the right season has
-	// the right number of episodes. Falls back to pure title score.
-	if best, ok := p.selectSeries(ctx, scored, meta); ok {
-		if slug, id, err := p.verifyCandidate(ctx, anilistID, titles[0], best.slug, best.score, true); err == nil {
-			return slug, id, nil
-		}
-	}
-	// Watch-page verification in score order, exact-title fallback inside.
+	// Anivexa parity: take the top-scored candidate and read its show id
+	// straight off the watch page — no threshold, no verification rounds.
 	for _, c := range scored {
-		if slug, id, err := p.verifyCandidate(ctx, anilistID, titles[0], c.slug, c.score, false); err == nil {
-			return slug, id, nil
+		watchHTML, err := p.fetchPage(ctx, anikotoBase+"/watch/"+c.slug)
+		if err != nil {
+			continue
+		}
+		m := regexp.MustCompile(`data-id="(\d+)"`).FindStringSubmatch(watchHTML)
+		if len(m) >= 2 && m[1] != "" {
+			p.log.Info().Str("anilistId", anilistID).Str("slug", c.slug).Str("showId", m[1]).Float64("score", c.score).Msg("anikoto: resolved from search")
+			return c.slug, m[1], nil
 		}
 	}
 	return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
@@ -983,13 +1097,6 @@ func titleScore(cand, want string) int {
 	return titleScoreEx(cand, "", want)
 }
 
-// showModifiers penalizes sequel/movie/spinoff-tinted candidates when the
-// wanted title has none of that tint (Anivexa parity).
-var showModifiers = []string{
-	"ova", "movie", "special", "specials", "tales", "journal",
-	"part", "season", "kanwa", "spinoff", "theatre",
-}
-
 // titleScoreEx scores name + Japanese name against the wanted title.
 func titleScoreEx(cand, candJp, want string) int {
 	if want == "" {
@@ -1203,7 +1310,7 @@ func (p *AnikotoProvider) fetchMapperServers(ctx context.Context, meta anikotoEp
 	if err != nil {
 		return nil
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", anikotoBase+"/")
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -1450,7 +1557,7 @@ func (p *AnikotoProvider) fetchVideoURL(ctx context.Context, linkID string) (str
 
 // setAjaxHeaders sets the standard headers for anikoto AJAX requests.
 func (p *AnikotoProvider) setAjaxHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
 	req.Header.Set("Referer", anikotoBase+"/")
@@ -1462,7 +1569,7 @@ func (p *AnikotoProvider) fetchPage(ctx context.Context, pageURL string) (string
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "text/html,application/xhtml+xml")
 	req.Header.Set("Referer", anikotoBase+"/")
 
