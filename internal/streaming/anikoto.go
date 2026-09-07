@@ -296,8 +296,11 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 	if err != nil || file == "" {
 		return nil, fmt.Errorf("megaplay direct: %w", err)
 	}
+	// Probe is best-effort: CDN edges (imgnex, norami, akirax) reject
+	// datacenter IPs with 403 — the client's HLS proxy handles real
+	// playback. Don't let a probe failure drop a valid stream.
 	if !p.probeHLS(ctx, file, origin) {
-		return nil, fmt.Errorf("megaplay direct: manifest probe failed for %s", file)
+		p.log.Debug().Str("file", file).Msg("megaplay direct: manifest probe failed (non-fatal)")
 	}
 	p.learnURLHost(file)
 	var subs []core.Subtitle

@@ -1154,6 +1154,9 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	for i := range servers {
 		proxySources(r, servers[i].Sources, servers[i].Headers)
 	}
+	if servers == nil {
+		servers = []core.Server{}
+	}
 	h.respondJSON(w, http.StatusOK, servers)
 }
 
