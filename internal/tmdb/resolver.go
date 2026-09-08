@@ -740,7 +740,8 @@ func getTmdbSeason(ctx context.Context, client *http.Client, token string, showI
 	if strings.TrimSpace(token) == "" {
 		return nil, newResolverError("TMDB_NOT_CONFIGURED", "TMDB episode metadata is not configured.", 503)
 	}
-	u := fmt.Sprintf("%s/tv/%d/season/%d?language=en-US", TMDBAPIBase, showID, seasonNumber)
+	// include_adult=true keeps adult (hentai) entries servable; harmless for non-adult.
+	u := fmt.Sprintf("%s/tv/%d/season/%d?language=en-US&include_adult=true", TMDBAPIBase, showID, seasonNumber)
 	key := cacheKey("tmdb-season", map[string]int{"showId": showID, "seasonNumber": seasonNumber})
 	val, err := cached(key, EpisodeTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
@@ -755,7 +756,7 @@ func getTmdbShow(ctx context.Context, client *http.Client, token string, showID 
 	if strings.TrimSpace(token) == "" {
 		return nil, newResolverError("TMDB_NOT_CONFIGURED", "TMDB episode metadata is not configured.", 503)
 	}
-	u := fmt.Sprintf("%s/tv/%d?language=en-US", TMDBAPIBase, showID)
+	u := fmt.Sprintf("%s/tv/%d?language=en-US&include_adult=true", TMDBAPIBase, showID)
 	key := cacheKey("tmdb-show", showID)
 	val, err := cached(key, EpisodeTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
@@ -770,7 +771,7 @@ func getTmdbMovie(ctx context.Context, client *http.Client, token string, movieI
 	if strings.TrimSpace(token) == "" {
 		return nil, newResolverError("TMDB_NOT_CONFIGURED", "TMDB episode metadata is not configured.", 503)
 	}
-	u := fmt.Sprintf("%s/movie/%d?language=en-US", TMDBAPIBase, movieID)
+	u := fmt.Sprintf("%s/movie/%d?language=en-US&include_adult=true", TMDBAPIBase, movieID)
 	key := cacheKey("tmdb-movie", movieID)
 	val, err := cached(key, EpisodeTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
@@ -1217,6 +1218,99 @@ func fribbToMappings(e fribbEntry) []tmdbMapping {
 		}
 	}
 	return out
+}
+
+// InferEpisodeCount derives an episode count from verified mappings when
+// AniList is down and AniZip returns an empty episode map (common for hentai,
+// e.g. anilist:368 returns episodes:{}). It parses AniBridge source ranges
+// like "1-6" -> 6. For open-ended ranges ("1-") it probes TMDB season length
+// when a token is available. Returns 0 if nothing can be inferred.
+func InferEpisodeCount(ctx context.Context, client *http.Client, token string, anilistID int) int {
+	if anilistID <= 0 {
+		return 0
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	// 1) AniBridge verified mappings (covers hentai missing from AniZip/Fribb).
+	if payload, err := getMapping(ctx, client, anilistID); err == nil {
+		if showMappings, _ := extractTmdbShowMappings(payload, anilistID); len(showMappings) > 0 {
+			if n := mappingRangeCount(ctx, client, token, showMappings); n > 0 {
+				return n
+			}
+		}
+		if movieMappings, _ := extractTmdbMovieMappings(payload, anilistID); len(movieMappings) > 0 {
+			if n := mappingRangeCount(ctx, client, token, movieMappings); n > 0 {
+				return n
+			}
+		}
+	}
+	// 2) Fribb exhaustive fallback.
+	if fribb, err := getFribbMappings(ctx, client, anilistID); err == nil && len(fribb) > 0 {
+		if n := mappingRangeCount(ctx, client, token, fribb); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+// mappingRangeCount returns the max closed source-range end across mappings.
+// Open-ended source ranges ("1-") fall back to TMDB season probing when a
+// token is configured, else they are skipped.
+func mappingRangeCount(ctx context.Context, client *http.Client, token string, mappings []tmdbMapping) int {
+	maxEnd := 0
+	needsProbe := false
+	for _, m := range mappings {
+		if m.Type == "movie" {
+			// Movie mappings are single-episode ("1":"1").
+			if maxEnd < 1 {
+				maxEnd = 1
+			}
+			continue
+		}
+		for srcRangeVal := range m.Ranges {
+			r := parseRange(srcRangeVal)
+			if r == nil {
+				continue
+			}
+			if r.end != nil {
+				if *r.end > maxEnd {
+					maxEnd = *r.end
+				}
+			} else {
+				needsProbe = true
+			}
+		}
+	}
+	if maxEnd > 0 {
+		return maxEnd
+	}
+	if !needsProbe {
+		return 0
+	}
+	// All ranges open-ended (e.g. Fribb "1-"): probe TMDB season length.
+	if strings.TrimSpace(token) == "" {
+		return 0
+	}
+	best := 0
+	for _, m := range mappings {
+		if m.Type != "tv" {
+			continue
+		}
+		season, err := getTmdbSeason(ctx, client, token, m.ShowID, m.SeasonNumber)
+		if err != nil {
+			continue
+		}
+		eps, _ := season["episodes"].([]any)
+		if len(eps) > best {
+			best = len(eps)
+		}
+		// One successful probe is enough; don't hammer TMDB.
+		if best > 0 {
+			break
+		}
+	}
+	return best
 }
 
 // Helper for URL encoding check
