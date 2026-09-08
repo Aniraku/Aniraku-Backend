@@ -355,6 +355,132 @@ func FetchAniZipEpisodes(ctx context.Context, client *http.Client, anilistID int
 	return episodes, nil
 }
 
+// AniZipImage is one entry of the AniZip /mappings "images" array.
+type AniZipImage struct {
+	CoverType string `json:"coverType"`
+	URL       string `json:"url"`
+}
+
+// FetchAniZipCover returns the best show-level cover from AniZip images
+// (Poster > Fanart > Banner > any https). Used as manual thumbnail fallback
+// when AniList is down and per-episode AniZip/TMDB images are missing.
+// Returns "" when unavailable. No Jikan involved.
+func FetchAniZipCover(ctx context.Context, client *http.Client, anilistID int) string {
+	if anilistID <= 0 {
+		return ""
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	u := fmt.Sprintf("%s/mappings?anilist_id=%d", AniZipBase, anilistID)
+	key := cacheKey("anizip-cover", anilistID)
+	val, err := cached(key, EpisodeTTL, func() (any, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("anizip returned %d", resp.StatusCode)
+		}
+		var raw struct {
+			Images []AniZipImage `json:"images"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+			return nil, err
+		}
+		return pickAniZipCover(raw.Images), nil
+	})
+	if err != nil {
+		return ""
+	}
+	s, _ := val.(string)
+	return strings.TrimSpace(s)
+}
+
+func pickAniZipCover(images []AniZipImage) string {
+	var banner, other string
+	for _, img := range images {
+		u := strings.TrimSpace(img.URL)
+		// https-only: http images break on https frontends (mixed content).
+		if u == "" || !strings.HasPrefix(u, "https://") {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(img.CoverType)) {
+		case "poster":
+			return u
+		case "fanart":
+			if other == "" {
+				other = u
+			}
+		case "banner":
+			if banner == "" {
+				banner = u
+			}
+		default:
+			if other == "" {
+				other = u
+			}
+		}
+	}
+	if other != "" {
+		return other
+	}
+	return banner
+}
+
+// FetchTmdbFallbackPoster returns a show-level TMDB poster/backdrop for the
+// given anime via its AniBridge mapping. Used as the last manual thumbnail
+// fallback when AniList cover + AniZip images + episode stills are all
+// missing (typical hentai-outage case). Returns "" when unavailable.
+func FetchTmdbFallbackPoster(ctx context.Context, client *http.Client, token string, anilistID int) string {
+	if anilistID <= 0 || strings.TrimSpace(token) == "" {
+		return ""
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	payload, err := getMapping(ctx, client, anilistID)
+	if err != nil {
+		return ""
+	}
+	if shows, _ := extractTmdbShowMappings(payload, anilistID); len(shows) > 0 {
+		m := shows[0]
+		if show, err := getTmdbShow(ctx, client, token, m.ShowID); err == nil {
+			if p := strings.TrimSpace(text(show["poster_path"])); p != "" {
+				if u := safeStillUrl(p); u != "" {
+					return u
+				}
+			}
+			if b := strings.TrimSpace(text(show["backdrop_path"])); b != "" {
+				if u := safeStillUrl(b); u != "" {
+					return u
+				}
+			}
+		}
+	}
+	if movies, _ := extractTmdbMovieMappings(payload, anilistID); len(movies) > 0 {
+		if movie, err := getTmdbMovie(ctx, client, token, movies[0].MovieID); err == nil {
+			if p := strings.TrimSpace(text(movie["poster_path"])); p != "" {
+				if u := safeStillUrl(p); u != "" {
+					return u
+				}
+			}
+			if b := strings.TrimSpace(text(movie["backdrop_path"])); b != "" {
+				if u := safeStillUrl(b); u != "" {
+					return u
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // ResolveEpisodesWithAnizip resolves episode metadata using AniZip + TMDB bidirectional merge.
 func ResolveEpisodesWithAnizip(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int) (*ResolveResult, error) {
 	// Fetch TMDB metadata
@@ -1288,7 +1414,9 @@ func mappingRangeCount(ctx context.Context, client *http.Client, token string, m
 	if !needsProbe {
 		return 0
 	}
-	// All ranges open-ended (e.g. Fribb "1-"): probe TMDB season length.
+	// All ranges open-ended (e.g. Fribb "1-"): probe TMDB season length,
+	// adjusted by the target offset ("6-" means anilist 1 = tmdb 6) and
+	// including continuation seasons so the count stays exact.
 	if strings.TrimSpace(token) == "" {
 		return 0
 	}
@@ -1297,13 +1425,30 @@ func mappingRangeCount(ctx context.Context, client *http.Client, token string, m
 		if m.Type != "tv" {
 			continue
 		}
+		targetStart := openEndedTargetStart(m.Ranges)
 		season, err := getTmdbSeason(ctx, client, token, m.ShowID, m.SeasonNumber)
 		if err != nil {
 			continue
 		}
 		eps, _ := season["episodes"].([]any)
-		if len(eps) > best {
-			best = len(eps)
+		total := len(eps) - (targetStart - 1)
+		if total < 0 {
+			total = 0
+		}
+		// Add continuation seasons (same-show seasons after this one).
+		if show, serr := getTmdbShow(ctx, client, token, m.ShowID); serr == nil {
+			for _, sn := range continuationSeasonNumbers(show, m.SeasonNumber) {
+				cs, cerr := getTmdbSeason(ctx, client, token, m.ShowID, sn)
+				if cerr != nil {
+					continue
+				}
+				if ceps, _ := cs["episodes"].([]any); len(ceps) > 0 {
+					total += len(ceps)
+				}
+			}
+		}
+		if total > best {
+			best = total
 		}
 		// One successful probe is enough; don't hammer TMDB.
 		if best > 0 {
@@ -1311,6 +1456,32 @@ func mappingRangeCount(ctx context.Context, client *http.Client, token string, m
 		}
 	}
 	return best
+}
+
+// openEndedTargetStart returns the smallest TMDB target episode number across
+// open-ended mappings (e.g. ranges {"1-":"6-"} -> 6). Defaults to 1.
+func openEndedTargetStart(ranges map[string]string) int {
+	start := 1
+	for srcRangeVal, targetRangeVal := range ranges {
+		src := parseRange(srcRangeVal)
+		if src == nil || src.end != nil {
+			continue
+		}
+		parts := strings.SplitN(strings.TrimSpace(targetRangeVal), "|", 2)
+		for _, trStr := range strings.Split(strings.TrimSpace(parts[0]), ",") {
+			tr := parseRange(strings.TrimSpace(trStr))
+			if tr == nil || tr.end != nil {
+				continue
+			}
+			if tr.start >= 1 && (start == 1 || tr.start < start) {
+				start = tr.start
+			}
+		}
+	}
+	if start < 1 {
+		return 1
+	}
+	return start
 }
 
 // Helper for URL encoding check
