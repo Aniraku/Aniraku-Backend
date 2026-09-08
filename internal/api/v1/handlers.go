@@ -761,7 +761,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// AniList outages (or titles with unknown counts) leave episodeCount at
 	// 0, which collapses this response to an empty list even though AniZip
 	// carries the full episode map — derive the count from AniZip instead of
-	// returning nothing.
+	// returning nothing. Hentai often returns episodes:{} from AniZip, so fall
+	// back to AniBridge verified mapping ranges (e.g. anilist:368 "1-6" -> 6).
 	if episodeCount == 0 {
 		if azMeta, err := tmdb.FetchAniZipMediaMeta(r.Context(), h.httpClient, anilistID); err == nil && azMeta.EpisodeCount > 0 {
 			episodeCount = azMeta.EpisodeCount
@@ -770,6 +771,13 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			if n, err := strconv.Atoi(k); err == nil && n > episodeCount {
 				episodeCount = n
 			}
+		}
+		if episodeCount == 0 {
+			inferCtx, inferCancel := context.WithTimeout(r.Context(), 15*time.Second)
+			if n := tmdb.InferEpisodeCount(inferCtx, h.httpClient, h.cfg.TMDB.ReadAccessToken, anilistID); n > 0 {
+				episodeCount = n
+			}
+			inferCancel()
 		}
 	}
 
@@ -785,16 +793,21 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		// Must stay under the server's 60s WriteTimeout or the connection is
 		// killed mid-request and the client gets nothing.
 		tmdbByNumber = map[int]*tmdb.EpisodeMetadata{}
-		fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 50*time.Second)
-		defer fetchCancel()
-		result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
-		if result != nil {
-			for _, ep := range result.Episodes {
-				tmdbByNumber[ep.Number] = ep
+		if len(episodeNumbers) > 0 {
+			fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 50*time.Second)
+			defer fetchCancel()
+			result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
+			if result != nil {
+				for _, ep := range result.Episodes {
+					tmdbByNumber[ep.Number] = ep
+				}
+			}
+			// Only cache non-empty results; caching an empty map poisons
+			// hentai titles for 30min when TMDB is briefly unreachable.
+			if len(tmdbByNumber) > 0 {
+				tmdb.CacheEpisodes(anilistID, tmdbByNumber)
 			}
 		}
-		// Cache for next request.
-		tmdb.CacheEpisodes(anilistID, tmdbByNumber)
 	}
 
 	coverFallback := ""
