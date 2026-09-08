@@ -763,6 +763,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// carries the full episode map — derive the count from AniZip instead of
 	// returning nothing. Hentai often returns episodes:{} from AniZip, so fall
 	// back to AniBridge verified mapping ranges (e.g. anilist:368 "1-6" -> 6).
+	// Anisearch titles are fetched once here and reused below for titles.
+	var anisearchEps map[int]*tmdb.AnisearchEpisode
 	if episodeCount == 0 {
 		if azMeta, err := tmdb.FetchAniZipMediaMeta(r.Context(), h.httpClient, anilistID); err == nil && azMeta.EpisodeCount > 0 {
 			episodeCount = azMeta.EpisodeCount
@@ -778,6 +780,19 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 				episodeCount = n
 			}
 			inferCancel()
+		}
+		// Last-resort exact count from Anisearch (via AniZip anisearch_id):
+		// covers hentai missing from AniList, AniZip episodes, AniBridge and
+		// Fribb alike. No Jikan involved.
+		if episodeCount == 0 {
+			asiCtx, asiCancel := context.WithTimeout(r.Context(), 15*time.Second)
+			anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)
+			asiCancel()
+			for n := range anisearchEps {
+				if n > episodeCount {
+					episodeCount = n
+				}
+			}
 		}
 	}
 
@@ -810,6 +825,9 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Manual fallback cover: AniList art first, then AniZip Poster, then TMDB
+	// show poster — so every exact episode still has the anime cover image
+	// even when AniList is down and per-episode stills are missing. No Jikan.
 	coverFallback := ""
 	if img, ok := media["coverImage"].(map[string]any); ok {
 		if v, _ := img["extraLarge"].(string); v != "" {
@@ -819,6 +837,35 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		} else if v, _ := img["medium"].(string); v != "" {
 			coverFallback = v
 		}
+	}
+	if coverFallback == "" {
+		if c := tmdb.FetchAniZipCover(r.Context(), h.httpClient, anilistID); c != "" {
+			coverFallback = c
+		}
+	}
+	if coverFallback == "" && strings.TrimSpace(token) != "" {
+		covCtx, covCancel := context.WithTimeout(r.Context(), 15*time.Second)
+		if p := tmdb.FetchTmdbFallbackPoster(covCtx, h.httpClient, token, anilistID); p != "" {
+			coverFallback = p
+		}
+		covCancel()
+	}
+
+	// Never stamp a junk cover onto every episode: validate the final
+	// fallback (guards a blind-trusted AniList URL).
+	if coverFallback != "" && !tmdb.IsValidAniZipThumbnail(coverFallback) {
+		coverFallback = ""
+	}
+
+	// Anisearch episode titles (last resort): only when AniZip + TMDB both
+	// have nothing for this anime. Thumbnails intentionally stay the anime
+	// poster (coverFallback) per product decision — Anisearch ships a generic
+	// placeholder cover for adult titles. Reuses the fetch from the count
+	// stage above when available.
+	if episodeCount > 0 && anisearchEps == nil && len(anizipData) == 0 && len(tmdbByNumber) == 0 {
+		asiCtx, asiCancel := context.WithTimeout(r.Context(), 15*time.Second)
+		anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)
+		asiCancel()
 	}
 
 	episodes := make([]map[string]any, episodeCount)
@@ -833,13 +880,25 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		anizipKey := fmt.Sprintf("%d", epNum)
 		anizipEp, hasAnizip := anizipData[anizipKey]
 
-		// Merge: AniZip title → TMDB title → generic.
+		// Merge: AniZip title → TMDB title → Anisearch title → generic.
+		// Thumbnails are validated before use: junk URLs previously flowed
+		// straight to clients as broken images. TMDB stills win (verified
+		// image.tmdb.org stills), else AniZip art, else the anime poster
+		// (coverFallback) applied below — never an Anisearch placeholder.
+		if asiEp, ok := anisearchEps[epNum]; ok && asiEp != nil {
+			if cur, _ := ep["title"].(string); !tmdb.IsPublishedTitle(cur) && tmdb.IsPublishedTitle(asiEp.Title) {
+				ep["title"] = asiEp.Title
+			}
+			if _, hasAir := ep["airdate"]; !hasAir && asiEp.Airdate != "" {
+				ep["airdate"] = asiEp.Airdate
+			}
+		}
 		if hasAnizip {
 			if t := anizipEp.BestTitle(); t != "" {
 				ep["title"] = t
 			}
-			if anizipEp.Thumbnail != "" {
-				ep["thumbnail"] = anizipEp.Thumbnail
+			if tmdb.IsValidAniZipThumbnail(anizipEp.Thumbnail) {
+				ep["thumbnail"] = strings.TrimSpace(anizipEp.Thumbnail)
 			}
 			if anizipEp.Airdate != "" {
 				ep["airdate"] = anizipEp.Airdate
@@ -849,8 +908,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			if tmdbMeta.Title != "" {
 				ep["title"] = tmdbMeta.Title
 			}
-			if tmdbMeta.Thumbnail != nil && *tmdbMeta.Thumbnail != "" {
-				ep["thumbnail"] = *tmdbMeta.Thumbnail
+			if tmdbMeta.Thumbnail != nil && tmdb.HasVerifiedTmdbThumbnail(*tmdbMeta.Thumbnail) {
+				ep["thumbnail"] = strings.TrimSpace(*tmdbMeta.Thumbnail)
 			}
 			if tmdbMeta.Description != nil && *tmdbMeta.Description != "" {
 				ep["description"] = *tmdbMeta.Description
