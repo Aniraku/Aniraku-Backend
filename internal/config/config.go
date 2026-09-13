@@ -72,6 +72,7 @@ type TMDBConfig struct {
 
 type ScrapingConfig struct {
 	AnimeXBase    string `mapstructure:"animex_base"`
+	AnimeXPlyrAPI string `mapstructure:"animex_plyr_api"`
 	FlixCloudBase string `mapstructure:"flixcloud_base"`
 	AniZipBase    string `mapstructure:"anizip_base"`
 }
@@ -114,6 +115,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("tmdb.image_base", "https://image.tmdb.org/t/p/w780")
 	v.SetDefault("tmdb.anibridge_api", "https://mappings.anibridge.eliasbenb.dev/api/v3/mappings")
 	v.SetDefault("scraping.animex_base", "https://animex.one")
+	v.SetDefault("scraping.animex_plyr_api", "https://pp.animex.one")
 	v.SetDefault("scraping.flixcloud_base", "https://flixcloud.cc")
 	v.SetDefault("scraping.anizip_base", "https://api.ani.zip")
 
@@ -196,6 +198,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if val := os.Getenv("ANIRAKU_ANIMEX_BASE"); val != "" {
 		v.Set("scraping.animex_base", val)
+	}
+	if val := os.Getenv("ANIRAKU_ANIMEX_PLYR_API"); val != "" {
+		v.Set("scraping.animex_plyr_api", val)
 	}
 	if val := os.Getenv("ANIRAKU_FLIXCLOUD_BASE"); val != "" {
 		v.Set("scraping.flixcloud_base", val)

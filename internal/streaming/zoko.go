@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
+	"github.com/Aniraku/Aniraku-Backend/internal/tmdb"
 )
 
 const (
@@ -131,14 +133,8 @@ func (p *ZokoProvider) probeManifest(ctx context.Context, manifestURL string) bo
 	return err == nil && strings.Contains(string(head), "#EXTM3U")
 }
 
-// FindEpisodeSource resolves the direct HLS stream for an AniList-keyed
-// episode. Returns nil (not an error) when the manifest probe fails so the
-// caller can fall through to other providers.
-func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
-	if lang != "dub" {
-		lang = "sub"
-	}
-	embedURL := fmt.Sprintf("%s/stream/ani/%s/%d/%s", zokoBase, url.PathEscape(anilistID), episode, lang)
+// zokoFetchEmbed fetches a Zoko embed page and extracts the payload.
+func (p *ZokoProvider) zokoFetchEmbed(ctx context.Context, embedURL string) (*zokoPayload, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, embedURL, nil)
 	if err != nil {
 		return nil, err
@@ -161,15 +157,16 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 	if len(m) < 2 {
 		return nil, fmt.Errorf("zoko payload not found on embed page")
 	}
-	payload, err := deobfuscateZokoPayload(string(m[1]))
-	if err != nil {
-		return nil, err
-	}
+	return deobfuscateZokoPayload(string(m[1]))
+}
+
+// zokoBuildSourceResult converts a Zoko payload into a SourceResult.
+func (p *ZokoProvider) zokoBuildSourceResult(ctx context.Context, payload *zokoPayload, source string) (*SourceResult, error) {
 	if payload.Src == "" || !strings.Contains(payload.Src, ".m3u8") {
 		return nil, fmt.Errorf("zoko payload has no m3u8 src")
 	}
 	if !p.probeManifest(ctx, payload.Src) {
-		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("zoko: manifest probe failed (CDN blocked), dropping source")
+		p.log.Info().Str("source", source).Msg("zoko: manifest probe failed (CDN blocked), dropping source")
 		return nil, nil
 	}
 	p.learnURLHost(payload.Src)
@@ -191,8 +188,6 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 		})
 	}
 
-	// Zoko's own download link ships here; the manager additionally merges
-	// the Anikoto download links in, so the client gets both together.
 	var downloads []core.DownloadLink
 	if d := strings.TrimSpace(payload.Download); d != "" {
 		dlURL := d
@@ -222,4 +217,40 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 		Intro:     intro,
 		Outro:     outro,
 	}, nil
+}
+
+// FindEpisodeSource resolves the direct HLS stream for an episode.
+// Tries AniList-keyed URL first; when that returns no payload, looks up the
+// MAL ID via AniZip mappings and retries with /stream/mal/:malId/:ep/:lang.
+func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+	if lang != "dub" {
+		lang = "sub"
+	}
+
+	// --- attempt 1: AniList-keyed URL ---
+	anilistURL := fmt.Sprintf("%s/stream/ani/%s/%d/%s", zokoBase, url.PathEscape(anilistID), episode, lang)
+	payload, err := p.zokoFetchEmbed(ctx, anilistURL)
+	if err == nil {
+		result, err2 := p.zokoBuildSourceResult(ctx, payload, "anilist")
+		if err2 != nil || result != nil {
+			return result, err2
+		}
+		// manifest probe failed — fall through to MAL
+	}
+
+	// --- attempt 2: MAL-keyed URL ---
+	anilistInt, _ := strconv.Atoi(anilistID)
+	if anilistInt <= 0 {
+		return nil, fmt.Errorf("zoko: anilist ID %q is not a valid integer, cannot look up MAL", anilistID)
+	}
+	malID := tmdb.FetchMalID(ctx, p.client, anilistInt)
+	if malID <= 0 {
+		return nil, fmt.Errorf("zoko: no MAL ID found for anilist %s", anilistID)
+	}
+	malURL := fmt.Sprintf("%s/stream/mal/%d/%d/%s", zokoBase, malID, episode, lang)
+	payload, err = p.zokoFetchEmbed(ctx, malURL)
+	if err != nil {
+		return nil, fmt.Errorf("zoko MAL fallback (mal=%d): %w", malID, err)
+	}
+	return p.zokoBuildSourceResult(ctx, payload, fmt.Sprintf("mal=%d", malID))
 }

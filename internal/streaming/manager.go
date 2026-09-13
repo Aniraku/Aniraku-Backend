@@ -69,6 +69,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if zk, ok := p.(*ZokoProvider); ok {
 			zk.SetHostLearner(fn)
 		}
+		if ax, ok := p.(*AnimeXProvider); ok {
+			ax.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -103,13 +106,15 @@ type SourceResult struct {
 
 // NewManager builds the provider set. Anikoto is primary (fully in-process:
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
-// m3u8); Zoko (ZokoAnime, AniList-keyed) is second; FlixCloud is the fallback
-// for embed playback.
+// m3u8); AnimeX (plyr API, XOR-decoded direct URLs) is second; Zoko
+// (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
+// playback.
 func NewManager(log zerolog.Logger) *Manager {
 	return &Manager{
 		log: log,
 		providers: []Provider{
 			NewAnikotoProvider(log),
+			NewAnimeXProvider(log, ""),
 			NewZokoProvider(log),
 			NewFlixCloudProvider(log),
 		},
@@ -141,6 +146,15 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anikoto: no sources for this episode")
+	case "animex", "yuki", "neko", "zuna", "sora":
+		result, err := m.tryAnimeX(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("animex: no sources for this episode")
 	case "zoko", "zokoanime":
 		// Frontend sends "zoko"; accept "zokoanime" as an alias. Backend
 		// hits ZokoAnime (/stream/ani/{anilistId}/{ep}/{sub|dub}).
@@ -165,9 +179,11 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
-	// Anikoto direct first, Zoko (AniList-keyed) second, FlixCloud embed fallback.
+	// Anikoto direct first, AnimeX (plyr API) second, Zoko (AniList-keyed)
+	// third, FlixCloud embed fallback.
 	candidates := []func() (*core.StreamResult, error){
 		func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
+		func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
 		func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) },
 		func() (*core.StreamResult, error) {
 			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
@@ -214,13 +230,19 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// All providers run AT ONCE (fan-out), then merge in fixed provider
 	// order and rank by playback verdict.
 	anilistID := fmt.Sprintf("%d", animeID)
-	var akServers, zkServers, fcServers []core.Server
+	var akServers, axServers, zkServers, fcServers []core.Server
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		if !containsHentai(genres) {
 			akServers = m.collectAnikotoServers(ctx, anilistID, episode, lang)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if !containsHentai(genres) {
+			axServers = m.collectAnimeXServers(ctx, anilistID, episode, lang)
 		}
 	}()
 	go func() {
@@ -242,7 +264,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// case — akServers was fetched in parallel above.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang)
 
-	allServers := append(append(akServers, zkServers...), fcServers...)
+	allServers := append(append(append(akServers, axServers...), zkServers...), fcServers...)
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
@@ -465,6 +487,53 @@ func (m *Manager) getZokoProvider() *ZokoProvider {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) getAnimeXProvider() *AnimeXProvider {
+	for _, p := range m.providers {
+		if ax, ok := p.(*AnimeXProvider); ok {
+			return ax
+		}
+	}
+	return nil
+}
+
+// tryAnimeX resolves an AnimeX stream (plyr API with XOR-decoded direct URLs).
+func (m *Manager) tryAnimeX(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	ax := m.getAnimeXProvider()
+	if ax == nil {
+		return nil, fmt.Errorf("animex provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying animex")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := ax.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("animex failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectAnimeXServers maps AnimeX sources to AnimeX-1 / AnimeX-2 servers.
+func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		ax, ok := prov.(*AnimeXProvider)
+		if !ok {
+			continue
+		}
+		sr, err := ax.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			continue // silent skip
+		}
+		out = appendNamedServers(out, animexServers[:], "animex", lang, sr)
+	}
+	return out
 }
 
 // tryZoko resolves a ZokoAnime stream (frontend "zoko" -> backend ZokoAnime
