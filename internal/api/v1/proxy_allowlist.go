@@ -41,6 +41,8 @@ var defaultCDNSuffixes = []string{
 		"norami.top","fetch.nexabloom.top",
 		// ZokoAnime embed CDN (observed 2026-09-13, referer-gated)
 		"aniwatchtv.uk",
+		// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
+		"aniwatchtv.site",
 	"fast4speed.rsvp",
 	// Additional anime CDN hosts from DeepSeek audit
 	"ans-bio-video.com",
@@ -60,6 +62,7 @@ var defaultCDNSuffixes = []string{
 	"megaplay.pro",
 	"megaplay.club",
 	"megaplay.cc",
+	"mikora.top",
 	"uwucdn.net",
 	"owocdn.net",
 	"kotocdn.net",

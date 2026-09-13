@@ -99,6 +99,51 @@ func FetchAnisearchID(ctx context.Context, client *http.Client, anilistID int) i
 	return n
 }
 
+// FetchMalID resolves the MyAnimeList ID for an AniList ID via AniZip mappings.
+// Returns 0 when unavailable.
+func FetchMalID(ctx context.Context, client *http.Client, anilistID int) int {
+	if anilistID <= 0 {
+		return 0
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	u := fmt.Sprintf("%s/mappings?anilist_id=%d", AniZipBase, anilistID)
+	key := cacheKey("mal-id", anilistID)
+	val, err := cached(key, AnisearchTTL, func() (any, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("anizip returned %d", resp.StatusCode)
+		}
+		var raw struct {
+			Mappings struct {
+				MalID int `json:"mal_id"`
+			} `json:"mappings"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); err != nil {
+			return nil, err
+		}
+		return raw.Mappings.MalID, nil
+	})
+	if err != nil {
+		return 0
+	}
+	n, _ := val.(int)
+	if n <= 0 {
+		return 0
+	}
+	return n
+}
+
 // FetchAnisearchEpisodes returns per-episode titles keyed by episode number
 // for an AniList ID, via its AniZip anisearch_id. Returns nil on any failure.
 // Results are cached 24h; callers treat nil/empty as "no fallback".

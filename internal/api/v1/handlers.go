@@ -1317,6 +1317,22 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	// Set headers from query param
 	headersJSON := r.URL.Query().Get("headers")
 	applyProxyQueryHeaders(req, headersJSON)
+
+	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header
+	// that the CDN requires. The token format is base64url(xor(url\0referer\0ua, key)).
+	if strings.Contains(decodedURL, "cdnx.aniwatchtv.site/uwu/") {
+		_, ref, ua := streaming.DecodeAnimeXProxyURL(decodedURL)
+		if ref != "" {
+			req.Header.Set("Referer", ref)
+		}
+		if ua != "" && req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", ua)
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+		}
+	}
+
 	// FlixCloud's m3u8 JWT is bound to the IP that hit the decrypt endpoint
 	// (the `client_ip` claim), and the CDN validates the actual TCP source IP
 	// of every request. It does not honor X-Forwarded-For, X-Real-IP, or
