@@ -72,9 +72,6 @@ type animexAPIResponse struct {
 	Headers map[string]string `json:"headers"`
 }
 
-// animexServers holds the display names for each sub/dub provider variant.
-var animexServers = [2]string{"AnimeX-1", "AnimeX-2"}
-
 // AnimeXProvider resolves streams from the AnimeX plyr player API.
 // It fetches the plyr page first to establish Cloudflare clearance, then uses
 // those cookies to call the sources API and decode XOR+base64url proxy URLs
@@ -446,8 +443,9 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	p.log.Info().Str("provider", serverName).Str("lang", lang).Int("sources", len(sources)).Msg("animex: resolved")
 
 	return &SourceResult{
-		Sources:   sources,
-		Headers:   map[string]string{"Referer": referer},
+		Sources:    sources,
+		Headers:    map[string]string{"Referer": referer},
+		ServerName: serverName,
 		Intro:     intro,
 		Outro:     outro,
 	}, nil
