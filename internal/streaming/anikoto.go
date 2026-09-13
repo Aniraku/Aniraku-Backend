@@ -189,18 +189,25 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 				}
 			}
 		}
+		// probeState tracks whether the resolved file already went through a
+		// probe inside the edge picker: 0 = not probed yet, 1 = passed,
+		// 2 = failed. A probe failure on this egress means the media proxy
+		// (same egress) will 403 too — the server is dropped, not surfaced.
+		probeState := 0
 		if hlsURL == "" {
-			file, tr, in, out, orig, rErr := p.resolveEmbed(ctx, embedURL)
-			if rErr == nil && file != "" {
-				hlsURL = file
+			f, tr, in, out, orig, pOK, rErr := resolveMegaPlayPlayable(ctx, p.client, embedURL, func(ff, oo string) bool {
+				return p.probeHLS(ctx, ff, oo)
+			})
+			if rErr == nil && f != "" && pOK {
+				hlsURL = f
 				tracks = tr
 				inTs, outTs = in, out
 				origin = orig
+				probeState = 1
 			} else {
-				p.log.Debug().Err(rErr).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: embed decrypt failed, serving embed url")
-				if o, e2 := url.Parse(embedURL); e2 == nil && o.Host != "" {
-					origin = o.Scheme + "://" + o.Host
-				}
+				p.log.Info().Err(rErr).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: no playable CDN edge, dropping server")
+				seenName[e.name] = true
+				continue
 			}
 		}
 		if strings.HasPrefix(embedURL, "http") {
@@ -230,12 +237,23 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		}
 
 		if hlsURL != "" {
-			// CDN-blocked manifests must not surface as playable servers:
-			// probe with the embed origin referer and drop the source when
-			// the CDN rejects it (e.g. nexabloom 403-for-everyone episodes).
-			if !p.probeHLS(ctx, hlsURL, origin) {
-				p.log.Info().Str("server", e.name).Str("url", hlsURL).Msg("anikoto: manifest probe failed (CDN blocked), dropping server")
-				seenName[e.name] = true
+			// The verdict reflects the probe: passing CDNs rank "proxy" (top);
+			// CDNs that block this egress are kept but demoted to "embed" rank
+			// so the client only falls back to them after the working servers.
+			// The edge picker already probed when it picked the CDN edge, so
+			// only probe here when it did not (base64-fragment path).
+			if probeState == 0 {
+				if p.probeHLS(ctx, hlsURL, origin) {
+					probeState = 1
+				} else {
+					probeState = 2
+				}
+			}
+			verdict := "proxy"
+			if probeState == 2 {
+				// Probe failed and the edge picker found no open edge — the
+				// media proxy on this egress would 403 too, so drop.
+				p.log.Info().Str("server", e.name).Str("url", hlsURL).Msg("anikoto: manifest blocked from this egress, dropping server")
 				continue
 			}
 			// Decrypted: vouch the manifest and subtitle hosts for the proxy
@@ -258,7 +276,7 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 				Type:         "hls",
 				Quality:      "auto",
 				Subtitles:    subs,
-				Verification: "proxy",
+				Verification: verdict,
 			})
 			variants = append(variants, embedVariant(embedURL))
 		} else {
@@ -358,19 +376,20 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 	}
 	embedURL := fmt.Sprintf("https://megaplay.buzz/stream/ani/%s/%d/%s", anilistID, episode, lang)
 	p.log.Info().Str("url", embedURL).Msg("megaplayDirect: trying")
-	file, tracks, inTs, outTs, origin, err := p.resolveEmbed(ctx, embedURL)
+	file, tracks, inTs, outTs, origin, pOK, err := resolveMegaPlayPlayable(ctx, p.client, embedURL, func(f, o string) bool {
+		return p.probeHLS(ctx, f, o)
+	})
 	if err != nil || file == "" {
-		p.log.Info().Err(err).Str("url", embedURL).Msg("megaplayDirect: resolveEmbed failed")
+		p.log.Info().Err(err).Str("url", embedURL).Msg("megaplayDirect: resolve failed")
 		return nil, fmt.Errorf("megaplay direct: %w", err)
 	}
-	p.log.Info().Str("file", file).Str("origin", origin).Msg("megaplayDirect: resolved")
-	// CDN-blocked manifests must not surface as playable servers. Megaplay
-	// edges (nexabloom) have served 403-for-everyone episodes; a failed probe
-	// here returns an error so the caller falls through to other providers.
-	if !p.probeHLS(ctx, file, origin) {
-		p.log.Info().Str("file", file).Msg("megaplay direct: manifest probe failed (CDN blocked)")
+	// Every CDN edge probed blocked from this egress — the media proxy would
+	// 403 too. Return an error so the caller falls through to other providers.
+	if !pOK {
+		p.log.Info().Str("file", file).Msg("megaplay direct: no playable CDN edge from this egress")
 		return nil, fmt.Errorf("megaplay direct: CDN blocked manifest")
 	}
+	p.log.Info().Str("file", file).Str("origin", origin).Msg("megaplayDirect: resolved")
 	p.learnURLHost(file)
 	var subs []core.Subtitle
 	for _, t := range tracks {
@@ -486,10 +505,17 @@ func decryptMegaPlayEnc(enc string) (string, error) {
 }
 
 // resolveEmbed decrypts a MegaPlay-style embed URL to a direct file URL.
-// Handles #aHR0c... base64 embeds and data-id -> /stream/getSources embeds.
-// Anivexa extractEmbedSource parity: spoofed Referer (hianimes.re) when
-// fetching the embed page, then getSources API call for the HLS manifest.
+// Package-level so the OGFLix provider can reuse the exact same chain.
 func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
+	return resolveMegaPlayEmbed(ctx, p.client, embedURL)
+}
+
+// resolveMegaPlayEmbed is the shared MegaPlay decrypt chain: #aHR0c... base64
+// embeds, data-id -> /stream/getSourcesNew (plain JSON), then legacy
+// getSources + AES enc decrypt. Anivexa extractEmbedSource parity: spoofed
+// Referer (hianimes.re) when fetching the embed page, then getSources API
+// call for the HLS manifest.
+func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
 	origin = embedURL
 	if i := strings.Index(embedURL, "/stream/"); i != -1 {
 		origin = embedURL[:i]
@@ -514,7 +540,7 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 	embedReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	embedReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	embedReq.Header.Set("Referer", "https://hianimes.re/")
-	embedResp, err := p.client.Do(embedReq)
+	embedResp, err := client.Do(embedReq)
 	if err != nil {
 		return "", nil, nil, nil, origin, fmt.Errorf("embed page fetch failed: %w", err)
 	}
@@ -535,9 +561,21 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 	// The player rewrites stream/getSources -> stream/getSourcesNew (plain
 	// JSON); the legacy endpoint returns an AES-encrypted "enc" blob instead
 	// of sources.file. Try New first, fall back to legacy + decrypt.
+	// MegaPlay's own JS appends the embed's ?s= variant (tcdn/bcdn) to every
+	// getSources call — the variant picks the CDN edge (tcdn -> megap.shiora
+	// .site, bcdn/default -> fetch.nexabloom.top). Passing it through is what
+	// makes tcdn embeds resolve to an edge that does not block datacenter
+	// IPs.
+	embedEdge := ""
+	if eu, eErr := url.Parse(embedURL); eErr == nil {
+		embedEdge = eu.Query().Get("s")
+	}
 	fetchSources := func(endpoint string) ([]byte, error) {
 		srcURL := fmt.Sprintf("%s/%s?id=%s&id=%s",
 			strings.TrimSuffix(origin, "/"), endpoint, url.QueryEscape(m[1]), url.QueryEscape(m[1]))
+		if embedEdge != "" {
+			srcURL += "&s=" + url.QueryEscape(embedEdge)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
 		if err != nil {
 			return nil, err
@@ -545,7 +583,7 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
-		resp, err := p.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return nil, err
 		}
@@ -596,15 +634,106 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 	return data.Sources.File, tracks, data.Intro, data.Outro, origin, nil
 }
 
+// megaPlayEdgeVariants returns the s-param variants to try for an embed,
+// with the embed's own variant first. MegaPlay's getSources picks the CDN
+// edge server-side and the mapping rotates — the same embed can hand back a
+// datacenter-blocked edge (bcdn/default -> fetch.nexabloom.top) one call and
+// an open edge (tcdn -> shiora/akirax/mikora) the next.
+func megaPlayEdgeVariants(embedURL string) []string {
+	own := ""
+	if eu, eErr := url.Parse(embedURL); eErr == nil {
+		own = eu.Query().Get("s")
+	}
+	variants := []string{own}
+	for _, v := range []string{"tcdn", "bcdn", ""} {
+		dup := false
+		for _, e := range variants {
+			if e == v {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			variants = append(variants, v)
+		}
+	}
+	return variants
+}
+
+// resolveMegaPlayPlayable resolves a MegaPlay embed across every CDN edge
+// until one decrypts AND passes the probe callback, so a rotated blocked
+// edge never demotes a server another edge would serve fine. probe may be
+// nil to accept the first successful decrypt. probedOK reports whether the
+// returned file passed the probe; when every edge decrypts but none probes
+// clean, the first decrypt is returned with probedOK=false so the caller can
+// still surface it (demoted) instead of dropping a provider-confirmed source.
+func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL string, probe func(file, origin string) bool) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, probedOK bool, err error) {
+	// Strip the s param so each variant can be requested explicitly.
+	base := embedURL
+	if eu, eErr := url.Parse(embedURL); eErr == nil && eu.Query().Get("s") != "" {
+		q := eu.Query()
+		q.Del("s")
+		eu.RawQuery = q.Encode()
+		base = eu.String()
+	}
+	join := "?"
+	if strings.Contains(base, "?") {
+		join = "&"
+	}
+
+	var (
+		fbFile, fbOrigin   string
+		fbTracks           []megaplayTrack
+		fbIn, fbOut        *core.SkipTimestamp
+		firstDecErr        error
+	)
+	for _, v := range megaPlayEdgeVariants(embedURL) {
+		u := base
+		if v != "" {
+			u = base + join + "s=" + url.QueryEscape(v)
+		}
+		f, tr, in, out, orig, dErr := resolveMegaPlayEmbed(ctx, client, u)
+		if dErr != nil || f == "" {
+			if firstDecErr == nil {
+				firstDecErr = dErr
+			}
+			continue
+		}
+		if probe == nil || probe(f, orig) {
+			return f, tr, in, out, orig, true, nil
+		}
+		if fbFile == "" {
+			fbFile, fbTracks, fbIn, fbOut, fbOrigin = f, tr, in, out, orig
+		}
+	}
+	if fbFile != "" {
+		return fbFile, fbTracks, fbIn, fbOut, fbOrigin, false, nil
+	}
+	if firstDecErr != nil {
+		return "", nil, nil, nil, "", false, firstDecErr
+	}
+	return "", nil, nil, nil, "", false, fmt.Errorf("megaplay: no sources on any edge")
+}
+
 // probeHLS verifies a manifest URL serves a real playlist right now.
 func (p *AnikotoProvider) probeHLS(ctx context.Context, fileURL, origin string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	return probeManifestHLS(ctx, p.client, fileURL, origin)
+}
+
+// probeManifestHLS is the shared manifest probe: GET the playlist with the
+// embed origin referer and require an #EXTM3U header. Capped at 5s — a
+// manifest either answers quickly or the CDN is blocking this egress, and
+// blocking probes must not stall the whole fan-out.
+func probeManifestHLS(ctx context.Context, client *http.Client, fileURL, origin string) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return false
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		if resp != nil {
 			resp.Body.Close()
@@ -1257,13 +1386,19 @@ func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID strin
 	return "", fmt.Errorf("no title found for anilistId=%s", anilistID)
 }
 
-// fetchAniListMeta resolves titles + synonyms (Anivexa searches english,
-// romaji and synonyms as separate keywords). Primary source is AniList
-// GraphQL; when AniList is down — it has recurring global outages (403
-// "temporarily disabled", 429 rate limits) — it falls back to AniZip, which
-// mirrors the same mappings keyed by AniList ID.
+// fetchAniListMeta resolves titles + synonyms for an AniList ID. Package-level
+// so the OGFLix provider shares the exact same lookup (AniList GraphQL with
+// AniZip fallback).
 func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string) (anilistMeta, error) {
-	meta, err := p.fetchAniListMetaUpstream(ctx, anilistID)
+	return fetchAniListMetaFor(ctx, p.client, anilistID)
+}
+
+// fetchAniListMetaFor is the shared AniList meta lookup. Primary source is
+// AniList GraphQL; when AniList is down — it has recurring global outages
+// (403 "temporarily disabled", 429 rate limits) — it falls back to AniZip,
+// which mirrors the same mappings keyed by AniList ID.
+func fetchAniListMetaFor(ctx context.Context, client *http.Client, anilistID string) (anilistMeta, error) {
+	meta, err := fetchAniListMetaUpstream(ctx, client, anilistID)
 	if err == nil {
 		return meta, nil
 	}
@@ -1271,7 +1406,7 @@ func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string
 	if idErr != nil {
 		return meta, fmt.Errorf("anilist meta failed (%v); anizip fallback skipped (invalid id)", err)
 	}
-	az, azErr := tmdb.FetchAniZipMediaMeta(ctx, p.client, id)
+	az, azErr := tmdb.FetchAniZipMediaMeta(ctx, client, id)
 	if azErr != nil {
 		return meta, fmt.Errorf("anilist meta failed (%v) and anizip fallback failed (%v)", err, azErr)
 	}
@@ -1286,7 +1421,7 @@ func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string
 // fetchAniListMetaUpstream is the direct AniList GraphQL lookup. It reports
 // real upstream failures (HTTP status, GraphQL error payload) instead of
 // misreporting them as "no title".
-func (p *AnikotoProvider) fetchAniListMetaUpstream(ctx context.Context, anilistID string) (anilistMeta, error) {
+func fetchAniListMetaUpstream(ctx context.Context, client *http.Client, anilistID string) (anilistMeta, error) {
 	var out anilistMeta
 	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji} synonyms episodes format} }"}`
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co",
@@ -1297,7 +1432,7 @@ func (p *AnikotoProvider) fetchAniListMetaUpstream(ctx context.Context, anilistI
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	resp, err := p.client.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return out, err
 	}
