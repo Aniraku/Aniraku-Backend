@@ -230,6 +230,14 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 		}
 
 		if hlsURL != "" {
+			// CDN-blocked manifests must not surface as playable servers:
+			// probe with the embed origin referer and drop the source when
+			// the CDN rejects it (e.g. nexabloom 403-for-everyone episodes).
+			if !p.probeHLS(ctx, hlsURL, origin) {
+				p.log.Info().Str("server", e.name).Str("url", hlsURL).Msg("anikoto: manifest probe failed (CDN blocked), dropping server")
+				seenName[e.name] = true
+				continue
+			}
 			// Decrypted: vouch the manifest and subtitle hosts for the proxy
 			// allowlist — the auto-learn path for Anikoto CDN rotation.
 			p.learnURLHost(hlsURL)
@@ -287,6 +295,60 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 	}, nil
 }
 
+// FetchDownloadLinks returns Anikoto download links for an episode WITHOUT
+// resolving or probing stream manifests. Zoko attaches these (Anikoto-only)
+// to its servers, so downloads survive even when every Anikoto stream is
+// CDN-blocked and dropped from the server list.
+func (p *AnikotoProvider) FetchDownloadLinks(ctx context.Context, anilistID string, episode int, lang string) []core.DownloadLink {
+	if lang != "dub" {
+		lang = "sub"
+	}
+	_, showID, err := p.resolveShow(ctx, anilistID)
+	if err != nil {
+		return nil
+	}
+	dataIDs, epMeta, err := p.fetchEpisodeDataIDs(ctx, showID, episode)
+	if err != nil {
+		return nil
+	}
+	entries, err := p.fetchServers(ctx, dataIDs, "")
+	if err != nil {
+		entries = nil
+	}
+	entries = append(entries, p.fetchMapperServers(ctx, epMeta, lang)...)
+
+	var out []core.DownloadLink
+	seen := map[string]bool{}
+	for _, e := range entries {
+		lowerName := strings.ToLower(e.name)
+		if e.serverType != "dl" && !strings.Contains(lowerName, "download") &&
+			!strings.Contains(lowerName, "kiwi") {
+			continue
+		}
+		var durl string
+		if strings.HasPrefix(e.linkID, "http") {
+			durl = e.linkID
+		} else {
+			u, _, err := p.fetchVideoURL(ctx, e.linkID)
+			if err != nil || strings.TrimSpace(u) == "" {
+				continue
+			}
+			durl = u
+		}
+		if seen[durl] {
+			continue
+		}
+		seen[durl] = true
+		label := strings.TrimSpace(e.name)
+		if label == "" {
+			label = "Download"
+		}
+		out = append(out, core.DownloadLink{URL: durl, Label: label})
+		p.learnURLHost(durl)
+	}
+	return out
+}
+
 // megaplayDirect resolves streams straight from megaplay.buzz, which is
 // AniList-keyed: /stream/ani/{anilistId}/{episode}/{lang}. It bypasses the
 // anikoto catalog entirely and reuses the same MegaPlay decrypt chain.
@@ -302,11 +364,12 @@ func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, 
 		return nil, fmt.Errorf("megaplay direct: %w", err)
 	}
 	p.log.Info().Str("file", file).Str("origin", origin).Msg("megaplayDirect: resolved")
-	// Probe is best-effort: CDN edges (imgnex, norami, akirax) reject
-	// datacenter IPs with 403 — the client's HLS proxy handles real
-	// playback. Don't let a probe failure drop a valid stream.
+	// CDN-blocked manifests must not surface as playable servers. Megaplay
+	// edges (nexabloom) have served 403-for-everyone episodes; a failed probe
+	// here returns an error so the caller falls through to other providers.
 	if !p.probeHLS(ctx, file, origin) {
-		p.log.Debug().Str("file", file).Msg("megaplay direct: manifest probe failed (non-fatal)")
+		p.log.Info().Str("file", file).Msg("megaplay direct: manifest probe failed (CDN blocked)")
+		return nil, fmt.Errorf("megaplay direct: CDN blocked manifest")
 	}
 	p.learnURLHost(file)
 	var subs []core.Subtitle

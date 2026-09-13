@@ -66,6 +66,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if ak, ok := p.(*AnikotoProvider); ok {
 			ak.SetHostLearner(fn)
 		}
+		if zk, ok := p.(*ZokoProvider); ok {
+			zk.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -100,19 +103,21 @@ type SourceResult struct {
 
 // NewManager builds the provider set. Anikoto is primary (fully in-process:
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
-// m3u8); FlixCloud is the fallback for embed playback.
+// m3u8); Zoko (ZokoAnime, AniList-keyed) is second; FlixCloud is the fallback
+// for embed playback.
 func NewManager(log zerolog.Logger) *Manager {
 	return &Manager{
 		log: log,
 		providers: []Provider{
 			NewAnikotoProvider(log),
+			NewZokoProvider(log),
 			NewFlixCloudProvider(log),
 		},
 	}
 }
 
 // GetSources resolves sources using the default provider order (anikoto,
-// then flixcloud).
+// zoko, then flixcloud).
 func (m *Manager) GetSources(ctx context.Context, title string, episode int, lang, quality string) (*core.StreamResult, error) {
 	return m.GetSourcesForProvider(ctx, episode, "", lang, quality, 0)
 }
@@ -136,6 +141,17 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anikoto: no sources for this episode")
+	case "zoko", "zokoanime":
+		// Frontend sends "zoko"; accept "zokoanime" as an alias. Backend
+		// hits ZokoAnime (/stream/ani/{anilistId}/{ep}/{sub|dub}).
+		result, err := m.tryZoko(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("zoko: no sources for this episode")
 	case "flixcloud":
 		result, err := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		if err != nil {
@@ -146,12 +162,13 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi":
-		return nil, fmt.Errorf("provider %q removed - use anikoto or flixcloud", provider)
+		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
-	// Anikoto direct first, FlixCloud embed fallback.
+	// Anikoto direct first, Zoko (AniList-keyed) second, FlixCloud embed fallback.
 	candidates := []func() (*core.StreamResult, error){
 		func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
+		func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) },
 		func() (*core.StreamResult, error) {
 			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		},
@@ -197,9 +214,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// All providers run AT ONCE (fan-out), then merge in fixed provider
 	// order and rank by playback verdict.
 	anilistID := fmt.Sprintf("%d", animeID)
-	var akServers, fcServers []core.Server
+	var akServers, zkServers, fcServers []core.Server
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		if !containsHentai(genres) {
@@ -208,11 +225,24 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	}()
 	go func() {
 		defer wg.Done()
+		if !containsHentai(genres) {
+			zkServers = m.collectZokoServers(ctx, anilistID, episode, lang)
+		}
+	}()
+	go func() {
+		defer wg.Done()
 		fcServers = m.collectFlixServers(ctx, anilistID, episode, lang)
 	}()
 	wg.Wait()
 
-	allServers := append(akServers, fcServers...)
+	// Merged downloads for Zoko: Zoko's own link plus the already-fetched
+	// Anikoto download links together — falling back to one downloads-only
+	// Anikoto lookup when Anikoto streams were all CDN-blocked (no servers,
+	// but downloads may still exist). No extra network call in the common
+	// case — akServers was fetched in parallel above.
+	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang)
+
+	allServers := append(append(akServers, zkServers...), fcServers...)
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
@@ -281,6 +311,70 @@ func (m *Manager) collectAnikotoServers(ctx context.Context, anilistID string, e
 			continue
 		}
 		out = appendNamedServers(out, anikotoServers[:], "anikoto", lang, sr)
+	}
+	return out
+}
+
+// collectZokoServers maps ZokoAnime sources to the single "Zoko" server.
+// The provider stays probe-verified + proxied (never direct): ZokoProvider
+// drops CDN-blocked manifests before they can surface here.
+func (m *Manager) collectZokoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		zk, ok := prov.(*ZokoProvider)
+		if !ok {
+			continue
+		}
+		sr, err := zk.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			continue // silent skip: CDN-blocked or missing episode
+		}
+		out = appendNamedServers(out, []string{zokoServerName}, "zoko", lang, sr)
+	}
+	return out
+}
+
+// mergeZokoDownloads merges the Anikoto download links into the Zoko
+// servers alongside Zoko's own link (deduped by URL, Zoko's own first).
+// Stream sources are never mixed — only Downloads. Falls back to a
+// downloads-only Anikoto lookup when the parallel Anikoto fetch produced no
+// servers (e.g. every stream CDN-blocked).
+func mergeZokoDownloads(ctx context.Context, m *Manager, zkServers, akServers []core.Server, anilistID string, episode int, lang string) []core.Server {
+	if len(zkServers) == 0 {
+		return zkServers
+	}
+	var links []core.DownloadLink
+	for _, s := range akServers {
+		links = mergeDownloadLinks(links, s.Downloads)
+	}
+	if len(links) == 0 {
+		if ak := m.getAnikotoProvider(); ak != nil {
+			links = ak.FetchDownloadLinks(ctx, anilistID, episode, lang)
+		}
+	}
+	for i := range zkServers {
+		zkServers[i].Downloads = mergeDownloadLinks(zkServers[i].Downloads, links)
+	}
+	return zkServers
+}
+
+// mergeDownloadLinks dedupes download links by URL, keeping primary order.
+func mergeDownloadLinks(primary, fallback []core.DownloadLink) []core.DownloadLink {
+	seen := make(map[string]bool, len(primary)+len(fallback))
+	out := make([]core.DownloadLink, 0, len(primary)+len(fallback))
+	for _, d := range primary {
+		if d.URL == "" || seen[d.URL] {
+			continue
+		}
+		seen[d.URL] = true
+		out = append(out, d)
+	}
+	for _, d := range fallback {
+		if d.URL == "" || seen[d.URL] {
+			continue
+		}
+		seen[d.URL] = true
+		out = append(out, d)
 	}
 	return out
 }
@@ -359,6 +453,43 @@ func (m *Manager) tryAnikoto(ctx context.Context, animeID int, episode int, lang
 	}
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+func (m *Manager) getZokoProvider() *ZokoProvider {
+	for _, p := range m.providers {
+		if zk, ok := p.(*ZokoProvider); ok {
+			return zk
+		}
+	}
+	return nil
+}
+
+// tryZoko resolves a ZokoAnime stream (frontend "zoko" -> backend ZokoAnime
+// /stream/ani/{anilistId}/{ep}/{sub|dub}). The stream itself always comes
+// from ZokoAnime, probe-verified + proxied — never Anikoto direct. Downloads
+// are merged: Zoko's own link plus the Anikoto download links together.
+func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	zk := m.getZokoProvider()
+	if zk == nil {
+		return nil, fmt.Errorf("zoko provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying zoko")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := zk.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("zoko failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	if ak := m.getAnikotoProvider(); ak != nil {
+		source.Downloads = mergeDownloadLinks(source.Downloads, ak.FetchDownloadLinks(ctx, anilistID, episode, lang))
 	}
 
 	return m.applyQualityFilter(source, quality), nil
