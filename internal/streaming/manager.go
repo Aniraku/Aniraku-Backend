@@ -2,14 +2,20 @@ package streaming
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 type contextKey string
@@ -57,6 +63,17 @@ type Manager struct {
 	// layer can feed the media-proxy CDN allowlist and provider CDN rotation
 	// never 403s at the gate.
 	LearnHost func(host string)
+
+	// hentai gate: hentai titles are served by OGFLix + FlixCloud only;
+	// anikoto/animex/zoko must not receive any request for them.
+	httpClient  *http.Client
+	hentaiMu    sync.Mutex
+	hentaiCache map[int]hentaiEntry
+}
+
+type hentaiEntry struct {
+	isHentai bool
+	expires  time.Time
 }
 
 // SetHostLearner registers the callback that receives provider-verified hosts.
@@ -71,6 +88,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		}
 		if ax, ok := p.(*AnimeXProvider); ok {
 			ax.SetHostLearner(fn)
+		}
+		if of, ok := p.(*OGFLixProvider); ok {
+			of.SetHostLearner(fn)
 		}
 	}
 }
@@ -108,7 +128,8 @@ type SourceResult struct {
 // NewManager builds the provider set. Anikoto is primary (fully in-process:
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
 // m3u8); AnimeX (plyr API, XOR-decoded direct URLs) is second; Zoko
-// (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
+// (ZokoAnime, AniList-keyed) is third; OGFLix (Zen API -> player resolve ->
+// MegaPlay decrypt) is the fourth; FlixCloud is the fallback for embed
 // playback.
 func NewManager(log zerolog.Logger) *Manager {
 	return &Manager{
@@ -117,9 +138,55 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAnikotoProvider(log),
 			NewAnimeXProvider(log, ""),
 			NewZokoProvider(log),
+			NewOGFlixProvider(log),
 			NewFlixCloudProvider(log),
 		},
+		httpClient:  &http.Client{Timeout: 15 * time.Second, Transport: netguard.NewTransport()},
+		hentaiCache: map[int]hentaiEntry{},
 	}
+}
+
+// isHentaiTitle reports whether the AniList title carries the Hentai genre
+// or is flagged isAdult. Results are cached 10 minutes; on lookup failure the
+// title is treated as non-hentai so playback never hard-fails on the gate.
+func (m *Manager) isHentaiTitle(ctx context.Context, animeID int) bool {
+	m.hentaiMu.Lock()
+	if e, ok := m.hentaiCache[animeID]; ok && time.Now().Before(e.expires) {
+		m.hentaiMu.Unlock()
+		return e.isHentai
+	}
+	m.hentaiMu.Unlock()
+
+	isHentai := false
+	query := `{"query":"{ Media(id:` + strconv.Itoa(animeID) + `,type:ANIME){genres isAdult} }"}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", strings.NewReader(query))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json")
+		resp, err := m.httpClient.Do(req)
+		if err == nil {
+			body, rErr := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+			resp.Body.Close()
+			if rErr == nil {
+				var out struct {
+					Data struct {
+						Media struct {
+							Genres  []string `json:"genres"`
+							IsAdult bool     `json:"isAdult"`
+						} `json:"Media"`
+					} `json:"data"`
+				}
+				if json.Unmarshal(body, &out) == nil && out.Data.Media.Genres != nil {
+					isHentai = containsHentai(out.Data.Media.Genres) || out.Data.Media.IsAdult
+				}
+			}
+		}
+	}
+
+	m.hentaiMu.Lock()
+	m.hentaiCache[animeID] = hentaiEntry{isHentai: isHentai, expires: time.Now().Add(10 * time.Minute)}
+	m.hentaiMu.Unlock()
+	return isHentai
 }
 
 // GetSources resolves sources using the default provider order (anikoto,
@@ -137,8 +204,21 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 // slug is accepted for API compatibility; the Anikoto resolver maps AniList
 // IDs itself, so the slug is unused today.
 func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
+	// Hentai titles are served by OGFLix + FlixCloud only: explicit requests
+	// for the other providers are rejected before any upstream call, and the
+	// fallback chain below shrinks to ogflix + flixcloud.
+	hentai := m.isHentaiTitle(ctx, animeID)
+	if hentai {
+		switch provider {
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "zoko", "zokoanime":
+			return nil, fmt.Errorf("provider %q is not available for this title", provider)
+		}
+	}
 	switch provider {
 	case "anikoto":
+		if hentai {
+			return nil, fmt.Errorf("provider %q is not available for this title", provider)
+		}
 		result, err := m.tryAnikoto(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -167,6 +247,15 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("zoko: no sources for this episode")
+	case "ogflix":
+		result, err := m.tryOGflix(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("ogflix: no sources for this episode")
 	case "flixcloud":
 		result, err := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		if err != nil {
@@ -181,14 +270,26 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	}
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko (AniList-keyed)
-	// third, FlixCloud embed fallback.
-	candidates := []func() (*core.StreamResult, error){
-		func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
-		func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
-		func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) },
-		func() (*core.StreamResult, error) {
-			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
-		},
+	// third, OGFLix (Zen API -> MegaPlay decrypt) fourth, FlixCloud embed
+	// fallback. Hentai titles only ever reach OGFLix + FlixCloud.
+	var candidates []func() (*core.StreamResult, error)
+	if hentai {
+		candidates = []func() (*core.StreamResult, error){
+			func() (*core.StreamResult, error) { return m.tryOGflix(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) {
+				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+			},
+		}
+	} else {
+		candidates = []func() (*core.StreamResult, error){
+			func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) { return m.tryOGflix(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) {
+				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+			},
+		}
 	}
 	for _, try := range candidates {
 		res, err := try()
@@ -228,28 +329,47 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		lang = "sub"
 	}
 
+	// Hard cap for the whole fan-out: one slow provider (dead embed, blocked
+	// CDN, hanging search) must not stretch the server list past this.
+	fanCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+	ctx = fanCtx
+
 	// All providers run AT ONCE (fan-out), then merge in fixed provider
 	// order and rank by playback verdict.
+	// Hentai gate: when the caller provides genres, trust them; otherwise
+	// resolve them once (cached) so hentai titles never reach the gated
+	// providers.
+	hentai := containsHentai(genres)
+	if !hentai && len(genres) == 0 {
+		hentai = m.isHentaiTitle(ctx, animeID)
+	}
 	anilistID := fmt.Sprintf("%d", animeID)
-	var akServers, axServers, zkServers, fcServers []core.Server
+	var akServers, axServers, zkServers, ofServers, fcServers []core.Server
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
-		if !containsHentai(genres) {
+		if !hentai {
 			akServers = m.collectAnikotoServers(ctx, anilistID, episode, lang)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if !containsHentai(genres) {
+		if !hentai {
 			axServers = m.collectAnimeXServers(ctx, anilistID, episode, lang)
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if !containsHentai(genres) {
+		if !hentai {
 			zkServers = m.collectZokoServers(ctx, anilistID, episode, lang)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if !hentai {
+			ofServers = m.collectOGflixServers(ctx, anilistID, episode, lang)
 		}
 	}()
 	go func() {
@@ -265,7 +385,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// case — akServers was fetched in parallel above.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang)
 
-	allServers := append(append(append(akServers, axServers...), zkServers...), fcServers...)
+	allServers := append(append(append(append(akServers, axServers...), zkServers...), ofServers...), fcServers...)
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
@@ -353,6 +473,25 @@ func (m *Manager) collectZokoServers(ctx context.Context, anilistID string, epis
 			continue // silent skip: CDN-blocked or missing episode
 		}
 		out = appendNamedServers(out, []string{zokoServerName}, "zoko", lang, sr)
+	}
+	return out
+}
+
+// collectOGflixServers maps OGFLix sources to the Hoshi (base) and Yume
+// (?s=tcdn) servers. Decrypted sources are kept even when the manifest probe
+// fails from the server egress — they play through the Aniraku media proxy.
+func (m *Manager) collectOGflixServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		of, ok := prov.(*OGFLixProvider)
+		if !ok {
+			continue
+		}
+		sr, err := of.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			continue // silent skip
+		}
+		out = appendNamedServers(out, ogflixServers[:], "ogflix", lang, sr)
 	}
 	return out
 }
@@ -564,6 +703,34 @@ func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, q
 
 	if ak := m.getAnikotoProvider(); ak != nil {
 		source.Downloads = mergeDownloadLinks(source.Downloads, ak.FetchDownloadLinks(ctx, anilistID, episode, lang))
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// tryOGflix resolves an OGFLix stream (Zen API -> player resolve -> MegaPlay
+// decrypt). Decrypted sources ship as Verification "proxy".
+func (m *Manager) tryOGflix(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	var of *OGFLixProvider
+	for _, p := range m.providers {
+		if o, ok := p.(*OGFLixProvider); ok {
+			of = o
+			break
+		}
+	}
+	if of == nil {
+		return nil, fmt.Errorf("ogflix provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying ogflix")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := of.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("ogflix failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
 	}
 
 	return m.applyQualityFilter(source, quality), nil

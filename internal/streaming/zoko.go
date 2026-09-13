@@ -165,8 +165,11 @@ func (p *ZokoProvider) zokoBuildSourceResult(ctx context.Context, payload *zokoP
 	if payload.Src == "" || !strings.Contains(payload.Src, ".m3u8") {
 		return nil, fmt.Errorf("zoko payload has no m3u8 src")
 	}
+	// The media proxy shares this server's egress: a manifest the probe
+	// cannot reach would 403 through the proxy too, so it is dropped instead
+	// of surfacing a server that can only produce 502s.
 	if !p.probeManifest(ctx, payload.Src) {
-		p.log.Info().Str("source", source).Msg("zoko: manifest probe failed (CDN blocked), dropping source")
+		p.log.Info().Str("source", source).Msg("zoko: manifest blocked from this egress, dropping source")
 		return nil, nil
 	}
 	p.learnURLHost(payload.Src)

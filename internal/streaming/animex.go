@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +28,9 @@ const (
 	animexPlyrBase   = "https://plyr.animex.one"
 )
 
-// animexProviders lists known AnimeX provider IDs (from the plyr player JS).
-// Priority order matches the client: ["beep","loli","uwu","zuna","yuki","neko","sora"]
-var animexProviders = []string{"yuki", "neko", "zuna", "sora", "uwu", "beep"}
+// animexProviders is the fallback provider order used when the plyr page
+// cannot be parsed. Priority matches the plyr subProviders list.
+var animexProviders = []string{"beep", "yuki", "neko", "sora", "loli"}
 
 // animexProviderNames maps provider IDs to human-readable server names.
 var animexProviderNames = map[string]string{
@@ -38,6 +40,7 @@ var animexProviderNames = map[string]string{
 	"sora": "Sora",
 	"uwu":  "Koharu",
 	"beep": "Lumi",
+	"loli": "Anzu",
 }
 
 // animexProviderDefaultReferer maps provider IDs to their default referer.
@@ -48,6 +51,17 @@ var animexProviderDefaultReferer = map[string]string{
 	"beep": "",
 	"neko": "",
 	"zuna": "",
+}
+
+// animexChallengeError marks a Cloudflare challenge/block response from the
+// AnimeX API (pp.animex.one). It is transient: re-establishing the plyr
+// clearance session and retrying usually gets through.
+type animexChallengeError struct {
+	status int
+}
+
+func (e *animexChallengeError) Error() string {
+	return fmt.Sprintf("animex api returned HTTP %d (cloudflare challenge)", e.status)
 }
 
 // animexAPIResponse is the JSON shape returned by the AnimeX sources API.
@@ -179,6 +193,14 @@ func (p *AnimeXProvider) ensureSession(ctx context.Context) error {
 	return nil
 }
 
+// invalidateSession drops the cached Cloudflare clearance so the next
+// ensureSession call re-establishes it.
+func (p *AnimeXProvider) invalidateSession() {
+	p.sessionMu.Lock()
+	p.session = nil
+	p.sessionMu.Unlock()
+}
+
 // FindEpisodeSource resolves an AnimeX episode stream by establishing a session,
 // calling the plyr API, decoding XOR+base64url proxy URLs, and returning
 // direct m3u8 + subtitles.
@@ -191,23 +213,50 @@ func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string
 		lang = "sub"
 	}
 
-	// Fetch the plyr page to get the correct slug for this anime.
-	slug, err := p.fetchPlyrSlug(ctx, anilistID, episode)
+	// Fetch the plyr page to get the show slug and the authoritative
+	// per-language provider list (the plyr page is what the site itself
+	// uses — episodes that only exist on a provider missing from our static
+	// list, e.g. loli, are exactly the ones that "don't show up").
+	slug, providers, err := p.fetchPlyrData(ctx, anilistID, episode, lang)
 	if err != nil {
-		p.log.Debug().Err(err).Msg("animex: failed to get slug from plyr page, using anilistId")
-		slug = anilistID
+		// One short-backoff retry: the plyr page intermittently serves the
+		// Cloudflare challenge.
+		time.Sleep(time.Second)
+		slug, providers, err = p.fetchPlyrData(ctx, anilistID, episode, lang)
 	}
-	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Msg("animex: resolved slug for API")
+	if err != nil {
+		p.log.Debug().Err(err).Msg("animex: failed to read plyr page, using anilistId and static providers")
+		slug = anilistID
+		providers = animexProviders
+	}
+	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Strs("providers", providers).Msg("animex: resolved plyr data")
 
 	// Establish Cloudflare clearance session first
 	if err := p.ensureSession(ctx); err != nil {
 		p.log.Debug().Err(err).Msg("animex: session establishment failed, trying anyway")
 	}
 
-	// Try each provider in order until one returns sources.
+	// Try each provider in order until one returns sources. A Cloudflare
+	// challenge on the API (intermittent 403 HTML) is transient: invalidate
+	// the cached plyr session and retry the same provider once with fresh
+	// clearance. Sources the provider confirmed are never dropped later —
+	// this loop is the only gate.
 	var lastErr error
-	for _, providerID := range animexProviders {
+	sessionRetried := false
+	for _, providerID := range providers {
 		result, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
+		if err != nil {
+			var challenge *animexChallengeError
+			if errors.As(err, &challenge) && !sessionRetried {
+				sessionRetried = true
+				p.log.Info().Str("provider", providerID).Msg("animex: cloudflare challenge, refreshing session and retrying")
+				p.invalidateSession()
+				if sessErr := p.ensureSession(ctx); sessErr != nil {
+					p.log.Debug().Err(sessErr).Msg("animex: session refresh failed")
+				}
+				result, err = p.resolveProvider(ctx, slug, episode, lang, providerID)
+			}
+		}
 		if err != nil {
 			lastErr = err
 			p.log.Debug().Err(err).Str("provider", providerID).Msg("animex: provider failed")
@@ -224,36 +273,73 @@ func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string
 	return nil, fmt.Errorf("animex: no sources found for any provider")
 }
 
-// fetchPlyrSlug fetches the AnimeX plyr page and extracts the show slug from
-// the embedded SvelteKit page data. The slug is used as the `id` parameter
-// in the sources API call.
-func (p *AnimeXProvider) fetchPlyrSlug(ctx context.Context, anilistID string, episode int) (string, error) {
+// fetchPlyrData fetches the AnimeX plyr page once and extracts BOTH the show
+// slug and the per-language provider list from the embedded SvelteKit data:
+//
+//	servers:{subProviders:[{id:"beep",default:true,...},...],dubProviders:[...]},
+//	id:"bleach-...-ts6ov",anilistId:185874,...
+//
+// The provider list is authoritative — the site only offers what it lists
+// here, so querying exactly these IDs (in listed order) is what makes every
+// available episode show up.
+func (p *AnimeXProvider) fetchPlyrData(ctx context.Context, anilistID string, episode int, lang string) (string, []string, error) {
 	plyrURL := fmt.Sprintf("%s/e/%s/%d", animexPlyrBase, anilistID, episode)
-	p.log.Debug().Str("url", plyrURL).Msg("animex: fetching plyr page for slug")
+	p.log.Debug().Str("url", plyrURL).Msg("animex: fetching plyr page")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, plyrURL, nil)
 	if err != nil {
-		return "", fmt.Errorf("plyr request: %w", err)
+		return "", nil, fmt.Errorf("plyr request: %w", err)
 	}
 	req.Header.Set("User-Agent", animexPlayerUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("plyr fetch: %w", err)
+		return "", nil, fmt.Errorf("plyr fetch: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("plyr returned HTTP %d", resp.StatusCode)
+		return "", nil, fmt.Errorf("plyr returned HTTP %d", resp.StatusCode)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	if err != nil {
-		return "", fmt.Errorf("plyr read: %w", err)
+		return "", nil, fmt.Errorf("plyr read: %w", err)
 	}
+	html := string(body)
 
-	return extractPlyrSlug(string(body))
+	slug, err := extractPlyrSlug(html)
+	if err != nil {
+		return "", nil, err
+	}
+	providers := extractPlyrProviders(html, lang)
+	if len(providers) == 0 {
+		providers = animexProviders
+	}
+	return slug, providers, nil
+}
+
+// extractPlyrProviders parses the subProviders/dubProviders ID list for the
+// requested language out of the SvelteKit page data.
+func extractPlyrProviders(html, lang string) []string {
+	key := `subProviders:`
+	if lang == "dub" {
+		key = `dubProviders:`
+	}
+	start := strings.Index(html, key)
+	if start < 0 {
+		return nil
+	}
+	region := html[start:]
+	if end := strings.Index(region, "],"); end >= 0 {
+		region = region[:end]
+	}
+	var out []string
+	for _, m := range regexp.MustCompile(`id:"([a-z0-9]+)"`).FindAllStringSubmatch(region, -1) {
+		out = append(out, m[1])
+	}
+	return out
 }
 
 // extractPlyrSlug parses the SvelteKit embedded page data from the plyr HTML
@@ -342,6 +428,11 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusForbidden {
+		// Cloudflare challenge/block — transient, retryable via a fresh
+		// plyr session.
+		return nil, &animexChallengeError{status: resp.StatusCode}
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
 		return nil, fmt.Errorf("animex api returned HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
@@ -356,13 +447,18 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		return nil, nil
 	}
 
-	// 2. Apply per-provider URL transforms (mirrors the client-side Xr() function)
-	// The API returns direct URLs; the client JS then encodes them via CDN proxy.
-	// For our backend, we keep them direct and just apply domain rewrites.
+	// 2. Probe + tag. The API returns direct CDN URLs gated behind per-
+	// provider Referer/User-Agent headers (returned in apiResp.Headers).
+	// Browsers cannot attach those headers themselves, so playback always
+	// goes through the Aniraku media proxy: every source ships with
+	// Verification "proxy" and the provider headers attached to the result.
+	// A failed probe is not fatal — the proxy egress and residential clients
+	// can reach CDNs that block this server.
 	referer := apiResp.Headers["Referer"]
 	if referer == "" {
 		referer = animexProviderDefaultReferer[providerID]
 	}
+	userAgent := apiResp.Headers["User-Agent"]
 
 	var sources []core.Source
 	for _, src := range apiResp.Sources {
@@ -384,6 +480,14 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 
 		// Learn the host for CDN allowlist
 		p.learnURLHost(directURL)
+
+		// The media proxy shares this server's egress: a manifest the probe
+		// cannot reach would 403 through the proxy too, so it is dropped
+		// instead of surfacing a server that can only produce 502s.
+		if !p.ProbeHLS(ctx, directURL, referer, userAgent) {
+			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: manifest blocked from this egress, dropping source")
+			continue
+		}
 
 		// Build subtitle tracks from the API response
 		var subs []core.Subtitle
@@ -421,7 +525,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 			Type:         srcType,
 			Quality:      src.Quality,
 			Subtitles:    subs,
-			Verification: "direct",
+			Verification: "proxy",
 		})
 	}
 
@@ -442,12 +546,25 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	}
 	p.log.Info().Str("provider", serverName).Str("lang", lang).Int("sources", len(sources)).Msg("animex: resolved")
 
+	// Attach the provider headers (Referer, and User-Agent for providers like
+	// sora whose CDN expects a mobile UA) so the media proxy replays them.
+	headers := map[string]string{}
+	for k, v := range apiResp.Headers {
+		headers[k] = v
+	}
+	if headers["Referer"] == "" && referer != "" {
+		headers["Referer"] = referer
+	}
+	if headers["User-Agent"] == "" {
+		headers["User-Agent"] = animexPlayerUA
+	}
+
 	return &SourceResult{
 		Sources:    sources,
-		Headers:    map[string]string{"Referer": referer},
+		Headers:    headers,
 		ServerName: serverName,
-		Intro:     intro,
-		Outro:     outro,
+		Intro:      intro,
+		Outro:      outro,
 	}, nil
 }
 
@@ -517,13 +634,19 @@ func DecodeAnimeXProxyURL(proxyURL string) (originalURL, referer, userAgent stri
 	return originalURL, referer, userAgent
 }
 
-// ProbeHLS verifies a manifest URL serves a real HLS playlist.
-func (p *AnimeXProvider) ProbeHLS(ctx context.Context, manifestURL, referer string) bool {
+// ProbeHLS verifies a manifest URL serves a real HLS playlist. referer and
+// userAgent mirror the provider headers the CDN expects; empty values are
+// omitted.
+func (p *AnimeXProvider) ProbeHLS(ctx context.Context, manifestURL, referer, userAgent string) bool {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return false
 	}
-	req.Header.Set("User-Agent", animexPlayerUA)
+	ua := userAgent
+	if ua == "" {
+		ua = animexPlayerUA
+	}
+	req.Header.Set("User-Agent", ua)
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
