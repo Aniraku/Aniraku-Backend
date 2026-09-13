@@ -32,12 +32,12 @@ var animexProviders = []string{"yuki", "neko", "zuna", "sora", "uwu", "beep"}
 
 // animexProviderNames maps provider IDs to human-readable server names.
 var animexProviderNames = map[string]string{
-	"yuki": "Yuki",
-	"neko": "Neko",
-	"zuna": "Zuna",
+	"yuki": "Nthing",
+	"neko": "Chibi",
+	"zuna": "Kira",
 	"sora": "Sora",
-	"uwu":  "UWU",
-	"beep": "Beep",
+	"uwu":  "Koharu",
+	"beep": "Lumi",
 }
 
 // animexProviderDefaultReferer maps provider IDs to their default referer.
@@ -441,7 +441,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 
 	serverName := animexProviderNames[providerID]
 	if serverName == "" {
-		serverName = providerID
+		serverName = "Hana"
 	}
 	p.log.Info().Str("provider", serverName).Str("lang", lang).Int("sources", len(sources)).Msg("animex: resolved")
 
