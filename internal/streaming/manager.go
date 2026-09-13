@@ -95,9 +95,10 @@ type Episode struct {
 }
 
 type SourceResult struct {
-	Sources   []core.Source
-	Headers   map[string]string
-	Downloads []core.DownloadLink
+	Sources    []core.Source
+	Headers    map[string]string
+	Downloads  []core.DownloadLink
+	ServerName string
 	// Intro/Outro are provider skip segments, passed through to the client
 	// so it can offer manual skip buttons.
 	Intro *core.SkipTimestamp
@@ -531,7 +532,11 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 		if err != nil || sr == nil || len(sr.Sources) == 0 {
 			continue // silent skip
 		}
-		out = appendNamedServers(out, animexServers[:], "animex", lang, sr)
+		name := sr.ServerName
+		if name == "" {
+			name = "AnimeX"
+		}
+		out = appendNamedServers(out, []string{name}, "animex", lang, sr)
 	}
 	return out
 }
