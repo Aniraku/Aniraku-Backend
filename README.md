@@ -95,6 +95,8 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 | Network safety | `internal/netguard/` (SSRF `Control` + `NoRedirects` + guarded `http.Client` factory) |
 | Streaming providers | `internal/streaming/` (`anikoto.go`, `flixcloud.go`, `manager.go`) |
 | TMDB resolver | `internal/tmdb/` (`resolver.go` AniBridge+Fribb, `merge.go`) |
+| API contract | [`docs/openapi.yaml`](docs/openapi.yaml) |
+| Architecture deep-dive | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
 
 ## Configuration
 
@@ -110,6 +112,10 @@ The default configuration is in [`config.yaml`](config.yaml). Secrets are read f
 The default local address is `127.0.0.1:43211` with bounded `Read/Write/Idle` timeouts and `SIGINT`/`SIGTERM` shutdown.
 
 See `.env.example` for a template (placeholders, no real keys).
+
+### Deployment notes
+
+- **Trusted proxies & rate limiting** — `ANIRAKU_TRUSTED_PROXY_CIDRS` (comma-separated CIDRs) declares reverse proxies whose `X-Forwarded-For` entries may be trusted; the rightmost untrusted entry becomes the client IP used for rate limiting and logging. With **no** CIDRs configured, `X-Forwarded-For` is ignored entirely and the socket peer is used. Behind Render (default `render.yaml`) that means all visitors share one rate-limit bucket keyed on the proxy IP — safe against spoofing, but coarse. Render publishes no stable proxy CIDRs, so the safe default is left in place; set the variable only when terminating TLS somewhere with *known* CIDRs (e.g. Cloudflare). Never trust client-supplied XFF entries directly — spoofed values mint fresh rate-limit buckets.
 
 ## Embedded API interface
 

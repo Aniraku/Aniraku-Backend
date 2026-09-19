@@ -22,7 +22,15 @@ func loadEnv(path string) {
 			continue
 		}
 		if k, v, ok := strings.Cut(line, "="); ok {
-			os.Setenv(strings.TrimSpace(k), strings.TrimSpace(v))
+			k = strings.TrimSpace(k)
+			// Standard dotenv semantics: variables already present in the
+			// process environment win over the file, so an operator setting
+			// ANIRAKU_SERVER_DEBUG=true in the shell is not silently reverted
+			// by a stale value in .env.
+			if _, exists := os.LookupEnv(k); exists {
+				continue
+			}
+			os.Setenv(k, strings.TrimSpace(v))
 		}
 	}
 }
@@ -61,6 +69,9 @@ type ServerConfig struct {
 	UIDist             string `mapstructure:"ui_dist"`
 	Debug              bool   `mapstructure:"debug"`
 	AnikotoMappingPath string `mapstructure:"anikoto_mapping_path"`
+	// EnablePprof mounts the standard pprof handlers under /debug/pprof,
+	// behind auth + RequireAdmin. Opt-in via ANIRAKU_ENABLE_PPROF=true.
+	EnablePprof bool `mapstructure:"enable_pprof"`
 }
 
 type TMDBConfig struct {
@@ -160,6 +171,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if akp := os.Getenv("ANIRAKU_ANIKOTO_MAPPING_PATH"); akp != "" {
 		v.Set("server.anikoto_mapping_path", akp)
+	}
+	if pv := os.Getenv("ANIRAKU_ENABLE_PPROF"); pv == "true" || pv == "1" {
+		v.Set("server.enable_pprof", true)
 	}
 
 	// OAuth sync credentials (optional — feature disabled when absent)

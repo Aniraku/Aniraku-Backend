@@ -73,7 +73,16 @@ var adminHTTPClient = netguard.NewHTTPClient(10 * time.Second)
 // DEFINER function scoped to auth.uid()) whether that user is an admin. The
 // client can never self-declare admin; the check runs with the caller's own
 // JWT, so RLS and the function's auth.uid() scoping both apply.
-func RequireAdmin(supabaseURL string, log zerolog.Logger) func(http.Handler) http.Handler {
+//
+// Header roles mirror supabaseRequest: the apikey header must carry the
+// project's ANON key (the gateway rejects anything that is not a project
+// key with "Invalid API key" — a user JWT is not a project key), while the
+// Authorization bearer carries the user's JWT, which PostgREST resolves to
+// the authenticated role so auth.uid() inside is_admin() evaluates for the
+// actual caller. anonKey is passed explicitly rather than read from a
+// package global so the failure mode is a construction-time configuration
+// concern, not a hidden dependency. An empty anonKey fails closed (500).
+func RequireAdmin(supabaseURL, anonKey string, log zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
@@ -85,6 +94,13 @@ func RequireAdmin(supabaseURL string, log zerolog.Logger) func(http.Handler) htt
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return
 			}
+			if anonKey == "" {
+				// Configuration error: without the project anon key every RPC
+				// would be rejected at the gateway anyway. Fail closed.
+				log.Error().Msg("admin check: supabase anon key not configured")
+				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
+				return
+			}
 
 			rawToken := Token(ctx)
 			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -94,7 +110,7 @@ func RequireAdmin(supabaseURL string, log zerolog.Logger) func(http.Handler) htt
 				http.Error(w, `{"error":"internal server error"}`, http.StatusInternalServerError)
 				return
 			}
-			req.Header.Set("apikey", rawToken)
+			req.Header.Set("apikey", anonKey)
 			req.Header.Set("Authorization", "Bearer "+rawToken)
 			req.Header.Set("Content-Type", "application/json")
 

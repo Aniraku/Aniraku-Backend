@@ -37,12 +37,12 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
-		// New CDN hosts (observed 2026-08-04)
-		"norami.top","fetch.nexabloom.top",
-		// ZokoAnime embed CDN (observed 2026-09-13, referer-gated)
-		"aniwatchtv.uk",
-		// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
-		"aniwatchtv.site",
+	// New CDN hosts (observed 2026-08-04)
+	"norami.top", "fetch.nexabloom.top",
+	// ZokoAnime embed CDN (observed 2026-09-13, referer-gated)
+	"aniwatchtv.uk",
+	// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
+	"aniwatchtv.site",
 	"fast4speed.rsvp",
 	// Additional anime CDN hosts from DeepSeek audit
 	"ans-bio-video.com",

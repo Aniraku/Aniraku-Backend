@@ -22,10 +22,10 @@ import (
 )
 
 const (
-	animexXORKey     = "10b06cdc1ca48c9fb0b94af97cc040cf"
-	animexCDNBase    = "https://cdnx.aniwatchtv.site"
-	animexPlayerUA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-	animexPlyrBase   = "https://plyr.animex.one"
+	animexXORKey   = "10b06cdc1ca48c9fb0b94af97cc040cf"
+	animexCDNBase  = "https://cdnx.aniwatchtv.site"
+	animexPlayerUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+	animexPlyrBase = "https://plyr.animex.one"
 )
 
 // animexProviders is the fallback provider order used when the plyr page
@@ -96,9 +96,9 @@ type AnimeXProvider struct {
 	apiBase   string
 	learnHost func(host string)
 
-	sessionMu   sync.Mutex
-	session     *animexSession
-	sessionTTL  time.Duration
+	sessionMu  sync.Mutex
+	session    *animexSession
+	sessionTTL time.Duration
 }
 
 // animexSession holds a Cloudflare clearance session for the AnimeX API.

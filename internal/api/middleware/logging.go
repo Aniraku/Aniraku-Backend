@@ -25,7 +25,10 @@ func Logging(log zerolog.Logger) func(http.Handler) http.Handler {
 
 			next.ServeHTTP(wrapped, r)
 
+			RecordRequestStatus(wrapped.status)
+
 			log.Info().
+				Str("request_id", GetRequestID(r.Context())).
 				Str("method", r.Method).
 				Str("path", r.URL.Path).
 				Int("status", wrapped.status).
