@@ -241,7 +241,7 @@ func (p *OGFLixProvider) resolveShow(ctx context.Context, anilistID string) (str
 		n = 4
 	}
 	type verification struct {
-		slug   string
+		slug     string
 		verified bool
 	}
 	verifications := make([]verification, n)

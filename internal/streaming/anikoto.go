@@ -682,10 +682,10 @@ func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL 
 	}
 
 	var (
-		fbFile, fbOrigin   string
-		fbTracks           []megaplayTrack
-		fbIn, fbOut        *core.SkipTimestamp
-		firstDecErr        error
+		fbFile, fbOrigin string
+		fbTracks         []megaplayTrack
+		fbIn, fbOut      *core.SkipTimestamp
+		firstDecErr      error
 	)
 	for _, v := range megaPlayEdgeVariants(embedURL) {
 		u := base

@@ -1,0 +1,932 @@
+openapi: 3.1.0
+info:
+  title: Aniraku Backend API
+  version: "1.0"
+  description: |
+    Go service layer for the Aniraku web and Android clients: catalog metadata
+    (AniList/AniZip/TMDB), multi-provider playback resolution, a media proxy
+    with SSRF/allowlist gating, Supabase-backed account features, and MAL /
+    AniList sync.
+
+    Versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is
+    kept for compatibility. All responses are JSON unless noted (media proxy
+    streams raw bytes / HLS playlists).
+
+    Rate limits: 30 req/s (burst 60) globally per client IP; 10 req/s (burst
+    20) on the media proxy. Exceeding a limit returns `429` with `Retry-After`.
+servers:
+  - url: https://api.aniraku.tech
+  - url: http://127.0.0.1:43211
+tags:
+  - name: health
+  - name: catalog
+  - name: playback
+  - name: account
+  - name: sync
+  - name: admin
+security:
+  - {}
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [health]
+      summary: Liveness probe
+      security: []
+      responses:
+        "200":
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  uptime_seconds: { type: integer }
+                  version: { type: string }
+
+  /api/v1/version:
+    get:
+      tags: [health]
+      summary: Build version, commit, and build date
+      security: []
+      responses:
+        "200":
+          description: Version info
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string }
+                  commit: { type: string }
+                  date: { type: string }
+
+  /api/v1/anime/{id}:
+    get:
+      tags: [catalog]
+      summary: Full anime record (AniList-backed)
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/anilistId"
+      responses:
+        "200":
+          description: Anime record (raw AniList Media object)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnimeRecord"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/anime/{id}/episodes:
+    get:
+      tags: [catalog]
+      summary: Episode list with titles, thumbnails, and airdates
+      description: |
+        Merged from AniZip → TMDB → Anisearch → generic, with validated
+        thumbnails and a poster fallback for episodes without stills.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/anilistId"
+      responses:
+        "200":
+          description: Episode list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [episodes]
+                properties:
+                  episodes:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Episode"
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/anime/{id}/similar:
+    get:
+      tags: [catalog]
+      summary: Similar anime (AniList genre match, Jikan fallback)
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/anilistId"
+        - $ref: "#/components/parameters/page"
+        - $ref: "#/components/parameters/perPage"
+      responses:
+        "200":
+          description: Paged media list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaPage"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/anime/{id}/relations:
+    get:
+      tags: [catalog]
+      summary: Related anime records
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/anilistId"
+      responses:
+        "200":
+          description: Relations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MediaPage"
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/stream:
+    post:
+      tags: [playback]
+      summary: Resolve playback sources for an episode
+      description: |
+        Provider fallback chain (Anikoto → AnimeX → Zoko → OGFLix → FlixCloud)
+        or a specific provider when `provider` is set. HLS sources are
+        rewritten to point at `/api/v1/proxy`; subtitles are returned raw.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StreamRequest"
+      responses:
+        "200":
+          description: Stream result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/servers:
+    get:
+      tags: [playback]
+      summary: All selectable servers for an episode
+      description: Fans out to every provider concurrently and ranks by playback verdict.
+      security: []
+      parameters:
+        - name: animeId
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: episode
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: lang
+          in: query
+          schema: { type: string, default: sub, enum: [sub, dub] }
+        - name: genres
+          in: query
+          description: Comma-separated genres; used to gate hentai-unsafe providers.
+          schema: { type: string }
+        - name: refresh
+          in: query
+          schema: { type: string, enum: ["1", "true"] }
+      responses:
+        "200":
+          description: Server list (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Server"
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/proxy:
+    get:
+      tags: [playback]
+      summary: Media proxy (HLS, segments, keys, subtitles)
+      description: |
+        Streams allowlisted CDN media through the backend with uTLS
+        fingerprinting, SSRF-guarded dialing, HLS playlist rewriting, and
+        range forwarding. Not cached at the edge (`no-store, private`).
+      security: []
+      parameters:
+        - name: url
+          in: query
+          required: true
+          description: Target media URL (must pass the CDN host allowlist).
+          schema: { type: string }
+        - name: headers
+          in: query
+          description: JSON object of upstream headers.
+          schema: { type: string }
+        - name: rn
+          in: query
+          description: Cache-busting nonce (stripped before dialing upstream).
+          schema: { type: string }
+        - name: Range
+          in: header
+          schema: { type: string }
+      responses:
+        "200":
+          description: |
+            Media bytes or a rewritten HLS playlist
+            (`application/vnd.apple.mpegurl`), or cached AES key bytes
+            (`application/octet-stream`).
+        "206": { description: Partial content (range forwarded) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/Upstream" }
+    head:
+      tags: [playback]
+      summary: Media proxy (headers only)
+      security: []
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Upstream headers }
+
+  /api/v1/download:
+    get:
+      tags: [playback]
+      summary: Direct download proxy
+      description: Streams a full provider file through the allowlist gate with `Content-Disposition: attachment`.
+      security: []
+      parameters:
+        - name: url
+          in: query
+          required: true
+          schema: { type: string }
+        - name: headers
+          in: query
+          schema: { type: string }
+      responses:
+        "200": { description: File bytes }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /ani/v1/epsrc:
+    get:
+      tags: [playback]
+      summary: Legacy episode-source endpoint (compatibility)
+      security: []
+      deprecated: true
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: ep
+          in: query
+          required: true
+          schema: { type: integer }
+        - name: lang
+          in: query
+          schema: { type: string, default: sub }
+      responses:
+        "200":
+          description: Stream result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StreamResult"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/anilist:
+    post:
+      tags: [catalog]
+      summary: AniList GraphQL proxy
+      description: Forwards a GraphQL query with retry, token-bucket pacing, circuit breaking, and stale-cache fallback.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [query]
+              properties:
+                query: { type: string }
+                variables: { type: object }
+      responses:
+        "200": { description: GraphQL response (raw AniList JSON) }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/anime/{id}/progress:
+    post:
+      tags: [account]
+      summary: Upsert watch progress for an anime
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/anilistId"
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                episode: { type: integer }
+                position_sec: { type: integer }
+                completed: { type: boolean }
+      responses:
+        "200": { description: Saved }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/anime/{animeId}/episode/{episode}/rating:
+    post:
+      tags: [account]
+      summary: Save a per-episode rating
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: animeId
+          in: path
+          required: true
+          schema: { type: integer }
+        - name: episode
+          in: path
+          required: true
+          schema: { type: integer }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                score: { type: number }
+      responses:
+        "200": { description: Saved }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/anime/{animeId}/ratings:
+    get:
+      tags: [account]
+      summary: Per-episode ratings for an anime (current user)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: animeId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: Ratings }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/continue-watching:
+    get:
+      tags: [account]
+      summary: Continue-watching entries
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: List (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ContinueWatchingItem"
+
+  /api/v1/import/mal:
+    post:
+      tags: [account]
+      summary: Import MAL list into Aniraku
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Import result }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/import/anilist:
+    post:
+      tags: [account]
+      summary: Import AniList list into Aniraku
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Import result }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/import/{jobId}:
+    get:
+      tags: [account]
+      summary: Import job status (compatibility stub)
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: jobId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Always reports the job id with status pending }
+
+  /api/v1/export/mal:
+    post:
+      tags: [account]
+      summary: Export Aniraku list to MAL
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Export result }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/export/anilist:
+    post:
+      tags: [account]
+      summary: Export Aniraku list to AniList
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Export result }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/profile/{username}:
+    get:
+      tags: [account]
+      summary: Public profile by username
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: username
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Profile }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/v1/profile:
+    put:
+      tags: [account]
+      summary: Update the current user's profile
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Updated }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/favorites:
+    get:
+      tags: [account]
+      summary: List the current user's favorites
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Favorites }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [account]
+      summary: Add a favorite
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Added }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/favorites/{mediaId}:
+    delete:
+      tags: [account]
+      summary: Remove a favorite
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: mediaId
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200": { description: Removed }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/logs:
+    post:
+      tags: [account]
+      summary: Ingest client-side log lines
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Accepted }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/settings/{key}:
+    get:
+      tags: [account]
+      summary: Read a user setting
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Setting value (may be empty) }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    put:
+      tags: [account]
+      summary: Write a user setting
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: key
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Saved }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502": { $ref: "#/components/responses/Upstream" }
+
+  /api/v1/notifications:
+    get:
+      tags: [account]
+      summary: List notifications
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Notifications }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/notifications/{id}/read:
+    put:
+      tags: [account]
+      summary: Mark one notification read
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200": { description: Marked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/notifications/read-all:
+    put:
+      tags: [account]
+      summary: Mark all notifications read
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Marked }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/sync:
+    get:
+      tags: [sync]
+      summary: Sync connection status for the current user
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Per-provider connection state }
+
+  /api/v1/sync/{provider}/authorize:
+    get:
+      tags: [sync]
+      summary: Begin OAuth authorization (mal | anilist)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/syncProvider"
+      responses:
+        "200": { description: Authorization URL / state }
+        "400": { $ref: "#/components/responses/BadRequest" }
+
+  /api/v1/sync/callback:
+    post:
+      tags: [sync]
+      summary: OAuth callback (generic, provider in body)
+      security: []
+      responses:
+        "200": { description: Handled }
+
+  /api/v1/sync/{provider}/callback:
+    post:
+      tags: [sync]
+      summary: OAuth callback
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/syncProvider"
+      responses:
+        "200": { description: Handled }
+
+  /api/v1/sync/{provider}:
+    delete:
+      tags: [sync]
+      summary: Disconnect a sync provider
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/syncProvider"
+      responses:
+        "200": { description: Disconnected }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/sync/update:
+    post:
+      tags: [sync]
+      summary: Push watch progress to connected providers
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Synced }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/sync/score:
+    put:
+      tags: [sync]
+      summary: Push a score update to connected providers
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Synced }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/admin/stats:
+    get:
+      tags: [admin]
+      summary: Aggregated service statistics (admin only)
+      security:
+        - bearerAuth: []
+      responses:
+        "200": { description: Stats }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /api/v1/metrics:
+    get:
+      tags: [admin]
+      summary: Operational metrics snapshot (admin only)
+      description: Request counters, AniList cache/circuit state, runtime stats.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Metrics JSON
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  uptime_seconds: { type: integer }
+                  version: { type: string }
+                  commit: { type: string }
+                  requests:
+                    type: object
+                    additionalProperties: { type: integer }
+                  anilist:
+                    type: object
+                    additionalProperties: true
+                  browse_cache_hits: { type: integer }
+                  dynamic_cdn_hosts: { type: integer }
+                  runtime:
+                    type: object
+                    additionalProperties: true
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Supabase access token for the `authenticated` audience.
+
+  parameters:
+    anilistId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer }
+      description: AniList media ID.
+    page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 100, default: 1 }
+    perPage:
+      name: perPage
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 20, default: 12 }
+    syncProvider:
+      name: provider
+      in: path
+      required: true
+      schema: { type: string, enum: [mal, anilist] }
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Not allowed (allowlist gate, admin gate, or SSRF guard)
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No matching resource or source
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Upstream rate limited or local bucket exhausted
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Upstream:
+      description: Upstream provider failed
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    Title:
+      type: object
+      properties:
+        romaji: { type: [string, "null"] }
+        english: { type: [string, "null"] }
+        native: { type: [string, "null"] }
+        userPreferred: { type: [string, "null"] }
+
+    AnimeRecord:
+      type: object
+      description: AniList Media object as returned by the GraphQL API.
+      properties:
+        id: { type: integer }
+        idMal: { type: [integer, "null"] }
+        title: { $ref: "#/components/schemas/Title" }
+        description: { type: string }
+        format: { type: string }
+        status: { type: string }
+        episodes: { type: [integer, "null"] }
+        duration: { type: [integer, "null"] }
+        genres: { type: array, items: { type: string } }
+        averageScore: { type: [integer, "null"] }
+        popularity: { type: integer }
+        season: { type: [string, "null"] }
+        seasonYear: { type: [integer, "null"] }
+        nextAiringEpisode:
+          type: [object, "null"]
+          properties:
+            episode: { type: integer }
+            airingAt: { type: integer }
+        isAdult: { type: boolean }
+
+    Episode:
+      type: object
+      properties:
+        number: { type: integer }
+        title: { type: string }
+        thumbnail: { type: string }
+        description: { type: string }
+        airdate: { type: string }
+
+    PageInfo:
+      type: object
+      properties:
+        total: { type: integer }
+        lastPage: { type: integer }
+        hasNextPage: { type: boolean }
+        currentPage: { type: integer }
+        perPage: { type: integer }
+
+    MediaPage:
+      type: object
+      properties:
+        media:
+          type: array
+          items: { $ref: "#/components/schemas/AnimeRecord" }
+        pageInfo: { $ref: "#/components/schemas/PageInfo" }
+
+    Subtitle:
+      type: object
+      properties:
+        url: { type: string }
+        lang: { type: string }
+        label: { type: string }
+
+    Source:
+      type: object
+      properties:
+        url:
+          type: string
+          description: HLS URL, rewritten to /api/v1/proxy when type is hls.
+        type: { type: string, example: hls }
+        quality: { type: string, example: auto }
+        subtitles:
+          type: array
+          items: { $ref: "#/components/schemas/Subtitle" }
+        verification:
+          type: string
+          description: Soft playback verdict — proxy | direct | embed | dead.
+          enum: [proxy, direct, embed, dead]
+
+    DownloadLink:
+      type: object
+      properties:
+        url: { type: string }
+        label: { type: string }
+
+    StreamRequest:
+      type: object
+      required: [animeId, episode]
+      properties:
+        animeId: { type: integer, description: AniList ID }
+        episode: { type: integer, minimum: 1 }
+        provider:
+          type: string
+          description: Optional specific provider (anikoto | animex | zoko | ogflix | flixcloud).
+        lang: { type: string, default: sub, enum: [sub, dub] }
+        quality: { type: string, default: auto }
+        refresh: { type: boolean, default: false, description: Bypass provider caches }
+        slug: { type: string, description: Accepted for API compatibility; unused }
+
+    StreamResult:
+      type: object
+      properties:
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/Source" }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+          description: Headers required when fetching source URLs.
+        qualities:
+          type: array
+          items: { type: string }
+        servers:
+          type: array
+          items: { $ref: "#/components/schemas/Server" }
+        downloads:
+          type: array
+          items: { $ref: "#/components/schemas/DownloadLink" }
+        intro:
+          $ref: "#/components/schemas/SkipTimestamp"
+        outro:
+          $ref: "#/components/schemas/SkipTimestamp"
+
+    SkipTimestamp:
+      type: object
+      properties:
+        start: { type: number }
+        end: { type: number }
+
+    Server:
+      type: object
+      properties:
+        name: { type: string, example: Niko }
+        provider: { type: string, example: anikoto }
+        lang: { type: string, enum: [sub, dub] }
+        sources:
+          type: array
+          items: { $ref: "#/components/schemas/Source" }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        downloads:
+          type: array
+          items: { $ref: "#/components/schemas/DownloadLink" }
+
+    ContinueWatchingItem:
+      type: object
+      properties:
+        animeId: { type: integer }
+        title: { type: string }
+        image: { type: string }
+        episode: { type: integer }
+        time: { type: number }
+        duration: { type: number }
+        timestamp: { type: integer }

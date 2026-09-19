@@ -29,3 +29,11 @@ services:
         sync: false
       - key: ANIRAKU_OAUTH_STATE_SECRET
         sync: false
+      # Rate limiting keys on the client IP. Behind Render's proxy the socket
+      # peer is that proxy, so without trusted CIDRs every visitor shares one
+      # rate-limit bucket. Render does not publish stable proxy CIDRs; set
+      # this only if you terminate TLS elsewhere (e.g. Cloudflare) with known
+      # CIDRs. Leave unset (default) to rate-limit on the proxy peer — safe
+      # but coarse. See README "Deployment notes".
+      - key: ANIRAKU_TRUSTED_PROXY_CIDRS
+        sync: false
