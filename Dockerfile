@@ -1,4 +1,6 @@
-# Build stage: pinned Go builder.
+# Build stage: pinned Go builder. go.mod's toolchain directive (go1.25.3)
+# upgrades the 1.25-alpine base automatically — pinned for CVE fixes
+# (GO-2025-39xx/40xx series, all stdlib, fixed in 1.25.2/1.25.3).
 FROM golang:1.25-alpine AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
