@@ -2,6 +2,8 @@ module github.com/Aniraku/Aniraku-Backend
 
 go 1.25.0
 
+toolchain go1.25.13
+
 require (
 	github.com/go-chi/chi/v5 v5.2.4
 	github.com/golang-jwt/jwt/v5 v5.2.2
