@@ -102,6 +102,12 @@ type mediaMeta struct {
 	image string
 }
 
+type animeWatchProgress struct {
+	Episode   int
+	Progress  int
+	Completed bool
+}
+
 // fetchMediaMeta resolves AniList IDs to title + cover image in batched
 // GraphQL round trips so imported rows render properly in the UI.
 func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[int]mediaMeta, error) {
@@ -225,6 +231,47 @@ func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int,
 		}
 	}
 	return ids, nil
+}
+
+// loadUserWatchProgress returns the latest/highest Aniraku episode state for
+// each title. Watch history stores one row per episode, so exports must fold
+// those rows into the provider's anime-level progress field instead of
+// treating every favorite as completed.
+func (h *Handlers) loadUserWatchProgress(ctx context.Context, userID string) (map[int]animeWatchProgress, error) {
+	resp, err := h.supabaseRequest(ctx, "GET",
+		"/rest/v1/watch_history?select=anime_id,episode_number,progress,duration,timestamp&user_id=eq."+encodePath(userID)+"&order=timestamp.desc&limit=5000",
+		nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("watch history fetch returned %s", resp.Status)
+	}
+	var rows []struct {
+		AnimeID   int     `json:"anime_id"`
+		Episode   int     `json:"episode_number"`
+		Progress  float64 `json:"progress"`
+		Duration  float64 `json:"duration"`
+		Timestamp int64   `json:"timestamp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return nil, err
+	}
+	result := make(map[int]animeWatchProgress)
+	for _, row := range rows {
+		if row.AnimeID <= 0 || row.Episode <= 0 {
+			continue
+		}
+		progress := row.Episode
+		completed := row.Duration > 0 && row.Progress >= row.Duration*0.95
+		current, ok := result[row.AnimeID]
+		if !ok || row.Episode > current.Episode ||
+			(row.Episode == current.Episode && (completed || int(row.Progress) > current.Progress)) {
+			result[row.AnimeID] = animeWatchProgress{Episode: row.Episode, Progress: progress, Completed: completed}
+		}
+	}
+	return result, nil
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -401,9 +448,8 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 // Export: Aniraku favorites → provider library
 // ────────────────────────────────────────────────────────────────
 
-// ExportMAL pushes Aniraku anime favorites into the user's connected
-// MyAnimeList library as "completed". Capped at importExportCap entries
-// per request to stay inside MAL's 60 req/min limit.
+// ExportMAL pushes Aniraku favorites into the user's connected MyAnimeList
+// library while preserving the highest watched episode for each title.
 func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
@@ -438,6 +484,11 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Skip titles already marked completed on MAL — no pointless writes.
+	watchProgress, progressErr := h.loadUserWatchProgress(r.Context(), userID)
+	if progressErr != nil {
+		h.log.Warn().Err(progressErr).Msg("mal export: watch history fetch failed, exporting without progress")
+		watchProgress = map[int]animeWatchProgress{}
+	}
 	completed, err := h.fetchMALCompletedSet(r.Context(), token.AccessToken)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("mal export: completed set fetch failed, exporting all")
@@ -445,7 +496,14 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 
 	exported, skipped, failed := 0, 0, 0
 	limited := favoriteCount > importExportCap
-	for i, malID := range malIDs {
+	processed := 0
+	for _, anilistID := range anilistIDs {
+		malID, ok := malIDs[anilistID]
+		if !ok {
+			continue
+		}
+		i := processed
+		processed++
 		if i > 0 && i%3 == 0 {
 			select {
 			case <-time.After(1100 * time.Millisecond):
@@ -454,12 +512,20 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if completed[malID] {
+		state := watchProgress[anilistID]
+		if completed[malID] && (state.Completed || state.Episode == 0) {
 			skipped++
 			continue
 		}
 		form := url.Values{}
-		form.Set("status", "completed")
+		if state.Episode > 0 {
+			form.Set("num_watched_episodes", fmt.Sprintf("%d", state.Episode))
+		}
+		if state.Completed {
+			form.Set("status", "completed")
+		} else {
+			form.Set("status", "watching")
+		}
 		req, err := http.NewRequestWithContext(r.Context(), "PUT",
 			fmt.Sprintf("https://api.myanimelist.net/v2/anime/%d/my_list_status", malID),
 			strings.NewReader(form.Encode()))
@@ -492,8 +558,8 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ExportAniList pushes Aniraku anime favorites into the user's connected
-// AniList library as COMPLETED. Capped at importExportCap per request.
+// ExportAniList pushes Aniraku favorites into the user's connected AniList
+// library while preserving the highest watched episode for each title.
 func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
@@ -514,12 +580,18 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadGateway, "could not read your favorites")
 		return
 	}
-	if len(ids) > importExportCap {
+	favoriteCount := len(ids)
+	if favoriteCount > importExportCap {
 		ids = ids[:importExportCap]
 	}
 
-	query := `mutation ($id: Int) {
-		SaveMediaListEntry(mediaId: $id, status: COMPLETED) { id }
+	watchProgress, progressErr := h.loadUserWatchProgress(r.Context(), userID)
+	if progressErr != nil {
+		h.log.Warn().Err(progressErr).Msg("anilist export: watch history fetch failed, exporting without progress")
+		watchProgress = map[int]animeWatchProgress{}
+	}
+	query := `mutation ($id: Int, $progress: Int, $status: MediaListStatus) {
+		SaveMediaListEntry(mediaId: $id, progress: $progress, status: $status) { id }
 	}`
 	// Skip titles already marked completed on AniList — no pointless writes.
 	completed, err := h.fetchAniListCompletedSet(r.Context(), token.AccessToken)
@@ -528,7 +600,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exported, skipped, failed := 0, 0, 0
-	limited := len(ids) > importExportCap
+	limited := favoriteCount > importExportCap
 	for i, id := range ids {
 		if i > 0 && i%3 == 0 {
 			select {
@@ -538,11 +610,18 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if completed[id] {
+		state := watchProgress[id]
+		if completed[id] && (state.Completed || state.Episode == 0) {
 			skipped++
 			continue
 		}
-		raw, err := h.anilistAuthed(r.Context(), token.AccessToken, query, map[string]any{"id": id})
+		status := "CURRENT"
+		if state.Completed {
+			status = "COMPLETED"
+		}
+		raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, map[string]any{
+			"id": id, "progress": state.Episode, "status": status,
+		})
 		if err != nil {
 			failed++
 			continue
@@ -610,9 +689,9 @@ func (h *Handlers) fetchAniListCompletedSet(ctx context.Context, accessToken str
 	return completed, nil
 }
 
-// resolveAniListIDsToMAL maps a batch of AniList IDs to MAL IDs in a single
-// GraphQL round trip (media id_in). IDs without a mapping are dropped.
-func (h *Handlers) resolveAniListIDsToMAL(ctx context.Context, anilistIDs []int) ([]int, error) {
+// resolveAniListIDsToMAL maps AniList IDs to MAL IDs in batched GraphQL
+// round trips. IDs without a mapping are omitted.
+func (h *Handlers) resolveAniListIDsToMAL(ctx context.Context, anilistIDs []int) (map[int]int, error) {
 	mapped := map[int]int{}
 	for start := 0; start < len(anilistIDs); start += 50 {
 		end := start + 50
@@ -643,13 +722,7 @@ func (h *Handlers) resolveAniListIDsToMAL(ctx context.Context, anilistIDs []int)
 			}
 		}
 	}
-	malIDs := make([]int, 0, len(anilistIDs))
-	for _, id := range anilistIDs {
-		if malID, ok := mapped[id]; ok {
-			malIDs = append(malIDs, malID)
-		}
-	}
-	return malIDs, nil
+	return mapped, nil
 }
 
 // fetchMALCompletedSet returns the set of MAL anime ids the user has
@@ -715,4 +788,56 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 		return nil, fmt.Errorf("anilist returned %d", resp.StatusCode)
 	}
 	return raw, nil
+}
+
+// anilistAuthedWithRetry retries transient transport, rate-limit, and server
+// failures. AniList can return HTTP 200 with a GraphQL errors array, so those
+// responses are inspected as well instead of being reported as success.
+func (h *Handlers) anilistAuthedWithRetry(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		raw, err := h.anilistAuthed(ctx, accessToken, query, variables)
+		if err == nil {
+			var out struct {
+				Errors []struct {
+					Message string `json:"message"`
+				} `json:"errors"`
+			}
+			if json.Unmarshal(raw, &out) == nil && len(out.Errors) == 0 {
+				return raw, nil
+			}
+			message := "AniList rejected the request"
+			if len(out.Errors) > 0 && out.Errors[0].Message != "" {
+				message = out.Errors[0].Message
+			}
+			lastErr = fmt.Errorf("%s", message)
+		} else {
+			lastErr = err
+		}
+		if attempt == maxAttempts-1 || !isRetryableAniListError(lastErr) {
+			break
+		}
+		wait := time.Duration(500*(1<<attempt)) * time.Millisecond
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetryableAniListError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "429") ||
+		strings.Contains(message, "rate") ||
+		strings.Contains(message, "too many") ||
+		strings.Contains(message, "temporarily") ||
+		strings.Contains(message, "returned 5") ||
+		strings.Contains(message, "timeout") ||
+		strings.Contains(message, "connection")
 }
