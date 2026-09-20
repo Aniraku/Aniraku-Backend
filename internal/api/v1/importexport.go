@@ -40,6 +40,7 @@ const (
 	importBatchSize     = 200  // supabase rows per POST
 	importWatchBatch    = 200  // watch_history rows per POST
 	importMaxWatchRows  = 2000 // max synthesized watch rows per import
+	exportWriteCap      = 60   // max provider writes per export (bounds request time)
 	fullEpisodeSeconds  = 1440 // synthetic progress/duration for imported eps (24 min)
 )
 
@@ -851,8 +852,21 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	// score comes back in the viewer's own scoreFormat, so fetch the
 	// format alongside the entries to normalize everything to 1-10.
 	// Media carries title/cover/total inline — no follow-up meta fetch.
-	// userId is passed explicitly (null → viewer default): omitting it
-	// makes AniList reject the collection with a 400.
+	// The viewer ID is resolved first and passed explicitly: a null
+	// userId does not reliably default to the viewer (400).
+	viewerID, err := h.fetchAniListViewerID(r.Context(), token.AccessToken)
+	if err != nil {
+		switch {
+		case isAniListAuthError(err):
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+		case isRetryableAniListError(err):
+			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests — wait a minute and try again")
+		default:
+			h.log.Warn().Err(err).Msg("anilist import: viewer lookup failed")
+			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+") — try again")
+		}
+		return
+	}
 	query := `query ($userId: Int) {
 		Viewer {
 			id
@@ -874,7 +888,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}`
-	raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, map[string]any{})
+	raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, map[string]any{"userId": viewerID})
 	if err != nil {
 		switch {
 		case isAniListAuthError(err):
@@ -1183,6 +1197,12 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	var firstExportErr error
 	writes := 0
 	for _, id := range ids {
+		// Bound the request well under the server write timeout: stop
+		// taking new writes past the cap, re-run to continue.
+		if writes >= exportWriteCap {
+			limited = true
+			break
+		}
 		wp := watchProgress[id]
 		done := exportCompleted(wp, totals[id].episodes)
 		wantStatus := "watching"
@@ -1282,6 +1302,30 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// fetchAniListViewerID resolves the token owner's user ID. Collection
+// queries take it explicitly: a null userId does not reliably default
+// to the viewer and AniList answers such calls with a 400.
+func (h *Handlers) fetchAniListViewerID(ctx context.Context, accessToken string) (int, error) {
+	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, `query { Viewer { id } }`, map[string]any{})
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Data struct {
+			Viewer struct {
+				ID int `json:"id"`
+			} `json:"Viewer"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return 0, err
+	}
+	if out.Data.Viewer.ID <= 0 {
+		return 0, fmt.Errorf("AniList returned no viewer for this token")
+	}
+	return out.Data.Viewer.ID, nil
+}
+
 // anilistListState is a provider-side entry normalized like providerEntry.
 type anilistListState struct {
 	Progress int
@@ -1293,15 +1337,19 @@ type anilistListState struct {
 // (progress, status, normalized score) in a single query so exports can
 // diff-then-write instead of blindly rewriting every title.
 func (h *Handlers) fetchAniListListState(ctx context.Context, accessToken string) (map[int]anilistListState, error) {
-	// userId is passed explicitly (null → viewer default): omitting it
-	// makes AniList reject the collection with a 400.
+	// The viewer ID is resolved first and passed explicitly: a null
+	// userId does not reliably default to the viewer (400).
+	viewerID, err := h.fetchAniListViewerID(ctx, accessToken)
+	if err != nil {
+		return nil, err
+	}
 	query := `query ($userId: Int) {
 		Viewer { mediaListOptions { scoreFormat } }
 		MediaListCollection(userId: $userId, type: ANIME) {
 			lists { entries { mediaId status progress score } }
 		}
 	}`
-	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, query, map[string]any{})
+	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, query, map[string]any{"userId": viewerID})
 	if err != nil {
 		return nil, err
 	}
