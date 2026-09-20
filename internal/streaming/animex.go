@@ -29,9 +29,31 @@ const (
 )
 
 // animexProviders is the fallback provider order used when the plyr page
-// cannot be parsed. Priority matches the plyr subProviders list. Bad sources
-// are filtered per-source by content sniffing, not per-provider.
-var animexProviders = []string{"beep", "yuki", "neko", "sora", "loli"}
+// cannot be parsed. Priority matches the plyr subProviders list, minus
+// blocked providers (see animexBlockedProviders).
+var animexProviders = []string{"beep", "yuki", "neko", "sora"}
+
+// animexBlockedProviders lists sub-providers that must never be offered,
+// regardless of what the plyr page lists. loli ("Anzu") serves image-segment
+// playlists (numbered .jpg payloads) — it does not play, so it is hard-
+// excluded before any network call. Everything else is resolved and gated
+// only by the manifest reachability probe: no content sniffing in the drop
+// path, because providers like yuki (Mochi) cloak probe requests with image
+// payloads while serving real video to players.
+var animexBlockedProviders = map[string]bool{
+	"loli": true,
+}
+
+// filterBlockedProviders drops blocked sub-provider IDs from a plyr list.
+func filterBlockedProviders(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, id := range in {
+		if !animexBlockedProviders[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
 
 // animexProviderNames maps provider IDs to human-readable server names.
 var animexProviderNames = map[string]string{
@@ -261,6 +283,9 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 		slug = anilistID
 		providers = animexProviders
 	}
+	// The plyr list is authoritative, but known-bad sub-providers (loli /
+	// Anzu) are excluded no matter what it lists.
+	providers = filterBlockedProviders(providers)
 	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Strs("providers", providers).Msg("animex: resolved plyr data")
 
 	// Establish Cloudflare clearance session first.
@@ -517,33 +542,16 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		}
 
 		// Learn the host for CDN allowlist
-		p.learnURLHost(directURL)
-
-		// The media proxy shares this server's egress: a manifest the probe
+		p.learnURLHost(directURL) // The media proxy shares this server's egress: a manifest the probe
 		// cannot reach would 403 through the proxy too, so it is dropped
-		// instead of surfacing a server that can only produce 502s. The same
-		// single fetch doubles as the image-segment guard: providers like
-		// loli (Anzu) serve valid #EXTM3U playlists whose segments are
-		// numbered images — reachable, "valid", and impossible to play.
-		ok, head := p.probeHLSHead(ctx, directURL, referer, userAgent)
-		if !ok {
+		// instead of surfacing a server that can only produce 502s.
+		//
+		// Deliberately NO segment-level content sniffing here: probe requests
+		// are not always served the same bytes players get (yuki/Mochi's CDN
+		// answered a probe with image data while the stream plays fine), so
+		// byte-level verdicts are not trustworthy as a drop condition.
+		if ok, _ := p.probeHLSHead(ctx, directURL, referer, userAgent); !ok {
 			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: manifest blocked from this egress, dropping source")
-			continue
-		}
-		// Content-sniff the first segment. Extensions are meaningless here:
-		// providers disguise real video as .jpg (hls.js sniffs magic bytes, so
-		// it plays), while genuine image slideshows (Anzu/loli) also hide
-		// behind valid #EXTM3U playlists. Drop on image data, and drop when
-		// the segment is unreachable from this egress — animex sources ship
-		// as Verification "proxy", so proxy egress == probe egress and an
-		// unreachable segment can never play. Undecidable heads keep the
-		// source (fail-open), mirroring the manifest probe.
-		switch v := p.playlistSegmentVerdict(ctx, directURL, referer, userAgent, head, 0); v {
-		case "image":
-			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: image-segment playlist detected (first segment is image data), dropping source")
-			continue
-		case "unreachable":
-			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: first segment unreachable from this egress, dropping source")
 			continue
 		}
 
@@ -693,62 +701,8 @@ func DecodeAnimeXProxyURL(proxyURL string) (originalURL, referer, userAgent stri
 }
 
 // ---------------------------------------------------------------------------
-// Image-segment detection — content sniffing, not extension matching
+// Manifest probe
 // ---------------------------------------------------------------------------
-
-// HLS players never trust file extensions: hls.js and friends sniff segment
-// magic bytes, which is why playlists full of ".jpg"-named segments often
-// contain perfectly playable video disguised to evade scrapers. The only
-// reliable test is to fetch the first segment and classify its bytes.
-
-// classifySegmentHead reports what kind of payload b (the first bytes of a
-// media segment) most likely is: "image", "video", or "unknown".
-func classifySegmentHead(b []byte) string {
-	switch {
-	case len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF: // JPEG
-		return "image"
-	case len(b) >= 4 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G': // PNG
-		return "image"
-	case len(b) >= 3 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F': // GIF
-		return "image"
-	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP": // WebP
-		return "image"
-	}
-	if len(b) >= 12 && (string(b[4:8]) == "ftyp" || string(b[4:8]) == "styp") {
-		brand := strings.ToLower(string(b[8:12]))
-		switch {
-		case strings.HasPrefix(brand, "avif"), strings.HasPrefix(brand, "avis"),
-			strings.HasPrefix(brand, "heic"), strings.HasPrefix(brand, "heim"),
-			strings.HasPrefix(brand, "mif1"), strings.HasPrefix(brand, "msf1"):
-			return "image" // HEIF/AVIF still-image containers
-		default:
-			return "video" // isom, mp42, dash, msdh, avc1, ...
-		}
-	}
-	if len(b) >= 4 {
-		switch string(b[:4]) {
-		case "moof", "mdat", "moov", "styp":
-			return "video" // fragmented / new-style MP4 boxes
-		}
-	}
-	if len(b) >= 1 && b[0] == 0x47 { // MPEG-TS sync byte
-		return "video"
-	}
-	return "unknown"
-}
-
-// firstPlaylistURI returns the first non-comment line of an m3u8 head —
-// either a media segment (media playlist) or a variant playlist (master).
-func firstPlaylistURI(head []byte) string {
-	for _, line := range strings.Split(string(head), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		return line
-	}
-	return ""
-}
 
 // fetchHead GETs up to limit bytes of a URL with provider referer/UA.
 func (p *AnimeXProvider) fetchHead(ctx context.Context, rawURL, referer, userAgent string, limit int64) ([]byte, bool) {
@@ -780,69 +734,11 @@ func (p *AnimeXProvider) fetchHead(ctx context.Context, rawURL, referer, userAge
 	return head, true
 }
 
-// playlistSegmentVerdict content-classifies what an HLS playlist actually
-// serves, by reading its first real segment's bytes:
-//
-//	"image"       first segment is image data (JPEG/PNG/GIF/WebP/HEIF/AVIF)
-//	"video"       first segment is MPEG-TS or MP4/fMP4 (possibly disguised)
-//	"unreachable" manifest resolved but the segment cannot be fetched from
-//	              this egress — playback through the media proxy cannot work
-//	"undecidable" segment bytes classify as unknown, or a referenced playlist
-//	              could not be resolved — callers keep the source
-//
-// Master playlists are followed one level deep into the first variant.
-func (p *AnimeXProvider) playlistSegmentVerdict(ctx context.Context, manifestURL, referer, userAgent string, head []byte, depth int) string {
-	uri := firstPlaylistURI(head)
-	if uri == "" {
-		return "undecidable"
-	}
-	// Master playlist: follow the first variant one level down.
-	if strings.Contains(string(head), "#EXT-X-STREAM-INF") && depth == 0 {
-		variant, ok := resolveReference(manifestURL, uri)
-		if !ok {
-			return "undecidable"
-		}
-		vhead, ok := p.fetchHead(ctx, variant, referer, userAgent, 8192)
-		if !ok {
-			return "undecidable"
-		}
-		return p.playlistSegmentVerdict(ctx, variant, referer, userAgent, vhead, depth+1)
-	}
-	segURL, ok := resolveReference(manifestURL, uri)
-	if !ok {
-		return "undecidable"
-	}
-	seg, ok := p.fetchHead(ctx, segURL, referer, userAgent, 512)
-	if !ok {
-		return "unreachable"
-	}
-	switch classifySegmentHead(seg) {
-	case "image":
-		return "image"
-	case "video":
-		return "video"
-	default:
-		return "undecidable"
-	}
-}
-
-// resolveReference resolves a playlist URI reference against the manifest URL.
-func resolveReference(manifestURL, ref string) (string, bool) {
-	base, err := url.Parse(manifestURL)
-	if err != nil {
-		return "", false
-	}
-	r, err := url.Parse(ref)
-	if err != nil {
-		return "", false
-	}
-	return base.ResolveReference(r).String(), true
-}
-
-// probeHLSHead fetches a manifest and returns up to 8KB of its head
-// alongside the reachability verdict. One fetch powers both the manifest
-// probe ("does it look like HLS and answer from our egress?") and the
-// image-segment guard ("is its first segment actually image data?").
+// probeHLSHead verifies a manifest URL answers from this egress with a real
+// HLS playlist. It intentionally inspects the manifest only — no segment
+// fetching, no content classification: probe requests are not always served
+// the same bytes players get (yuki/Mochi's CDN answers probes with image
+// payloads while the stream plays fine), so deeper verdicts misfire.
 func (p *AnimeXProvider) probeHLSHead(ctx context.Context, manifestURL, referer, userAgent string) (bool, []byte) {
 	head, ok := p.fetchHead(ctx, manifestURL, referer, userAgent, 8192)
 	if !ok {
