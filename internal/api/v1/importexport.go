@@ -578,13 +578,19 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	}
 
 	watchMax, err := h.loadUserWatchMax(ctx, userID)
+	historyOK := err == nil
 	if err != nil {
-		h.log.Warn().Err(err).Msg("import: watch history fetch failed, importing progress blind")
+		// Fail safe: without the existing history we cannot merge, and a
+		// blind upsert would overwrite real per-episode progress rows.
+		h.log.Warn().Err(err).Msg("import: watch history fetch failed, skipping progress import")
 		watchMax = map[int]int{}
 	}
 	rated, err := h.loadRatedAnime(ctx, userID, ids)
+	scoresOK := err == nil
 	if err != nil {
-		h.log.Warn().Err(err).Msg("import: ratings fetch failed, importing scores blind")
+		// Fail safe: without the existing ratings we cannot tell which
+		// titles are unrated, and upserting would overwrite local scores.
+		h.log.Warn().Err(err).Msg("import: ratings fetch failed, skipping score import")
 		rated = map[int]bool{}
 	}
 
@@ -614,29 +620,41 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		} else if total := m.episodes; total > 0 && want > total {
 			want = total
 		}
-		from := watchMax[e.AnimeID] + 1
-		if from < 1 {
-			from = 1
-		}
-		for ep := from; ep <= want; ep++ {
-			if len(watchRows) >= importMaxWatchRows {
-				limited = true
+		// Merge-only: rows are only ever appended after the real history.
+		// If the existing history could not be read we skip progress
+		// entirely instead of blind-upserting over real rows.
+		if historyOK {
+			from := watchMax[e.AnimeID] + 1
+			if from < 1 {
+				from = 1
+			}
+			for ep := from; ep <= want; ep++ {
+				if len(watchRows) >= importMaxWatchRows {
+					limited = true
+					break
+				}
+				// Backdate merged rows (1h apart, oldest first) so a bulk
+				// import never outranks genuine recent watches in history /
+				// continue-watching ordering.
+				ts := now - int64(want-ep+1)*3600000
+				watchRows = append(watchRows, map[string]any{
+					"user_id":        userID,
+					"anime_id":       e.AnimeID,
+					"anime_title":    title,
+					"anime_image":    m.image,
+					"episode_number": ep,
+					"progress":       fullEpisodeSeconds,
+					"duration":       fullEpisodeSeconds,
+					"timestamp":      ts,
+				})
+				episodesAdded++
+			}
+			if limited {
 				break
 			}
-			watchRows = append(watchRows, map[string]any{
-				"user_id":        userID,
-				"anime_id":       e.AnimeID,
-				"anime_title":    title,
-				"anime_image":    m.image,
-				"episode_number": ep,
-				"progress":       fullEpisodeSeconds,
-				"duration":       fullEpisodeSeconds,
-				"timestamp":      now,
-			})
-			episodesAdded++
 		}
-		if limited {
-			break
+		if !scoresOK {
+			continue
 		}
 		if e.Score >= 1 && e.Score <= 10 && !rated[e.AnimeID] {
 			rated[e.AnimeID] = true // one score row per title
