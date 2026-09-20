@@ -863,7 +863,8 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn().Err(err).Msg("anilist import: rate-limited or unavailable")
 			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests — wait a minute and try again")
 		default:
-			h.respondError(w, http.StatusBadGateway, "could not reach AniList — try again")
+			h.log.Warn().Err(err).Msg("anilist import: query failed")
+			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+") — try again")
 		}
 		return
 	}
@@ -1202,14 +1203,28 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				scoresSent++
 			}
 		} else {
+			if firstExportErr == nil {
+				msg := "AniList rejected the update"
+				if len(out.Errors) > 0 && out.Errors[0].Message != "" {
+					msg = "AniList rejected the update — " + out.Errors[0].Message
+				}
+				firstExportErr = fmt.Errorf("%s", msg)
+			}
 			failed++
 		}
 	}
 	// Every write rejected on credentials is an auth problem, not 36
 	// individual failures — say so instead of reporting "N failed".
-	if exported == 0 && failed > 0 && isAniListAuthError(firstExportErr) {
-		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
-		return
+	// Otherwise report the first error verbatim so the cause is visible.
+	if exported == 0 && failed > 0 {
+		if isAniListAuthError(firstExportErr) {
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+			return
+		}
+		if firstExportErr != nil {
+			h.respondError(w, http.StatusBadGateway, "AniList export failed ("+firstExportErr.Error()+")")
+			return
+		}
 	}
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
