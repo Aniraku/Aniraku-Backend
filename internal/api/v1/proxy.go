@@ -488,7 +488,12 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	if n, err := io.Copy(w, resp.Body); err != nil {
+		// The status line is already sent; the client will see a truncated
+		// chunked response. Log it so upstream drops are distinguishable
+		// from nginx/app-level truncation.
+		h.log.Warn().Err(err).Int64("bytes_copied", n).Str("proxy_url", decodedURL).Msg("proxy stream copy aborted")
+	}
 }
 
 // Download proxies a direct video download URL through the backend so the
@@ -615,20 +620,20 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 	// redirects to private targets are rejected at dial time and no client
 	// follows redirects at all (noRedirects).
 	if !https {
-		return h.httpClient.Do(req)
+		return h.proxyHTTPClient.Do(req)
 	}
 
-	resp, err := h.h2Client.Do(req)
+	resp, err := h.proxyH2Client.Do(req)
 	if err == nil {
 		return resp, nil
 	}
-	resp, err = h.h1Client.Do(req)
+	resp, err = h.proxyH1Client.Do(req)
 	if err == nil {
 		return resp, nil
 	}
 	// ponytail: standard Go TLS fallback — utls Chrome fingerprint triggers
 	// bot detection on some CDNs (nekostream, watching.onl). Native Go TLS works fine.
-	return h.goTLSClient.Do(req)
+	return h.proxyGoTLSClient.Do(req)
 }
 
 // applyProxyQueryHeaders applies the ?headers= JSON to a proxy upstream
