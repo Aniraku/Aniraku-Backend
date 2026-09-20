@@ -14,6 +14,7 @@ func allowedOrigins() map[string]bool {
 		"http://localhost:3001":      true,
 		"http://localhost:43211":     true,
 		"http://localhost:5173":      true,
+		"https://aniraku.tech":       true,
 		"https://aniraku.vercel.app": true,
 		"https://www.aniraku.tech":   true,
 		"https://test.aniraku.tech":  true,
