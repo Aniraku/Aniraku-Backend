@@ -36,7 +36,18 @@ type Handlers struct {
 	httpClient     *http.Client
 	goTLSClient    *http.Client
 	downloadClient *http.Client
-	keyCache       sync.Map
+
+	// Media-proxy clients: same transports as their API counterparts but
+	// WITHOUT http.Client.Timeout. That timeout is end-to-end — it covers
+	// streaming the response body — so a 30s cap aborts large/slow HLS
+	// segments mid-transfer and the browser sees ERR_INCOMPLETE_CHUNKED_ENCODING.
+	// Boundaries for these clients: 15s dial timeout, 30s response-header
+	// timeout (h1), and the proxy request's context (client disconnect).
+	proxyH2Client    *http.Client
+	proxyH1Client    *http.Client
+	proxyHTTPClient  *http.Client
+	proxyGoTLSClient *http.Client
+	keyCache         sync.Map
 	// Browse/trending cache with TTL
 	browseCache    sync.Map
 	browseCacheTTL time.Duration
@@ -105,6 +116,9 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 			return tlsConn, nil
 		},
 		MaxIdleConnsPerHost: 10,
+		// Bounds how long a no-timeout proxy client waits for response
+		// headers from a stalled CDN; the body itself is unbounded.
+		ResponseHeaderTimeout: 30 * time.Second,
 	}
 
 	httpClient := &http.Client{
@@ -132,6 +146,26 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		h1Client:    &http.Client{Timeout: 30 * time.Second, Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
 		httpClient:  httpClient,
 		goTLSClient: goTLSClient,
+		// Media-proxy variants: no end-to-end Timeout so segment bodies can
+		// stream for as long as the client keeps reading (see struct comment).
+		proxyH2Client: &http.Client{Transport: h2Transport, CheckRedirect: netguard.NoRedirects},
+		proxyH1Client: &http.Client{Transport: h1Transport, CheckRedirect: netguard.NoRedirects},
+		proxyHTTPClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext:           baseDialer.DialContext,
+				MaxIdleConnsPerHost:   10,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+			CheckRedirect: netguard.NoRedirects,
+		},
+		proxyGoTLSClient: &http.Client{
+			Transport: &http.Transport{
+				DialContext:           baseDialer.DialContext,
+				MaxIdleConnsPerHost:   10,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+			CheckRedirect: netguard.NoRedirects,
+		},
 		// Full-file downloads: no client timeout (the request context bounds
 		// the transfer), SSRF-guarded transport, redirects refused.
 		downloadClient: netguard.NewHTTPClient(0),
