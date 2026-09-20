@@ -856,9 +856,8 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	}`
 	raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, map[string]any{})
 	if err != nil {
-		lower := strings.ToLower(err.Error())
 		switch {
-		case strings.Contains(lower, "unauthor") || strings.Contains(lower, "invalid token"):
+		case isAniListAuthError(err):
 			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 		case isRetryableAniListError(err):
 			h.log.Warn().Err(err).Msg("anilist import: rate-limited or unavailable")
@@ -1157,6 +1156,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
 	limited := favoriteCount > importExportCap
+	var firstExportErr error
 	for i, id := range ids {
 		if i > 0 && i%3 == 0 {
 			select {
@@ -1185,6 +1185,9 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 		raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, vars)
 		if err != nil {
+			if firstExportErr == nil {
+				firstExportErr = err
+			}
 			failed++
 			continue
 		}
@@ -1201,6 +1204,12 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		} else {
 			failed++
 		}
+	}
+	// Every write rejected on credentials is an auth problem, not 36
+	// individual failures — say so instead of reporting "N failed".
+	if exported == 0 && failed > 0 && isAniListAuthError(firstExportErr) {
+		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+		return
 	}
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
@@ -1392,6 +1401,20 @@ func (h *Handlers) anilistAuthedWithRetry(ctx context.Context, accessToken, quer
 		}
 	}
 	return nil, lastErr
+}
+
+// isAniListAuthError reports whether an AniList call failed on credentials
+// (HTTP 401/403 or an Unauthorized GraphQL error) as opposed to a network,
+// rate-limit, or server problem.
+func isAniListAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "401") ||
+		strings.Contains(message, "403") ||
+		strings.Contains(message, "unauthor") ||
+		strings.Contains(message, "invalid token")
 }
 
 func isRetryableAniListError(err error) bool {
