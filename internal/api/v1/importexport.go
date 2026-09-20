@@ -1472,7 +1472,7 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("anilist returned %d", resp.StatusCode)
+		return nil, fmt.Errorf("anilist returned %d: %s", resp.StatusCode, truncate(raw, 300))
 	}
 	return raw, nil
 }
