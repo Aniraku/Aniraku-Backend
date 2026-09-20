@@ -659,7 +659,11 @@ func (m *Manager) tryAnimeX(ctx context.Context, animeID int, episode int, lang,
 	return m.applyQualityFilter(source, quality), nil
 }
 
-// collectAnimeXServers maps AnimeX sources to AnimeX-1 / AnimeX-2 servers.
+// collectAnimeXServers maps AnimeX sources to servers. Every sub-provider
+// the plyr page lists (Mochi/yuki, Chibi/neko, Kira/zuna, Lumi/beep, Anzu/loli,
+// Sora, ...) that resolves becomes its own named server — first source wins
+// if a sub-provider returns several. Results keep their per-provider
+// Referer/UA headers (result-level), so they must map 1:1 onto servers.
 func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
 	for _, prov := range m.providers {
@@ -667,15 +671,20 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 		if !ok {
 			continue
 		}
-		sr, err := ax.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
+		results, err := ax.FindAllEpisodeSources(ctx, anilistID, episode, lang)
+		if err != nil && len(results) == 0 {
 			continue // silent skip
 		}
-		name := sr.ServerName
-		if name == "" {
-			name = "AnimeX"
+		for _, sr := range results {
+			if sr == nil || len(sr.Sources) == 0 {
+				continue // silent skip
+			}
+			name := sr.ServerName
+			if name == "" {
+				name = "Hana"
+			}
+			out = appendNamedServers(out, []string{name}, "animex", lang, sr)
 		}
-		out = appendNamedServers(out, []string{name}, "animex", lang, sr)
 	}
 	return out
 }

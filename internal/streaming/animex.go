@@ -29,12 +29,13 @@ const (
 )
 
 // animexProviders is the fallback provider order used when the plyr page
-// cannot be parsed. Priority matches the plyr subProviders list.
+// cannot be parsed. Priority matches the plyr subProviders list. Bad sources
+// are filtered per-source by content sniffing, not per-provider.
 var animexProviders = []string{"beep", "yuki", "neko", "sora", "loli"}
 
 // animexProviderNames maps provider IDs to human-readable server names.
 var animexProviderNames = map[string]string{
-	"yuki": "Nthing",
+	"yuki": "Mochi",
 	"neko": "Chibi",
 	"zuna": "Kira",
 	"sora": "Sora",
@@ -201,26 +202,57 @@ func (p *AnimeXProvider) invalidateSession() {
 	p.sessionMu.Unlock()
 }
 
-// FindEpisodeSource resolves an AnimeX episode stream by establishing a session,
-// calling the plyr API, decoding XOR+base64url proxy URLs, and returning
-// direct m3u8 + subtitles.
+// FindEpisodeSource resolves the first available AnimeX stream (plyr API,
+// XOR-decoded direct m3u8 + subtitles). Contract: exactly one SourceResult —
+// used by the fast /stream fallback path.
 //
 // The AnimeX API expects a slug ID (e.g. "bleach-thousand-year-blood-war-the-calamity-ts6ov"),
-// NOT the numeric AniList ID. This method fetches the plyr page to extract the
-// correct slug from the embedded SvelteKit data.
+// NOT the numeric AniList ID. The plyr page is fetched to extract the correct
+// slug from the embedded SvelteKit data.
 func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+	results, lastErr := p.resolveAllProviders(ctx, anilistID, episode, lang)
+	for _, r := range results {
+		if r != nil && len(r.Sources) > 0 {
+			return r, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("animex: no sources found for any provider")
+}
+
+// FindAllEpisodeSources resolves EVERY sub-provider the plyr page lists for
+// the episode (beep/yuki/neko/sora/loli/...), not just the first one that
+// answers. Each returned SourceResult carries its own provider-specific
+// Referer/User-Agent headers, so callers must map results to servers (one
+// server per result) rather than merging sources under a single header set.
+// Results are ordered by plyr priority. Used by the /servers fan-out.
+func (p *AnimeXProvider) FindAllEpisodeSources(ctx context.Context, anilistID string, episode int, lang string) ([]*SourceResult, error) {
+	return p.resolveAllProviders(ctx, anilistID, episode, lang)
+}
+
+// resolveAllProviders is the shared resolver behind FindEpisodeSource and
+// FindAllEpisodeSources.
+//
+// The plyr page gives the authoritative per-language provider list — episodes
+// that only exist on a provider missing from our static list (e.g. loli) are
+// exactly the ones that otherwise "don't show up". Providers resolve with
+// bounded concurrency (3): wide enough to stay well inside the fan-out
+// budget, narrow enough not to provoke Cloudflare rate limiting on the shared
+// clearance session. A Cloudflare challenge on the API (intermittent 403
+// HTML) is transient: one session refresh, then each challenged provider is
+// retried once with fresh clearance.
+func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID string, episode int, lang string) ([]*SourceResult, error) {
 	if lang != "dub" {
 		lang = "sub"
 	}
 
-	// Fetch the plyr page to get the show slug and the authoritative
-	// per-language provider list (the plyr page is what the site itself
-	// uses — episodes that only exist on a provider missing from our static
-	// list, e.g. loli, are exactly the ones that "don't show up").
+	// Fetch the plyr page for the show slug + provider list. One
+	// short-backoff retry: the plyr page intermittently serves the
+	// Cloudflare challenge.
 	slug, providers, err := p.fetchPlyrData(ctx, anilistID, episode, lang)
 	if err != nil {
-		// One short-backoff retry: the plyr page intermittently serves the
-		// Cloudflare challenge.
 		time.Sleep(time.Second)
 		slug, providers, err = p.fetchPlyrData(ctx, anilistID, episode, lang)
 	}
@@ -231,46 +263,52 @@ func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string
 	}
 	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Strs("providers", providers).Msg("animex: resolved plyr data")
 
-	// Establish Cloudflare clearance session first
+	// Establish Cloudflare clearance session first.
 	if err := p.ensureSession(ctx); err != nil {
 		p.log.Debug().Err(err).Msg("animex: session establishment failed, trying anyway")
 	}
 
-	// Try each provider in order until one returns sources. A Cloudflare
-	// challenge on the API (intermittent 403 HTML) is transient: invalidate
-	// the cached plyr session and retry the same provider once with fresh
-	// clearance. Sources the provider confirmed are never dropped later —
-	// this loop is the only gate.
-	var lastErr error
-	sessionRetried := false
-	for _, providerID := range providers {
-		result, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
-		if err != nil {
-			var challenge *animexChallengeError
-			if errors.As(err, &challenge) && !sessionRetried {
-				sessionRetried = true
-				p.log.Info().Str("provider", providerID).Msg("animex: cloudflare challenge, refreshing session and retrying")
-				p.invalidateSession()
-				if sessErr := p.ensureSession(ctx); sessErr != nil {
-					p.log.Debug().Err(sessErr).Msg("animex: session refresh failed")
-				}
-				result, err = p.resolveProvider(ctx, slug, episode, lang, providerID)
-			}
-		}
-		if err != nil {
-			lastErr = err
-			p.log.Debug().Err(err).Str("provider", providerID).Msg("animex: provider failed")
-			continue
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-	}
+	results := make([]*SourceResult, len(providers))
+	errs := make([]error, len(providers))
+	var refreshOnce sync.Once
+	sem := make(chan struct{}, 3) // bounded concurrency
+	var wg sync.WaitGroup
+	for i, providerID := range providers {
+		wg.Add(1)
+		go func(i int, providerID string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-	if lastErr != nil {
-		return nil, lastErr
+			res, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
+			if err != nil {
+				var challenge *animexChallengeError
+				if errors.As(err, &challenge) {
+					refreshOnce.Do(func() {
+						p.log.Info().Msg("animex: cloudflare challenge, refreshing session")
+						p.invalidateSession()
+						if sessErr := p.ensureSession(ctx); sessErr != nil {
+							p.log.Debug().Err(sessErr).Msg("animex: session refresh failed")
+						}
+					})
+					res, err = p.resolveProvider(ctx, slug, episode, lang, providerID)
+				}
+			}
+			if err != nil {
+				p.log.Debug().Err(err).Str("provider", providerID).Msg("animex: provider failed")
+			}
+			results[i], errs[i] = res, err
+		}(i, providerID)
 	}
-	return nil, fmt.Errorf("animex: no sources found for any provider")
+	wg.Wait()
+
+	var lastErr error
+	for _, e := range errs {
+		if e != nil {
+			lastErr = errors.Join(lastErr, e)
+		}
+	}
+	return results, lastErr
 }
 
 // fetchPlyrData fetches the AnimeX plyr page once and extracts BOTH the show
@@ -483,9 +521,29 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 
 		// The media proxy shares this server's egress: a manifest the probe
 		// cannot reach would 403 through the proxy too, so it is dropped
-		// instead of surfacing a server that can only produce 502s.
-		if !p.ProbeHLS(ctx, directURL, referer, userAgent) {
+		// instead of surfacing a server that can only produce 502s. The same
+		// single fetch doubles as the image-segment guard: providers like
+		// loli (Anzu) serve valid #EXTM3U playlists whose segments are
+		// numbered images — reachable, "valid", and impossible to play.
+		ok, head := p.probeHLSHead(ctx, directURL, referer, userAgent)
+		if !ok {
 			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: manifest blocked from this egress, dropping source")
+			continue
+		}
+		// Content-sniff the first segment. Extensions are meaningless here:
+		// providers disguise real video as .jpg (hls.js sniffs magic bytes, so
+		// it plays), while genuine image slideshows (Anzu/loli) also hide
+		// behind valid #EXTM3U playlists. Drop on image data, and drop when
+		// the segment is unreachable from this egress — animex sources ship
+		// as Verification "proxy", so proxy egress == probe egress and an
+		// unreachable segment can never play. Undecidable heads keep the
+		// source (fail-open), mirroring the manifest probe.
+		switch v := p.playlistSegmentVerdict(ctx, directURL, referer, userAgent, head, 0); v {
+		case "image":
+			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: image-segment playlist detected (first segment is image data), dropping source")
+			continue
+		case "unreachable":
+			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: first segment unreachable from this egress, dropping source")
 			continue
 		}
 
@@ -634,13 +692,69 @@ func DecodeAnimeXProxyURL(proxyURL string) (originalURL, referer, userAgent stri
 	return originalURL, referer, userAgent
 }
 
-// ProbeHLS verifies a manifest URL serves a real HLS playlist. referer and
-// userAgent mirror the provider headers the CDN expects; empty values are
-// omitted.
-func (p *AnimeXProvider) ProbeHLS(ctx context.Context, manifestURL, referer, userAgent string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+// ---------------------------------------------------------------------------
+// Image-segment detection — content sniffing, not extension matching
+// ---------------------------------------------------------------------------
+
+// HLS players never trust file extensions: hls.js and friends sniff segment
+// magic bytes, which is why playlists full of ".jpg"-named segments often
+// contain perfectly playable video disguised to evade scrapers. The only
+// reliable test is to fetch the first segment and classify its bytes.
+
+// classifySegmentHead reports what kind of payload b (the first bytes of a
+// media segment) most likely is: "image", "video", or "unknown".
+func classifySegmentHead(b []byte) string {
+	switch {
+	case len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF: // JPEG
+		return "image"
+	case len(b) >= 4 && b[0] == 0x89 && b[1] == 'P' && b[2] == 'N' && b[3] == 'G': // PNG
+		return "image"
+	case len(b) >= 3 && b[0] == 'G' && b[1] == 'I' && b[2] == 'F': // GIF
+		return "image"
+	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP": // WebP
+		return "image"
+	}
+	if len(b) >= 12 && (string(b[4:8]) == "ftyp" || string(b[4:8]) == "styp") {
+		brand := strings.ToLower(string(b[8:12]))
+		switch {
+		case strings.HasPrefix(brand, "avif"), strings.HasPrefix(brand, "avis"),
+			strings.HasPrefix(brand, "heic"), strings.HasPrefix(brand, "heim"),
+			strings.HasPrefix(brand, "mif1"), strings.HasPrefix(brand, "msf1"):
+			return "image" // HEIF/AVIF still-image containers
+		default:
+			return "video" // isom, mp42, dash, msdh, avc1, ...
+		}
+	}
+	if len(b) >= 4 {
+		switch string(b[:4]) {
+		case "moof", "mdat", "moov", "styp":
+			return "video" // fragmented / new-style MP4 boxes
+		}
+	}
+	if len(b) >= 1 && b[0] == 0x47 { // MPEG-TS sync byte
+		return "video"
+	}
+	return "unknown"
+}
+
+// firstPlaylistURI returns the first non-comment line of an m3u8 head —
+// either a media segment (media playlist) or a variant playlist (master).
+func firstPlaylistURI(head []byte) string {
+	for _, line := range strings.Split(string(head), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
+	}
+	return ""
+}
+
+// fetchHead GETs up to limit bytes of a URL with provider referer/UA.
+func (p *AnimeXProvider) fetchHead(ctx context.Context, rawURL, referer, userAgent string, limit int64) ([]byte, bool) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	ua := userAgent
 	if ua == "" {
@@ -650,16 +764,99 @@ func (p *AnimeXProvider) ProbeHLS(ctx context.Context, manifestURL, referer, use
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", limit-1))
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return nil, false
 	}
-	head, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return err == nil && strings.Contains(string(head), "#EXTM3U")
+	head, err := io.ReadAll(io.LimitReader(resp.Body, limit))
+	if err != nil {
+		return nil, false
+	}
+	return head, true
+}
+
+// playlistSegmentVerdict content-classifies what an HLS playlist actually
+// serves, by reading its first real segment's bytes:
+//
+//	"image"       first segment is image data (JPEG/PNG/GIF/WebP/HEIF/AVIF)
+//	"video"       first segment is MPEG-TS or MP4/fMP4 (possibly disguised)
+//	"unreachable" manifest resolved but the segment cannot be fetched from
+//	              this egress — playback through the media proxy cannot work
+//	"undecidable" segment bytes classify as unknown, or a referenced playlist
+//	              could not be resolved — callers keep the source
+//
+// Master playlists are followed one level deep into the first variant.
+func (p *AnimeXProvider) playlistSegmentVerdict(ctx context.Context, manifestURL, referer, userAgent string, head []byte, depth int) string {
+	uri := firstPlaylistURI(head)
+	if uri == "" {
+		return "undecidable"
+	}
+	// Master playlist: follow the first variant one level down.
+	if strings.Contains(string(head), "#EXT-X-STREAM-INF") && depth == 0 {
+		variant, ok := resolveReference(manifestURL, uri)
+		if !ok {
+			return "undecidable"
+		}
+		vhead, ok := p.fetchHead(ctx, variant, referer, userAgent, 8192)
+		if !ok {
+			return "undecidable"
+		}
+		return p.playlistSegmentVerdict(ctx, variant, referer, userAgent, vhead, depth+1)
+	}
+	segURL, ok := resolveReference(manifestURL, uri)
+	if !ok {
+		return "undecidable"
+	}
+	seg, ok := p.fetchHead(ctx, segURL, referer, userAgent, 512)
+	if !ok {
+		return "unreachable"
+	}
+	switch classifySegmentHead(seg) {
+	case "image":
+		return "image"
+	case "video":
+		return "video"
+	default:
+		return "undecidable"
+	}
+}
+
+// resolveReference resolves a playlist URI reference against the manifest URL.
+func resolveReference(manifestURL, ref string) (string, bool) {
+	base, err := url.Parse(manifestURL)
+	if err != nil {
+		return "", false
+	}
+	r, err := url.Parse(ref)
+	if err != nil {
+		return "", false
+	}
+	return base.ResolveReference(r).String(), true
+}
+
+// probeHLSHead fetches a manifest and returns up to 8KB of its head
+// alongside the reachability verdict. One fetch powers both the manifest
+// probe ("does it look like HLS and answer from our egress?") and the
+// image-segment guard ("is its first segment actually image data?").
+func (p *AnimeXProvider) probeHLSHead(ctx context.Context, manifestURL, referer, userAgent string) (bool, []byte) {
+	head, ok := p.fetchHead(ctx, manifestURL, referer, userAgent, 8192)
+	if !ok {
+		return false, nil
+	}
+	return strings.Contains(string(head), "#EXTM3U"), head
+}
+
+// ProbeHLS verifies a manifest URL serves a real HLS playlist. referer and
+// userAgent mirror the provider headers the CDN expects; empty values are
+// omitted.
+func (p *AnimeXProvider) ProbeHLS(ctx context.Context, manifestURL, referer, userAgent string) bool {
+	ok, _ := p.probeHLSHead(ctx, manifestURL, referer, userAgent)
+	return ok
 }
 
 // ---------------------------------------------------------------------------
