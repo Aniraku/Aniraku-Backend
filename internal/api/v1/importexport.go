@@ -854,9 +854,18 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}`
-	raw, err := h.anilistAuthed(r.Context(), token.AccessToken, query, map[string]any{})
+	raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, map[string]any{})
 	if err != nil {
-		h.respondError(w, http.StatusBadGateway, "could not reach AniList — try again")
+		lower := strings.ToLower(err.Error())
+		switch {
+		case strings.Contains(lower, "unauthor") || strings.Contains(lower, "invalid token"):
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+		case isRetryableAniListError(err):
+			h.log.Warn().Err(err).Msg("anilist import: rate-limited or unavailable")
+			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests — wait a minute and try again")
+		default:
+			h.respondError(w, http.StatusBadGateway, "could not reach AniList — try again")
+		}
 		return
 	}
 	var out struct {
