@@ -153,7 +153,7 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 	jar, _ := cookiejar.New(nil)
 	return &AnimeXProvider{
 		client: &http.Client{
-			Timeout:   20 * time.Second,
+			Timeout:   45 * time.Second,
 			Transport: netguard.NewTransport(),
 			Jar:       jar,
 		},

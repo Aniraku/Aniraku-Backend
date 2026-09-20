@@ -24,6 +24,7 @@ const (
 	MappingResponseLimit = 100
 	RequestTimeout       = 30 * time.Second
 	MappingTTL           = 24 * time.Hour
+	SeasonTTL            = 24 * time.Hour
 	EpisodeTTL           = 5 * time.Minute
 )
 
@@ -869,7 +870,7 @@ func getTmdbSeason(ctx context.Context, client *http.Client, token string, showI
 	// include_adult=true keeps adult (hentai) entries servable; harmless for non-adult.
 	u := fmt.Sprintf("%s/tv/%d/season/%d?language=en-US&include_adult=true", TMDBAPIBase, showID, seasonNumber)
 	key := cacheKey("tmdb-season", map[string]int{"showId": showID, "seasonNumber": seasonNumber})
-	val, err := cached(key, EpisodeTTL, func() (any, error) {
+	val, err := cached(key, SeasonTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
 	})
 	if err != nil {
@@ -884,7 +885,7 @@ func getTmdbShow(ctx context.Context, client *http.Client, token string, showID 
 	}
 	u := fmt.Sprintf("%s/tv/%d?language=en-US&include_adult=true", TMDBAPIBase, showID)
 	key := cacheKey("tmdb-show", showID)
-	val, err := cached(key, EpisodeTTL, func() (any, error) {
+	val, err := cached(key, SeasonTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
 	})
 	if err != nil {
@@ -899,7 +900,7 @@ func getTmdbMovie(ctx context.Context, client *http.Client, token string, movieI
 	}
 	u := fmt.Sprintf("%s/movie/%d?language=en-US&include_adult=true", TMDBAPIBase, movieID)
 	key := cacheKey("tmdb-movie", movieID)
-	val, err := cached(key, EpisodeTTL, func() (any, error) {
+	val, err := cached(key, SeasonTTL, func() (any, error) {
 		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
 	})
 	if err != nil {
@@ -1068,6 +1069,16 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 	for _, v := range activeMap {
 		active = append(active, v)
 	}
+	sort.Slice(active, func(i, j int) bool {
+		a, b := active[i], active[j]
+		if a.Type != b.Type {
+			return a.Type < b.Type
+		}
+		if a.ShowID != b.ShowID {
+			return a.ShowID < b.ShowID
+		}
+		return a.SeasonNumber < b.SeasonNumber
+	})
 	if len(active) == 0 {
 		return &ResolveResult{
 			AnilistID:    anilistID,
@@ -1078,21 +1089,49 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 		}, nil
 	}
 	// fetch TMDB metadata
-	tmdbMeta := map[string]map[string]any{} // key -> entry
-	// also need to handle movie
-	for _, mapping := range active {
-		if mapping.Type == "movie" {
-			movie, err := getTmdbMovie(ctx, client, token, mapping.MovieID)
-			if err != nil {
-				return nil, err
+	//
+	// Seasons/movies are independent of each other, and long-running shows
+	// map to many TMDB seasons (One Piece: ~20). Sequential fetching made
+	// cold episode lists take 10s+ (20+ HTTP round trips in a row), so fetch
+	// them through a bounded worker pool, then verify/merge deterministically
+	// below — same output, same error semantics, a fraction of the latency.
+	type seasonResult struct {
+		mapping tmdbMapping
+		season  map[string]any // tv
+		movie   map[string]any // movie
+		err     error
+	}
+	results := make([]seasonResult, len(active))
+	sem := make(chan struct{}, 16)
+	var fetchWg sync.WaitGroup
+	for i := range active {
+		fetchWg.Add(1)
+		go func(i int) {
+			defer fetchWg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			m := active[i]
+			if m.Type == "movie" {
+				movie, err := getTmdbMovie(ctx, client, token, m.MovieID)
+				results[i] = seasonResult{mapping: m, movie: movie, err: err}
+				return
 			}
-			tmdbMeta[fmt.Sprintf("movie:%d:1", mapping.MovieID)] = movie
+			season, err := getTmdbSeason(ctx, client, token, m.ShowID, m.SeasonNumber)
+			results[i] = seasonResult{mapping: m, season: season, err: err}
+		}(i)
+	}
+	fetchWg.Wait()
+
+	tmdbMeta := map[string]map[string]any{} // key -> entry
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err
+		}
+		if r.mapping.Type == "movie" {
+			tmdbMeta[fmt.Sprintf("movie:%d:1", r.mapping.MovieID)] = r.movie
 			continue
 		}
-		season, err := getTmdbSeason(ctx, client, token, mapping.ShowID, mapping.SeasonNumber)
-		if err != nil {
-			return nil, err
-		}
+		season := r.season
 		// verify season_number
 		var seasonNum int
 		switch v := season["season_number"].(type) {
@@ -1101,7 +1140,7 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 		case int:
 			seasonNum = v
 		}
-		if seasonNum != mapping.SeasonNumber {
+		if seasonNum != r.mapping.SeasonNumber {
 			return nil, newResolverError("TMDB_SEASON_MISMATCH", "TMDB returned an unexpected season for the verified mapping.", 502)
 		}
 		eps, _ := season["episodes"].([]any)
@@ -1117,7 +1156,7 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 			case int:
 				epNum = v
 			}
-			key := fmt.Sprintf("tv:%d:%d:%d", mapping.ShowID, mapping.SeasonNumber, epNum)
+			key := fmt.Sprintf("tv:%d:%d:%d", r.mapping.ShowID, r.mapping.SeasonNumber, epNum)
 			tmdbMeta[key] = entry
 		}
 	}
@@ -1145,42 +1184,89 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 		}
 		g.targetNumbers[*m.TmdbNumber] = true
 	}
-	for _, g := range contGroups {
-		show, err := getTmdbShow(ctx, client, token, g.showId)
-		if err != nil {
-			return nil, err
+	// Continuation groups are independent of each other — fetched through
+	// the shared worker pool; within a group, seasons are also fetched
+	// concurrently (see below).
+	if len(contGroups) > 0 {
+		var mu sync.Mutex
+		var firstErr error
+		var contWg sync.WaitGroup
+		for _, g := range contGroups {
+			contWg.Add(1)
+			go func(g *contGroup) {
+				defer contWg.Done()
+				show, err := getTmdbShow(ctx, client, token, g.showId)
+				if err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+					return
+				}
+				pending := map[int]bool{}
+				for k := range g.targetNumbers {
+					pending[k] = true
+				}
+				seasonNums := continuationSeasonNumbers(show, g.afterSeasonNumber)
+				// Seasons within a continuation group are independent —
+				// fetch them through the shared worker pool instead of one
+				// after another. The sequential early-exit saved a few
+				// requests but cost seconds on long-running shows; the 24h
+				// season cache absorbs the extra fetches. No semaphore is
+				// taken at group level — only the inner fetches acquire
+				// slots, so nesting can never deadlock the pool.
+				seasonResults := make([]map[string]any, len(seasonNums))
+				var innerWg sync.WaitGroup
+				for si, seasonNum := range seasonNums {
+					innerWg.Add(1)
+					go func(si, seasonNum int) {
+						defer innerWg.Done()
+						sem <- struct{}{}
+						defer func() { <-sem }()
+						season, err := getTmdbSeason(ctx, client, token, g.showId, seasonNum)
+						if err != nil {
+							return
+						}
+						seasonResults[si] = season
+					}(si, seasonNum)
+				}
+				innerWg.Wait()
+				local := map[string]map[string]any{}
+				for _, season := range seasonResults {
+					if season == nil {
+						continue
+					}
+					eps, _ := season["episodes"].([]any)
+					for _, e := range eps {
+						entry, _ := e.(map[string]any)
+						if entry == nil {
+							continue
+						}
+						var epNum int
+						switch v := entry["episode_number"].(type) {
+						case float64:
+							epNum = int(v)
+						case int:
+							epNum = v
+						}
+						if !pending[epNum] {
+							continue
+						}
+						local[fmt.Sprintf("tv:continuation:%d:%d", g.showId, epNum)] = entry
+						delete(pending, epNum)
+					}
+				}
+				mu.Lock()
+				for k, v := range local {
+					tmdbMeta[k] = v
+				}
+				mu.Unlock()
+			}(g)
 		}
-		pending := map[int]bool{}
-		for k := range g.targetNumbers {
-			pending[k] = true
-		}
-		for _, seasonNum := range continuationSeasonNumbers(show, g.afterSeasonNumber) {
-			season, err := getTmdbSeason(ctx, client, token, g.showId, seasonNum)
-			if err != nil {
-				continue
-			}
-			eps, _ := season["episodes"].([]any)
-			for _, e := range eps {
-				entry, _ := e.(map[string]any)
-				if entry == nil {
-					continue
-				}
-				var epNum int
-				switch v := entry["episode_number"].(type) {
-				case float64:
-					epNum = int(v)
-				case int:
-					epNum = v
-				}
-				if !pending[epNum] {
-					continue
-				}
-				tmdbMeta[fmt.Sprintf("tv:continuation:%d:%d", g.showId, epNum)] = entry
-				delete(pending, epNum)
-			}
-			if len(pending) == 0 {
-				break
-			}
+		contWg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
 		}
 	}
 	// build episodes

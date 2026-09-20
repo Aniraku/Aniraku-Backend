@@ -77,7 +77,7 @@ func (p *ZokoProvider) learnURLHost(raw string) {
 
 func NewZokoProvider(log zerolog.Logger) *ZokoProvider {
 	return &ZokoProvider{
-		client: &http.Client{Timeout: 15 * time.Second, Transport: netguard.NewTransport()},
+		client: &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		log:    log,
 	}
 }
