@@ -833,12 +833,14 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	// score comes back in the viewer's own scoreFormat, so fetch the
 	// format alongside the entries to normalize everything to 1-10.
 	// Media carries title/cover/total inline — no follow-up meta fetch.
-	query := `query {
+	// userId is passed explicitly (null → viewer default): omitting it
+	// makes AniList reject the collection with a 400.
+	query := `query ($userId: Int) {
 		Viewer {
 			id
 			mediaListOptions { scoreFormat }
 		}
-		MediaListCollection(type: ANIME) {
+		MediaListCollection(userId: $userId, type: ANIME) {
 			lists {
 				entries {
 					mediaId
@@ -1149,17 +1151,41 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	query := `mutation ($id: Int, $progress: Int, $status: MediaListStatus, $score: Float) {
 		SaveMediaListEntry(mediaId: $id, progress: $progress, status: $status, scoreRaw: $score) { id }
 	}`
-	// Skip titles already marked completed on AniList — no pointless writes.
-	completed, err := h.fetchAniListCompletedSet(r.Context(), token.AccessToken)
+	// Diff-then-write: fetch the provider's current state once and only
+	// write titles that actually differ. This collapses repeat exports to
+	// a single read and keeps first-time bursts inside rate limits.
+	remote, err := h.fetchAniListListState(r.Context(), token.AccessToken)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("anilist export: completed set fetch failed, exporting all")
+		h.log.Warn().Err(err).Msg("anilist export: remote state fetch failed, exporting all")
+		remote = map[int]anilistListState{}
 	}
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
 	limited := favoriteCount > importExportCap
 	var firstExportErr error
-	for i, id := range ids {
-		if i > 0 && i%3 == 0 {
+	writes := 0
+	for _, id := range ids {
+		wp := watchProgress[id]
+		done := exportCompleted(wp, totals[id].episodes)
+		wantStatus := "watching"
+		if done {
+			wantStatus = "completed"
+		}
+		wantScore := scores[id]
+		if wantScore < 1 || wantScore > 10 {
+			wantScore = 0
+		}
+		if cur, ok := remote[id]; ok {
+			progressOK := cur.Progress >= wp.Episode
+			statusOK := (wantStatus == "completed" && cur.Status == "completed") ||
+				(wantStatus == "watching" && cur.Status == "watching")
+			scoreOK := wantScore == 0 || cur.Score == wantScore
+			if progressOK && statusOK && scoreOK {
+				skipped++
+				continue
+			}
+		}
+		if writes > 0 && writes%2 == 0 {
 			select {
 			case <-time.After(1100 * time.Millisecond):
 			case <-r.Context().Done():
@@ -1167,22 +1193,22 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		state := watchProgress[id]
-		done := exportCompleted(state, totals[id].episodes)
-		if completed[id] && (done || state.Episode == 0) {
-			skipped++
-			continue
+		writes++
+		// Never regress a provider lead (e.g. episodes watched on AniList
+		// directly past the Aniraku max).
+		progress := wp.Episode
+		if cur, ok := remote[id]; ok && cur.Progress > progress {
+			progress = cur.Progress
 		}
 		status := "CURRENT"
 		if done {
 			status = "COMPLETED"
 		}
 		vars := map[string]any{
-			"id": id, "progress": state.Episode, "status": status,
+			"id": id, "progress": progress, "status": status,
 		}
-		score := scores[id]
-		if score >= 1 && score <= 10 {
-			vars["score"] = float64(score) * 10
+		if wantScore != 0 {
+			vars["score"] = float64(wantScore) * 10
 		}
 		raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, vars)
 		if err != nil {
@@ -1199,7 +1225,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 		if json.Unmarshal(raw, &out) == nil && len(out.Errors) == 0 {
 			exported++
-			if score >= 1 && score <= 10 {
+			if wantScore != 0 {
 				scoresSent++
 			}
 		} else {
@@ -1238,12 +1264,83 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// anilistListState is a provider-side entry normalized like providerEntry.
+type anilistListState struct {
+	Progress int
+	Status   string // completed | watching | planning | paused | dropped
+	Score    int    // 1-10, 0 = none
+}
+
+// fetchAniListListState returns the user's current AniList entries
+// (progress, status, normalized score) in a single query so exports can
+// diff-then-write instead of blindly rewriting every title.
+func (h *Handlers) fetchAniListListState(ctx context.Context, accessToken string) (map[int]anilistListState, error) {
+	// userId is passed explicitly (null → viewer default): omitting it
+	// makes AniList reject the collection with a 400.
+	query := `query ($userId: Int) {
+		Viewer { mediaListOptions { scoreFormat } }
+		MediaListCollection(userId: $userId, type: ANIME) {
+			lists { entries { mediaId status progress score } }
+		}
+	}`
+	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, query, map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	var out struct {
+		Data struct {
+			Viewer struct {
+				MediaListOptions struct {
+					ScoreFormat string `json:"scoreFormat"`
+				} `json:"mediaListOptions"`
+			} `json:"Viewer"`
+			MediaListCollection struct {
+				Lists []struct {
+					Entries []struct {
+						MediaID  int     `json:"mediaId"`
+						Status   string  `json:"status"`
+						Progress int     `json:"progress"`
+						Score    float64 `json:"score"`
+					} `json:"entries"`
+				} `json:"lists"`
+			} `json:"MediaListCollection"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	format := out.Data.Viewer.MediaListOptions.ScoreFormat
+	state := map[int]anilistListState{}
+	for _, list := range out.Data.MediaListCollection.Lists {
+		for _, e := range list.Entries {
+			if e.MediaID <= 0 {
+				continue
+			}
+			progress := e.Progress
+			if progress < 0 {
+				progress = 0
+			}
+			cur, ok := state[e.MediaID]
+			next := anilistListState{
+				Progress: progress,
+				Status:   normalizeAniListStatus(e.Status),
+				Score:    anilistScoreToTen(e.Score, format),
+			}
+			// Duplicate rows across lists: keep the furthest progress.
+			if !ok || next.Progress > cur.Progress {
+				state[e.MediaID] = next
+			}
+		}
+	}
+	return state, nil
+}
+
 // fetchAniListCompletedSet returns the set of AniList ids the user has
 // already marked completed.
 func (h *Handlers) fetchAniListCompletedSet(ctx context.Context, accessToken string) (map[int]bool, error) {
-	query := `query ($status: MediaListStatus) {
+	query := `query ($userId: Int, $status: MediaListStatus) {
 		Viewer {
-			mediaListCollection(type: ANIME, status: $status) {
+			mediaListCollection(userId: $userId, type: ANIME, status: $status) {
 				lists { entries { mediaId } }
 			}
 		}
