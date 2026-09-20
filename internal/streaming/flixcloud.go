@@ -37,7 +37,7 @@ func NewFlixCloudProvider(log zerolog.Logger) *FlixCloudProvider {
 	}
 	return &FlixCloudProvider{
 		client: &http.Client{
-			Timeout:   15 * time.Second,
+			Timeout:   45 * time.Second,
 			Transport: netguard.NewTransport(),
 		},
 		log:         log,

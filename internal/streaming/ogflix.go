@@ -137,7 +137,7 @@ func (p *OGFLixProvider) learnURLHost(raw string) {
 func NewOGFlixProvider(log zerolog.Logger) *OGFLixProvider {
 	jar, _ := cookiejar.New(nil)
 	return &OGFLixProvider{
-		client:    &http.Client{Timeout: 15 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
+		client:    &http.Client{Timeout: 45 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
 		log:       log,
 		slugCache: map[string]string{},
 	}

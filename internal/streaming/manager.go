@@ -141,7 +141,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewOGFlixProvider(log),
 			NewFlixCloudProvider(log),
 		},
-		httpClient:  &http.Client{Timeout: 15 * time.Second, Transport: netguard.NewTransport()},
+		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
 	}
 }

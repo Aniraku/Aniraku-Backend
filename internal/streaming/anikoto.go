@@ -73,7 +73,7 @@ func NewAnikotoProvider(log zerolog.Logger) *AnikotoProvider {
 	// this server at private addresses.
 	jar, _ := cookiejar.New(nil)
 	return &AnikotoProvider{
-		client: &http.Client{Timeout: 15 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
+		client: &http.Client{Timeout: 45 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
 		log:    log,
 	}
 }
