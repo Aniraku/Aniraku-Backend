@@ -8,12 +8,15 @@ import (
 
 func allowedOrigins() map[string]bool {
 	allowed := map[string]bool{
-		"http://127.0.0.1:3000":      true,
-		"http://127.0.0.1:43211":     true,
-		"http://localhost:3000":      true,
-		"http://localhost:3001":      true,
-		"http://localhost:43211":     true,
-		"http://localhost:5173":      true,
+		// Miruro frontend (this repo) runs on :3000 — keep both loopbacks.
+		"http://127.0.0.1:3000":  true,
+		"http://localhost:3000":  true,
+		"http://127.0.0.1:43211": true,
+		"http://localhost:3001":  true,
+		"http://localhost:43211": true,
+		"http://localhost:5173":  true,
+		// Miruro legacy dev port (kept for compat).
+		"http://127.0.0.1:5173":      true,
 		"https://aniraku.tech":       true,
 		"https://aniraku.vercel.app": true,
 		"https://www.aniraku.tech":   true,
