@@ -39,7 +39,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          CGO_ENABLED=0 go build -tags web \
+          CGO_ENABLED=0 go build \
             -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${GITHUB_SHA::8} -X main.BuildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             -o "aniraku-server-${GOOS}-${GOARCH}" ./cmd/aniraku-server
           sha256sum "aniraku-server-${GOOS}-${GOARCH}" > "aniraku-server-${GOOS}-${GOARCH}.sha256"

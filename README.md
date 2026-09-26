@@ -91,7 +91,6 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 | Authentication | `internal/auth/` |
 | Configuration | `internal/config/` (`TMDB`, `Scraping` bases) |
 | Core models and errors | `internal/core/` |
-| Embedded UI support | `internal/embed/` |
 | Network safety | `internal/netguard/` (SSRF `Control` + `NoRedirects` + guarded `http.Client` factory) |
 | Streaming providers | `internal/streaming/` (`anikoto.go`, `flixcloud.go`, `manager.go`) |
 | TMDB resolver | `internal/tmdb/` (`resolver.go` AniBridge+Fribb, `merge.go`) |
