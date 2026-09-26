@@ -15,8 +15,9 @@ import (
 )
 
 // tokenBucket is a simple client-side rate limiter. We hold ourselves to
-// ~60 req/min (AniList's documented limit is 90/min per IP) so bursts from
-// parallel page-load requests never trigger upstream 429s in the first place.
+// ~24 req/min sustained (AniList's limit is 30/min per IP since 2026) so
+// bursts from parallel page-load requests never trigger upstream 429s in
+// the first place.
 type tokenBucket struct {
 	mu       sync.Mutex
 	capacity float64
@@ -79,10 +80,15 @@ func newAnilistClient(h *Handlers) *anilistClient {
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,
-		// Burst 15, 0.9/s refill (~54/min sustained): a page load fires
-		// ~10-15 parallel queries (home/catalog), and the old burst of 40
-		// tripped AniList's shared-per-IP 429s on every fast scroll.
-		limiter: newTokenBucket(15, 0.9),
+		// Burst 8, 0.4/s refill (~24/min sustained): AniList's limit is
+		// 30 req/min per IP (down from 90). The old 0.9/s refill
+		// (~54/min) tripped 429s on every fast scroll; each 429 then
+		// burned blind 1/2/3s retries inside AniList's 60s ban window
+		// while queued requests piled up behind them — minutes of felt
+		// slowness from a fast page load. A page load fires ~10-15
+		// parallel queries; the burst absorbs that, the refill keeps us
+		// under the ceiling.
+		limiter: newTokenBucket(8, 0.4),
 	}
 }
 
@@ -320,7 +326,13 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 		if err != nil {
 			lastErr = err
 			if attempt < c.maxRetries {
-				time.Sleep(c.baseDelay * time.Duration(attempt+1))
+				// Ctx-aware: a disconnected client must not keep this
+				// goroutine sleeping through backoff it will never use.
+				select {
+				case <-time.After(c.baseDelay * time.Duration(attempt+1)):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			if c.h.anilistCircuit != nil {
@@ -340,8 +352,20 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			if attempt < c.maxRetries {
-				delay := c.baseDelay * time.Duration(attempt+1)
-				time.Sleep(delay)
+				// AniList bans in ~60s windows (Retry-After: 60). The old
+				// 1/2/3s sleeps just burned retries inside the ban while
+				// queued requests piled up behind them; wait out the
+				// window once, ctx-aware, then retry a single time.
+				wait := parseRetryAfter(resp.Header.Get("Retry-After"))
+				if wait <= 0 {
+					wait = 60 * time.Second
+				}
+				c.h.log.Warn().Dur("wait", wait).Msg("AniList rate limited, honoring retry window")
+				select {
+				case <-time.After(wait):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 				continue
 			}
 			if c.h.anilistCircuit != nil {

@@ -79,15 +79,12 @@ func TestLiveProviderProbe(t *testing.T) {
 	go probe("zoko", func() ([]core.Server, error) {
 		return m.collectZokoServers(ctx, anilistID, episode, lang), nil
 	})
-	go probe("ogflix", func() ([]core.Server, error) {
-		return m.collectOGflixServers(ctx, anilistID, episode, lang), nil
-	})
 	go probe("flixcloud", func() ([]core.Server, error) {
 		return m.collectFlixServers(ctx, anilistID, episode, lang), nil
 	})
 
 	okCount := 0
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 4; i++ {
 		r := <-results
 		status := "FAIL"
 		if r.err == nil && r.sources > 0 {
@@ -96,5 +93,5 @@ func TestLiveProviderProbe(t *testing.T) {
 		}
 		t.Logf("provider %-9s %s servers=%d sources=%d err=%v", r.name, status, r.servers, r.sources, r.err)
 	}
-	t.Logf("probe result: %d/5 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
+	t.Logf("probe result: %d/4 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
 }

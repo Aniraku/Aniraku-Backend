@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/auth"
@@ -36,12 +38,26 @@ import (
 // stays well inside provider rate limits and the platform's timeout.
 
 const (
-	importExportCap     = 150  // max titles per request
-	importBatchSize     = 200  // supabase rows per POST
-	importWatchBatch    = 200  // watch_history rows per POST
-	importMaxWatchRows  = 2000 // max synthesized watch rows per import
-	exportWriteCap      = 60   // max provider writes per export (bounds request time)
-	fullEpisodeSeconds  = 1440 // synthetic progress/duration for imported eps (24 min)
+	importExportCap    = 150  // max titles per request
+	importBatchSize    = 200  // supabase rows per POST
+	importWatchBatch   = 200  // watch_history rows per POST
+	importMaxWatchRows = 2000 // max synthesized watch rows per import
+	exportWriteCap     = 60   // max provider writes per export (bounds request time)
+	// exportTimeBudget hard-stops an export's write loop so the JSON
+	// response is always on its way well before nginx's 180s
+	// proxy_read_timeout — the write deadline is lifted for these routes
+	// (see liftExportWriteDeadline), so the loop is the only thing still
+	// bounding the request. Past the budget the handler responds with
+	// limited=true and the client re-runs to continue where it left off.
+	exportTimeBudget   = 150 * time.Second
+	fullEpisodeSeconds = 1440 // synthetic progress/duration for imported eps (24 min)
+	// AniList now enforces 30 req/min per token/IP. Exports stay at 10
+	// requests/min (one request every 6s, 3x headroom under the ceiling)
+	// with up to exportAniListBatchSize title mutations packed into each
+	// write request via GraphQL aliases — up to ~100 titles/min of
+	// throughput while spending only 10 req/min of the budget.
+	exportAniListRequestInterval = 6 * time.Second
+	exportAniListBatchSize       = 10
 )
 
 // requireProviderToken returns the user's stored token for a provider,
@@ -224,9 +240,9 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 			Data struct {
 				Page struct {
 					Media []struct {
-						ID       int `json:"id"`
+						ID       int  `json:"id"`
 						Episodes *int `json:"episodes"`
-						Title struct {
+						Title    struct {
 							Romaji  string `json:"romaji"`
 							English string `json:"english"`
 						} `json:"title"`
@@ -854,7 +870,11 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	// Media carries title/cover/total inline — no follow-up meta fetch.
 	// The viewer ID is resolved first and passed explicitly: a null
 	// userId does not reliably default to the viewer (400).
-	viewerID, err := h.fetchAniListViewerID(r.Context(), token.AccessToken)
+	// Imports keep the direct (unpaged) call: two requests total.
+	direct := func(ctx context.Context, query string, vars map[string]any) ([]byte, error) {
+		return h.anilistAuthedWithRetry(ctx, token.AccessToken, query, vars)
+	}
+	viewerID, err := h.fetchAniListViewerID(r.Context(), token.AccessToken, direct)
 	if err != nil {
 		switch {
 		case isAniListAuthError(err):
@@ -905,7 +925,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	var out struct {
 		Data struct {
 			Viewer struct {
-				ID int `json:"id"`
+				ID               int `json:"id"`
 				MediaListOptions struct {
 					ScoreFormat string `json:"scoreFormat"`
 				} `json:"mediaListOptions"`
@@ -917,9 +937,9 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 						Status   string  `json:"status"`
 						Progress int     `json:"progress"`
 						Score    float64 `json:"score"`
-						Media struct {
+						Media    struct {
 							Episodes *int `json:"episodes"`
-							Title struct {
+							Title    struct {
 								Romaji  string `json:"romaji"`
 								English string `json:"english"`
 							} `json:"title"`
@@ -1004,10 +1024,156 @@ func exportCompleted(state animeWatchProgress, total int) bool {
 	return true
 }
 
+// liftExportWriteDeadline clears the server-wide 60s WriteTimeout for this
+// request. A full export (favorites/watch-history/scores pre-fetch + media
+// meta + up to exportWriteCap provider writes at rate-limit pace) routinely
+// runs past 60s; without the lift the response write fails after the
+// deadline, the connection is closed before a single header is sent, nginx
+// answers 502 — and because nginx's own error page carries no
+// Access-Control-Allow-Origin, browsers surface it as a CORS error even
+// though CORS is configured correctly. The exportTimeBudget loop cap keeps
+// the total under nginx's 180s proxy_read_timeout.
+func liftExportWriteDeadline(w http.ResponseWriter) {
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+}
+
+// anilistExportPacer spaces one export's AniList requests to at most one
+// per interval (10/min against AniList's 30 req/min ceiling). A pacer is
+// created per export request and shared by every AniList call that export
+// makes — pre-fetch reads and batched writes alike — so the whole export
+// stays inside the budget with headroom to spare.
+type anilistExportPacer struct {
+	mu       sync.Mutex
+	last     time.Time
+	interval time.Duration
+}
+
+func newAnilistExportPacer(interval time.Duration) *anilistExportPacer {
+	return &anilistExportPacer{interval: interval}
+}
+
+// wait blocks until interval has passed since the previous request. The
+// first call proceeds immediately.
+func (p *anilistExportPacer) wait(ctx context.Context) error {
+	p.mu.Lock()
+	d := time.Until(p.last.Add(p.interval))
+	p.mu.Unlock()
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// mark records that a request was just sent.
+func (p *anilistExportPacer) mark() {
+	p.mu.Lock()
+	p.last = time.Now()
+	p.mu.Unlock()
+}
+
+// anilistCall sends one AniList GraphQL request with a user token.
+type anilistCall func(ctx context.Context, query string, variables map[string]any) ([]byte, error)
+
+// anilistExportCall is the only way export code talks to AniList: it paces
+// the request through the export's pacer, sends it with Retry-After-aware
+// retries, then records the send time for the next call's spacing.
+func (h *Handlers) anilistExportCall(ctx context.Context, pacer *anilistExportPacer, accessToken, query string, variables map[string]any) ([]byte, error) {
+	if err := pacer.wait(ctx); err != nil {
+		return nil, err
+	}
+	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, query, variables)
+	pacer.mark()
+	return raw, err
+}
+
+// anilistExportWrite is one title update queued for the batched export.
+type anilistExportWrite struct {
+	MediaID   int
+	Progress  int
+	Status    string  // "CURRENT" or "COMPLETED"
+	Score     float64 // scoreRaw; 0 = omit
+	WantScore int     // 1..10, 0 = none (counts scoresSent on success)
+}
+
+// buildAniListBulkMutation packs a batch of title updates into a single
+// GraphQL request using field aliases (m0, m1, ...). All values are ints
+// from our own DB or fixed enum strings, so inlining them is safe — and one
+// request carrying exportAniListBatchSize mutations spends 1 req/min of the
+// AniList budget instead of 10.
+func buildAniListBulkMutation(writes []anilistExportWrite) string {
+	var b strings.Builder
+	b.WriteString("mutation {")
+	for i, w := range writes {
+		fmt.Fprintf(&b, " m%d: SaveMediaListEntry(mediaId: %d, progress: %d, status: %s", i, w.MediaID, w.Progress, w.Status)
+		if w.Score > 0 {
+			fmt.Fprintf(&b, ", scoreRaw: %g", w.Score)
+		}
+		b.WriteString(") { id }")
+	}
+	b.WriteString(" }")
+	return b.String()
+}
+
+// parseAniListBulkResult maps a bulk-mutation response back onto its
+// aliases: an alias with a non-null entry id succeeded; aliases named in a
+// GraphQL error path — or missing/null in data — failed. ok has one entry
+// per requested alias, in order.
+func parseAniListBulkResult(raw []byte, aliases int) (ok []bool, firstErr string) {
+	ok = make([]bool, aliases)
+	var out struct {
+		Data map[string]struct {
+			ID *int `json:"id"`
+		} `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+			Path    []any  `json:"path"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return ok, "AniList returned an unreadable response"
+	}
+	bad := map[string]bool{}
+	for _, e := range out.Errors {
+		if firstErr == "" && e.Message != "" {
+			firstErr = e.Message
+		}
+		if len(e.Path) > 0 {
+			if alias, isStr := e.Path[0].(string); isStr {
+				bad[alias] = true
+			}
+		}
+	}
+	for i := range ok {
+		alias := fmt.Sprintf("m%d", i)
+		entry, present := out.Data[alias]
+		ok[i] = present && !bad[alias] && entry.ID != nil
+	}
+	if firstErr == "" {
+		for _, good := range ok {
+			if !good {
+				firstErr = "AniList rejected the update"
+				break
+			}
+		}
+	}
+	return ok, firstErr
+}
+
 // ExportMAL pushes Aniraku favorites into the user's connected MyAnimeList
 // library, writing progress (num_watched_episodes), status
 // (watching/completed) and score in a single per-title write.
 func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
+	liftExportWriteDeadline(w)
+	start := time.Now()
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
@@ -1068,6 +1234,12 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	limited := favoriteCount > importExportCap
 	processed := 0
 	for _, anilistID := range anilistIDs {
+		// Wall-clock budget (see exportTimeBudget): stop taking new
+		// writes in time to still deliver the JSON response.
+		if time.Since(start) >= exportTimeBudget {
+			limited = true
+			break
+		}
 		malID, ok := malIDs[anilistID]
 		if !ok {
 			continue
@@ -1140,6 +1312,8 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 // library, writing progress, status (CURRENT/COMPLETED) and score
 // (scoreRaw) in a single per-title write.
 func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
+	liftExportWriteDeadline(w)
+	start := time.Now()
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
@@ -1174,19 +1348,35 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn().Err(scoresErr).Msg("anilist export: ratings fetch failed, exporting without scores")
 		scores = map[int]int{}
 	}
+	// Everything AniList-facing below shares one pacer and one deadline:
+	// at most one request every 6s (10 batched req/min of AniList's
+	// 30 req/min ceiling), and the export stops taking new requests at the
+	// time budget so the JSON response still beats nginx's timeout.
+	exportCtx, cancel := context.WithTimeout(r.Context(), exportTimeBudget)
+	defer cancel()
+	pacer := newAnilistExportPacer(exportAniListRequestInterval)
+	paced := func(ctx context.Context, query string, vars map[string]any) ([]byte, error) {
+		return h.anilistExportCall(ctx, pacer, token.AccessToken, query, vars)
+	}
+
 	totals := map[int]mediaMeta{}
-	if m, merr := h.fetchMediaMeta(r.Context(), ids); merr == nil {
+	// The meta lookup uses the public client (up to 3 instant requests for
+	// 150 titles): separate it from the paced authed burst by one interval.
+	if err := pacer.wait(exportCtx); err != nil {
+		h.respondError(w, http.StatusGatewayTimeout, "export interrupted")
+		return
+	}
+	if m, merr := h.fetchMediaMeta(exportCtx, ids); merr == nil {
 		totals = m
 	} else {
 		h.log.Warn().Err(merr).Msg("anilist export: episode totals unavailable, using watch flags")
 	}
-	query := `mutation ($id: Int, $progress: Int, $status: MediaListStatus, $score: Float) {
-		SaveMediaListEntry(mediaId: $id, progress: $progress, status: $status, scoreRaw: $score) { id }
-	}`
+	pacer.mark()
 	// Diff-then-write: fetch the provider's current state once and only
 	// write titles that actually differ. This collapses repeat exports to
-	// a single read and keeps first-time bursts inside rate limits.
-	remote, err := h.fetchAniListListState(r.Context(), token.AccessToken)
+	// a couple of reads, and the paced batched writes below stay inside
+	// AniList's 30 req/min ceiling.
+	remote, err := h.fetchAniListListState(exportCtx, token.AccessToken, paced)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("anilist export: remote state fetch failed, exporting all")
 		remote = map[int]anilistListState{}
@@ -1194,12 +1384,14 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
 	limited := favoriteCount > importExportCap
+	rateLimitedStop := false
 	var firstExportErr error
-	writes := 0
+
+	// Phase 1 — diff: collect the titles that actually need writing.
+	// Skipped titles cost nothing; only pending titles consume the cap.
+	var pending []anilistExportWrite
 	for _, id := range ids {
-		// Bound the request well under the server write timeout: stop
-		// taking new writes past the cap, re-run to continue.
-		if writes >= exportWriteCap {
+		if len(pending) >= exportWriteCap {
 			limited = true
 			break
 		}
@@ -1223,15 +1415,6 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		if writes > 0 && writes%2 == 0 {
-			select {
-			case <-time.After(1100 * time.Millisecond):
-			case <-r.Context().Done():
-				h.respondError(w, http.StatusGatewayTimeout, "export interrupted")
-				return
-			}
-		}
-		writes++
 		// Never regress a provider lead (e.g. episodes watched on AniList
 		// directly past the Aniraku max).
 		progress := wp.Episode
@@ -1242,45 +1425,69 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		if done {
 			status = "COMPLETED"
 		}
-		vars := map[string]any{
-			"id": id, "progress": progress, "status": status,
-		}
+		w := anilistExportWrite{MediaID: id, Progress: progress, Status: status, WantScore: wantScore}
 		if wantScore != 0 {
-			vars["score"] = float64(wantScore) * 10
+			w.Score = float64(wantScore) * 10
 		}
-		raw, err := h.anilistAuthedWithRetry(r.Context(), token.AccessToken, query, vars)
+		pending = append(pending, w)
+	}
+
+	// Phase 2 — write in batches of exportAniListBatchSize mutations per
+	// request, one request per 6s (10 batched req/min). The budget check
+	// before each batch guarantees the JSON response still goes out.
+	for off := 0; off < len(pending); off += exportAniListBatchSize {
+		if time.Since(start) >= exportTimeBudget {
+			limited = true
+			break
+		}
+		end := off + exportAniListBatchSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		batch := pending[off:end]
+		raw, err := h.anilistExportCall(exportCtx, pacer, token.AccessToken, buildAniListBulkMutation(batch), nil)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+				limited = true
+				break
+			}
+			if isAniListRateLimitError(err) {
+				// The retry helper already waited out full Retry-After
+				// windows and the limit still holds: pause here and let
+				// the client re-run — diff-then-write skips what's done.
+				h.log.Warn().Err(err).Int("remaining", len(pending)-off).
+					Msg("anilist export: rate limit persists, pausing for re-run")
+				limited, rateLimitedStop = true, true
+				break
+			}
 			if firstExportErr == nil {
 				firstExportErr = err
 			}
-			failed++
+			failed += len(batch)
 			continue
 		}
-		var out struct {
-			Errors []struct {
-				Message string `json:"message"`
-			} `json:"errors"`
+		ok, msg := parseAniListBulkResult(raw, len(batch))
+		if msg != "" && firstExportErr == nil {
+			firstExportErr = fmt.Errorf("%s", msg)
 		}
-		if json.Unmarshal(raw, &out) == nil && len(out.Errors) == 0 {
+		for i, good := range ok {
+			if !good {
+				failed++
+				continue
+			}
 			exported++
-			if wantScore != 0 {
+			if batch[i].WantScore != 0 {
 				scoresSent++
 			}
-		} else {
-			if firstExportErr == nil {
-				msg := "AniList rejected the update"
-				if len(out.Errors) > 0 && out.Errors[0].Message != "" {
-					msg = "AniList rejected the update — " + out.Errors[0].Message
-				}
-				firstExportErr = fmt.Errorf("%s", msg)
-			}
-			failed++
 		}
 	}
 	// Every write rejected on credentials is an auth problem, not 36
 	// individual failures — say so instead of reporting "N failed".
 	// Otherwise report the first error verbatim so the cause is visible.
-	if exported == 0 && failed > 0 {
+	// A rate-limit pause is not a failure: it answers 200 with
+	// limited=true (+rate_limited) so the client re-runs and resumes —
+	// diff-then-write skips everything already exported.
+	if exported == 0 && failed > 0 && !rateLimitedStop {
 		if isAniListAuthError(firstExportErr) {
 			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 			return
@@ -1291,22 +1498,25 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h.respondJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
-		"provider": "anilist",
-		"exported": exported,
-		"skipped":  skipped,
-		"failed":   failed,
-		"scores":   scoresSent,
-		"total":    len(ids),
-		"limited":  limited,
+		"status":       "ok",
+		"provider":     "anilist",
+		"exported":     exported,
+		"skipped":      skipped,
+		"failed":       failed,
+		"scores":       scoresSent,
+		"total":        len(ids),
+		"limited":      limited,
+		"rate_limited": rateLimitedStop,
 	})
 }
 
 // fetchAniListViewerID resolves the token owner's user ID. Collection
 // queries take it explicitly: a null userId does not reliably default
-// to the viewer and AniList answers such calls with a 400.
-func (h *Handlers) fetchAniListViewerID(ctx context.Context, accessToken string) (int, error) {
-	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, `query { Viewer { id } }`, map[string]any{})
+// to the viewer and AniList answers such calls with a 400. call is how the
+// request is sent — the plain retry helper for imports, the paced export
+// call for exports.
+func (h *Handlers) fetchAniListViewerID(ctx context.Context, accessToken string, call anilistCall) (int, error) {
+	raw, err := call(ctx, `query { Viewer { id } }`, map[string]any{})
 	if err != nil {
 		return 0, err
 	}
@@ -1336,10 +1546,10 @@ type anilistListState struct {
 // fetchAniListListState returns the user's current AniList entries
 // (progress, status, normalized score) in a single query so exports can
 // diff-then-write instead of blindly rewriting every title.
-func (h *Handlers) fetchAniListListState(ctx context.Context, accessToken string) (map[int]anilistListState, error) {
+func (h *Handlers) fetchAniListListState(ctx context.Context, accessToken string, call anilistCall) (map[int]anilistListState, error) {
 	// The viewer ID is resolved first and passed explicitly: a null
 	// userId does not reliably default to the viewer (400).
-	viewerID, err := h.fetchAniListViewerID(ctx, accessToken)
+	viewerID, err := h.fetchAniListViewerID(ctx, accessToken, call)
 	if err != nil {
 		return nil, err
 	}
@@ -1349,7 +1559,7 @@ func (h *Handlers) fetchAniListListState(ctx context.Context, accessToken string
 			lists { entries { mediaId status progress score } }
 		}
 	}`
-	raw, err := h.anilistAuthedWithRetry(ctx, accessToken, query, map[string]any{"userId": viewerID})
+	raw, err := call(ctx, query, map[string]any{"userId": viewerID})
 	if err != nil {
 		return nil, err
 	}
@@ -1522,6 +1732,59 @@ func (h *Handlers) fetchMALCompletedSet(ctx context.Context, accessToken string)
 	return completed, nil
 }
 
+// anilistHTTPError is a non-200 GraphQL response. It carries the status code
+// and the server's Retry-After so rate-limited callers can wait out the
+// window instead of burning retries inside it. Error() preserves the
+// historical "anilist returned %d: %s" text that isRetryableAniListError /
+// isAniListAuthError string-match on.
+type anilistHTTPError struct {
+	status     int
+	retryAfter time.Duration
+	body       string
+}
+
+func (e *anilistHTTPError) Error() string {
+	return fmt.Sprintf("anilist returned %d: %s", e.status, e.body)
+}
+
+// waitAfter429 is how long to pause after this error when it is a rate
+// limit: the server's Retry-After, defaulting to one full minute when the
+// header is missing (AniList's limit resets per minute; observed responses
+// carry "Retry-After: 60"). Returns 0 for non-429 errors.
+func (e *anilistHTTPError) waitAfter429() time.Duration {
+	if e.status != http.StatusTooManyRequests {
+		return 0
+	}
+	if e.retryAfter <= 0 {
+		return 60 * time.Second
+	}
+	return e.retryAfter
+}
+
+// parseRetryAfter reads a Retry-After header given in delta-seconds form.
+// HTTP-date form and garbage both yield 0 ("no server preference").
+func parseRetryAfter(v string) time.Duration {
+	secs, err := strconv.Atoi(strings.TrimSpace(v))
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
+// isAniListRateLimitError reports whether err is an AniList HTTP 429 (typed
+// or matched by text, covering GraphQL-200 error payloads too).
+func isAniListRateLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var httpErr *anilistHTTPError
+	if errors.As(err, &httpErr) {
+		return httpErr.status == http.StatusTooManyRequests
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") || strings.Contains(msg, "too many")
+}
+
 // anilistAuthed POSTs a GraphQL request to AniList with a user token.
 func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	payload, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
@@ -1538,7 +1801,11 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("anilist returned %d: %s", resp.StatusCode, truncate(raw, 300))
+		return nil, &anilistHTTPError{
+			status:     resp.StatusCode,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+			body:       truncate(raw, 300),
+		}
 	}
 	return raw, nil
 }
@@ -1546,6 +1813,9 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 // anilistAuthedWithRetry retries transient transport, rate-limit, and server
 // failures. AniList can return HTTP 200 with a GraphQL errors array, so those
 // responses are inspected as well instead of being reported as success.
+// Rate limits (HTTP 429) are honored, not hammered: the wait follows the
+// server's Retry-After header (default one full minute — AniList's window
+// resets per minute), so a retry lands after the window instead of inside it.
 func (h *Handlers) anilistAuthedWithRetry(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	const maxAttempts = 4
 	var lastErr error
@@ -1572,6 +1842,17 @@ func (h *Handlers) anilistAuthedWithRetry(ctx context.Context, accessToken, quer
 			break
 		}
 		wait := time.Duration(500*(1<<attempt)) * time.Millisecond
+		if isAniListRateLimitError(lastErr) {
+			wait = 60 * time.Second
+			var httpErr *anilistHTTPError
+			if errors.As(lastErr, &httpErr) {
+				if w := httpErr.waitAfter429(); w > 0 {
+					wait = w
+				}
+			}
+			h.log.Warn().Err(lastErr).Dur("wait", wait).
+				Msg("anilist rate-limited, honoring retry window")
+		}
 		select {
 		case <-time.After(wait):
 		case <-ctx.Done():

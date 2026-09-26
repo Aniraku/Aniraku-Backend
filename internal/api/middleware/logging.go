@@ -17,6 +17,18 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+// Unwrap exposes the wrapped writer to http.ResponseController. Without it,
+// handlers calling http.NewResponseController(w).SetWriteDeadline(...) fail
+// with ErrNotSupported at this wrapper: the response-timeout lifts used by
+// the media proxy and the long export routes would silently do nothing, and
+// any response slower than the server-wide 60s WriteTimeout would be killed
+// mid-flight (nginx then answers 502, which browsers report as a CORS
+// error). Every other middleware in the chain passes the writer through
+// unwrapped, and chi's Compress provides its own Unwrap.
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
+}
+
 func Logging(log zerolog.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

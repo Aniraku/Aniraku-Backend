@@ -103,7 +103,7 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 The default configuration is in [`config.yaml`](config.yaml). Secrets are read from environment variables (see `.env.example`) rather than being committed. **Never commit real keys** — and note that deleting a file from git does not remove it from history; secrets must be rotated after any leak.
 
 **Key areas:**
-- `server.host/port/debug`, `ui_dist`, `anikoto_mapping_path`;
+- `server.host/port/debug`, `ui_dist`;
 - `supabase.url/anon_key/service_key/jwt_aud` — `jwks_url` is derived automatically (`{url}/auth/v1/.well-known/jwks.json`), override with `ANIRAKU_SUPABASE_JWKS_URL` only if needed;
 - `tmdb.read_access_token/api_base/image_base/anibridge_api` — `TMDB_READ_ACCESS_TOKEN` (v4) for episode fallback;
 - `scraping.animex_base/flixcloud_base/anizip_base` — override via `ANIRAKU_*` env vars;

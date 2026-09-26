@@ -56,6 +56,75 @@ func (p *FlixCloudProvider) FindEpisodes(ctx context.Context, providerID string)
 	return nil, fmt.Errorf("flixcloud episode listing not implemented")
 }
 
+// fetchReanime GETs the Reanime server list and returns the raw JSON body,
+// or nil when it could not be obtained. A single retry with a short backoff
+// absorbs transient failures — including the intermittent Cloudflare JS
+// challenge this endpoint serves to datacenter egress ("Just a moment..."
+// HTML). Every failure logs at Warn: this provider's skips used to be
+// Debug-only, which made a fully-broken FlixCloud invisible in production.
+func (p *FlixCloudProvider) fetchReanime(ctx context.Context, providerID string, episode int) []byte {
+	reanimeURL := fmt.Sprintf("%s/api/flix/%s/%d", p.reanimeBase, providerID, episode)
+	const attempts = 2
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(1500 * time.Millisecond):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reanimeURL, nil)
+		if err != nil {
+			p.log.Warn().Err(err).Str("anilistId", providerID).Msg("flixcloud: reanime request build failed")
+			return nil
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			p.log.Warn().Err(err).Str("anilistId", providerID).Int("episode", episode).
+				Int("attempt", attempt).Msg("flixcloud: reanime request failed")
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			p.log.Warn().Int("status", resp.StatusCode).Str("anilistId", providerID).
+				Int("attempt", attempt).Msg("flixcloud: reanime returned non-200")
+			resp.Body.Close()
+			continue
+		}
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if err != nil {
+			p.log.Warn().Err(err).Str("anilistId", providerID).Int("attempt", attempt).
+				Msg("flixcloud: reanime body read failed")
+			continue
+		}
+
+		trimmed := strings.TrimSpace(string(body))
+		if trimmed == "" || trimmed[0] != '{' {
+			// Not JSON: the Cloudflare challenge page or an error interstitial.
+			p.log.Warn().Str("anilistId", providerID).Int("attempt", attempt).
+				Str("body", truncateForLog(trimmed, 160)).
+				Msg("flixcloud: reanime returned non-JSON (challenge or interstitial?)")
+			continue
+		}
+		return body
+	}
+	return nil
+}
+
+// truncateForLog keeps log lines bounded while still showing the part of an
+// upstream response that identifies the failure (challenge title, error text).
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
+}
+
 type reanimeServer struct {
 	ID         string `json:"$id"`
 	ServerName string `json:"serverName"`
@@ -69,38 +138,23 @@ type reanimeResponse struct {
 }
 
 func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
-	reanimeURL := fmt.Sprintf("%s/api/flix/%s/%d", p.reanimeBase, providerID, episode)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reanimeURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		p.log.Debug().Err(err).Str("anilistId", providerID).Int("episode", episode).Msg("flixcloud: reanime request failed")
+	body := p.fetchReanime(ctx, providerID, episode)
+	if body == nil {
 		return nil, nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		p.log.Debug().Int("status", resp.StatusCode).Str("anilistId", providerID).Msg("flixcloud: reanime returned non-200")
-		return nil, nil
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return nil, err
 	}
 
 	var apiResp reanimeResponse
 	if err := json.Unmarshal(body, &apiResp); err != nil {
-		p.log.Debug().Err(err).Str("anilistId", providerID).Msg("flixcloud: reanime parse failed")
+		p.log.Warn().Err(err).Str("anilistId", providerID).Int("episode", episode).
+			Str("body", truncateForLog(string(body), 160)).
+			Msg("flixcloud: reanime parse failed")
 		return nil, nil
 	}
 
 	if !apiResp.Success || len(apiResp.Servers) == 0 {
-		p.log.Debug().Str("anilistId", providerID).Msg("flixcloud: no servers from reanime")
+		p.log.Warn().Str("anilistId", providerID).Int("episode", episode).
+			Bool("success", apiResp.Success).Int("servers", len(apiResp.Servers)).
+			Msg("flixcloud: no servers from reanime")
 		return nil, nil
 	}
 

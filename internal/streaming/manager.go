@@ -64,8 +64,9 @@ type Manager struct {
 	// never 403s at the gate.
 	LearnHost func(host string)
 
-	// hentai gate: hentai titles are served by OGFLix + FlixCloud only;
-	// anikoto/animex/zoko must not receive any request for them.
+	// hentai gate: hentai titles are served by Zoko (MAL-keyed) +
+	// FlixCloud + Zenime only; anikoto/animex must not receive any request
+	// for them.
 	httpClient  *http.Client
 	hentaiMu    sync.Mutex
 	hentaiCache map[int]hentaiEntry
@@ -83,14 +84,17 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if ak, ok := p.(*AnikotoProvider); ok {
 			ak.SetHostLearner(fn)
 		}
+		if zn, ok := p.(*ZenimeProvider); ok {
+			zn.SetHostLearner(fn)
+		}
 		if zk, ok := p.(*ZokoProvider); ok {
 			zk.SetHostLearner(fn)
 		}
 		if ax, ok := p.(*AnimeXProvider); ok {
 			ax.SetHostLearner(fn)
 		}
-		if of, ok := p.(*OGFLixProvider); ok {
-			of.SetHostLearner(fn)
+		if nn, ok := p.(*NiNProvider); ok {
+			nn.SetHostLearner(fn)
 		}
 	}
 }
@@ -119,6 +123,12 @@ type SourceResult struct {
 	Headers    map[string]string
 	Downloads  []core.DownloadLink
 	ServerName string
+	// ServerNames optionally names each entry of Sources in order (e.g.
+	// Anikoto's Niko for the AniList-keyed stream, Momo for the MAL-keyed
+	// one). appendNamedServers prefers these when the lengths match and
+	// falls back to positional names otherwise, so providers that don't
+	// set this behave exactly as before.
+	ServerNames []string
 	// Intro/Outro are provider skip segments, passed through to the client
 	// so it can offer manual skip buttons.
 	Intro *core.SkipTimestamp
@@ -128,9 +138,9 @@ type SourceResult struct {
 // NewManager builds the provider set. Anikoto is primary (fully in-process:
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
 // m3u8); AnimeX (plyr API, XOR-decoded direct URLs) is second; Zoko
-// (ZokoAnime, AniList-keyed) is third; OGFLix (Zen API -> player resolve ->
-// MegaPlay decrypt) is the fourth; FlixCloud is the fallback for embed
-// playback.
+// (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
+// playback. (OGFLix removed: api.anizen.tr challenged every request and
+// every resolved edge was blocked — pure fan-out latency for nothing.)
 func NewManager(log zerolog.Logger) *Manager {
 	return &Manager{
 		log: log,
@@ -138,8 +148,9 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAnikotoProvider(log),
 			NewAnimeXProvider(log, ""),
 			NewZokoProvider(log),
-			NewOGFlixProvider(log),
 			NewFlixCloudProvider(log),
+			NewZenimeProvider(log),
+			NewNiNProvider(log),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -200,17 +211,29 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 	return m.GetSourcesForProviderWithSlug(ctx, episode, provider, lang, quality, animeID, "")
 }
 
+// zokoPaused kills every ZokoAnime upstream call (server list, stream
+// fallback chain, explicit provider requests) while it is unreliable.
+// Currently unpaused: streams are back, reliability re-verified.
+// Flip back to true if it degrades again; no other change needed.
+// NOTE: the Kiwi download fetcher (kiwi_downloads.go) is independent —
+// the zokoanime.video download API endpoints proved stable even while
+// streams flapped — so it keeps serving regardless of this flag.
+const zokoPaused = false
+
 // GetSourcesForProviderWithSlug is the frontend-aware streaming entry point.
 // slug is accepted for API compatibility; the Anikoto resolver maps AniList
 // IDs itself, so the slug is unused today.
 func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
-	// Hentai titles are served by OGFLix + FlixCloud only: explicit requests
-	// for the other providers are rejected before any upstream call, and the
-	// fallback chain below shrinks to ogflix + flixcloud.
+	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud + Zenime:
+	// explicit requests for anikoto/animex are
+	// rejected before any upstream call, and the fallback chain below
+	// shrinks accordingly. Zoko only indexes hentai by MAL ID, so its
+	// AniList-keyed attempt falls through to the MAL lookup inside
+	// the provider.
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "zoko", "zokoanime":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -239,6 +262,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	case "zoko", "zokoanime":
 		// Frontend sends "zoko"; accept "zokoanime" as an alias. Backend
 		// hits ZokoAnime (/stream/ani/{anilistId}/{ep}/{sub|dub}).
+		if zokoPaused {
+			return nil, fmt.Errorf("zoko is temporarily paused while reliability recovers")
+		}
 		result, err := m.tryZoko(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -247,15 +273,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("zoko: no sources for this episode")
-	case "ogflix":
-		result, err := m.tryOGflix(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("ogflix: no sources for this episode")
 	case "flixcloud":
 		result, err := m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		if err != nil {
@@ -265,31 +282,62 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
-	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi":
-		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
+	case "zenime":
+		// Explicit Zenime requests are allowed for every title including
+		// hentai (its hentai arms providers only serve hentai titles).
+		result, err := m.tryZenime(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("zenime: no sources for this episode")
+	case "nin", "supaplay":
+		// Supaplay (anistream's embed lineup) — SFW titles only: the
+		// hentai reject above short-circuits adult titles before any
+		// upstream call (Supaplay's API 502s them).
+		result, err := m.tryNiN(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("nin: no sources for this episode")
+	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix":
+		return nil, fmt.Errorf("provider %q removed - use anikoto, zenime or flixcloud", provider)
 	}
 	var lastErr error
-	// Anikoto direct first, AnimeX (plyr API) second, Zoko (AniList-keyed)
-	// third, OGFLix (Zen API -> MegaPlay decrypt) fourth, FlixCloud embed
-	// fallback. Hentai titles only ever reach OGFLix + FlixCloud.
+	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
+	// while paused), FlixCloud embed fourth, Zenime (arms API) last. Hentai
+	// titles only ever reach Zoko (MAL-keyed for hentai, when unpaused),
+	// FlixCloud (Reanime embeds, covers hentai) and Zenime (hentaimama).
 	var candidates []func() (*core.StreamResult, error)
 	if hentai {
-		candidates = []func() (*core.StreamResult, error){
-			func() (*core.StreamResult, error) { return m.tryOGflix(ctx, animeID, episode, lang, quality) },
+		candidates = []func() (*core.StreamResult, error){}
+		if !zokoPaused {
+			candidates = append(candidates,
+				func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) })
+		}
+		candidates = append(candidates,
 			func() (*core.StreamResult, error) {
 				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 			},
-		}
+			func() (*core.StreamResult, error) { return m.tryZenime(ctx, animeID, episode, lang, quality) },
+		)
 	} else {
 		candidates = []func() (*core.StreamResult, error){
 			func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
 			func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
-			func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) },
-			func() (*core.StreamResult, error) { return m.tryOGflix(ctx, animeID, episode, lang, quality) },
-			func() (*core.StreamResult, error) {
-				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
-			},
 		}
+		if !zokoPaused {
+			candidates = append(candidates,
+				func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) })
+		}
+		candidates = append(candidates, func() (*core.StreamResult, error) {
+			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+		}, func() (*core.StreamResult, error) { return m.tryZenime(ctx, animeID, episode, lang, quality) })
 	}
 	for _, try := range candidates {
 		res, err := try()
@@ -345,36 +393,92 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		hentai = m.isHentaiTitle(ctx, animeID)
 	}
 	anilistID := fmt.Sprintf("%d", animeID)
-	var akServers, axServers, zkServers, ofServers, fcServers []core.Server
+
+	// No snapshot cache: tokenized URLs (megaplay ?token=, proxied nonces)
+	// expire without a reliable invalidation signal, and a cached list also
+	// froze whichever request base first wrapped it — a localhost health
+	// probe once poisoned every public response for a full TTL with
+	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
+	// probed list instead; speed comes from the collectors themselves.
+
+	var akServers, axServers, zkServers, fcServers, znServers, nnServers []core.Server
+	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
-	wg.Add(5)
+
+	// Per-collector wall time, logged after the merge: the fan-out's
+	// response latency IS its slowest collector, so every round needs the
+	// culprit visible instead of guessed.
+	fanStart := time.Now()
+	var dmu sync.Mutex
+	collectorMs := map[string]int64{}
+	run := func(name string, fn func() []core.Server) []core.Server {
+		start := time.Now()
+		out := fn()
+		dmu.Lock()
+		collectorMs[name] = time.Since(start).Milliseconds()
+		dmu.Unlock()
+		return out
+	}
+
+	wg.Add(7)
+	// Anikoto, AnimeX and NiN are never queried for hentai titles (hentai
+	// gate — Supaplay's API 502s them). Zoko, FlixCloud and Zenime serve
+	// them: Zoko only via its MAL-keyed path (its AniList index carries no
+	// hentai), FlixCloud via Reanime, Zenime via its hentai arms providers.
 	go func() {
 		defer wg.Done()
 		if !hentai {
-			akServers = m.collectAnikotoServers(ctx, anilistID, episode, lang)
+			akServers = run("anikoto", func() []core.Server {
+				return m.collectAnikotoServers(ctx, anilistID, episode, lang)
+			})
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		if !hentai {
-			axServers = m.collectAnimeXServers(ctx, anilistID, episode, lang)
+			axServers = run("animex", func() []core.Server {
+				return m.collectAnimeXServers(ctx, anilistID, episode, lang)
+			})
 		}
+	}()
+	go func() {
+		defer wg.Done()
+		if !zokoPaused {
+			zkServers = run("zoko", func() []core.Server {
+				return m.collectZokoServers(ctx, anilistID, episode, lang)
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		fcServers = run("flixcloud", func() []core.Server {
+			return m.collectFlixServers(ctx, anilistID, episode, lang)
+		})
+	}()
+	go func() {
+		defer wg.Done()
+		znServers = run("zenime", func() []core.Server {
+			return m.collectZenimeServers(ctx, anilistID, episode, lang, hentai)
+		})
 	}()
 	go func() {
 		defer wg.Done()
 		if !hentai {
-			zkServers = m.collectZokoServers(ctx, anilistID, episode, lang)
+			nnServers = run("nin", func() []core.Server {
+				return m.collectNiNServers(ctx, anilistID, episode, lang)
+			})
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		if !hentai {
-			ofServers = m.collectOGflixServers(ctx, anilistID, episode, lang)
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		fcServers = m.collectFlixServers(ctx, anilistID, episode, lang)
+		// Runs alongside the provider fan-out (not after it): a slow
+		// provider must never starve the download fetch of context
+		// budget — observed 46s responses when the 45s fan-out cap trips.
+		start := time.Now()
+		kiwiLinks = fetchKiwiDownloads(ctx, m.httpClient, anilistID, episode, lang)
+		dmu.Lock()
+		collectorMs["kiwiDownloads"] = time.Since(start).Milliseconds()
+		dmu.Unlock()
 	}()
 	wg.Wait()
 
@@ -382,13 +486,31 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Anikoto download links together — falling back to one downloads-only
 	// Anikoto lookup when Anikoto streams were all CDN-blocked (no servers,
 	// but downloads may still exist). No extra network call in the common
-	// case — akServers was fetched in parallel above.
-	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang)
+	// case — akServers was fetched in parallel above. The whole Anikoto
+	// merge is skipped for hentai titles: it would send them to a gated
+	// provider.
+	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
+	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers)
 
-	allServers := append(append(append(append(akServers, axServers...), zkServers...), ofServers...), fcServers...)
+	allServers := append(append(append(append(append(akServers, axServers...), zkServers...), fcServers...), znServers...), nnServers...)
+	// Kiwi download links (fetched in parallel above): attach to every
+	// non-embed server (embed players take no file links). Independent of
+	// the Zoko streaming provider and its pause flag.
+	if len(kiwiLinks) > 0 {
+		allServers = attachKiwiDownloads(allServers, kiwiLinks)
+	} else {
+		m.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("servers: no kiwi download links")
+	}
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
+
+	m.log.Info().
+		Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
+		Int("servers", len(allServers)).
+		Int64("totalMs", time.Since(fanStart).Milliseconds()).
+		Interface("collectorMs", collectorMs).
+		Msg("servers: fan-out complete")
 
 	return allServers
 }
@@ -404,6 +526,13 @@ func appendNamedServers(out []core.Server, serverNames []string, provider, lang 
 		name := serverNames[len(serverNames)-1]
 		if i < len(serverNames) {
 			name = serverNames[i]
+		}
+		// A result may name its own sources (Anikoto: Niko for the
+		// AniList-keyed stream, Momo for the MAL-keyed one) — that wins
+		// over positional naming so each key keeps its slot even when
+		// the other key is missing.
+		if len(sr.ServerNames) == len(sr.Sources) && sr.ServerNames[i] != "" {
+			name = sr.ServerNames[i]
 		}
 		if idx, ok := nameIndex[name]; ok {
 			if len(src.Subtitles) > len(out[idx].Sources[0].Subtitles) {
@@ -433,10 +562,45 @@ func (m *Manager) collectFlixServers(ctx context.Context, anilistID string, epis
 			continue
 		}
 		sr, err := fc.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
-			continue // silent skip
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "flixcloud").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // the provider logs its own reason (Warn inside flixcloud.go)
 		}
 		out = appendNamedServers(out, []string{"Yuta", "Syota", "Mike"}, "flixcloud", lang, sr)
+	}
+	return out
+}
+
+// collectZenimeServers maps Zenime sources to Miru (xanime) servers — or
+// Miru (hentaimama) for hentai titles. Slot names ride on the result, so
+// each arms provider keeps its display name.
+func (m *Manager) collectZenimeServers(ctx context.Context, anilistID string, episode int, lang string, hentai bool) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		zn, ok := prov.(*ZenimeProvider)
+		if !ok {
+			continue
+		}
+		var sr *SourceResult
+		var err error
+		if hentai {
+			sr, err = zn.FindHentaiEpisodeSource(ctx, anilistID, episode, lang)
+		} else {
+			sr, err = zn.FindEpisodeSource(ctx, anilistID, episode, lang)
+		}
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "zenime").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Bool("hentai", hentai).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // the provider logs why (no episode match / blocked segments)
+		}
+		out = appendNamedServers(out, []string{"Miru"}, "zenime", lang, sr)
 	}
 	return out
 }
@@ -450,8 +614,13 @@ func (m *Manager) collectAnikotoServers(ctx context.Context, anilistID string, e
 			continue
 		}
 		sr, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "anikoto").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
 			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // the provider logs why (dropped servers / CDN block)
 		}
 		out = appendNamedServers(out, anikotoServers[:], "anikoto", lang, sr)
 	}
@@ -469,55 +638,104 @@ func (m *Manager) collectZokoServers(ctx context.Context, anilistID string, epis
 			continue
 		}
 		sr, err := zk.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
-			continue // silent skip: CDN-blocked or missing episode
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "zoko").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // CDN-blocked or missing episode (logged inside zoko.go)
 		}
 		out = appendNamedServers(out, []string{zokoServerName}, "zoko", lang, sr)
 	}
 	return out
 }
 
-// collectOGflixServers maps OGFLix sources to the Hoshi (base) and Yume
-// (?s=tcdn) servers. Decrypted sources are kept even when the manifest probe
-// fails from the server egress — they play through the Aniraku media proxy.
-func (m *Manager) collectOGflixServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+// collectNiNServers maps Supaplay (NiN) sources to the single "NiN" server.
+// The shipped URL is Supaplay's authless hls-proxy relay, probe-verified
+// before it can surface (Zoko-style honesty: a relay the probe cannot reach
+// would only produce 502s through the media proxy).
+func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
 	for _, prov := range m.providers {
-		of, ok := prov.(*OGFLixProvider)
+		nn, ok := prov.(*NiNProvider)
 		if !ok {
 			continue
 		}
-		sr, err := of.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil || sr == nil || len(sr.Sources) == 0 {
-			continue // silent skip
+		sr, err := nn.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "nin").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
 		}
-		out = appendNamedServers(out, ogflixServers[:], "ogflix", lang, sr)
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // blocked relay or missing episode (logged inside nin.go)
+		}
+		out = appendNamedServers(out, []string{ninServerName}, "nin", lang, sr)
 	}
 	return out
 }
 
 // mergeZokoDownloads merges the Anikoto download links into the Zoko
 // servers alongside Zoko's own link (deduped by URL, Zoko's own first).
-// Stream sources are never mixed — only Downloads. Falls back to a
-// downloads-only Anikoto lookup when the parallel Anikoto fetch produced no
-// servers (e.g. every stream CDN-blocked).
-func mergeZokoDownloads(ctx context.Context, m *Manager, zkServers, akServers []core.Server, anilistID string, episode int, lang string) []core.Server {
-	if len(zkServers) == 0 {
+// Stream sources are never mixed — only Downloads. Anikoto direct-only
+// resolution carries no download links, so in practice this merges nothing
+// today; the loop stays for any future provider-side downloads. hentai
+// titles skip the merge entirely: Anikoto is gated for them, so only
+// Zoko's own links survive.
+func mergeZokoDownloads(ctx context.Context, m *Manager, zkServers, akServers []core.Server, anilistID string, episode int, lang string, hentai bool) []core.Server {
+	if len(zkServers) == 0 || hentai {
 		return zkServers
 	}
 	var links []core.DownloadLink
 	for _, s := range akServers {
 		links = mergeDownloadLinks(links, s.Downloads)
 	}
-	if len(links) == 0 {
-		if ak := m.getAnikotoProvider(); ak != nil {
-			links = ak.FetchDownloadLinks(ctx, anilistID, episode, lang)
-		}
-	}
 	for i := range zkServers {
 		zkServers[i].Downloads = mergeDownloadLinks(zkServers[i].Downloads, links)
 	}
 	return zkServers
+}
+
+// mergeNiNSubtitles attaches verified subtitle tracks to NiN's servers from
+// the sibling collectors of the same episode, in order Niko -> animex (Mochi
+// et al) -> Zoko. Supaplay's own tracks are unusable from every path we
+// have (rawFile hosts TLS-blocked from this egress, its subtitle-proxy 404s,
+// the frontend's proxy hits the same walls), while the borrowed tracks point
+// at hosts the frontend already proxies fine — same episode, same timings.
+// Without a donor NiN simply ships no subs; it never resurrects its own.
+func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server) []core.Server {
+	if len(nnServers) == 0 {
+		return nnServers
+	}
+	var donor []core.Subtitle
+	for _, pool := range [][]core.Server{akServers, axServers, zkServers} {
+		for _, s := range pool {
+			for _, src := range s.Sources {
+				if len(src.Subtitles) > 0 {
+					donor = src.Subtitles
+					break
+				}
+			}
+			if donor != nil {
+				break
+			}
+		}
+		if donor != nil {
+			break
+		}
+	}
+	if donor == nil {
+		return nnServers
+	}
+	for i := range nnServers {
+		for j := range nnServers[i].Sources {
+			subs := make([]core.Subtitle, len(donor))
+			copy(subs, donor)
+			nnServers[i].Sources[j].Subtitles = subs
+		}
+	}
+	return nnServers
 }
 
 // mergeDownloadLinks dedupes download links by URL, keeping primary order.
@@ -629,6 +847,24 @@ func (m *Manager) getZokoProvider() *ZokoProvider {
 	return nil
 }
 
+func (m *Manager) getZenimeProvider() *ZenimeProvider {
+	for _, p := range m.providers {
+		if zn, ok := p.(*ZenimeProvider); ok {
+			return zn
+		}
+	}
+	return nil
+}
+
+func (m *Manager) getNiNProvider() *NiNProvider {
+	for _, p := range m.providers {
+		if nn, ok := p.(*NiNProvider); ok {
+			return nn
+		}
+	}
+	return nil
+}
+
 func (m *Manager) getAnimeXProvider() *AnimeXProvider {
 	for _, p := range m.providers {
 		if ax, ok := p.(*AnimeXProvider); ok {
@@ -673,7 +909,9 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 		}
 		results, err := ax.FindAllEpisodeSources(ctx, anilistID, episode, lang)
 		if err != nil && len(results) == 0 {
-			continue // silent skip
+			m.log.Warn().Err(err).Str("provider", "animex").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
 		}
 		for _, sr := range results {
 			if sr == nil || len(sr.Sources) == 0 {
@@ -691,8 +929,9 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 
 // tryZoko resolves a ZokoAnime stream (frontend "zoko" -> backend ZokoAnime
 // /stream/ani/{anilistId}/{ep}/{sub|dub}). The stream itself always comes
-// from ZokoAnime, probe-verified + proxied — never Anikoto direct. Downloads
-// are merged: Zoko's own link plus the Anikoto download links together.
+// from ZokoAnime, probe-verified + proxied — never Anikoto direct.
+// Downloads are Zoko's own links only (Anikoto direct-only resolution
+// carries no download links).
 func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	zk := m.getZokoProvider()
 	if zk == nil {
@@ -710,33 +949,52 @@ func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, q
 		return nil, nil
 	}
 
-	if ak := m.getAnikotoProvider(); ak != nil {
-		source.Downloads = mergeDownloadLinks(source.Downloads, ak.FetchDownloadLinks(ctx, anilistID, episode, lang))
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// tryZenime resolves a Zenime stream (arms API: xanime -> Miru;
+// hentaimama -> Miru for hentai titles).
+func (m *Manager) tryZenime(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	zn := m.getZenimeProvider()
+	if zn == nil {
+		return nil, fmt.Errorf("zenime provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying zenime")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	var source *SourceResult
+	var err error
+	if m.isHentaiTitle(ctx, animeID) {
+		source, err = zn.FindHentaiEpisodeSource(ctx, anilistID, episode, lang)
+	} else {
+		source, err = zn.FindEpisodeSource(ctx, anilistID, episode, lang)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("zenime failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
 	}
 
 	return m.applyQualityFilter(source, quality), nil
 }
 
-// tryOGflix resolves an OGFLix stream (Zen API -> player resolve -> MegaPlay
-// decrypt). Decrypted sources ship as Verification "proxy".
-func (m *Manager) tryOGflix(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
-	var of *OGFLixProvider
-	for _, p := range m.providers {
-		if o, ok := p.(*OGFLixProvider); ok {
-			of = o
-			break
-		}
-	}
-	if of == nil {
-		return nil, fmt.Errorf("ogflix provider not configured")
+// tryNiN resolves a Supaplay stream (anistream embed lineup; provider "nin").
+// Probe-verified inside the provider; hentai titles never reach it (the
+// explicit switch rejects them — Supaplay 502s its API for hentai).
+func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	nn := m.getNiNProvider()
+	if nn == nil {
+		return nil, fmt.Errorf("nin provider not configured")
 	}
 
-	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying ogflix")
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying nin")
 
 	anilistID := fmt.Sprintf("%d", animeID)
-	source, err := of.FindEpisodeSource(ctx, anilistID, episode, lang)
+	source, err := nn.FindEpisodeSource(ctx, anilistID, episode, lang)
 	if err != nil {
-		return nil, fmt.Errorf("ogflix failed: %w", err)
+		return nil, fmt.Errorf("nin failed: %w", err)
 	}
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil

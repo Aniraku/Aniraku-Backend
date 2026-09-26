@@ -51,6 +51,12 @@ type episodeCacheEntry struct {
 
 const episodeCacheTTL = 30 * time.Minute
 
+// maxEpisodeCacheEntries bounds the per-anime episode cache: without a cap
+// every anime ever browsed keeps its episode map for the process lifetime.
+// Eviction only drops expired entries (identical to a TTL miss — the caller
+// just refetches) or, over the cap, the stalest entry first.
+const maxEpisodeCacheEntries = 2000
+
 func GetCachedEpisodes(anilistID int, nums []int) map[int]*EpisodeMetadata {
 	val, ok := episodeCache.Load(anilistID)
 	if !ok {
@@ -81,6 +87,7 @@ func setCachedEpisodes(anilistID int, data map[int]*EpisodeMetadata) {
 	if !ok {
 		entry = &episodeCacheEntry{episodes: data, fetchedAt: time.Now()}
 		episodeCache.Store(anilistID, entry)
+		evictEpisodeCacheIfNeeded()
 		return
 	}
 	entry = val.(*episodeCacheEntry)
@@ -94,6 +101,47 @@ func setCachedEpisodes(anilistID int, data map[int]*EpisodeMetadata) {
 		}
 	}
 	entry.fetchedAt = time.Now()
+	evictEpisodeCacheIfNeeded()
+}
+
+// evictEpisodeCacheIfNeeded drops expired entries and trims the cache to
+// maxEpisodeCacheEntries, stalest first. Runs on the store (cache-miss)
+// path only, so the scan never touches hot reads.
+func evictEpisodeCacheIfNeeded() {
+	count := 0
+	type aged struct {
+		key     any
+		fetched time.Time
+	}
+	var fresh []aged
+	var expired []any
+	episodeCache.Range(func(k, v any) bool {
+		entry, ok := v.(*episodeCacheEntry)
+		if !ok {
+			expired = append(expired, k)
+			return true
+		}
+		entry.mu.RLock()
+		fetched := entry.fetchedAt
+		entry.mu.RUnlock()
+		if time.Since(fetched) > episodeCacheTTL {
+			expired = append(expired, k)
+			return true
+		}
+		count++
+		fresh = append(fresh, aged{key: k, fetched: fetched})
+		return true
+	})
+	for _, k := range expired {
+		episodeCache.Delete(k)
+	}
+	if count <= maxEpisodeCacheEntries {
+		return
+	}
+	sort.Slice(fresh, func(i, j int) bool { return fresh[i].fetched.Before(fresh[j].fetched) })
+	for _, a := range fresh[:count-maxEpisodeCacheEntries] {
+		episodeCache.Delete(a.key)
+	}
 }
 
 // EnrichInBackground fetches TMDB episode metadata and caches it.
@@ -203,7 +251,52 @@ func cached(key string, ttl time.Duration, loader func() (any, error)) (any, err
 		return nil, err
 	}
 	responseCache.Store(key, cacheEntry{value: val, expiresAt: time.Now().Add(ttl)})
+	evictResponseCacheIfNeeded()
 	return val, nil
+}
+
+// maxResponseCacheEntries bounds the generic loader cache: expired keys are
+// only deleted when re-read, so entries nobody asks for again would
+// otherwise live for the process lifetime. Eviction is behavior-preserving —
+// a dropped entry is just a cache miss and the loader re-runs.
+const maxResponseCacheEntries = 5000
+
+// evictResponseCacheIfNeeded drops expired entries and trims the cache to
+// maxResponseCacheEntries, earliest-expiring first. Runs on the store
+// (cache-miss) path only, so the scan never touches hot reads.
+func evictResponseCacheIfNeeded() {
+	count := 0
+	now := time.Now()
+	type aged struct {
+		key     any
+		expires time.Time
+	}
+	var fresh []aged
+	var expired []any
+	responseCache.Range(func(k, v any) bool {
+		e, ok := v.(cacheEntry)
+		if !ok {
+			expired = append(expired, k)
+			return true
+		}
+		if !e.expiresAt.After(now) {
+			expired = append(expired, k)
+			return true
+		}
+		count++
+		fresh = append(fresh, aged{key: k, expires: e.expiresAt})
+		return true
+	})
+	for _, k := range expired {
+		responseCache.Delete(k)
+	}
+	if count <= maxResponseCacheEntries {
+		return
+	}
+	sort.Slice(fresh, func(i, j int) bool { return fresh[i].expires.Before(fresh[j].expires) })
+	for _, a := range fresh[:count-maxResponseCacheEntries] {
+		responseCache.Delete(a.key)
+	}
 }
 
 // --- AniZip episode metadata ---

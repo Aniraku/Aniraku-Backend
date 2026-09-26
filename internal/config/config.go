@@ -64,11 +64,10 @@ func (s *SyncConfig) MALConfigured() bool     { return s.MALClientID != "" }
 func (s *SyncConfig) AniListConfigured() bool { return s.AniListClientID != "" }
 
 type ServerConfig struct {
-	Host               string `mapstructure:"host"`
-	Port               int    `mapstructure:"port"`
-	UIDist             string `mapstructure:"ui_dist"`
-	Debug              bool   `mapstructure:"debug"`
-	AnikotoMappingPath string `mapstructure:"anikoto_mapping_path"`
+	Host   string `mapstructure:"host"`
+	Port   int    `mapstructure:"port"`
+	UIDist string `mapstructure:"ui_dist"`
+	Debug  bool   `mapstructure:"debug"`
 	// EnablePprof mounts the standard pprof handlers under /debug/pprof,
 	// behind auth + RequireAdmin. Opt-in via ANIRAKU_ENABLE_PPROF=true.
 	EnablePprof bool `mapstructure:"enable_pprof"`
@@ -168,9 +167,6 @@ func Load(configPath string) (*Config, error) {
 	}
 	if debug := os.Getenv("ANIRAKU_SERVER_DEBUG"); debug == "true" || debug == "1" {
 		v.Set("server.debug", true)
-	}
-	if akp := os.Getenv("ANIRAKU_ANIKOTO_MAPPING_PATH"); akp != "" {
-		v.Set("server.anikoto_mapping_path", akp)
 	}
 	if pv := os.Getenv("ANIRAKU_ENABLE_PPROF"); pv == "true" || pv == "1" {
 		v.Set("server.enable_pprof", true)

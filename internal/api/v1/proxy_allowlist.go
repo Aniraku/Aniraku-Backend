@@ -44,6 +44,16 @@ var defaultCDNSuffixes = []string{
 	// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
 	"aniwatchtv.site",
 	"fast4speed.rsvp",
+	// AnimeX beep native CDN + its referer host (API returns
+	// playeng.animeapps.top URLs with a playeng referer, used as-is since
+	// the bd.aniwatchtv.site rewrite was dropped — bd Cloudflare-blocks
+	// datacenter egress while playeng serves it)
+	"animeapps.top",
+	// Xanime video servers (numbered xanivsrcNN.org rotate per title) +
+	// AnimeParadise stream gateway (fetches upstream itself)
+	"xanivsrc.org",
+	"xanivsrc10.org",
+	"animeparadise.moe",
 	// Additional anime CDN hosts from DeepSeek audit
 	"ans-bio-video.com",
 	"ans-bio-video.net",
@@ -90,6 +100,10 @@ var defaultCDNSuffixes = []string{
 	"fast4speed.com",
 	// Anikoto provider embed CDNs
 	"anikototv.to", "megaplay.buzz",
+	// Supaplay (NiN provider — anistream.one embed lineup): the shipped
+	// source is its authless hls-proxy relay (supaplay.fun/hls-proxy?url=),
+	// which streams MegaPlay-catalog files on edges that block us directly
+	"supaplay.fun",
 	// Anikoto HLS CDNs (Anivexa - kryntal, atomic4cdn)
 	"kryntal.top", "cdn.kryntal.top",
 	"atomic4cdn.top", "vault-97.atomic4cdn.top", "vault-98.atomic4cdn.top",
