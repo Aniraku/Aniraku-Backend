@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -39,7 +40,20 @@ func Logging(log zerolog.Logger) func(http.Handler) http.Handler {
 
 			RecordRequestStatus(wrapped.status)
 
-			log.Info().
+			// The media proxy answers every HLS segment fetch — during
+			// playback it is the overwhelming majority of requests, and
+			// every line carries the same path ("/api/v1/proxy"), so
+			// production logged ~65MB/h of near-identical entries in the
+			// container log on the 15G VM. Successful proxy responses drop
+			// to Debug (disabled in production); failures stay at Info so
+			// a broken source is still visible, and the proxy handler's
+			// own Warn lines (429 / upstream rejected / stream aborted)
+			// are untouched.
+			level := log.Info()
+			if wrapped.status < 400 && strings.HasPrefix(r.URL.Path, "/api/v1/proxy") {
+				level = log.Debug()
+			}
+			level.
 				Str("request_id", GetRequestID(r.Context())).
 				Str("method", r.Method).
 				Str("path", r.URL.Path).
