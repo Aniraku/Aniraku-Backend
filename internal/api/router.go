@@ -15,7 +15,6 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/api/v1"
 	"github.com/Aniraku/Aniraku-Backend/internal/auth"
 	"github.com/Aniraku/Aniraku-Backend/internal/config"
-	"github.com/Aniraku/Aniraku-Backend/internal/embed"
 )
 
 // envInt reads a numeric env override, falling back to def when unset or
@@ -162,10 +161,15 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		}
 	})
 
-	uiFS := embed.FS()
-	if uiFS != nil {
-		r.Handle("/*", embed.Handler())
-	}
+	// Pure API backend — no embedded UI. Unknown paths answer JSON 404 so
+	// clients never receive an HTML page (the old web-tagged build served
+	// the API-docs GUI from a /* catch-all, which masked missing routes as
+	// 200 HTML and bloated the binary with the static assets).
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	})
 
 	return r
 }

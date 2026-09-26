@@ -25,6 +25,14 @@ import (
 // old keys keep validating tokens for at most this window past expiry.
 const jwksGrace = 24 * time.Hour
 
+// jwksRefreshMinInterval rate-limits JWKS refresh attempts across all
+// callers. Without it, a token whose kid never appears in the JWKS (garbage
+// kid headers, or a rotation not yet published) re-triggered a refresh on
+// every iteration of GetKey — a livelock that fetched Supabase's JWKS
+// several times a second and logged "refreshing JWKS" indefinitely
+// (~116k lines in 6h observed in production).
+const jwksRefreshMinInterval = 60 * time.Second
+
 type JWKS struct {
 	keys    map[string]crypto.PublicKey
 	mu      sync.Mutex
@@ -39,7 +47,10 @@ type JWKS struct {
 	// refresh ran while holding mu, serializing all token verification behind
 	// one upstream HTTP call.
 	refreshing bool
-	cond       *sync.Cond
+	// lastAttempt rate-limits refreshes across callers (see
+	// jwksRefreshMinInterval); guarded by mu.
+	lastAttempt time.Time
+	cond        *sync.Cond
 }
 
 type jwksResponse struct {
@@ -72,6 +83,13 @@ func NewJWKS(url string, log zerolog.Logger) *JWKS {
 
 func (j *JWKS) GetKey(ctx context.Context, kid string) (crypto.PublicKey, error) {
 	j.mu.Lock()
+	// attempted bounds THIS call to at most one refresh. Once we have
+	// triggered or awaited a refresh and the kid is still missing, the kid
+	// is unknown — return instead of looping. The old code looped forever
+	// here: every unknown-kid request re-entered the refresh path, turning
+	// it into a livelock (one JWKS fetch + one "refreshing JWKS" line per
+	// cycle, several times a second).
+	attempted := false
 	for {
 		if key, ok := j.keys[kid]; ok && time.Now().Before(j.expires) {
 			j.mu.Unlock()
@@ -81,10 +99,18 @@ func (j *JWKS) GetKey(ctx context.Context, kid string) (crypto.PublicKey, error)
 		// a key we have not seen — refresh once before giving up.
 		fresh := time.Now().Before(j.expires) && len(j.keys) > 0
 		if fresh || j.refreshing {
-			if fresh && !j.refreshing {
+			// Rate-limited across all callers so a flood of unknown-kid
+			// tokens cannot hammer Supabase while a rotation is pending.
+			allow := time.Since(j.lastAttempt) >= jwksRefreshMinInterval
+			if fresh && !j.refreshing && !attempted && allow {
+				attempted = true
+				j.lastAttempt = time.Now()
 				j.refreshing = true
 				go func() {
-					j.doRefresh(ctx)
+					// Detach from the caller: its context dies when the client
+					// disconnects, which used to fail the refresh for everyone
+					// and immediately retrigger it on the next request.
+					j.doRefresh(context.Background())
 					j.mu.Lock()
 					j.refreshing = false
 					j.cond.Broadcast()
@@ -95,9 +121,22 @@ func (j *JWKS) GetKey(ctx context.Context, kid string) (crypto.PublicKey, error)
 				j.cond.Wait()
 				continue
 			}
-			continue
+			if attempted {
+				break // our refresh finished and the kid is still absent
+			}
+			if !allow {
+				// Someone refreshed within the cooldown and the kid still
+				// isn't published — treat as unknown instead of spinning.
+				break
+			}
+			continue // someone else's refresh just finished; re-read the map
 		}
 		// Stale/empty keys, nobody else refreshing: do it on this goroutine.
+		if attempted {
+			break
+		}
+		attempted = true
+		j.lastAttempt = time.Now()
 		j.refreshing = true
 		err := j.doRefreshLocked(ctx)
 		j.refreshing = false
@@ -114,6 +153,8 @@ func (j *JWKS) GetKey(ctx context.Context, kid string) (crypto.PublicKey, error)
 			return nil, err
 		}
 	}
+	j.mu.Unlock()
+	return nil, fmt.Errorf("jwks: unknown key id %q", kid)
 }
 
 // doRefresh performs the network refresh outside the lock and installs the

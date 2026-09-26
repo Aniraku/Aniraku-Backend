@@ -134,7 +134,7 @@ const zenimeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 func NewZenimeProvider(log zerolog.Logger) *ZenimeProvider {
 	base := strings.TrimRight(os.Getenv("ANIRAKU_ARMS_BASE"), "/")
 	if base == "" {
-		base = "https://arms-manga-api.vercel.app"
+		base = "https://zenime-new-api.vercel.app/"
 	}
 	return &ZenimeProvider{
 		client:  &http.Client{Timeout: 30 * time.Second, Transport: netguard.NewTransport()},

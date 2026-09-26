@@ -10,12 +10,13 @@ COPY . .
 ARG VERSION=0.1.0
 ARG COMMIT=dev
 ARG BUILDDATE=unknown
-RUN CGO_ENABLED=0 go build -tags web \
+RUN CGO_ENABLED=0 go build \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILDDATE}" \
     -o /aniraku-server ./cmd/aniraku-server
 
 # Runtime stage: minimal, non-root, no unused runtimes. The static Go binary
-# embeds the UI; only CA certificates are needed for outbound TLS.
+# is API-only (no embedded UI); only CA certificates are needed for outbound
+# TLS.
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates wget && adduser -D -u 65532 -g "" appuser
 WORKDIR /app

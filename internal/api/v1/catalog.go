@@ -218,6 +218,28 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	anilistID := id
 
+	// Hard total budget for every upstream stage below. The stages run
+	// serially (AniZip + AniList + count fallbacks + TMDB resolve + cover),
+	// each with its own 15–50s timeout — summed they can exceed the server's
+	// 60s WriteTimeout, at which point the connection is killed before a
+	// single byte is written and the browser sees ERR_TIMED_OUT with zero
+	// log lines (production incident: /anime/21/episodes hung >180s while
+	// /health answered in 5ms on the same port). 45s bounds the whole chain
+	// under 60s so the handler ALWAYS answers — partial data beats a dead
+	// connection.
+	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
+	defer cancel()
+
+	// Cumulative stage marks, logged once (Warn) only when the total passes
+	// slowThreshold — so the next slow incident names the guilty stage
+	// instead of leaving no trace at all.
+	const slowThreshold = 5 * time.Second
+	started := time.Now()
+	var stages strings.Builder
+	mark := func(name string) {
+		fmt.Fprintf(&stages, "%s=%dms ", name, time.Since(started).Milliseconds())
+	}
+
 	// AniList metadata and the AniZip episode map are independent sources —
 	// fetch AniZip concurrently so the AniList round trip never serializes
 	// in front of it. The channel close gives the happens-before edge: the
@@ -226,7 +248,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	anizipDone := make(chan struct{})
 	go func() {
 		defer close(anizipDone)
-		data, _ := tmdb.FetchAniZipEpisodes(r.Context(), h.httpClient, anilistID)
+		data, _ := tmdb.FetchAniZipEpisodes(ctx, h.httpClient, anilistID)
 		anizipData = data
 	}()
 
@@ -236,7 +258,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// reads as zero values below, which routes count derivation to AniZip.
 	var media map[string]any
 	query := `query ($id: Int) { Media(id: $id, type: ANIME) { id title { romaji english userPreferred } coverImage { extraLarge large medium } episodes format status nextAiringEpisode { episode airingAt } } }`
-	raw, err := h.anilistClient.do(r.Context(), query, map[string]any{"id": id})
+	raw, err := h.anilistClient.do(ctx, query, map[string]any{"id": id})
 	if err != nil {
 		h.log.Warn().Err(err).Int("id", id).Msg("episodes: anilist metadata unavailable, serving from anizip/tmdb only")
 	} else {
@@ -246,6 +268,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		media, _ = data["Media"].(map[string]any)
 	}
 	<-anizipDone
+	mark("list")
 
 	episodeCount := 0
 	if eps, ok := media["episodes"].(float64); ok && eps > 0 {
@@ -266,7 +289,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// Anisearch titles are fetched once here and reused below for titles.
 	var anisearchEps map[int]*tmdb.AnisearchEpisode
 	if episodeCount == 0 {
-		if azMeta, err := tmdb.FetchAniZipMediaMeta(r.Context(), h.httpClient, anilistID); err == nil && azMeta.EpisodeCount > 0 {
+		if azMeta, err := tmdb.FetchAniZipMediaMeta(ctx, h.httpClient, anilistID); err == nil && azMeta.EpisodeCount > 0 {
 			episodeCount = azMeta.EpisodeCount
 		}
 		for k := range anizipData {
@@ -275,7 +298,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if episodeCount == 0 {
-			inferCtx, inferCancel := context.WithTimeout(r.Context(), 15*time.Second)
+			inferCtx, inferCancel := context.WithTimeout(ctx, 15*time.Second)
 			if n := tmdb.InferEpisodeCount(inferCtx, h.httpClient, h.cfg.TMDB.ReadAccessToken, anilistID); n > 0 {
 				episodeCount = n
 			}
@@ -285,7 +308,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		// covers hentai missing from AniList, AniZip episodes, AniBridge and
 		// Fribb alike. No Jikan involved.
 		if episodeCount == 0 {
-			asiCtx, asiCancel := context.WithTimeout(r.Context(), 15*time.Second)
+			asiCtx, asiCancel := context.WithTimeout(ctx, 15*time.Second)
 			anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)
 			asiCancel()
 			for n := range anisearchEps {
@@ -295,6 +318,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	mark("count")
 
 	token := h.cfg.TMDB.ReadAccessToken
 
@@ -323,7 +347,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	if coverFallback == "" {
 		go func() {
 			defer close(coverDone)
-			if c := tmdb.FetchAniZipCover(r.Context(), h.httpClient, anilistID); c != "" {
+			if c := tmdb.FetchAniZipCover(ctx, h.httpClient, anilistID); c != "" {
 				coverFallback = c
 			}
 		}()
@@ -332,12 +356,12 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	tmdbByNumber := tmdb.GetCachedEpisodes(anilistID, episodeNumbers)
 	if tmdbByNumber == nil {
-		// Cache miss — fetch TMDB with generous timeout (blocks until done).
-		// Must stay under the server's 60s WriteTimeout or the connection is
-		// killed mid-request and the client gets nothing.
+		// Cache miss — fetch TMDB with a generous timeout (blocks until
+		// done), but still derived from the handler's total 45s budget so
+		// the chain can never outlive the server's 60s WriteTimeout.
 		tmdbByNumber = map[int]*tmdb.EpisodeMetadata{}
 		if len(episodeNumbers) > 0 {
-			fetchCtx, fetchCancel := context.WithTimeout(r.Context(), 50*time.Second)
+			fetchCtx, fetchCancel := context.WithTimeout(ctx, 50*time.Second)
 			defer fetchCancel()
 			result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
 			if result != nil {
@@ -354,12 +378,13 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	<-coverDone
 	if coverFallback == "" && strings.TrimSpace(token) != "" {
-		covCtx, covCancel := context.WithTimeout(r.Context(), 15*time.Second)
+		covCtx, covCancel := context.WithTimeout(ctx, 15*time.Second)
 		if p := tmdb.FetchTmdbFallbackPoster(covCtx, h.httpClient, token, anilistID); p != "" {
 			coverFallback = p
 		}
 		covCancel()
 	}
+	mark("resolve+cover")
 
 	// Never stamp a junk cover onto every episode: validate the final
 	// fallback (guards a blind-trusted AniList URL).
@@ -373,10 +398,11 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// placeholder cover for adult titles. Reuses the fetch from the count
 	// stage above when available.
 	if episodeCount > 0 && anisearchEps == nil && len(anizipData) == 0 && len(tmdbByNumber) == 0 {
-		asiCtx, asiCancel := context.WithTimeout(r.Context(), 15*time.Second)
+		asiCtx, asiCancel := context.WithTimeout(ctx, 15*time.Second)
 		anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)
 		asiCancel()
 	}
+	mark("anisearch")
 
 	episodes := make([]map[string]any, episodeCount)
 	for i := 0; i < episodeCount; i++ {
@@ -432,6 +458,18 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			ep["thumbnail"] = coverFallback
 		}
 		episodes[i] = ep
+	}
+
+	// Lift the server-wide write deadline for this response (mirrors
+	// GetServers): the 519KB One Piece payload on a slow client could
+	// otherwise be cut at 60s even though every stage fit in 45s.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+	if total := time.Since(started); total > slowThreshold {
+		h.log.Warn().Int("id", id).Dur("total", total).
+			Str("stages", strings.TrimSpace(stages.String())).
+			Msg("episodes: slow response")
 	}
 
 	h.respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
