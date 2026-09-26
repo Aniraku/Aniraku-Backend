@@ -21,11 +21,14 @@ import (
 )
 
 const (
-	zokoBase       = "https://zokoanime.video"
 	zokoObfKey     = "otaku-embed-v1"
 	zokoPlayerUA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	zokoServerName = "Zoko"
 )
+
+// zokoBase is a var (not const) so tests can point the provider at a fake
+// server. The Kiwi download fetcher shares it: same backend, same base.
+var zokoBase = "https://zokoanime.video"
 
 // zokoPayload matches the deobfuscated window.__P blob the ZokoAnime embed
 // page ships. The player (zokoanime2.pages.dev/core/obfuscate.js) decodes it
@@ -248,6 +251,15 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 	}
 	malID := tmdb.FetchMalID(ctx, p.client, anilistInt)
 	if malID <= 0 {
+		// AniZip has no mapping for some titles — common for adult/hentai
+		// entries, and Zoko serves those ONLY MAL-keyed (its AniList index
+		// returns a page with no player payload). AniList itself always
+		// carries idMal, so it is the authoritative second source.
+		malID = fetchAniListMALID(ctx, p.client, anilistInt)
+	}
+	if malID <= 0 {
+		p.log.Warn().Str("anilistId", anilistID).
+			Msg("zoko: no MAL ID from AniZip or AniList, MAL-keyed fallback impossible")
 		return nil, fmt.Errorf("zoko: no MAL ID found for anilist %s", anilistID)
 	}
 	malURL := fmt.Sprintf("%s/stream/mal/%d/%d/%s", zokoBase, malID, episode, lang)
@@ -256,4 +268,56 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 		return nil, fmt.Errorf("zoko MAL fallback (mal=%d): %w", malID, err)
 	}
 	return p.zokoBuildSourceResult(ctx, payload, fmt.Sprintf("mal=%d", malID))
+}
+
+// fetchAniListMALID resolves the MyAnimeList ID from AniList's own idMal
+// field. It is the fallback when AniZip has no mapping (fetchAniListMALID
+// callers only reach it on an AniZip miss), and it returns 0 on any failure
+// so callers keep their existing "no MAL ID" error path.
+func fetchAniListMALID(ctx context.Context, client *http.Client, anilistID int) int {
+	if anilistID <= 0 {
+		return 0
+	}
+	query := `{"query":"{ Media(id:` + strconv.Itoa(anilistID) + `,type:ANIME){ idMal } }"}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", strings.NewReader(query))
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32*1024))
+	if err != nil {
+		return 0
+	}
+	return parseAniListMAL(body)
+}
+
+// parseAniListMAL extracts Media.idMal from an AniList GraphQL response.
+// Split out so the parsing rules are unit-testable without the network.
+func parseAniListMAL(body []byte) int {
+	var out struct {
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+		Data struct {
+			Media struct {
+				IDMal *int `json:"idMal"`
+			} `json:"Media"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return 0
+	}
+	if out.Data.Media.IDMal == nil || *out.Data.Media.IDMal <= 0 {
+		return 0
+	}
+	return *out.Data.Media.IDMal
 }

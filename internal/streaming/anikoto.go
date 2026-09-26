@@ -11,12 +11,13 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/rs/zerolog"
 
@@ -45,6 +46,13 @@ type AnikotoProvider struct {
 	// layer registers it to feed the media-proxy CDN allowlist so rotated CDN
 	// hostnames are allowed the moment they surface instead of 403ing.
 	learnHost func(host string)
+
+	// Last-good merged results for stale serving: megaplay edges flap on
+	// minute timescales while files stay stable for hours, so a
+	// minutes-old result plays fine and keeps Niko/Momo listed through
+	// dead windows instead of flickering out.
+	staleMu sync.Mutex
+	stale   map[string]*animexStaleEntry
 }
 
 // SetHostLearner registers the verified-host callback.
@@ -75,6 +83,7 @@ func NewAnikotoProvider(log zerolog.Logger) *AnikotoProvider {
 	return &AnikotoProvider{
 		client: &http.Client{Timeout: 45 * time.Second, Jar: jar, Transport: netguard.NewTransport()},
 		log:    log,
+		stale:  make(map[string]*animexStaleEntry),
 	}
 }
 
@@ -88,306 +97,234 @@ func (p *AnikotoProvider) FindEpisodes(ctx context.Context, providerID string) (
 	return nil, fmt.Errorf("anikoto episode listing not implemented")
 }
 
-// FindEpisodeSource resolves AnikotoTV streams directly (Anivexa anikototv
-// method, in-process — no Render hop): show resolve -> episode data-ids ->
-// server list -> server?get embed -> MegaPlay decrypt -> verified m3u8.
-// Same return contract as before (Quality "auto", Verification "proxy").
+// FindEpisodeSource resolves Anikoto streams via megaplay.buzz directly
+// (AniList-keyed Niko slot first, MAL-keyed Momo slot second): page fetch
+// -> MegaPlay decrypt -> verified m3u8. Same return contract (Quality
+// "auto", Verification "proxy"); dub works through the same URL scheme.
 func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
 	if lang != "dub" {
 		lang = "sub"
 	}
-
-	slug, showID, err := p.resolveShow(ctx, providerID)
+	key := providerID + "/" + strconv.Itoa(episode) + "/" + lang
+	// Fresh serve: a successful resolve stays playable for minutes (file
+	// URLs are stable, tokens outlive the window), so repeat lookups —
+	// /servers fires on every player open — return instantly without
+	// re-contacting megaplay. This also stops the probe bursts that make
+	// Cloudflare rate-limit this egress into fake "blocked" verdicts.
+	if fresh := p.loadAnikotoFresh(key); fresh != nil {
+		return fresh, nil
+	}
+	sr, err := p.megaplayDirectKeys(ctx, providerID, p.megaplayMALID(ctx, providerID), episode, lang)
+	if sr != nil && len(sr.Sources) > 0 {
+		p.storeAnikotoStale(key, sr)
+		return sr, err
+	}
+	// Fresh resolve failed: serve the last good result while fresh instead
+	// of dropping Niko/Momo for a minutes-long edge/rate flap.
 	if err != nil {
-		p.log.Info().Err(err).Str("anilistId", providerID).Msg("anikoto: resolveShow failed, trying megaplayDirect")
-		// Megaplay is directly AniList-keyed — resolve without anikoto's
-		// show catalog when the show itself cannot be matched.
-		if mp, mpErr := p.megaplayDirect(ctx, providerID, episode, lang); mpErr == nil {
-			return mp, nil
-		} else {
-			p.log.Info().Err(mpErr).Str("anilistId", providerID).Msg("anikoto: megaplayDirect also failed")
+		if stale := p.loadAnikotoStale(key); stale != nil {
+			p.log.Info().Str("anilistId", providerID).Int("episode", episode).Msg("anikoto: serving stale result after failure")
+			return stale, nil
 		}
-		return nil, err
 	}
-	_ = slug
-
-	dataIDs, epMeta, err := p.fetchEpisodeDataIDs(ctx, showID, episode)
-	if err != nil {
-		return nil, err
-	}
-	entries, err := p.fetchServers(ctx, dataIDs, "")
-	if err != nil {
-		return nil, err
-	}
-	// Nekostream mapper extras (Anivexa parity): extra servers + downloads.
-	entries = append(entries, p.fetchMapperServers(ctx, epMeta, lang)...)
-
-	var sources []core.Source
-	var variants []string
-	var downloads []core.DownloadLink
-	var intro, outro *core.SkipTimestamp
-	referer := ""
-	seenName := map[string]bool{}
-	seenDL := map[string]bool{}
-
-	for _, e := range entries {
-		// Anivexa parity: dedupe by server NAME, not file URL — the
-		// same file behind two servers (Vidstream/HD) lists twice,
-		// and ?s=tcdn variants may resolve differently per fetch.
-		if seenName[e.name] {
-			continue
-		}
-		lowerName := strings.ToLower(e.name)
-		isDL := e.serverType == "dl" || strings.Contains(lowerName, "download") ||
-			strings.Contains(lowerName, "kiwi")
-		var embedURL string
-		var skip map[string][]float64
-		if strings.HasPrefix(e.linkID, "http") {
-			// Mapper-provided direct embed URL (Anivexa parity).
-			embedURL = e.linkID
-		} else {
-			var err error
-			embedURL, skip, err = p.fetchVideoURL(ctx, e.linkID)
-			if err != nil || strings.TrimSpace(embedURL) == "" {
-				p.log.Debug().Err(err).Str("server", e.name).Str("linkId", e.linkID).Msg("anikoto: embed url fetch failed")
-				continue
-			}
-		}
-		if isDL {
-			if !seenDL[embedURL] {
-				seenDL[embedURL] = true
-				label := strings.TrimSpace(e.name)
-				if label == "" {
-					label = "Download"
-				}
-				downloads = append(downloads, core.DownloadLink{URL: embedURL, Label: label})
-				// Vouch the download host for the proxy allowlist: the URL
-				// came from the provider's own server/mapper chain.
-				p.learnURLHost(embedURL)
-			}
-			continue
-		}
-		if e.serverType != lang {
-			p.log.Debug().Str("server", e.name).Str("serverType", e.serverType).Str("want", lang).Msg("anikoto: server language mismatch")
-			continue
-		}
-		// Anivexa extractEmbedSource parity, hardened: try the #aHR0c base64
-		// fragment first, then the MegaPlay decrypt chain (getSourcesNew,
-		// then legacy getSources + AES enc decrypt). When decryption yields a
-		// file we serve direct HLS; when it does not, the embed URL itself
-		// ships as a type:"embed" stream (Anivexa priority-4 fallback) so the
-		// client's embedded player can still play it — a source is ALWAYS
-		// returned for the episode, never dropped.
-		hlsURL := ""
-		var tracks []megaplayTrack
-		var inTs, outTs *core.SkipTimestamp
-		origin := embedURL
-		if i := strings.Index(embedURL, "#aHR0c"); i != -1 {
-			if raw, e := base64.StdEncoding.DecodeString(embedURL[i+1:]); e == nil {
-				if s := strings.TrimSpace(string(raw)); strings.Contains(s, ".m3u8") {
-					hlsURL = s
-				}
-			}
-		}
-		// probeState tracks whether the resolved file already went through a
-		// probe inside the edge picker: 0 = not probed yet, 1 = passed,
-		// 2 = failed. A probe failure on this egress means the media proxy
-		// (same egress) will 403 too — the server is dropped, not surfaced.
-		probeState := 0
-		if hlsURL == "" {
-			f, tr, in, out, orig, pOK, rErr := resolveMegaPlayPlayable(ctx, p.client, embedURL, func(ff, oo string) bool {
-				return p.probeHLS(ctx, ff, oo)
-			})
-			if rErr == nil && f != "" && pOK {
-				hlsURL = f
-				tracks = tr
-				inTs, outTs = in, out
-				origin = orig
-				probeState = 1
-			} else {
-				p.log.Info().Err(rErr).Str("server", e.name).Str("embed", embedURL).Msg("anikoto: no playable CDN edge, dropping server")
-				seenName[e.name] = true
-				continue
-			}
-		}
-		if strings.HasPrefix(embedURL, "http") {
-			if o, e := url.Parse(embedURL); e == nil && o.Host != "" {
-				if origin == embedURL {
-					origin = o.Scheme + "://" + o.Host
-				}
-			}
-		}
-		seenName[e.name] = true
-		if referer == "" {
-			referer = strings.TrimSuffix(origin, "/") + "/"
-		}
-		if intro == nil {
-			if inTs != nil {
-				intro = &core.SkipTimestamp{Start: inTs.Start, End: inTs.End}
-			} else if len(skip["intro"]) == 2 {
-				intro = &core.SkipTimestamp{Start: skip["intro"][0], End: skip["intro"][1]}
-			}
-		}
-		if outro == nil {
-			if outTs != nil {
-				outro = &core.SkipTimestamp{Start: outTs.Start, End: outTs.End}
-			} else if len(skip["outro"]) == 2 {
-				outro = &core.SkipTimestamp{Start: skip["outro"][0], End: skip["outro"][1]}
-			}
-		}
-
-		if hlsURL != "" {
-			// The verdict reflects the probe: passing CDNs rank "proxy" (top);
-			// CDNs that block this egress are kept but demoted to "embed" rank
-			// so the client only falls back to them after the working servers.
-			// The edge picker already probed when it picked the CDN edge, so
-			// only probe here when it did not (base64-fragment path).
-			if probeState == 0 {
-				if p.probeHLS(ctx, hlsURL, origin) {
-					probeState = 1
-				} else {
-					probeState = 2
-				}
-			}
-			verdict := "proxy"
-			if probeState == 2 {
-				// Probe failed and the edge picker found no open edge — the
-				// media proxy on this egress would 403 too, so drop.
-				p.log.Info().Str("server", e.name).Str("url", hlsURL).Msg("anikoto: manifest blocked from this egress, dropping server")
-				continue
-			}
-			// Decrypted: vouch the manifest and subtitle hosts for the proxy
-			// allowlist — the auto-learn path for Anikoto CDN rotation.
-			p.learnURLHost(hlsURL)
-			var subs []core.Subtitle
-			for _, t := range tracks {
-				if strings.TrimSpace(t.URL) == "" {
-					continue
-				}
-				p.learnURLHost(t.URL)
-				subs = append(subs, core.Subtitle{
-					URL:   t.URL,
-					Lang:  mapSubtitleLang(t.Label),
-					Label: t.Label,
-				})
-			}
-			sources = append(sources, core.Source{
-				URL:          hlsURL,
-				Type:         "hls",
-				Quality:      "auto",
-				Subtitles:    subs,
-				Verification: verdict,
-			})
-			variants = append(variants, embedVariant(embedURL))
-		} else {
-			// Anivexa priority-4 fallback: play through the embed itself.
-			sources = append(sources, core.Source{
-				URL:          embedURL,
-				Type:         "embed",
-				Quality:      "auto",
-				Verification: "embed",
-			})
-			variants = append(variants, embedVariant(embedURL))
-		}
-		// No cap (Anivexa parity): every server lists.
-	}
-	sources = dedupeSourcesByURL(sources, variants)
-	if len(sources) == 0 {
-		// The anikoto ajax/embed chain produced nothing usable (dead embeds,
-		// blocked getSources, probe failures). Megaplay hosts the same files
-		// keyed directly by AniList ID — try it before giving up.
-		if mp, mpErr := p.megaplayDirect(ctx, providerID, episode, lang); mpErr == nil {
-			return mp, nil
-		}
-		return nil, nil
-	}
-	if referer == "" {
-		referer = "https://megaplay.buzz/"
-	}
-	return &SourceResult{
-		Sources:   sources,
-		Headers:   map[string]string{"Referer": referer},
-		Downloads: downloads,
-		Intro:     intro,
-		Outro:     outro,
-	}, nil
+	return sr, err
 }
 
-// FetchDownloadLinks returns Anikoto download links for an episode WITHOUT
-// resolving or probing stream manifests. Zoko attaches these (Anikoto-only)
-// to its servers, so downloads survive even when every Anikoto stream is
-// CDN-blocked and dropped from the server list.
-func (p *AnikotoProvider) FetchDownloadLinks(ctx context.Context, anilistID string, episode int, lang string) []core.DownloadLink {
-	if lang != "dub" {
-		lang = "sub"
-	}
-	_, showID, err := p.resolveShow(ctx, anilistID)
-	if err != nil {
-		return nil
-	}
-	dataIDs, epMeta, err := p.fetchEpisodeDataIDs(ctx, showID, episode)
-	if err != nil {
-		return nil
-	}
-	entries, err := p.fetchServers(ctx, dataIDs, "")
-	if err != nil {
-		entries = nil
-	}
-	entries = append(entries, p.fetchMapperServers(ctx, epMeta, lang)...)
-
-	var out []core.DownloadLink
-	seen := map[string]bool{}
-	for _, e := range entries {
-		lowerName := strings.ToLower(e.name)
-		if e.serverType != "dl" && !strings.Contains(lowerName, "download") &&
-			!strings.Contains(lowerName, "kiwi") {
-			continue
-		}
-		var durl string
-		if strings.HasPrefix(e.linkID, "http") {
-			durl = e.linkID
-		} else {
-			u, _, err := p.fetchVideoURL(ctx, e.linkID)
-			if err != nil || strings.TrimSpace(u) == "" {
+// storeAnikotoStale remembers a good merged result (deep-copied).
+func (p *AnikotoProvider) storeAnikotoStale(key string, sr *SourceResult) {
+	p.staleMu.Lock()
+	defer p.staleMu.Unlock()
+	if len(p.stale) >= maxAnimeXStaleEntries {
+		now := time.Now()
+		var oldestKey string
+		var oldest time.Time
+		first := true
+		for k, e := range p.stale {
+			if now.Sub(e.fetchedAt) > animexStaleTTL {
+				delete(p.stale, k)
 				continue
 			}
-			durl = u
+			if first || e.fetchedAt.Before(oldest) {
+				oldestKey, oldest, first = k, e.fetchedAt, false
+			}
 		}
-		if seen[durl] {
-			continue
+		if len(p.stale) >= maxAnimeXStaleEntries && oldestKey != "" {
+			delete(p.stale, oldestKey)
 		}
-		seen[durl] = true
-		label := strings.TrimSpace(e.name)
-		if label == "" {
-			label = "Download"
-		}
-		out = append(out, core.DownloadLink{URL: durl, Label: label})
-		p.learnURLHost(durl)
 	}
-	return out
+	p.stale[key] = &animexStaleEntry{res: cloneSourceResult(sr), fetchedAt: time.Now()}
 }
 
-// megaplayDirect resolves streams straight from megaplay.buzz, which is
-// AniList-keyed: /stream/ani/{anilistId}/{episode}/{lang}. It bypasses the
-// anikoto catalog entirely and reuses the same MegaPlay decrypt chain.
-func (p *AnikotoProvider) megaplayDirect(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
-	if lang != "dub" {
-		lang = "sub"
+// loadAnikotoStale returns the stored result while fresh.
+func (p *AnikotoProvider) loadAnikotoStale(key string) *SourceResult {
+	p.staleMu.Lock()
+	defer p.staleMu.Unlock()
+	e, ok := p.stale[key]
+	if !ok {
+		return nil
 	}
-	embedURL := fmt.Sprintf("https://megaplay.buzz/stream/ani/%s/%d/%s", anilistID, episode, lang)
-	p.log.Info().Str("url", embedURL).Msg("megaplayDirect: trying")
+	if time.Since(e.fetchedAt) > animexStaleTTL {
+		delete(p.stale, key)
+		return nil
+	}
+	return e.res
+}
+
+// anikotoFreshTTL is how long a successful resolve is served without
+// re-contacting megaplay. Short enough that a rotated file/token cannot
+// outstay its welcome for long, long enough that a burst of /servers
+// calls collapses into one upstream resolve.
+const anikotoFreshTTL = 5 * time.Minute
+
+// loadAnikotoFresh returns the last successful result within
+// anikotoFreshTTL. Expired or missing entries return nil (caller resolves
+// fresh); the wider animexStaleTTL window still backs failures up via
+// loadAnikotoStale.
+func (p *AnikotoProvider) loadAnikotoFresh(key string) *SourceResult {
+	p.staleMu.Lock()
+	defer p.staleMu.Unlock()
+	e, ok := p.stale[key]
+	if !ok || time.Since(e.fetchedAt) > anikotoFreshTTL {
+		return nil
+	}
+	return e.res
+}
+
+// megaplayBase is the megaplay host. A var (not const) so tests can point
+// the key-resolve flow at a fake server.
+var megaplayBase = "https://megaplay.buzz"
+
+// megaplayDirectKeys resolves both megaplay.buzz keys for an episode — the
+// AniList-keyed page (Niko slot) and, when malID > 0, the MAL-keyed page
+// (Momo slot) — merging them into one result with per-source slot names.
+// Serial, not parallel: if the AniList attempt proves the host is
+// rate-limiting us, the MAL page (same limiter) is skipped instead of
+// doubling down on a limiting host. A MAL result identical to the AniList
+// file collapses to Niko only.
+func (p *AnikotoProvider) megaplayDirectKeys(ctx context.Context, anilistID string, malID, episode int, lang string) (*SourceResult, error) {
+	aniURL := fmt.Sprintf("%s/stream/ani/%s/%d/%s", megaplayBase, anilistID, episode, lang)
+	aniRes, aniErr := p.megaplayDirectURL(ctx, aniURL, "ani="+anilistID)
+	var malRes *SourceResult
+	if malID > 0 && !isMegaPlayRateLimited(aniErr) {
+		if aniErr != nil && isMegaPlayMissing(aniErr) {
+			p.log.Info().Str("anilistId", anilistID).Msg("megaplayDirect: not carried ani-keyed, trying MAL key")
+		}
+		malURL := fmt.Sprintf("%s/stream/mal/%d/%d/%s", megaplayBase, malID, episode, lang)
+		var malErr error
+		malRes, malErr = p.megaplayDirectURL(ctx, malURL, fmt.Sprintf("mal=%d", malID))
+		if malErr != nil {
+			p.log.Info().Err(malErr).Str("anilistId", anilistID).Msg("megaplayDirect: MAL key failed")
+		}
+	}
+	if aniRes == nil && malRes == nil {
+		if aniErr != nil {
+			return nil, fmt.Errorf("megaplay direct: %w", aniErr)
+		}
+		return nil, fmt.Errorf("megaplay direct: no sources")
+	}
+	out := &SourceResult{}
+	var names []string
+	if aniRes != nil {
+		out.Sources = append(out.Sources, aniRes.Sources...)
+		names = append(names, "Niko")
+		out.Headers = aniRes.Headers
+		out.Intro, out.Outro = aniRes.Intro, aniRes.Outro
+	}
+	if malRes != nil && len(malRes.Sources) > 0 {
+		if len(out.Sources) > 0 && malRes.Sources[0].URL == out.Sources[0].URL {
+			p.log.Info().Str("anilistId", anilistID).Msg("megaplayDirect: MAL resolved the same file, keeping Niko only")
+		} else {
+			out.Sources = append(out.Sources, malRes.Sources...)
+			names = append(names, "Momo")
+			if out.Headers == nil {
+				out.Headers = malRes.Headers
+			}
+			if out.Intro == nil {
+				out.Intro = malRes.Intro
+			}
+			if out.Outro == nil {
+				out.Outro = malRes.Outro
+			}
+		}
+	}
+	out.ServerNames = names
+	return out, nil
+}
+
+// megaplayMALID resolves the MAL ID for an AniList ID: AniZip mappings
+// first, AniList's own idMal second (AniZip misses some titles, and this
+// path exists precisely for titles missing from one index or another).
+func (p *AnikotoProvider) megaplayMALID(ctx context.Context, anilistID string) int {
+	id, err := strconv.Atoi(anilistID)
+	if err != nil || id <= 0 {
+		return 0
+	}
+	if malID := tmdb.FetchMalID(ctx, p.client, id); malID > 0 {
+		return malID
+	}
+	return fetchAniListMALID(ctx, p.client, id)
+}
+
+// isMegaPlayMissing reports the "title not carried under this key" failure:
+// the page answers 200 but carries no data-id, so the embed resolver fails
+// with "embed file id not found". Anything else (decrypt failure, blocked
+// CDN, rate limit) is a different problem the other key will not fix — same
+// host, usually the same edges.
+func isMegaPlayMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "embed file id not found")
+}
+
+// megaplayOrigin derives the API origin for a megaplay embed URL. All
+// megaplay.buzz API routes (getSourcesNew, getSources) live at the host
+// root — including for nested player paths like /videojs/stream/..., whose
+// naive /stream/ split would point at a non-existent
+// /videojs/stream/getSourcesNew (404 on every edge, misreported as
+// blocked). Other hosts keep the legacy split behavior.
+func megaplayOrigin(embedURL string) string {
+	if u, e := url.Parse(embedURL); e == nil && u.Host != "" {
+		if u.Host == "megaplay.buzz" {
+			return u.Scheme + "://" + u.Host
+		}
+		if i := strings.Index(embedURL, "/stream/"); i != -1 {
+			return embedURL[:i]
+		}
+		return u.Scheme + "://" + u.Host
+	}
+	return embedURL
+}
+
+// MAL-keyed) through the shared MegaPlay decrypt + probe chain and builds
+// the SourceResult. This is the former megaplayDirect body, unchanged.
+// megaplayDirectURL resolves one megaplay.buzz /stream page (ani- or
+// MAL-keyed) through the shared MegaPlay decrypt + probe chain and builds
+// the SourceResult.
+func (p *AnikotoProvider) megaplayDirectURL(ctx context.Context, embedURL, label string) (*SourceResult, error) {
+	p.log.Info().Str("url", embedURL).Str("key", label).Msg("megaplayDirect: trying")
+	// Segment-depth probe, not master-depth: megaplay spreads masters and
+	// segments across edges with different Cloudflare policies (observed:
+	// nexabloom master 200 while quavex.top segments 403 on every header
+	// combination). A reachable master with blocked segments only produces
+	// a spinning player, so variants are selected by segment reachability.
 	file, tracks, inTs, outTs, origin, pOK, err := resolveMegaPlayPlayable(ctx, p.client, embedURL, func(f, o string) bool {
-		return p.probeHLS(ctx, f, o)
+		return p.probeHLSegments(ctx, f, o)
 	})
-	if err != nil || file == "" {
+	if err != nil {
 		p.log.Info().Err(err).Str("url", embedURL).Msg("megaplayDirect: resolve failed")
-		return nil, fmt.Errorf("megaplay direct: %w", err)
+		// Unwrapped: megaplayDirect matches on this error to decide
+		// whether the MAL-keyed page is worth trying; it adds context.
+		return nil, err
+	}
+	if file == "" {
+		return nil, fmt.Errorf("embed returned no file")
 	}
 	// Every CDN edge probed blocked from this egress — the media proxy would
 	// 403 too. Return an error so the caller falls through to other providers.
 	if !pOK {
 		p.log.Info().Str("file", file).Msg("megaplay direct: no playable CDN edge from this egress")
-		return nil, fmt.Errorf("megaplay direct: CDN blocked manifest")
+		return nil, fmt.Errorf("CDN blocked manifest")
 	}
 	p.log.Info().Str("file", file).Str("origin", origin).Msg("megaplayDirect: resolved")
 	p.learnURLHost(file)
@@ -517,11 +454,7 @@ func (p *AnikotoProvider) resolveEmbed(ctx context.Context, embedURL string) (fi
 // call for the HLS manifest.
 func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL string) (file string, tracks []megaplayTrack, intro, outro *core.SkipTimestamp, origin string, err error) {
 	origin = embedURL
-	if i := strings.Index(embedURL, "/stream/"); i != -1 {
-		origin = embedURL[:i]
-	} else if u, e := url.Parse(embedURL); e == nil && u.Host != "" {
-		origin = u.Scheme + "://" + u.Host
-	}
+	origin = megaplayOrigin(embedURL)
 	if i := strings.Index(embedURL, "#aHR0c"); i != -1 {
 		if raw, e := base64.StdEncoding.DecodeString(embedURL[i+1:]); e == nil {
 			if s := strings.TrimSpace(string(raw)); strings.Contains(s, ".m3u8") {
@@ -540,7 +473,8 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 	embedReq.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	embedReq.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	embedReq.Header.Set("Referer", "https://hianimes.re/")
-	embedResp, err := client.Do(embedReq)
+	// Cloudflare-blocked egress retries once through the worker proxy.
+	embedResp, err := fetchWithWorkerFallback(ctx, client, embedReq)
 	if err != nil {
 		return "", nil, nil, nil, origin, fmt.Errorf("embed page fetch failed: %w", err)
 	}
@@ -583,7 +517,7 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 		req.Header.Set("X-Requested-With", "XMLHttpRequest")
 		req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
-		resp, err := client.Do(req)
+		resp, err := fetchWithWorkerFallback(ctx, client, req)
 		if err != nil {
 			return nil, err
 		}
@@ -632,6 +566,79 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 		tracks = append(tracks, megaplayTrack{URL: t.File, Label: label})
 	}
 	return data.Sources.File, tracks, data.Intro, data.Outro, origin, nil
+}
+
+// megaplayWorkerBase is a public CORS worker used as a fallback egress
+// for megaplay.buzz fetches when Cloudflare blocks our datacenter IP
+// (429/403/5xx + challenge statuses). The worker's Cloudflare egress
+// passes where ours is refused (verified live: real embed pages + working
+// getSourcesNew through it). Used ONLY as a fallback after a direct
+// failure — never primary — so normal traffic never depends on
+// third-party generosity. ANIRAKU_MEGAPLAY_WORKER overrides without a
+// rebuild; empty disables the fallback.
+var megaplayWorkerBase = megaplayWorkerBaseFromEnv()
+
+func megaplayWorkerBaseFromEnv() string {
+	if v := os.Getenv("ANIRAKU_MEGAPLAY_WORKER"); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "https://cors-proxy.brentkennetha.workers.dev"
+}
+
+// needsWorkerRetry reports whether a failed fetch is worth one retry
+// through the worker proxy: Cloudflare statuses (429/403 rate-limit and
+// challenge pages, 5xx gateway/upstream errors) and transport errors.
+// Anything else (including a cancelled context, and 200s whose bodies
+// fail later parsing) is returned as-is.
+func needsWorkerRetry(resp *http.Response, err error) bool {
+	if err != nil {
+		return true
+	}
+	if resp == nil {
+		return true
+	}
+	switch resp.StatusCode {
+	case http.StatusTooManyRequests, http.StatusForbidden,
+		http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		520, 521, 522, 523, 524:
+		return true
+	}
+	return false
+}
+
+// fetchWithWorkerFallback performs req directly, retrying once through the
+// CORS worker proxy when Cloudflare blocks our egress. On worker failure
+// the ORIGINAL outcome is returned, so callers never see a worse error
+// than they would have without the fallback.
+func fetchWithWorkerFallback(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
+	resp, err := client.Do(req)
+	if ctx.Err() != nil || !needsWorkerRetry(resp, err) || megaplayWorkerBase == "" {
+		return resp, err
+	}
+	if resp != nil && resp.Body != nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+	}
+	wurl := megaplayWorkerBase + "/?url=" + url.QueryEscape(req.URL.String())
+	wreq, werr := http.NewRequestWithContext(ctx, req.Method, wurl, nil)
+	if werr != nil {
+		return resp, err
+	}
+	for k, vv := range req.Header {
+		for _, v := range vv {
+			wreq.Header.Add(k, v)
+		}
+	}
+	wresp, werr := client.Do(wreq)
+	if werr != nil || wresp.StatusCode != http.StatusOK {
+		if wresp != nil && wresp.Body != nil {
+			io.Copy(io.Discard, io.LimitReader(wresp.Body, 4096))
+			wresp.Body.Close()
+		}
+		return resp, err
+	}
+	return wresp, nil
 }
 
 // megaPlayEdgeVariants returns the s-param variants to try for an embed,
@@ -697,6 +704,19 @@ func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL 
 			if firstDecErr == nil {
 				firstDecErr = dErr
 			}
+			// All variants hit the same megaplay.buzz rate limiter from
+			// the same egress: a 429 on one variant means the rest will
+			// 429 too. Break instead of burning ~3 requests per
+			// remaining variant on a verdict that's already known, and
+			// record the rate limit (even over an earlier different
+			// failure) so callers know the whole host is limiting us —
+			// not that the title is missing under this key.
+			if isMegaPlayRateLimited(dErr) {
+				if firstDecErr == nil || !isMegaPlayRateLimited(firstDecErr) {
+					firstDecErr = dErr
+				}
+				break
+			}
 			continue
 		}
 		if probe == nil || probe(f, orig) {
@@ -715,37 +735,77 @@ func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL 
 	return "", nil, nil, nil, "", false, fmt.Errorf("megaplay: no sources on any edge")
 }
 
-// probeHLS verifies a manifest URL serves a real playlist right now.
-func (p *AnikotoProvider) probeHLS(ctx context.Context, fileURL, origin string) bool {
-	return probeManifestHLS(ctx, p.client, fileURL, origin)
+// isMegaPlayRateLimited reports whether an embed-resolve error is the host
+// rate-limiting this egress (HTTP 429). resolveMegaPlayEmbed surfaces the
+// embed-page status verbatim ("embed page returned HTTP 429: ..."), so a
+// substring match is precise — no other error in this chain carries a bare
+// 429.
+func isMegaPlayRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "429") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "rate limit")
 }
 
-// probeManifestHLS is the shared manifest probe: GET the playlist with the
-// embed origin referer and require an #EXTM3U header. Capped at 5s — a
-// manifest either answers quickly or the CDN is blocking this egress, and
-// blocking probes must not stall the whole fan-out.
-func probeManifestHLS(ctx context.Context, client *http.Client, fileURL, origin string) bool {
-	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, fileURL, nil)
+// probeHLSegments verifies a resolved master playlist is actually playable
+// from this egress, end to end: master -> first media playlist -> first
+// segment must all serve media bytes. See megaplayDirectURL for why
+// master-depth is not enough. Relative segment/playlist URLs resolve
+// against their parent, mirroring player behavior.
+func (p *AnikotoProvider) probeHLSegments(ctx context.Context, fileURL, origin string) bool {
+	return probeSegmentsStrict(ctx, p.client, fileURL, origin, "")
+}
+
+// firstPlaylistURL returns the first non-directive URL in a playlist,
+// resolved against the playlist's own URL like a player resolves it.
+func firstPlaylistURL(body, parent string) string {
+	base, err := url.Parse(parent)
 	if err != nil {
-		return false
+		return ""
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", strings.TrimSuffix(origin, "/")+"/")
-	resp, err := client.Do(req)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		if resp != nil {
-			resp.Body.Close()
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
 		}
+		if ref, err := url.Parse(line); err == nil {
+			return base.ResolveReference(ref).String()
+		}
+	}
+	return ""
+}
+
+// segmentBytesPlayable judges raw segment bytes by magic, never by
+// extension or host: MPEG-TS sync (0x47), ID3 timed-metadata prefix, fmp4
+// boxes (ftyp/moof), or a nested playlist all pass. Cloudflare block pages
+// (HTML) and tiny decoy payloads (1x1 PNG cloaks served instead of video)
+// fail.
+func segmentBytesPlayable(head []byte) bool {
+	if len(head) == 0 {
 		return false
 	}
-	defer resp.Body.Close()
-	head, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	if err != nil {
+	sample := string(head)
+	if len(sample) > 4096 {
+		sample = sample[:4096]
+	}
+	if strings.Contains(strings.ToLower(sample), "<html") {
 		return false
 	}
-	return strings.Contains(string(head), "#EXTM3U")
+	if head[0] == 0x47 {
+		return true
+	}
+	if len(head) >= 3 && head[0] == 'I' && head[1] == 'D' && head[2] == '3' {
+		return true
+	}
+	for _, magic := range []string{"ftyp", "moof", "#EXTM3U"} {
+		if strings.Contains(sample, magic) {
+			return true
+		}
+	}
+	return false
 }
 
 // mapSubtitleLang maps a track label to a two-letter language code.
@@ -884,126 +944,44 @@ func scoreShowCandidate(cand titleCand, meta anilistMeta) float64 {
 	return score
 }
 
-// resolveShow finds the AnikotoTV show slug and ID from an AniList ID.
-// Anivexa findAnikotoShow parity: static mapping fast path, then search the
-// full keywords (english, romaji, synonyms — no word splitting), score every
-// candidate additively, and take the top one with NO threshold and no extra
-// verification round. The old dice/0.5-threshold port failed shows like
-// AniList 8 that Anivexa resolves fine.
-func (p *AnikotoProvider) resolveShow(ctx context.Context, anilistID string) (slug string, showID string, err error) {
-	// Fast path: check static mapping
-	if entry := GetAnikotoMapping(anilistID); entry != nil {
-		p.log.Info().Str("anilistId", anilistID).Str("slug", entry.Slug).Str("showId", entry.ShowID).Msg("anikoto: resolved from mapping")
-		return entry.Slug, entry.ShowID, nil
-	}
-
-	meta, err := p.fetchAniListMeta(ctx, anilistID)
-	if err != nil {
-		return "", "", fmt.Errorf("anilist title fetch failed: %w", err)
-	}
-	queries := map[string]bool{}
-	for _, t := range meta.keywords() {
-		queries[t] = true
-	}
-	seen := map[string]*titleCand{}
-	var order []string
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for q := range queries {
-		wg.Add(1)
-		go func(q string) {
-			defer wg.Done()
-			html, err := p.searchPage(ctx, q)
-			if err != nil {
-				return
-			}
-			local := parseTitleAnchors(html)
-			mu.Lock()
-			for _, c := range local {
-				if _, ok := seen[c.slug]; !ok {
-					cp := c
-					seen[c.slug] = &cp
-					order = append(order, c.slug)
-				}
-			}
-			mu.Unlock()
-		}(q)
-	}
-	wg.Wait()
-	scored := make([]titleCand, 0, len(order))
-	for _, slug := range order {
-		c := *seen[slug]
-		c.score = scoreShowCandidate(c, meta)
-		scored = append(scored, c)
-	}
-	if len(scored) == 0 {
-		return "", "", fmt.Errorf("no search results on anikoto for anilistId=%s", anilistID)
-	}
-	sort.SliceStable(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
-
-	// Anivexa parity: take the top-scored candidate and read its show id
-	// straight off the watch page — no threshold, no verification rounds.
-	for _, c := range scored {
-		watchHTML, err := p.fetchPage(ctx, anikotoBase+"/watch/"+c.slug)
-		if err != nil {
-			continue
+// filterLatinKeywords keeps at most max Latin-script queries, preserving
+// order (English and romaji come first from keywords()). Non-Latin queries
+// can never match a Latin-script catalog — verified live against
+// anikototv.to — so they are dropped before any request is made. Shared by
+// the Anikoto and OGFLix resolvers.
+func filterLatinKeywords(keywords []string, max int) []string {
+	out := make([]string, 0, len(keywords))
+	seen := map[string]bool{}
+	for _, k := range keywords {
+		if len(out) >= max {
+			break
 		}
-		m := regexp.MustCompile(`data-id="(\d+)"`).FindStringSubmatch(watchHTML)
-		if len(m) >= 2 && m[1] != "" {
-			p.log.Info().Str("anilistId", anilistID).Str("slug", c.slug).Str("showId", m[1]).Float64("score", c.score).Msg("anikoto: resolved from search")
-			return c.slug, m[1], nil
+		if k = strings.TrimSpace(k); k != "" && !seen[k] && isLatinTitle(k) {
+			seen[k] = true
+			out = append(out, k)
 		}
 	}
-	return "", "", fmt.Errorf("no matching show found for anilistId=%s", anilistID)
+	return out
 }
 
-// searchPage fetches one Anikoto filter-search page, retrying the site's
-// intermittent backend 500s ("An Internal Error Has Occurred").
-func (p *AnikotoProvider) searchPage(ctx context.Context, q string) (string, error) {
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
-			}
-		}
-		html, err := p.searchPageOnce(ctx, q)
-		if err == nil && looksLikeFilterPage(html) {
-			return html, nil
-		}
-		if err != nil {
-			lastErr = err
-		} else {
-			lastErr = fmt.Errorf("filter page failed validation")
+// isLatinTitle reports whether s is usable as an anikoto.tv filter query:
+// the catalog is Latin-script, so a query containing CJK, Arabic, Hebrew,
+// Thai or Indic scripts can never match and only wastes a request (plus
+// retry sleeps during site flaps). Accented Latin, Cyrillic and Greek pass
+// through conservatively and fetch exactly as today.
+func isLatinTitle(s string) bool {
+	if strings.TrimSpace(s) == "" {
+		return false
+	}
+	for _, r := range s {
+		if unicode.In(r, unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul,
+			unicode.Arabic, unicode.Hebrew, unicode.Thai, unicode.Devanagari, unicode.Tamil,
+			unicode.Telugu, unicode.Kannada, unicode.Malayalam, unicode.Bengali,
+			unicode.Myanmar, unicode.Khmer, unicode.Lao) {
+			return false
 		}
 	}
-	return "", lastErr
-}
-
-func looksLikeFilterPage(html string) bool {
-	return len(html) > 20000 && strings.Contains(strings.ToLower(html), "<html")
-}
-
-func (p *AnikotoProvider) searchPageOnce(ctx context.Context, q string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		fmt.Sprintf("%s/filter?keyword=%s", anikotoBase, url.QueryEscape(q)), nil)
-	if err != nil {
-		return "", err
-	}
-	p.setAjaxHeaders(req)
-	req.Header.Del("X-Requested-With")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
+	return true
 }
 
 type titleCand struct {
@@ -1011,386 +989,6 @@ type titleCand struct {
 	name  string
 	jp    string
 	score float64
-}
-
-// parseTitleAnchors extracts title anchors (real names), falling back to
-// generic watch links when the page variant lacks them.
-func parseTitleAnchors(html string) []titleCand {
-	seen := map[string]bool{}
-	var out []titleCand
-	add := func(re *regexp.Regexp, withJp bool) {
-		for _, m := range re.FindAllStringSubmatch(html, -1) {
-			slug := m[1]
-			if seen[slug] || strings.HasPrefix(slug, "genre") || strings.HasPrefix(slug, "filter") {
-				continue
-			}
-			seen[slug] = true
-			name, jp := "", ""
-			if withJp {
-				jp = strings.TrimSpace(m[2])
-				name = strings.TrimSpace(stripHTMLTags(m[3]))
-			} else {
-				name = strings.TrimSpace(stripHTMLTags(m[2]))
-			}
-			name = strings.ReplaceAll(name, "&amp;", "&")
-			if name == "" {
-				name = slug
-			}
-			out = append(out, titleCand{slug: slug, name: name, jp: jp})
-		}
-	}
-	add(regexp.MustCompile(`<a\s+class="name d-title"\s+href="(?:https?://anikototv\.to)?/watch/([^"/]+?)(?:/ep-\d+)?"[^>]*data-jp="([^"]*)"[^>]*>(.*?)</a>`), true)
-	if len(out) == 0 {
-		add(regexp.MustCompile(`<a[^>]*href="(?:https?://anikototv\.to)?/watch/([^"/]+?)(?:/ep-\d+)?"[^>]*>(.*?)</a>`), false)
-	}
-	return out
-}
-
-// verifyCandidate checks the watch page (AniList banner proof, else exact
-// title fallback), caches the mapping, and returns slug + show ID.
-func (p *AnikotoProvider) verifyCandidate(ctx context.Context, anilistID, title, slug string, score float64, trust bool) (string, string, error) {
-	baseSlug := regexp.MustCompile(`/ep-\d+$`).ReplaceAllString(slug, "")
-	pageURL := fmt.Sprintf("%s/watch/%s", anikotoBase, slug)
-	pageHTML, err := p.fetchPage(ctx, pageURL)
-	if err != nil {
-		return "", "", err
-	}
-	showID := extractShowID(pageHTML)
-	if showID == "" {
-		showID = tipNearSlug(pageHTML, baseSlug)
-	}
-	if showID == "" {
-		return "", "", fmt.Errorf("no show id")
-	}
-	pat := regexp.MustCompile(`anilist\.co/file/anilistcdn/media/anime/(?:banner|poster)/` + anilistID + `-`)
-	if pat.MatchString(pageHTML) {
-		p.log.Info().Str("slug", baseSlug).Str("showId", showID).Msg("anikoto: resolved from search")
-		AddAnikotoMapping(anilistID, AnikotoMapping{ShowID: showID, Slug: baseSlug, Title: title})
-		return baseSlug, showID, nil
-	}
-	// Trusted winners (episode-count validated) and exact title matches
-	// are accepted without banner proof; the episode list validates after.
-	if trust || score >= 0.9 {
-		p.log.Info().Str("slug", baseSlug).Str("showId", showID).Msg("anikoto: resolved by exact title (no banner proof)")
-		AddAnikotoMapping(anilistID, AnikotoMapping{ShowID: showID, Slug: baseSlug, Title: title})
-		return baseSlug, showID, nil
-	}
-	return "", "", fmt.Errorf("no banner proof for %s", slug)
-}
-
-// selectSeries validates top candidates by episode count (Anivexa parity):
-// score = title*0.7 + count*0.3, min 0.65. Returns the winner.
-func (p *AnikotoProvider) selectSeries(ctx context.Context, scored []titleCand, meta anilistMeta) (titleCand, bool) {
-	var zero titleCand
-	if meta.episodes <= 0 || len(scored) == 0 {
-		return zero, false
-	}
-	type res struct {
-		idx   int
-		count int
-		total int
-	}
-	n := len(scored)
-	if n > 3 {
-		n = 3
-	}
-	outs := make([]res, n)
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			nums := p.fetchEpisodeNumbers(ctx, scored[i].slug)
-			inRange := 0
-			for _, num := range nums {
-				if num >= 1 && num <= meta.episodes {
-					inRange++
-				}
-			}
-			outs[i] = res{idx: i, count: inRange, total: len(nums)}
-		}(i)
-	}
-	wg.Wait()
-	best := -1.0
-	bestIdx := -1
-	for _, r := range outs {
-		if r.total == 0 {
-			continue
-		}
-		need := r.count
-		want := meta.episodes
-		if want >= 6 {
-			wantNeed := want - 3
-			if wantNeed < 1 {
-				wantNeed = 1
-			}
-			countScore := 1.0
-			if need < wantNeed {
-				countScore = float64(need) / float64(wantNeed)
-			}
-			final := scored[r.idx].score*0.7 + countScore*0.3
-			if final >= 0.65 && final > best {
-				best, bestIdx = final, r.idx
-			}
-		} else if float64(need) > best {
-			best, bestIdx = float64(need), r.idx
-		}
-	}
-	if bestIdx == -1 {
-		return zero, false
-	}
-	return scored[bestIdx], true
-}
-
-// fetchEpisodeNumbers returns all episode numbers for a slug via its show ID.
-func (p *AnikotoProvider) fetchEpisodeNumbers(ctx context.Context, slug string) []int {
-	pageHTML, err := p.fetchPage(ctx, fmt.Sprintf("%s/watch/%s", anikotoBase, slug))
-	if err != nil {
-		return nil
-	}
-	showID := extractShowID(pageHTML)
-	if showID == "" {
-		return nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		fmt.Sprintf("%s/ajax/episode/list/%s", anikotoBase, showID),
-		strings.NewReader("style=&vrf="))
-	if err != nil {
-		return nil
-	}
-	p.setAjaxHeaders(req)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-	if err != nil {
-		return nil
-	}
-	var data struct {
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &data); err != nil {
-		return nil
-	}
-	var nums []int
-	for _, m := range regexp.MustCompile(`data-num="(\d+)"`).FindAllStringSubmatch(data.Result, -1) {
-		var n int
-		fmt.Sscanf(m[1], "%d", &n)
-		if n > 0 {
-			nums = append(nums, n)
-		}
-	}
-	return nums
-}
-
-// ---- Anivexa-parity search/scoring utils (best-ever method) ----
-
-func normDice(s string) string {
-	return regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(s), "")
-}
-
-func diceCoeff(a, b string) float64 {
-	na, nb := normDice(a), normDice(b)
-	if na == nb {
-		return 1
-	}
-	if len(na) < 2 || len(nb) < 2 {
-		return 0
-	}
-	bg := map[string]int{}
-	for i := 0; i+1 < len(na); i++ {
-		bg[na[i:i+2]]++
-	}
-	hits := 0
-	for i := 0; i+1 < len(nb); i++ {
-		if bg[nb[i:i+2]] > 0 {
-			hits++
-			bg[nb[i:i+2]]--
-		}
-	}
-	return 2 * float64(hits) / float64(len(na)+len(nb)-2)
-}
-
-// titleScoreDice mirrors Anivexa titleScore: dice base with number,
-// movie-asymmetry and length penalties.
-func titleScoreDice(query, candidate, slug string) float64 {
-	slugSp := strings.ReplaceAll(slug, "-", " ")
-	base := diceCoeff(query, candidate)
-	if s := diceCoeff(query, slugSp); s > base {
-		base = s
-	}
-	// Trailing hash segments (fc8mq, 752db) are site IDs, not sequel
-	// numbers: exclude them from the digit/length penalties.
-	slugCore := regexp.MustCompile(`-[a-z0-9]*[0-9][a-z0-9]*$`).ReplaceAllString(slug, "")
-	if slugCore == "" {
-		slugCore = slug
-	}
-	slug = slugCore
-	numRe := regexp.MustCompile(`\d+`)
-	qn := numRe.FindString(normDice(query))
-	sn := numRe.FindString(slug)
-	if qn != "" && sn != "" && qn != sn {
-		return base * 0.65
-	}
-	if qn != "" && sn == "" {
-		return base * 0.65
-	}
-	if qn == "" && sn != "" {
-		var n int
-		fmt.Sscanf(sn, "%d", &n)
-		if n > 1 && n < 1900 {
-			return base * (1 - 0.06*float64(n-1))
-		}
-	}
-	lq := strings.ToLower(query)
-	movieQ := strings.Contains(lq, "movie") || strings.Contains(lq, "film")
-	movieM := strings.Contains(strings.ToLower(candidate), "movie") ||
-		strings.Contains(strings.ToLower(candidate), "film") ||
-		strings.Contains(slug, "movie") || strings.Contains(slug, "film")
-	if movieQ && !movieM {
-		return base * 0.4
-	}
-	ql, sl := len(normDice(query)), len(normDice(slugSp))
-	if float64(sl) > float64(ql)*1.6+4 {
-		return base * 0.8
-	}
-	return base
-}
-
-// buildSearchQueries mirrors Anivexa: full title, first-4, first-3 words,
-// season/part/ordinal-stripped variant.
-func buildSearchQueries(title string) []string {
-	seen := map[string]bool{}
-	var out []string
-	add := func(q string) {
-		q = strings.TrimSpace(regexp.MustCompile(`\s+`).ReplaceAllString(q, " "))
-		if len(q) >= 3 && !seen[q] {
-			seen[q] = true
-			out = append(out, q)
-		}
-	}
-	add(title)
-	words := strings.Fields(title)
-	if len(words) > 4 {
-		add(strings.Join(words[:4], " "))
-	}
-	if len(words) > 3 {
-		add(strings.Join(words[:3], " "))
-	}
-	stripped := regexp.MustCompile(`(?i)\bseason\s*\d+\b|\bpart\s*\d+\b|\b\d+(rd|th|st|nd)\b`).ReplaceAllString(title, "")
-	if strings.TrimSpace(stripped) != strings.TrimSpace(title) {
-		add(stripped)
-	}
-	return out
-}
-
-// normShowTitle normalizes a title for fuzzy comparison.
-func normShowTitle(s string) string {
-	return regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(s), "")
-}
-
-// stripHTMLTags removes tags from a snippet.
-func stripHTMLTags(s string) string {
-	return regexp.MustCompile(`<[^>]+>`).ReplaceAllString(s, "")
-}
-
-// titleScore ranks a candidate slug/name against the wanted title.
-func titleScore(cand, want string) int {
-	return titleScoreEx(cand, "", want)
-}
-
-// titleScoreEx scores name + Japanese name against the wanted title.
-func titleScoreEx(cand, candJp, want string) int {
-	if want == "" {
-		return 0
-	}
-	score := 0
-	if candJp != "" && candJp == want {
-		score = 800
-	}
-	switch {
-	case cand == "" && score == 0:
-		return 0
-	case cand == want:
-		score = 1000
-	case strings.HasPrefix(cand, want) || strings.HasPrefix(want, cand):
-		if score < 80 {
-			score = 80
-		}
-	case strings.Contains(cand, want) || strings.Contains(want, cand):
-		if score < 40 {
-			score = 40
-		}
-	default:
-		if score == 0 {
-			score = 1
-		}
-	}
-	lowerWant := strings.ToLower(want)
-	lowerCand := strings.ToLower(cand)
-	for _, mod := range showModifiers {
-		if strings.Contains(lowerCand, mod) && !strings.Contains(lowerWant, mod) {
-			score -= 300
-		}
-	}
-	return score
-}
-
-// tipNearSlug finds the closest data-tip show ID before a slug occurrence.
-func tipNearSlug(html, slug string) string {
-	idx := strings.Index(html, "/watch/"+slug)
-	if idx == -1 {
-		return ""
-	}
-	window := html[maxInt(0, idx-3000):idx]
-	re := regexp.MustCompile(`data-tip="(\d+)"`)
-	matches := re.FindAllStringSubmatch(window, -1)
-	if len(matches) == 0 {
-		return ""
-	}
-	return matches[len(matches)-1][1]
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-// extractShowID pulls the data-id from the watch-main div.
-func extractShowID(html string) string {
-	re := regexp.MustCompile(`id="watch-main"[^>]*data-id="(\d+)"`)
-	m := re.FindStringSubmatch(html)
-	if len(m) >= 2 {
-		return m[1]
-	}
-	return ""
-}
-
-// fetchAniListTitle queries AniList GraphQL for the English or romaji title.
-func (p *AnikotoProvider) fetchAniListTitle(ctx context.Context, anilistID string) (string, error) {
-	m, err := p.fetchAniListMeta(ctx, anilistID)
-	if err != nil {
-		return "", err
-	}
-	if m.english != "" {
-		return m.english, nil
-	}
-	if m.romaji != "" {
-		return m.romaji, nil
-	}
-	return "", fmt.Errorf("no title found for anilistId=%s", anilistID)
-}
-
-// fetchAniListMeta resolves titles + synonyms for an AniList ID. Package-level
-// so the OGFLix provider shares the exact same lookup (AniList GraphQL with
-// AniZip fallback).
-func (p *AnikotoProvider) fetchAniListMeta(ctx context.Context, anilistID string) (anilistMeta, error) {
-	return fetchAniListMetaFor(ctx, p.client, anilistID)
 }
 
 // fetchAniListMetaFor is the shared AniList meta lookup. Primary source is
@@ -1491,308 +1089,4 @@ func fetchAniListMetaUpstream(ctx context.Context, client *http.Client, anilistI
 		return out, fmt.Errorf("no title found for anilistId=%s", anilistID)
 	}
 	return out, nil
-}
-
-// anikotoEpisode represents an episode entry from the HTML.
-type anikotoEpisode struct {
-	slug    string
-	dataIDs string
-	number  int
-}
-
-// anikotoEpMeta carries episode-list attributes needed downstream
-// (mapper lookup needs mal/slug/timestamp).
-type anikotoEpMeta struct {
-	mal       string
-	slug      string
-	timestamp string
-}
-
-// fetchMapperServers queries the nekostream mapper for extra servers and
-// download links (Anivexa parity). Entries with http link IDs are direct
-// embed URLs; name suffixes are trimmed like Anivexa.
-func (p *AnikotoProvider) fetchMapperServers(ctx context.Context, meta anikotoEpMeta, lang string) []anikotoServerEntry {
-	if meta.mal == "" || meta.slug == "" || meta.timestamp == "" {
-		return nil
-	}
-	u := fmt.Sprintf("https://mapper.nekostream.site/api/mal/%s/%s/%s",
-		url.PathEscape(meta.mal), url.PathEscape(meta.slug), url.PathEscape(meta.timestamp))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Referer", anikotoBase+"/")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return nil
-	}
-	// Generic decode: keys are server names with trailing -/_ trimmed.
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil
-	}
-	var out []anikotoServerEntry
-	for key, val := range raw {
-		if key == "status" {
-			continue
-		}
-		name := strings.Trim(strings.Trim(key, "-_"), " ")
-		var s struct {
-			URL      string            `json:"url"`
-			Download map[string]string `json:"download"`
-		}
-		// pick audio branch
-		var branch map[string]json.RawMessage
-		if err := json.Unmarshal(val, &branch); err != nil {
-			continue
-		}
-		ab, ok := branch[lang]
-		if !ok {
-			continue
-		}
-		if err := json.Unmarshal(ab, &s); err != nil {
-			continue
-		}
-		if s.URL != "" {
-			out = append(out, anikotoServerEntry{linkID: s.URL, name: name, serverType: lang})
-		}
-		for label, durl := range s.Download {
-			if durl != "" {
-				out = append(out, anikotoServerEntry{linkID: durl, name: name + " " + label, serverType: "dl"})
-			}
-		}
-	}
-	return out
-}
-
-// fetchEpisodeDataIDs fetches the episode list and returns the data-ids plus
-// mapper attributes for the target episode.
-func (p *AnikotoProvider) fetchEpisodeDataIDs(ctx context.Context, showID string, episode int) (string, anikotoEpMeta, error) {
-	// POST with empty style/vrf — the site requires this body
-	episodeURL := fmt.Sprintf("%s/ajax/episode/list/%s", anikotoBase, showID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, episodeURL, strings.NewReader("style=&vrf="))
-	if err != nil {
-		return "", anikotoEpMeta{}, err
-	}
-	p.setAjaxHeaders(req)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", anikotoEpMeta{}, fmt.Errorf("episode list request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
-	if err != nil {
-		return "", anikotoEpMeta{}, err
-	}
-
-	var result struct {
-		Status int    `json:"status"`
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", anikotoEpMeta{}, err
-	}
-	if result.Status != 200 {
-		return "", anikotoEpMeta{}, fmt.Errorf("episode list returned status %d", result.Status)
-	}
-
-	// Parse episode links: <a ... data-num="6" data-ids="..." ...>.
-	// data-num is authoritative (data-slug is an internal id on some pages).
-	episodeStr := strconv.Itoa(episode)
-	for _, pat := range []string{
-		`<a[^>]*?data-num="(\d+)"[^>]*?>`,
-		`<a[^>]*?data-slug="(\d+)"[^>]*?>`,
-	} {
-		re := regexp.MustCompile(pat)
-		for _, idx := range re.FindAllStringSubmatchIndex(result.Result, -1) {
-			if result.Result[idx[2]:idx[3]] != episodeStr {
-				continue
-			}
-			// Grab the whole tag for attribute extraction.
-			end := idx[1]
-			if j := indexOf(result.Result[end:], ">"); j >= 0 {
-				end += j
-			}
-			tag := result.Result[idx[0]:end]
-			ids := attrValue(tag, "data-ids")
-			if ids == "" {
-				continue
-			}
-			return ids, anikotoEpMeta{
-				mal:       attrValue(tag, "data-mal"),
-				slug:      attrValue(tag, "data-slug"),
-				timestamp: attrValue(tag, "data-timestamp"),
-			}, nil
-		}
-	}
-
-	return "", anikotoEpMeta{}, fmt.Errorf("episode %d not found in list", episode)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
-
-// anikotoServerEntry represents a server from the API.
-type anikotoServerEntry struct {
-	linkID     string
-	svID       string
-	name       string
-	serverType string
-}
-
-// fetchServers fetches the server list for a given data-ids and language.
-func (p *AnikotoProvider) fetchServers(ctx context.Context, dataIDs string, lang string) ([]anikotoServerEntry, error) {
-	serverURL := fmt.Sprintf("%s/ajax/server/list?servers=%s", anikotoBase, url.QueryEscape(dataIDs))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	p.setAjaxHeaders(req)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("server list request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return nil, err
-	}
-
-	var result struct {
-		Status int    `json:"status"`
-		Result string `json:"result"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, err
-	}
-	if result.Status != 200 {
-		return nil, fmt.Errorf("server list returned status %d", result.Status)
-	}
-
-	// Parse server HTML. Type blocks are bounded (each block ends where the
-	// next data-type block starts) so entries never leak across languages.
-	// <li> attributes are extracted independently — attribute ORDER varies.
-	var entries []anikotoServerEntry
-	typeRe := regexp.MustCompile(`<div[^>]*?class="type"[^>]*?data-type="([^"]+)"`)
-	locs := typeRe.FindAllStringSubmatchIndex(result.Result, -1)
-	stripTags := regexp.MustCompile(`<[^>]+>`)
-	for i, loc := range locs {
-		serverType := result.Result[loc[2]:loc[3]]
-		blockEnd := len(result.Result)
-		if i+1 < len(locs) {
-			blockEnd = locs[i+1][0]
-		}
-		block := result.Result[loc[1]:blockEnd]
-		for _, li := range regexp.MustCompile(`(?s)<li\b(.*?)>(.*?)</li>`).FindAllStringSubmatch(block, -1) {
-			attrs, inner := li[1], li[2]
-			linkID := attrValue(attrs, "data-link-id")
-			if linkID == "" {
-				continue
-			}
-			name := strings.TrimSpace(stripTags.ReplaceAllString(inner, ""))
-			entries = append(entries, anikotoServerEntry{
-				linkID:     linkID,
-				svID:       attrValue(attrs, "data-sv-id"),
-				name:       name,
-				serverType: serverType,
-			})
-		}
-		_ = lang
-	}
-
-	return entries, nil
-}
-
-// attrValue extracts one HTML attribute value from a tag-attribute string.
-func attrValue(attrs, name string) string {
-	m := regexp.MustCompile(regexp.QuoteMeta(name) + `="([^"]*)"`).FindStringSubmatch(attrs)
-	if len(m) >= 2 {
-		return m[1]
-	}
-	return ""
-}
-
-// fetchVideoURL gets the actual video iframe URL for a server link.
-func (p *AnikotoProvider) fetchVideoURL(ctx context.Context, linkID string) (string, map[string][]float64, error) {
-	serverURL := fmt.Sprintf("%s/ajax/server?get=%s", anikotoBase, url.QueryEscape(linkID))
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL, nil)
-	if err != nil {
-		return "", nil, err
-	}
-	p.setAjaxHeaders(req)
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", nil, fmt.Errorf("video URL request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return "", nil, err
-	}
-
-	var result struct {
-		Status int `json:"status"`
-		Result struct {
-			URL      string               `json:"url"`
-			SkipData map[string][]float64 `json:"skip_data"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", nil, err
-	}
-	if result.Status != 200 {
-		return "", nil, fmt.Errorf("video URL returned status %d", result.Status)
-	}
-
-	return result.Result.URL, result.Result.SkipData, nil
-}
-
-// setAjaxHeaders sets the standard headers for anikoto AJAX requests.
-func (p *AnikotoProvider) setAjaxHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("Accept", "application/json, text/javascript, */*; q=0.01")
-	req.Header.Set("Referer", anikotoBase+"/")
-}
-
-// fetchPage does a simple GET with browser UA and returns the response body as string.
-func (p *AnikotoProvider) fetchPage(ctx context.Context, pageURL string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml")
-	req.Header.Set("Referer", anikotoBase+"/")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return "", err
-	}
-	return string(body), nil
 }

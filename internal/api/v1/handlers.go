@@ -174,14 +174,8 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 	h.anilistClient = newAnilistClient(h)
 	h.anilistCircuit = newCircuitBreaker()
 
-	// Load AnikotoTV AniList→slug mapping (bundled in the binary by default;
-	// a configured ANIRAKU_ANIKOTO_MAPPING_PATH overrides it). Best-effort,
-	// non-fatal.
-	if err := streaming.LoadAnikotoMapping(cfg.Server.AnikotoMappingPath); err != nil {
-		log.Warn().Err(err).Str("path", cfg.Server.AnikotoMappingPath).Msg("anikoto: mapping not loaded, will search dynamically")
-	} else {
-		log.Info().Msg("anikoto: mapping loaded")
-	}
+	// AnikotoTV resolves directly from megaplay.buzz (AniList/MAL-keyed);
+	// no show-mapping state is needed.
 
 	// Anikoto-verified hosts (probeHLS-passed stream hosts, subtitle hosts,
 	// download hosts) feed the media-proxy CDN allowlist as they surface, so
