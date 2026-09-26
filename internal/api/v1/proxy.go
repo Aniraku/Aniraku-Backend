@@ -563,6 +563,18 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 	if rc := http.NewResponseController(w); rc != nil {
 		_ = rc.SetWriteDeadline(time.Time{})
 	}
+
+	// VOD segments and subtitles are immutable bytes — let the browser keep
+	// them. The no-store set at the top of the handler exists for playlists,
+	// whose rewritten child URLs carry per-request nonces; for segments it
+	// forced every seek-back, loop restart and quality-switch return to
+	// re-hit the origin — added round-trip time that shows up as buffering
+	// exactly when the segment mirrors are slow. Only full 200s qualify: a
+	// 206 must never be stored as the whole resource, and errors (404/5xx)
+	// stay uncached. Keys keep their own max-age=300 branch above.
+	if resp.StatusCode == http.StatusOK {
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+	}
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
 	if n, err := io.Copy(w, resp.Body); err != nil {
