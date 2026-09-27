@@ -57,13 +57,57 @@ const episodeCacheTTL = 30 * time.Minute
 // just refetches) or, over the cap, the stalest entry first.
 const maxEpisodeCacheEntries = 2000
 
+// entryLockWaitMax bounds every wait on an episode-cache entry lock.
+// Normal critical sections (map read/merge) last microseconds; if a lock
+// cannot be acquired within this budget, something is wrong and the caller
+// must degrade (cache miss / dropped write) instead of blocking — a request
+// path that waits on a mutex with no deadline can hang forever, ignoring
+// every context timeout above it. This is the hard guarantee behind the
+// 2026-09-27 deadlock fix: the episodes endpoint stays alive even if an
+// entry lock ever wedges again.
+const entryLockWaitMax = 50 * time.Millisecond
+
+// lockEntryW acquires the entry write lock with a deadline. False means
+// "skip the write" — dropping a cache write is always safe (the data is
+// derived and refetchable), hanging a request is never acceptable.
+func lockEntryW(entry *episodeCacheEntry) bool {
+	waitUntil := time.Now().Add(entryLockWaitMax)
+	for {
+		if entry.mu.TryLock() {
+			return true
+		}
+		if time.Now().After(waitUntil) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// lockEntryR acquires the entry read lock with a deadline. False means
+// "treat as cache miss" — the handler refetches upstream (slow for one
+// anime, but alive), instead of blocking on a wedged lock.
+func lockEntryR(entry *episodeCacheEntry) bool {
+	waitUntil := time.Now().Add(entryLockWaitMax)
+	for {
+		if entry.mu.TryRLock() {
+			return true
+		}
+		if time.Now().After(waitUntil) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func GetCachedEpisodes(anilistID int, nums []int) map[int]*EpisodeMetadata {
 	val, ok := episodeCache.Load(anilistID)
 	if !ok {
 		return nil
 	}
 	entry := val.(*episodeCacheEntry)
-	entry.mu.RLock()
+	if !lockEntryR(entry) {
+		return nil
+	}
 	defer entry.mu.RUnlock()
 	if time.Since(entry.fetchedAt) > episodeCacheTTL {
 		return nil
@@ -82,17 +126,24 @@ func GetCachedEpisodes(anilistID int, nums []int) map[int]*EpisodeMetadata {
 }
 
 func setCachedEpisodes(anilistID int, data map[int]*EpisodeMetadata) {
+	// New entries are fully initialized OFF the map and published once:
+	// no reader can ever observe a half-built entry, and eviction below
+	// runs with no entry lock held by this goroutine.
 	val, ok := episodeCache.Load(anilistID)
-	var entry *episodeCacheEntry
 	if !ok {
-		entry = &episodeCacheEntry{episodes: data, fetchedAt: time.Now()}
-		episodeCache.Store(anilistID, entry)
-		evictEpisodeCacheIfNeeded()
+		entry := &episodeCacheEntry{episodes: data, fetchedAt: time.Now()}
+		if _, loaded := episodeCache.LoadOrStore(anilistID, entry); !loaded {
+			evictEpisodeCacheIfNeeded()
+			return
+		}
+		val, _ = episodeCache.Load(anilistID)
+	}
+	entry := val.(*episodeCacheEntry)
+	// Bounded write: if the lock is wedged we drop this cache write
+	// (derived data, refetchable) instead of hanging the request.
+	if !lockEntryW(entry) {
 		return
 	}
-	entry = val.(*episodeCacheEntry)
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
 	if entry.episodes == nil {
 		entry.episodes = data
 	} else {
@@ -101,6 +152,12 @@ func setCachedEpisodes(anilistID int, data map[int]*EpisodeMetadata) {
 		}
 	}
 	entry.fetchedAt = time.Now()
+	entry.mu.Unlock()
+	// Eviction runs AFTER the entry lock is released. Calling it under the
+	// lock was the 2026-09-27 production deadlock: the Range callback takes
+	// each entry's RLock, including the one this goroutine already
+	// write-locks (Go's RWMutex is not reentrant), permanently poisoning
+	// the entry and cascading through every later cache write.
 	evictEpisodeCacheIfNeeded()
 }
 
@@ -121,7 +178,14 @@ func evictEpisodeCacheIfNeeded() {
 			expired = append(expired, k)
 			return true
 		}
-		entry.mu.RLock()
+		// Never block the eviction scan on an entry lock: a locked entry
+		// is in active use (hence fresh), so count it as fresh and move
+		// on. Blocking here is what turned one wedged entry into a
+		// cache-wide cascade on 2026-09-27.
+		if !entry.mu.TryRLock() {
+			count++
+			return true
+		}
 		fetched := entry.fetchedAt
 		entry.mu.RUnlock()
 		if time.Since(fetched) > episodeCacheTTL {
