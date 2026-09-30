@@ -161,7 +161,8 @@ func TestKaaFindEpisodeSource(t *testing.T) {
 }
 
 // Strict per-lang rule: sub reads ja-JP, dub reads en-US, each resolves
-// independently — and dub sources carry the SUB page's subtitle files.
+// independently. The dub resolve carries its own (en-US) page files here;
+// Manager.withDubSubtitles replaces them with the sub page's files.
 func TestKaaStrictPerLang(t *testing.T) {
 	f := newKaaFixture(t)
 	p := newKaaTestProvider(f)
@@ -177,8 +178,8 @@ func TestKaaStrictPerLang(t *testing.T) {
 	if n := atomic.LoadInt64(f.masterHits); n != 2 {
 		t.Fatalf("master fetched %d times, want 2 (one per lang)", n)
 	}
-	if len(dub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(dub.Sources[0].Subtitles[0].URL, "/vtt-sub.vtt") {
-		t.Fatalf("dub subtitles = %+v, want the SUB page vtt, not vtt-dub", dub.Sources[0].Subtitles)
+	if len(dub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(dub.Sources[0].Subtitles[0].URL, "/vtt-dub.vtt") {
+		t.Fatalf("provider dub subtitles = %+v, want the resolving (en-US) page vtt", dub.Sources[0].Subtitles)
 	}
 	if len(sub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(sub.Sources[0].Subtitles[0].URL, "/vtt-sub.vtt") {
 		t.Fatalf("sub subtitles = %+v, want the SUB page vtt", sub.Sources[0].Subtitles)

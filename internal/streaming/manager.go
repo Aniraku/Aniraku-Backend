@@ -975,8 +975,8 @@ func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, qu
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
-	// kaa already attaches the SUB player page's subtitle files on dub
-	// resolves; this is the backstop for the all-providers rule.
+	// Dub subtitle files come from the same provider's sub resolve
+	// (withDubSubtitles, enforced for every provider).
 	source = m.withDubSubtitles(ctx, "kaa", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
@@ -992,23 +992,16 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 }
 
 // withDubSubtitles enforces the operator rule: dub server sources carry the
-// SUB-language subtitle files. A sub resolve is fetched only when at least
-// one dub source lacks subtitles — dub results that already have them cost
-// zero extra upstream calls. Failures keep the dub result as-is (best
-// effort: subtitles must never fail playback). The input is never mutated:
-// provider caches may share the pointed-to result.
+// SUB-language subtitle files — the same files the sub listing serves, not
+// the dub resolve's own. Per source, subtitles are matched by upstream URL
+// (same stream → identical files); dub sources with no sub-side match get
+// the merged sub subtitle list. The sub resolve is fetched whenever dub
+// sources exist, because a mismatch is only visible after comparing.
+// Failures keep the dub result as-is (best effort: subtitles must never
+// fail playback). The input is never mutated: provider caches may share
+// the pointed-to result.
 func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistID string, episode int, sr *SourceResult) *SourceResult {
-	if !strings.EqualFold(lang, "dub") || sr == nil {
-		return sr
-	}
-	need := false
-	for i := range sr.Sources {
-		if len(sr.Sources[i].Subtitles) == 0 {
-			need = true
-			break
-		}
-	}
-	if !need {
+	if !strings.EqualFold(lang, "dub") || sr == nil || len(sr.Sources) == 0 {
 		return sr
 	}
 	var prov Provider
@@ -1027,28 +1020,57 @@ func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistI
 			Int("episode", episode).Msg("dub subtitles: sub resolve unavailable, keeping dub as-is")
 		return sr
 	}
+	subByURL := map[string][]core.Subtitle{}
 	seen := map[string]bool{}
-	var subs []core.Subtitle
+	var merged []core.Subtitle
 	for i := range sub.Sources {
-		for _, st := range sub.Sources[i].Subtitles {
+		s := &sub.Sources[i]
+		if len(s.Subtitles) > 0 && s.URL != "" {
+			subByURL[s.URL] = s.Subtitles
+		}
+		for _, st := range s.Subtitles {
 			if st.URL == "" || seen[st.URL] {
 				continue
 			}
 			seen[st.URL] = true
-			subs = append(subs, st)
+			merged = append(merged, st)
 		}
 	}
-	if len(subs) == 0 {
+	if len(merged) == 0 {
 		return sr
 	}
 	out := *sr
 	out.Sources = append([]core.Source(nil), sr.Sources...)
+	changed := false
 	for i := range out.Sources {
-		if len(out.Sources[i].Subtitles) == 0 {
-			out.Sources[i].Subtitles = subs
+		want, ok := subByURL[out.Sources[i].URL]
+		if !ok {
+			want = merged
+		}
+		if !sameSubtitleURLs(out.Sources[i].Subtitles, want) {
+			out.Sources[i].Subtitles = want
+			changed = true
 		}
 	}
+	if !changed {
+		return sr
+	}
 	return &out
+}
+
+// sameSubtitleURLs reports whether two subtitle lists carry the same files
+// in order (tags may differ — only the file identity matters for the
+// dub-uses-sub-files rule).
+func sameSubtitleURLs(a, b []core.Subtitle) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].URL != b[i].URL {
+			return false
+		}
+	}
+	return true
 }
 
 // collectKaaServers maps kaa.lt sources to per-player servers (VidStreaming,
