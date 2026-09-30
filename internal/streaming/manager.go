@@ -692,8 +692,9 @@ func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server,
 	if len(nnServers) == 0 {
 		return nnServers
 	}
-	// Dub listings already carry the nico subtitle files (withDubSubtitles)
-	// — never overwrite those with provider dub files; only fill sources
+	// Dub listings carry their default subtitles, except Sora (animex),
+	// whose sources already received the nico files via withDubSubtitles —
+	// never overwrite those with provider dub files; only fill sources
 	// that somehow have none (nico unavailable for the title).
 	fillEmptyOnly := strings.EqualFold(lang, "dub")
 	var donor []core.Subtitle
@@ -982,8 +983,8 @@ func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, qu
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
-	// Dub subtitle files come from the same provider's sub resolve
-	// (withDubSubtitles, enforced for every provider).
+	// Dub subtitle files: Sora (animex) dub uses the nico files
+	// (withDubSubtitles); every other provider keeps its defaults.
 	source = m.withDubSubtitles(ctx, "kaa", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
@@ -998,16 +999,18 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 	return nil
 }
 
-// withDubSubtitles enforces the operator rule: EVERY dub server source
-// carries the nico (kaa) subtitle files — never its own provider's sub
-// files. The kaa sub resolve is the single subtitle origin for dub across
-// all providers; per-source URL matching is gone because the origin is
-// fixed. kaa is fetched only on dub requests; when kaa is unconfigured,
-// has no match, or carries no subtitles, the dub result is kept as-is
-// (best effort: subtitles must never fail playback). The input is never
-// mutated: provider caches may share the pointed-to result.
+// withDubSubtitles enforces the operator rule: Sora (animex) dub sources
+// carry the nico (kaa) subtitle files. Sora serves krussdomi streams, so
+// nico subs are timing-compatible; every other provider's dub keeps its
+// default subtitles. kaa is fetched only for Sora dub requests; when kaa
+// is unconfigured, has no match, or carries no subtitles, the dub result
+// is kept as-is (best effort: subtitles must never fail playback). The
+// input is never mutated: provider caches may share the pointed-to result.
 func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistID string, episode int, sr *SourceResult) *SourceResult {
 	if !strings.EqualFold(lang, "dub") || sr == nil || len(sr.Sources) == 0 {
+		return sr
+	}
+	if provider != "animex" || !strings.EqualFold(sr.ServerName, "sora") {
 		return sr
 	}
 	ka := m.getKaaProvider()

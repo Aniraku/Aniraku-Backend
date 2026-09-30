@@ -55,10 +55,9 @@ import (
 // SERVER NAMES (operator): kaa servers are named by position — nico, robin,
 // D'Luff, then the same crew scheme — never raw player names.
 //
-// SUBTITLE RULE (operator): dub sources carry the SUB (ja-JP) page's
-// subtitle files. Enforced centrally by Manager.withDubSubtitles (per
-// upstream URL match, merged-list fallback) across all providers —
-// kaa only extracts its resolving page's own files here.
+// SUBTITLE RULE (operator): Sora (animex) dub sources carry the nico
+// subtitle files, enforced centrally by Manager.withDubSubtitles — every
+// other provider's dub keeps its default subtitles.
 const (
 	kaaAPIBase     = "https://kaa.lt"
 	kaaKrussOrigin = "https://krussdomi.com"
