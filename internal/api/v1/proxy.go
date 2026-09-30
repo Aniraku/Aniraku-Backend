@@ -81,13 +81,15 @@ func proxyStreamResult(r *http.Request, result *core.StreamResult, lang string) 
 	if result == nil {
 		return
 	}
-	proxySources(r, result.Sources, result.Headers, lang)
+	result.Sources = proxySources(r, result.Sources, result.Headers, lang)
 }
 
-func proxySources(r *http.Request, sources []core.Source, headers map[string]string, lang string) {
+func proxySources(r *http.Request, sources []core.Source, headers map[string]string, lang string) []core.Source {
+	out := make([]core.Source, len(sources))
+	copy(out, sources)
 	headersJSON, err := json.Marshal(headers)
 	if err != nil {
-		return
+		return out
 	}
 	headersParam := url.QueryEscape(string(headersJSON))
 	proxyBase := requestPublicBaseURL(r)
@@ -98,8 +100,8 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	if lang == "sub" || lang == "dub" {
 		alParam = "&al=" + lang
 	}
-	for i := range sources {
-		source := &sources[i]
+	for i := range out {
+		source := &out[i]
 		if strings.ToLower(source.Type) != "hls" || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
 			continue
 		}
@@ -110,6 +112,12 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 		// Subtitle hosts are still vouched for the allowlist by the provider
 		// (learnURLHost), so the proxy accepts them.
 	}
+	// The input slice is never mutated: provider resolve caches share their
+	// SourceResult backing arrays across requests, and wrapping in place
+	// baked the first request's proxyBase + al into every later response
+	// (observed: local 127.0.0.1 links and al=dub served on production sub
+	// requests). Callers use the returned copy.
+	return out
 }
 
 func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +200,7 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 
 	servers := h.stream.FindAllServers(ctx, anilistID, episode, lang, genres)
 	for i := range servers {
-		proxySources(r, servers[i].Sources, servers[i].Headers, lang)
+		servers[i].Sources = proxySources(r, servers[i].Sources, servers[i].Headers, lang)
 	}
 	if servers == nil {
 		servers = []core.Server{}

@@ -473,7 +473,9 @@ func (p *AnimeXProvider) loadStale(key string) *SourceResult {
 		delete(p.stale, key)
 		return nil
 	}
-	return e.res
+	// Deep copy: the proxy wrap and subtitle merge must never mutate the
+	// cached entry through the shared backing array.
+	return cloneSourceResult(e.res)
 }
 
 // cloneSourceResult deep-copies the mutable parts of a result so the stale

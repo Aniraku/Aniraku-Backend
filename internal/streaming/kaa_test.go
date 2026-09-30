@@ -27,6 +27,12 @@ type kaaFixture struct {
 	masterHits    *int64
 	segmentOrigin *string
 	emptyEpisodes bool
+	// dubNoPlayers emulates shows whose en-US listing page carries zero
+	// embeds (observed: Noblesse ep1) — strict per-lang means dub fails.
+	dubNoPlayers bool
+	// floatPages emulates page markers with fractional episode numbers
+	// (observed 14.5) that must not break episode listing.
+	floatPages bool
 }
 
 func newKaaFixture(t *testing.T) *kaaFixture {
@@ -41,8 +47,7 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	mux.HandleFunc("/api/show/naruto-f3cf/episodes", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		// Lang-aware watch slugs (like production): each lang page has
-		// its own player page and subtitle set, but both players serve
-		// the SAME master (dual-language rule).
+		// its own player page and subtitle set.
 		slug := "subslug"
 		if r.URL.Query().Get("lang") == "en-US" {
 			slug = "dubslug"
@@ -51,7 +56,14 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 			fmt.Fprint(w, `{"result":[],"pages":[]}`)
 			return
 		}
-		fmt.Fprintf(w, `{"result":[{"episode_number":1,"slug":%q,"title":"Enter"}],"pages":[]}`, slug)
+		if f.dubNoPlayers && r.URL.Query().Get("lang") == "en-US" {
+			slug = "dubempty"
+		}
+		pages := `[]`
+		if f.floatPages {
+			pages = `[{"number":1,"from":"01","to":"13","eps":[1,14.5]}]`
+		}
+		fmt.Fprintf(w, `{"result":[{"episode_number":1,"slug":%q,"title":"Enter"}],"pages":%s}`, slug, pages)
 	})
 	mux.HandleFunc("/naruto-f3cf/ep-1-subslug", func(w http.ResponseWriter, r *http.Request) {
 		player := kaaURL + "/subplayer?id=1"
@@ -60,6 +72,9 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	mux.HandleFunc("/naruto-f3cf/ep-1-dubslug", func(w http.ResponseWriter, r *http.Request) {
 		player := kaaURL + "/dubplayer?id=2"
 		fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s"}</html>`, player)
+	})
+	mux.HandleFunc("/naruto-f3cf/ep-1-dubempty", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><body>no embeds on this page</body></html>`)
 	})
 	mux.HandleFunc("/subplayer", func(w http.ResponseWriter, r *http.Request) {
 		master := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/master.m3u8`
@@ -145,9 +160,9 @@ func TestKaaFindEpisodeSource(t *testing.T) {
 	}
 }
 
-// Dual-language rule: sub then dub must fetch the master exactly once, and
-// dub sources must carry the SUB page's subtitle files.
-func TestKaaDualLangShared(t *testing.T) {
+// Strict per-lang rule: sub reads ja-JP, dub reads en-US, each resolves
+// independently — and dub sources carry the SUB page's subtitle files.
+func TestKaaStrictPerLang(t *testing.T) {
 	f := newKaaFixture(t)
 	p := newKaaTestProvider(f)
 	sub, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
@@ -158,14 +173,103 @@ func TestKaaDualLangShared(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dub: %v", err)
 	}
-	if sub.Sources[0].URL != dub.Sources[0].URL {
-		t.Fatalf("sub/dub URLs differ: %q vs %q", sub.Sources[0].URL, dub.Sources[0].URL)
-	}
-	if n := atomic.LoadInt64(f.masterHits); n != 1 {
-		t.Fatalf("master fetched %d times, want 1 (shared across langs)", n)
+	// Independent upstream resolves per lang (no cross-lang cache share).
+	if n := atomic.LoadInt64(f.masterHits); n != 2 {
+		t.Fatalf("master fetched %d times, want 2 (one per lang)", n)
 	}
 	if len(dub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(dub.Sources[0].Subtitles[0].URL, "/vtt-sub.vtt") {
 		t.Fatalf("dub subtitles = %+v, want the SUB page vtt, not vtt-dub", dub.Sources[0].Subtitles)
+	}
+	if len(sub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(sub.Sources[0].Subtitles[0].URL, "/vtt-sub.vtt") {
+		t.Fatalf("sub subtitles = %+v, want the SUB page vtt", sub.Sources[0].Subtitles)
+	}
+}
+
+// No dub embeds, no dub server: an en-US page without players fails the
+// dub resolve while sub keeps working (fresh provider = empty cache).
+func TestKaaDubMissingWhenNoPlayers(t *testing.T) {
+	f := newKaaFixture(t)
+	f.dubNoPlayers = true
+	p := newKaaTestProvider(f)
+	if _, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "dub"); err == nil {
+		t.Fatal("expected dub to fail when the en-US page has no players")
+	}
+	if _, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub"); err != nil {
+		t.Fatalf("sub must still resolve: %v", err)
+	}
+}
+
+// Fractional page markers (observed 14.5) must not break episode listing.
+func TestKaaFloatPageMarkers(t *testing.T) {
+	f := newKaaFixture(t)
+	f.floatPages = true
+	p := newKaaTestProvider(f)
+	sr, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil {
+		t.Fatalf("FindEpisodeSource with float page markers: %v", err)
+	}
+	if len(sr.Sources) != 1 {
+		t.Fatalf("sources = %d, want 1", len(sr.Sources))
+	}
+}
+
+// Cached resolve results are isolated copies: mutating a returned result
+// (as the quality filter / proxy wrap path does with its own copies) must
+// never poison the cache for later requests.
+func TestKaaResolveCacheIsolation(t *testing.T) {
+	f := newKaaFixture(t)
+	p := newKaaTestProvider(f)
+	sr, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil {
+		t.Fatalf("sub: %v", err)
+	}
+	sr.Sources[0].URL = "MUTATED"
+	again, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil {
+		t.Fatalf("sub again: %v", err)
+	}
+	if again.Sources[0].URL == "MUTATED" {
+		t.Fatal("cache poisoned through the previously returned slice")
+	}
+}
+
+// Production CatStream shape: protocol-relative master, triple-slash srt
+// subs, and a preview thumbnail track that is not a subtitle.
+func TestKaaFindMastersProtocolRelative(t *testing.T) {
+	txt := `"manifest":[0,"//bl.krussdomi.com/playlist/6798cdea169c31976b2d8f22/master.m3u8"],"x":"https://hls.krussdomi.com/manifest/abc/master.m3u8"`
+	got := kaaFindMasters(txt)
+	want := []string{
+		"https://bl.krussdomi.com/playlist/6798cdea169c31976b2d8f22/master.m3u8",
+		"https://hls.krussdomi.com/manifest/abc/master.m3u8",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("masters = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("masters = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestKaaFindSubtitlesSrtAndPreview(t *testing.T) {
+	txt := `"src":[0,"https:///subbl.krussdomi.com/6798cdea/309567_en.srt"],` +
+		`"src":[0,"https:///subbl.krussdomi.com/6798cdea/1617262191272_vi.srt"],` +
+		`"thumbnails":[0,"https:///subbl.krussdomi.com/6798cdea/preview-RCmUA.vtt"],` +
+		`"x":"//cdn.example.com/subs/en.vtt"`
+	got := kaaFindSubtitles(txt)
+	want := []string{
+		"https://subbl.krussdomi.com/6798cdea/309567_en.srt",
+		"https://subbl.krussdomi.com/6798cdea/1617262191272_vi.srt",
+		"https://cdn.example.com/subs/en.vtt",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("subtitles = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("subtitles = %v, want %v", got, want)
+		}
 	}
 }
 

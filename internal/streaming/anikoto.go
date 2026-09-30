@@ -155,7 +155,7 @@ func (p *AnikotoProvider) storeAnikotoStale(key string, sr *SourceResult) {
 	p.stale[key] = &animexStaleEntry{res: cloneSourceResult(sr), fetchedAt: time.Now()}
 }
 
-// loadAnikotoStale returns the stored result while fresh.
+// loadAnikotoStale returns a copy of the stored result while fresh.
 func (p *AnikotoProvider) loadAnikotoStale(key string) *SourceResult {
 	p.staleMu.Lock()
 	defer p.staleMu.Unlock()
@@ -167,7 +167,7 @@ func (p *AnikotoProvider) loadAnikotoStale(key string) *SourceResult {
 		delete(p.stale, key)
 		return nil
 	}
-	return e.res
+	return cloneSourceResult(e.res)
 }
 
 // anikotoFreshTTL is how long a successful resolve is served without
@@ -187,7 +187,7 @@ func (p *AnikotoProvider) loadAnikotoFresh(key string) *SourceResult {
 	if !ok || time.Since(e.fetchedAt) > anikotoFreshTTL {
 		return nil
 	}
-	return e.res
+	return cloneSourceResult(e.res)
 }
 
 // megaplayBase is the megaplay host. A var (not const) so tests can point
