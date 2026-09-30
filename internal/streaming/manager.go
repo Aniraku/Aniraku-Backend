@@ -65,7 +65,7 @@ type Manager struct {
 	LearnHost func(host string)
 
 	// hentai gate: hentai titles are served by Zoko (MAL-keyed) +
-	// FlixCloud + Zenime only; anikoto/animex must not receive any request
+	// FlixCloud only; anikoto/animex must not receive any request
 	// for them.
 	httpClient  *http.Client
 	hentaiMu    sync.Mutex
@@ -83,9 +83,6 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 	for _, p := range m.providers {
 		if ak, ok := p.(*AnikotoProvider); ok {
 			ak.SetHostLearner(fn)
-		}
-		if zn, ok := p.(*ZenimeProvider); ok {
-			zn.SetHostLearner(fn)
 		}
 		if zk, ok := p.(*ZokoProvider); ok {
 			zk.SetHostLearner(fn)
@@ -139,8 +136,15 @@ type SourceResult struct {
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
 // m3u8); AnimeX (plyr API, XOR-decoded direct URLs) is second; Zoko
 // (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
-// playback. (OGFLix removed: api.anizen.tr challenged every request and
-// every resolved edge was blocked — pure fan-out latency for nothing.)
+// playback. (Zenime removed 2026-09-30: arms API unreliable. OGFLix removed:
+// api.anizen.tr challenged every request and every resolved edge was blocked
+// — pure fan-out latency for nothing.)
+//
+// NOTE (operator): kaa.lt decrypted stream URLs are dual-language — one
+// resolved URL serves both sub (ja-JP) and dub (en-US). A future kaa.lt
+// provider must resolve once and share the result across langs, never fetch
+// per-lang. Reference scraper: /home/ichigoat/kaa_stream_scraper.py
+// (episodes API takes lang=ja-JP|en-US; the decrypted m3u8 covers both).
 func NewManager(log zerolog.Logger) *Manager {
 	return &Manager{
 		log: log,
@@ -149,7 +153,6 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAnimeXProvider(log, ""),
 			NewZokoProvider(log),
 			NewFlixCloudProvider(log),
-			NewZenimeProvider(log),
 			NewNiNProvider(log),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
@@ -224,7 +227,7 @@ const zokoPaused = false
 // slug is accepted for API compatibility; the Anikoto resolver maps AniList
 // IDs itself, so the slug is unused today.
 func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
-	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud + Zenime:
+	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
 	// rejected before any upstream call, and the fallback chain below
 	// shrinks accordingly. Zoko only indexes hentai by MAL ID, so its
@@ -282,17 +285,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
-	case "zenime":
-		// Explicit Zenime requests are allowed for every title including
-		// hentai (its hentai arms providers only serve hentai titles).
-		result, err := m.tryZenime(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("zenime: no sources for this episode")
 	case "nin", "supaplay":
 		// Supaplay (anistream's embed lineup) — SFW titles only: the
 		// hentai reject above short-circuits adult titles before any
@@ -305,14 +297,14 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("nin: no sources for this episode")
-	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix":
-		return nil, fmt.Errorf("provider %q removed - use anikoto, zenime or flixcloud", provider)
+	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime":
+		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
-	// while paused), FlixCloud embed fourth, Zenime (arms API) last. Hentai
-	// titles only ever reach Zoko (MAL-keyed for hentai, when unpaused),
-	// FlixCloud (Reanime embeds, covers hentai) and Zenime (hentaimama).
+	// while paused), FlixCloud embed last. Hentai titles only ever reach
+	// Zoko (MAL-keyed for hentai, when unpaused) and FlixCloud (Reanime
+	// embeds, covers hentai).
 	var candidates []func() (*core.StreamResult, error)
 	if hentai {
 		candidates = []func() (*core.StreamResult, error){}
@@ -324,7 +316,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			func() (*core.StreamResult, error) {
 				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 			},
-			func() (*core.StreamResult, error) { return m.tryZenime(ctx, animeID, episode, lang, quality) },
 		)
 	} else {
 		candidates = []func() (*core.StreamResult, error){
@@ -337,7 +328,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		candidates = append(candidates, func() (*core.StreamResult, error) {
 			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
-		}, func() (*core.StreamResult, error) { return m.tryZenime(ctx, animeID, episode, lang, quality) })
+		})
 	}
 	for _, try := range candidates {
 		res, err := try()
@@ -401,7 +392,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, znServers, nnServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -420,11 +411,11 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		return out
 	}
 
-	wg.Add(7)
+	wg.Add(6)
 	// Anikoto, AnimeX and NiN are never queried for hentai titles (hentai
-	// gate — Supaplay's API 502s them). Zoko, FlixCloud and Zenime serve
-	// them: Zoko only via its MAL-keyed path (its AniList index carries no
-	// hentai), FlixCloud via Reanime, Zenime via its hentai arms providers.
+	// gate — Supaplay's API 502s them). Zoko and FlixCloud serve them:
+	// Zoko only via its MAL-keyed path (its AniList index carries no
+	// hentai), FlixCloud via Reanime.
 	go func() {
 		defer wg.Done()
 		if !hentai {
@@ -453,12 +444,6 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		defer wg.Done()
 		fcServers = run("flixcloud", func() []core.Server {
 			return m.collectFlixServers(ctx, anilistID, episode, lang)
-		})
-	}()
-	go func() {
-		defer wg.Done()
-		znServers = run("zenime", func() []core.Server {
-			return m.collectZenimeServers(ctx, anilistID, episode, lang, hentai)
 		})
 	}()
 	go func() {
@@ -492,7 +477,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers)
 
-	allServers := append(append(append(append(append(akServers, axServers...), zkServers...), fcServers...), znServers...), nnServers...)
+	allServers := append(append(append(append(akServers, axServers...), zkServers...), fcServers...), nnServers...)
 	// Kiwi download links (fetched in parallel above): attach to every
 	// non-embed server (embed players take no file links). Independent of
 	// the Zoko streaming provider and its pause flag.
@@ -571,36 +556,6 @@ func (m *Manager) collectFlixServers(ctx context.Context, anilistID string, epis
 			continue // the provider logs its own reason (Warn inside flixcloud.go)
 		}
 		out = appendNamedServers(out, []string{"Yuta", "Syota", "Mike"}, "flixcloud", lang, sr)
-	}
-	return out
-}
-
-// collectZenimeServers maps Zenime sources to Miru (xanime) servers — or
-// Miru (hentaimama) for hentai titles. Slot names ride on the result, so
-// each arms provider keeps its display name.
-func (m *Manager) collectZenimeServers(ctx context.Context, anilistID string, episode int, lang string, hentai bool) []core.Server {
-	var out []core.Server
-	for _, prov := range m.providers {
-		zn, ok := prov.(*ZenimeProvider)
-		if !ok {
-			continue
-		}
-		var sr *SourceResult
-		var err error
-		if hentai {
-			sr, err = zn.FindHentaiEpisodeSource(ctx, anilistID, episode, lang)
-		} else {
-			sr, err = zn.FindEpisodeSource(ctx, anilistID, episode, lang)
-		}
-		if err != nil {
-			m.log.Warn().Err(err).Str("provider", "zenime").Str("anilistId", anilistID).
-				Int("episode", episode).Str("lang", lang).Bool("hentai", hentai).Msg("servers: provider failed")
-			continue
-		}
-		if sr == nil || len(sr.Sources) == 0 {
-			continue // the provider logs why (no episode match / blocked segments)
-		}
-		out = appendNamedServers(out, []string{"Miru"}, "zenime", lang, sr)
 	}
 	return out
 }
@@ -847,15 +802,6 @@ func (m *Manager) getZokoProvider() *ZokoProvider {
 	return nil
 }
 
-func (m *Manager) getZenimeProvider() *ZenimeProvider {
-	for _, p := range m.providers {
-		if zn, ok := p.(*ZenimeProvider); ok {
-			return zn
-		}
-	}
-	return nil
-}
-
 func (m *Manager) getNiNProvider() *NiNProvider {
 	for _, p := range m.providers {
 		if nn, ok := p.(*NiNProvider); ok {
@@ -944,34 +890,6 @@ func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, q
 	source, err := zk.FindEpisodeSource(ctx, anilistID, episode, lang)
 	if err != nil {
 		return nil, fmt.Errorf("zoko failed: %w", err)
-	}
-	if source == nil || len(source.Sources) == 0 {
-		return nil, nil
-	}
-
-	return m.applyQualityFilter(source, quality), nil
-}
-
-// tryZenime resolves a Zenime stream (arms API: xanime -> Miru;
-// hentaimama -> Miru for hentai titles).
-func (m *Manager) tryZenime(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
-	zn := m.getZenimeProvider()
-	if zn == nil {
-		return nil, fmt.Errorf("zenime provider not configured")
-	}
-
-	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying zenime")
-
-	anilistID := fmt.Sprintf("%d", animeID)
-	var source *SourceResult
-	var err error
-	if m.isHentaiTitle(ctx, animeID) {
-		source, err = zn.FindHentaiEpisodeSource(ctx, anilistID, episode, lang)
-	} else {
-		source, err = zn.FindEpisodeSource(ctx, anilistID, episode, lang)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("zenime failed: %w", err)
 	}
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
