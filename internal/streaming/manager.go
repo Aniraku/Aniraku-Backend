@@ -93,6 +93,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if nn, ok := p.(*NiNProvider); ok {
 			nn.SetHostLearner(fn)
 		}
+		if ka, ok := p.(*KaaProvider); ok {
+			ka.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -154,6 +157,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewZokoProvider(log),
 			NewFlixCloudProvider(log),
 			NewNiNProvider(log),
+			NewKaaProvider(log, "", ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -297,14 +301,25 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("nin: no sources for this episode")
+	case "kaa":
+		// Explicit kaa requests are allowed for every title: the
+		// decrypted krussdomi manifest serves sub and dub alike.
+		result, err := m.tryKaa(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("kaa: no sources for this episode")
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
-	// while paused), FlixCloud embed last. Hentai titles only ever reach
-	// Zoko (MAL-keyed for hentai, when unpaused) and FlixCloud (Reanime
-	// embeds, covers hentai).
+	// while paused), FlixCloud embed fourth, kaa.lt last. Hentai titles
+	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
+	// FlixCloud (Reanime embeds, covers hentai).
 	var candidates []func() (*core.StreamResult, error)
 	if hentai {
 		candidates = []func() (*core.StreamResult, error){}
@@ -328,6 +343,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		candidates = append(candidates, func() (*core.StreamResult, error) {
 			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+		}, func() (*core.StreamResult, error) {
+			return m.tryKaa(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -392,7 +409,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -411,7 +428,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		return out
 	}
 
-	wg.Add(6)
+	wg.Add(7)
 	// Anikoto, AnimeX and NiN are never queried for hentai titles (hentai
 	// gate — Supaplay's API 502s them). Zoko and FlixCloud serve them:
 	// Zoko only via its MAL-keyed path (its AniList index carries no
@@ -456,6 +473,14 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	}()
 	go func() {
 		defer wg.Done()
+		if !hentai {
+			kaServers = run("kaa", func() []core.Server {
+				return m.collectKaaServers(ctx, anilistID, episode, lang)
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
 		// Runs alongside the provider fan-out (not after it): a slow
 		// provider must never starve the download fetch of context
 		// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -477,7 +502,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers)
 
-	allServers := append(append(append(append(akServers, axServers...), zkServers...), fcServers...), nnServers...)
+	allServers := append(append(append(append(append(akServers, axServers...), zkServers...), fcServers...), nnServers...), kaServers...)
 	// Kiwi download links (fetched in parallel above): attach to every
 	// non-embed server (embed players take no file links). Independent of
 	// the Zoko streaming provider and its pause flag.
@@ -919,6 +944,60 @@ func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, qu
 	}
 
 	return m.applyQualityFilter(source, quality), nil
+}
+
+// tryKaa resolves a kaa.lt stream (krussdomi HLS master; the decrypted
+// manifest serves sub and dub alike, shared from the provider cache).
+func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	ka := m.getKaaProvider()
+	if ka == nil {
+		return nil, fmt.Errorf("kaa provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying kaa")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := ka.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("kaa failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+func (m *Manager) getKaaProvider() *KaaProvider {
+	for _, p := range m.providers {
+		if ka, ok := p.(*KaaProvider); ok {
+			return ka
+		}
+	}
+	return nil
+}
+
+// collectKaaServers maps kaa.lt sources to per-player servers (VidStreaming,
+// ...). Each source already carries its player display name.
+func (m *Manager) collectKaaServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		ka, ok := prov.(*KaaProvider)
+		if !ok {
+			continue
+		}
+		sr, err := ka.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "kaa").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue // the provider logs why (no episode match / unplayable)
+		}
+		out = appendNamedServers(out, []string{"Kaa"}, "kaa", lang, sr)
+	}
+	return out
 }
 
 func (m *Manager) applyQualityFilter(result *SourceResult, quality string) *core.StreamResult {
