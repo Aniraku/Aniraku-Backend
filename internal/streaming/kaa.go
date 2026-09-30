@@ -38,6 +38,20 @@ import (
 // 64d7164244c6d04c12f3fdbb under both langs. The resolve cache below is
 // keyed WITHOUT lang, so the second lang is always a cache hit and the
 // upstream is never fetched per-lang.
+//
+// AUDIO RULE: sources are always MASTER playlists, never quality variants.
+// Variant playlists carry zero #EXT-X-MEDIA lines (verified), so a player
+// loading a variant directly gets whatever audio is muxed/default (observed:
+// lang=sub playing dub on anilist 130298). The master carries both AUDIO
+// renditions, and the media proxy strips the wrong one per the request's
+// al=sub/dub parameter (see stripAudioRenditions) — the player then ABRs
+// natively across the master's variants with the correct track.
+//
+// SERVER NAMES (operator): kaa servers are named by position — nico, robin,
+// D'Luff, then the same crew scheme — never raw player names.
+//
+// SUBTITLE RULE (operator): dub sources carry the SUB (ja-JP) player page's
+// subtitle files, resolved on dub cache-miss and shared from the cache.
 const (
 	kaaAPIBase     = "https://kaa.lt"
 	kaaKrussOrigin = "https://krussdomi.com"
@@ -465,6 +479,19 @@ type kaaPlayer struct {
 	src   string
 }
 
+// kaaServerNames names kaa servers by position (operator scheme).
+func kaaServerName(i int) string {
+	if i >= 0 && i < len(kaaServerNames) {
+		return kaaServerNames[i]
+	}
+	return fmt.Sprintf("kaa-%d", i+1)
+}
+
+var kaaServerNames = []string{
+	"nico", "robin", "D'Luff",
+	"zoro", "sanji", "nami", "usopp", "chopper", "franky", "brook", "jimbei",
+}
+
 func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, episode int, kaaLang, reqLang string) (*SourceResult, error) {
 	eps, err := p.listEpisodes(ctx, slug, kaaLang, episode)
 	if err != nil {
@@ -490,26 +517,106 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	if len(players) == 0 {
 		return nil, fmt.Errorf("kaa: no embedded players on %s", watchURL)
 	}
+	// Every playable player becomes its own server (named by position) —
+	// first-win would hide working mirrors.
+	type hit struct {
+		master string
+		vtts   []string
+	}
+	var hits []hit
 	var lastErr error
 	for _, pl := range players {
 		// DASH-only arms carry no m3u8 — skip without an upstream call.
 		if strings.Contains(strings.ToLower(pl.src), "type=dash") {
 			continue
 		}
-		sr, err := p.resolvePlayer(ctx, pl, watchURL, reqLang)
-		if err == nil && sr != nil && len(sr.Sources) > 0 {
-			p.log.Info().Int("animeId", id).Int("episode", episode).
-				Str("lang", reqLang).Str("player", pl.name).Msg("kaa resolved")
-			return sr, nil
-		}
+		master, vtts, err := p.resolvePlayerMaster(ctx, pl, watchURL)
 		if err != nil {
 			lastErr = err
+			continue
+		}
+		hits = append(hits, hit{master: master, vtts: vtts})
+	}
+	if len(hits) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("kaa: no playable player for episode %d", episode)
+	}
+	p.log.Info().Int("animeId", id).Int("episode", episode).
+		Str("lang", reqLang).Int("players", len(hits)).Msg("kaa resolved")
+
+	headers := map[string]string{
+		"Referer": kaaKrussRef,
+		"Origin":  kaaKrussOrigin,
+	}
+	// Subtitle files always come from the SUB (ja-JP) player page: dub
+	// pages carry fewer/no subtitle links, and the operator rule is sub
+	// subs on dub sources. Best-effort — never fails the resolve.
+	dubSubs, err := p.kaaDubSubtitles(ctx, slug, episode)
+	if err != nil {
+		p.log.Warn().Err(err).Int("animeId", id).Int("episode", episode).Msg("kaa dub subtitles unavailable, using resolving page subs")
+		dubSubs = nil
+	}
+	sr := &SourceResult{Headers: headers}
+	for i, h := range hits {
+		vtts := h.vtts
+		if strings.EqualFold(reqLang, "dub") && len(dubSubs) > 0 {
+			vtts = dubSubs
+		}
+		var subs []core.Subtitle
+		for _, s := range vtts {
+			p.learnURLHost(s)
+			subs = append(subs, core.Subtitle{URL: s, Lang: reqLang, Label: reqLang})
+		}
+		p.learnURLHost(h.master)
+		sr.Sources = append(sr.Sources, core.Source{
+			URL:          h.master,
+			Type:         "hls",
+			Quality:      "auto",
+			Verification: "proxy",
+			Subtitles:    subs,
+		})
+		sr.ServerNames = append(sr.ServerNames, kaaServerName(i))
+	}
+	return sr, nil
+}
+
+// kaaDubSubtitles fetches subtitle links from the SUB (ja-JP) episode page
+// for attachment to dub sources.
+func (p *KaaProvider) kaaDubSubtitles(ctx context.Context, slug string, episode int) ([]string, error) {
+	eps, err := p.listEpisodes(ctx, slug, "ja-JP", episode)
+	if err != nil {
+		return nil, err
+	}
+	var match *kaaEpisode
+	for i := range eps {
+		if eps[i].Number == episode {
+			match = &eps[i]
+			break
 		}
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	if match == nil || match.Slug == "" {
+		return nil, fmt.Errorf("kaa: sub episode %d not listed", episode)
 	}
-	return nil, fmt.Errorf("kaa: no playable player for episode %d", episode)
+	watchURL := fmt.Sprintf("%s/%s/ep-%d-%s", p.kaaBase, slug, episode, match.Slug)
+	raw, err := p.doText(ctx, watchURL, p.kaaHeaders(p.kaaBase+"/"), 1<<20)
+	if err != nil {
+		return nil, err
+	}
+	for _, pl := range kaaExtractPlayers(raw) {
+		if strings.Contains(strings.ToLower(pl.src), "type=dash") {
+			continue
+		}
+		praw, err := p.doText(ctx, pl.src, p.kaaHeaders(watchURL), 1<<20)
+		if err != nil {
+			continue
+		}
+		if vtts := kaaVTTRe.FindAllString(kaaUnescape(praw), -1); len(vtts) > 0 {
+			return vtts, nil
+		}
+	}
+	return nil, fmt.Errorf("kaa: no sub subtitles for episode %d", episode)
 }
 
 func kaaExtractPlayers(raw string) []kaaPlayer {
@@ -535,55 +642,31 @@ func kaaUnescape(s string) string {
 	return strings.ReplaceAll(s, "\\/", "/")
 }
 
-func (p *KaaProvider) resolvePlayer(ctx context.Context, pl kaaPlayer, watchURL, reqLang string) (*SourceResult, error) {
+// resolvePlayerMaster verifies one embedded player and returns its master
+// playlist URL plus the player page's subtitle links.
+func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, watchURL string) (string, []string, error) {
 	raw, err := p.doText(ctx, pl.src, p.kaaHeaders(watchURL), 1<<20)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	txt := kaaUnescape(raw)
 	masters := kaaM3U8Re.FindAllString(txt, -1)
 	if len(masters) == 0 {
-		return nil, fmt.Errorf("kaa: player %q has no m3u8", pl.name)
+		return "", nil, fmt.Errorf("kaa: player %q has no m3u8", pl.name)
 	}
-	headers := map[string]string{
-		"Referer": kaaKrussRef,
-		"Origin":  kaaKrussOrigin,
-	}
+	vtts := kaaVTTRe.FindAllString(txt, -1)
 	var lastErr error
 	for _, master := range masters {
-		variants, ok := p.probeKaaMaster(ctx, master)
-		if !ok {
+		if _, ok := p.probeKaaMaster(ctx, master); !ok {
 			lastErr = fmt.Errorf("kaa: master probe failed")
 			continue
 		}
-		sr := &SourceResult{Headers: headers}
-		subs := kaaVTTRe.FindAllString(txt, -1)
-		for _, v := range variants {
-			p.learnURLHost(v.url)
-			src := core.Source{
-				URL:          v.url,
-				Type:         "hls",
-				Quality:      v.quality,
-				Verification: "proxy",
-			}
-			for _, s := range subs {
-				p.learnURLHost(s)
-				src.Subtitles = append(src.Subtitles, core.Subtitle{URL: s, Lang: reqLang, Label: reqLang})
-			}
-			sr.Sources = append(sr.Sources, src)
-			sr.ServerNames = append(sr.ServerNames, pl.name)
-		}
-		if len(sr.Sources) == 0 {
-			lastErr = fmt.Errorf("kaa: no variants in master")
-			continue
-		}
-		p.learnURLHost(master)
-		return sr, nil
+		return master, vtts, nil
 	}
 	if lastErr != nil {
-		return nil, lastErr
+		return "", nil, lastErr
 	}
-	return nil, fmt.Errorf("kaa: player %q unplayable", pl.name)
+	return "", nil, fmt.Errorf("kaa: player %q unplayable", pl.name)
 }
 
 type kaaVariant struct {

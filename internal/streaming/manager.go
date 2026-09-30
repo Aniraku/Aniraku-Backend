@@ -580,6 +580,7 @@ func (m *Manager) collectFlixServers(ctx context.Context, anilistID string, epis
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // the provider logs its own reason (Warn inside flixcloud.go)
 		}
+		sr = m.withDubSubtitles(ctx, "flixcloud", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{"Yuta", "Syota", "Mike"}, "flixcloud", lang, sr)
 	}
 	return out
@@ -602,6 +603,7 @@ func (m *Manager) collectAnikotoServers(ctx context.Context, anilistID string, e
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // the provider logs why (dropped servers / CDN block)
 		}
+		sr = m.withDubSubtitles(ctx, "anikoto", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, anikotoServers[:], "anikoto", lang, sr)
 	}
 	return out
@@ -626,6 +628,7 @@ func (m *Manager) collectZokoServers(ctx context.Context, anilistID string, epis
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // CDN-blocked or missing episode (logged inside zoko.go)
 		}
+		sr = m.withDubSubtitles(ctx, "zoko", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{zokoServerName}, "zoko", lang, sr)
 	}
 	return out
@@ -651,6 +654,7 @@ func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episo
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // blocked relay or missing episode (logged inside nin.go)
 		}
+		sr = m.withDubSubtitles(ctx, "nin", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{ninServerName}, "nin", lang, sr)
 	}
 	return out
@@ -785,6 +789,7 @@ func (m *Manager) tryFlixCloudWithSlug(ctx context.Context, animeID int, episode
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	source = m.withDubSubtitles(ctx, "flixcloud", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -814,6 +819,7 @@ func (m *Manager) tryAnikoto(ctx context.Context, animeID int, episode int, lang
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	source = m.withDubSubtitles(ctx, "anikoto", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -862,6 +868,7 @@ func (m *Manager) tryAnimeX(ctx context.Context, animeID int, episode int, lang,
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	source = m.withDubSubtitles(ctx, "animex", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -892,6 +899,7 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 			if name == "" {
 				name = "Hana"
 			}
+			sr = m.withDubSubtitles(ctx, "animex", lang, anilistID, episode, sr)
 			out = appendNamedServers(out, []string{name}, "animex", lang, sr)
 		}
 	}
@@ -919,6 +927,7 @@ func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, q
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	source = m.withDubSubtitles(ctx, "zoko", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -942,6 +951,7 @@ func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, qu
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	source = m.withDubSubtitles(ctx, "nin", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -964,6 +974,9 @@ func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, qu
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
+	// kaa already attaches the SUB player page's subtitle files on dub
+	// resolves; this is the backstop for the all-providers rule.
+	source = m.withDubSubtitles(ctx, "kaa", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }
@@ -975,6 +988,66 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 		}
 	}
 	return nil
+}
+
+// withDubSubtitles enforces the operator rule: dub server sources carry the
+// SUB-language subtitle files. A sub resolve is fetched only when at least
+// one dub source lacks subtitles — dub results that already have them cost
+// zero extra upstream calls. Failures keep the dub result as-is (best
+// effort: subtitles must never fail playback). The input is never mutated:
+// provider caches may share the pointed-to result.
+func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistID string, episode int, sr *SourceResult) *SourceResult {
+	if !strings.EqualFold(lang, "dub") || sr == nil {
+		return sr
+	}
+	need := false
+	for i := range sr.Sources {
+		if len(sr.Sources[i].Subtitles) == 0 {
+			need = true
+			break
+		}
+	}
+	if !need {
+		return sr
+	}
+	var prov Provider
+	for _, p := range m.providers {
+		if p.Name() == provider {
+			prov = p
+			break
+		}
+	}
+	if prov == nil {
+		return sr
+	}
+	sub, err := prov.FindEpisodeSource(ctx, anilistID, episode, "sub")
+	if err != nil || sub == nil {
+		m.log.Warn().Err(err).Str("provider", provider).Str("anilistId", anilistID).
+			Int("episode", episode).Msg("dub subtitles: sub resolve unavailable, keeping dub as-is")
+		return sr
+	}
+	seen := map[string]bool{}
+	var subs []core.Subtitle
+	for i := range sub.Sources {
+		for _, st := range sub.Sources[i].Subtitles {
+			if st.URL == "" || seen[st.URL] {
+				continue
+			}
+			seen[st.URL] = true
+			subs = append(subs, st)
+		}
+	}
+	if len(subs) == 0 {
+		return sr
+	}
+	out := *sr
+	out.Sources = append([]core.Source(nil), sr.Sources...)
+	for i := range out.Sources {
+		if len(out.Sources[i].Subtitles) == 0 {
+			out.Sources[i].Subtitles = subs
+		}
+	}
+	return &out
 }
 
 // collectKaaServers maps kaa.lt sources to per-player servers (VidStreaming,
@@ -995,6 +1068,7 @@ func (m *Manager) collectKaaServers(ctx context.Context, anilistID string, episo
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // the provider logs why (no episode match / unplayable)
 		}
+		sr = m.withDubSubtitles(ctx, "kaa", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{"Kaa"}, "kaa", lang, sr)
 	}
 	return out

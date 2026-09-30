@@ -26,13 +26,12 @@ type kaaFixture struct {
 	anilist       *httptest.Server
 	masterHits    *int64
 	segmentOrigin *string
-	episodesBody  string
+	emptyEpisodes bool
 }
 
 func newKaaFixture(t *testing.T) *kaaFixture {
 	t.Helper()
-	f := &kaaFixture{t: t, masterHits: new(int64), segmentOrigin: new(string),
-		episodesBody: `{"result":[{"episode_number":1,"slug":"2da064","title":"Enter"}],"pages":[]}`}
+	f := &kaaFixture{t: t, masterHits: new(int64), segmentOrigin: new(string)}
 	var kaaURL string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
@@ -41,16 +40,34 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	})
 	mux.HandleFunc("/api/show/naruto-f3cf/episodes", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, f.episodesBody)
+		// Lang-aware watch slugs (like production): each lang page has
+		// its own player page and subtitle set, but both players serve
+		// the SAME master (dual-language rule).
+		slug := "subslug"
+		if r.URL.Query().Get("lang") == "en-US" {
+			slug = "dubslug"
+		}
+		if f.emptyEpisodes {
+			fmt.Fprint(w, `{"result":[],"pages":[]}`)
+			return
+		}
+		fmt.Fprintf(w, `{"result":[{"episode_number":1,"slug":%q,"title":"Enter"}],"pages":[]}`, slug)
 	})
-	mux.HandleFunc("/naruto-f3cf/ep-1-2da064", func(w http.ResponseWriter, r *http.Request) {
-		player := kaaURL + "/cat-player/player?id=abc&source=vidstream&ln=ja-JP"
+	mux.HandleFunc("/naruto-f3cf/ep-1-subslug", func(w http.ResponseWriter, r *http.Request) {
+		player := kaaURL + "/subplayer?id=1"
 		fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s"}</html>`, player)
 	})
-	mux.HandleFunc("/cat-player/player", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/naruto-f3cf/ep-1-dubslug", func(w http.ResponseWriter, r *http.Request) {
+		player := kaaURL + "/dubplayer?id=2"
+		fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s"}</html>`, player)
+	})
+	mux.HandleFunc("/subplayer", func(w http.ResponseWriter, r *http.Request) {
 		master := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/master.m3u8`
-		vtt := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/en.vtt`
-		fmt.Fprintf(w, `<html>"%s" "%s"</html>`, master, vtt)
+		fmt.Fprintf(w, `<html>"%s" "%s/vtt-sub.vtt"</html>`, master, strings.ReplaceAll(kaaURL, "/", `\/`))
+	})
+	mux.HandleFunc("/dubplayer", func(w http.ResponseWriter, r *http.Request) {
+		master := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/master.m3u8`
+		fmt.Fprintf(w, `<html>"%s" "%s/vtt-dub.vtt"</html>`, master, strings.ReplaceAll(kaaURL, "/", `\/`))
 	})
 	mux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(f.masterHits, 1)
@@ -93,7 +110,7 @@ func newKaaTestProvider(f *kaaFixture) *KaaProvider {
 	return p
 }
 
-// Full chain: search -> episodes -> watch -> player -> master -> variants,
+// Full chain: search -> episodes -> watch -> player -> master source,
 // with the Origin header asserted on the segment request.
 func TestKaaFindEpisodeSource(t *testing.T) {
 	f := newKaaFixture(t)
@@ -102,35 +119,34 @@ func TestKaaFindEpisodeSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindEpisodeSource: %v", err)
 	}
-	if len(sr.Sources) != 2 {
-		t.Fatalf("sources = %d, want 2 variants", len(sr.Sources))
+	// Masters, not variants: exactly one source per player, so the media
+	// proxy's al=sub/dub audio strip can run (variants carry no AUDIO).
+	if len(sr.Sources) != 1 {
+		t.Fatalf("sources = %d, want 1 master", len(sr.Sources))
 	}
-	if sr.Sources[0].Quality != "720p" || sr.Sources[1].Quality != "360p" {
-		t.Fatalf("qualities = %q/%q, want 720p/360p", sr.Sources[0].Quality, sr.Sources[1].Quality)
+	s := sr.Sources[0]
+	if s.Type != "hls" || s.Verification != "proxy" || s.Quality != "auto" {
+		t.Fatalf("source = %+v, want hls/proxy/auto master", s)
 	}
-	for _, s := range sr.Sources {
-		if s.Type != "hls" || s.Verification != "proxy" {
-			t.Fatalf("source = %+v, want hls/proxy", s)
-		}
-		if !strings.HasPrefix(s.URL, f.kaa.URL+"/q") || !strings.HasSuffix(s.URL, "playlist.m3u8") {
-			t.Fatalf("variant URL not resolved absolute: %q", s.URL)
-		}
+	if want := f.kaa.URL + "/master.m3u8"; s.URL != want {
+		t.Fatalf("source URL = %q, want master %q", s.URL, want)
 	}
 	if sr.Headers["Origin"] != kaaKrussOrigin || sr.Headers["Referer"] != kaaKrussRef {
 		t.Fatalf("headers = %v, want Referer+Origin krussdomi", sr.Headers)
 	}
-	if len(sr.ServerNames) != 2 || sr.ServerNames[0] != "VidStreaming" {
-		t.Fatalf("server names = %v, want VidStreaming", sr.ServerNames)
+	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "nico" {
+		t.Fatalf("server names = %v, want [nico]", sr.ServerNames)
 	}
-	if len(sr.Sources[0].Subtitles) != 1 || !strings.HasSuffix(sr.Sources[0].Subtitles[0].URL, "/en.vtt") {
-		t.Fatalf("subtitles = %+v, want the vtt link", sr.Sources[0].Subtitles)
+	if len(s.Subtitles) != 1 || !strings.HasSuffix(s.Subtitles[0].URL, "/vtt-sub.vtt") {
+		t.Fatalf("subtitles = %+v, want the sub page vtt", s.Subtitles)
 	}
 	if got := *f.segmentOrigin; got != kaaKrussOrigin {
 		t.Fatalf("segment Origin = %q, want %q", got, kaaKrussOrigin)
 	}
 }
 
-// Dual-language rule: sub then dub must fetch the master exactly once.
+// Dual-language rule: sub then dub must fetch the master exactly once, and
+// dub sources must carry the SUB page's subtitle files.
 func TestKaaDualLangShared(t *testing.T) {
 	f := newKaaFixture(t)
 	p := newKaaTestProvider(f)
@@ -148,12 +164,24 @@ func TestKaaDualLangShared(t *testing.T) {
 	if n := atomic.LoadInt64(f.masterHits); n != 1 {
 		t.Fatalf("master fetched %d times, want 1 (shared across langs)", n)
 	}
+	if len(dub.Sources[0].Subtitles) != 1 || !strings.HasSuffix(dub.Sources[0].Subtitles[0].URL, "/vtt-sub.vtt") {
+		t.Fatalf("dub subtitles = %+v, want the SUB page vtt, not vtt-dub", dub.Sources[0].Subtitles)
+	}
+}
+
+func TestKaaServerName(t *testing.T) {
+	want := map[int]string{0: "nico", 1: "robin", 2: "D'Luff", 3: "zoro", 10: "jimbei", 11: "kaa-12", 25: "kaa-26"}
+	for i, w := range want {
+		if got := kaaServerName(i); got != w {
+			t.Fatalf("kaaServerName(%d) = %q, want %q", i, got, w)
+		}
+	}
 }
 
 // Empty episode list fails clean instead of hanging the chain.
 func TestKaaMissingEpisode(t *testing.T) {
 	f := newKaaFixture(t)
-	f.episodesBody = `{"result":[],"pages":[]}`
+	f.emptyEpisodes = true
 	p := newKaaTestProvider(f)
 	if _, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 99, "sub"); err == nil {
 		t.Fatal("expected error for unlisted episode")
