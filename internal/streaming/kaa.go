@@ -33,11 +33,16 @@ import (
 //     therefore always ships Referer+Origin in result Headers so the media
 //     proxy forwards them (applyProxyQueryHeaders passes both through).
 //
-// DUAL-LANGUAGE RULE (operator-verified): one decrypted krussdomi manifest
-// serves both sub (ja-JP) and dub (en-US) — Naruto ep1 resolves to manifest
-// 64d7164244c6d04c12f3fdbb under both langs. The resolve cache below is
-// keyed WITHOUT lang, so the second lang is always a cache hit and the
-// upstream is never fetched per-lang.
+// LANGUAGE RULE (operator, strict per-lang): each lang reads its own
+// listing — sub resolves ja-JP pages, dub resolves en-US pages, never the
+// other. When the dub page has no players, no dub server is listed even if
+// sub resolves (observed: Noblesse ep1 has a ja-JP CatStream embed but the
+// en-US page carries zero embeds). The resolve cache is keyed WITH lang so
+// a cached sub result can never leak into a dub listing or vice versa.
+// Dub sources still carry the SUB page's subtitle files (subtitle rule).
+//
+// Observed live 2026-10-01: ja-JP ep1 slug 67fd53 (players) vs en-US ep1
+// slug ae903e (no embeds) for the same show.
 //
 // AUDIO RULE: sources are always MASTER playlists, never quality variants.
 // Variant playlists carry zero #EXT-X-MEDIA lines (verified), so a player
@@ -66,8 +71,14 @@ const (
 var (
 	kaaPlayerRe = regexp.MustCompile(`\{\s*name:\s*"([^"]+)"\s*,\s*shortName:\s*"([^"]+)"\s*,\s*src:\s*"([^"]+)"\s*\}`)
 	kaaCatRe    = regexp.MustCompile(`https?://[a-zA-Z0-9.\-]+/cat-player/player\?[^"'\\s]+`)
-	kaaM3U8Re   = regexp.MustCompile(`https?://[^\s"'<>\\&]+\.m3u8[^\s"'<>\\&]*`)
-	kaaVTTRe    = regexp.MustCompile(`https?://[^\s"'<>\\&]+\.vtt[^\s"'<>\\&]*`)
+	// Master playlists: absolute AND protocol-relative (CatStream embeds
+	// "//bl.krussdomi.com/.../master.m3u8" — the reference scraper matches
+	// both via (?:https?:)?// and normalizes with _fix_url).
+	kaaM3U8Re = regexp.MustCompile(`(?:https?:)?//[^\s"'<>\\&]+\.m3u8[^\s"'<>\\&]*`)
+	// Subtitle files: .vtt AND .srt (CatStream ships srt only), absolute
+	// or protocol-relative. Thumbnail tracks (preview-*.vtt) are filtered
+	// by kaaFindSubtitles, not by this pattern.
+	kaaSubRe = regexp.MustCompile(`(?:https?:)?//[^\s"'<>\\&]+\.(?:vtt|srt)[^\s"'<>\\&]*`)
 )
 
 type KaaProvider struct {
@@ -91,6 +102,7 @@ type kaaSlugEntry struct {
 type kaaResolveKey struct {
 	slug    string
 	episode int
+	lang    string // strict per-lang: "sub" or "dub"
 }
 
 type kaaResolvedEntry struct {
@@ -245,7 +257,10 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 	var first struct {
 		Result []kaaEpisode `json:"result"`
 		Pages  []struct {
-			Eps []int `json:"eps"`
+			// Page markers are usually ints but kaa.lt sometimes emits
+			// fractional episode numbers (observed 14.5 for specials) —
+			// json.Number keeps the unmarshal from killing the resolve.
+			Eps []json.Number `json:"eps"`
 		} `json:"pages"`
 	}
 	u := fmt.Sprintf("%s/api/show/%s/episodes?ep=%d&lang=%s", p.kaaBase, slug, firstEp, lang)
@@ -253,9 +268,9 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 		return nil, err
 	}
 	eps := append([]kaaEpisode(nil), first.Result...)
-	seen := map[int]bool{}
+	seen := map[string]bool{}
 	for _, e := range eps {
-		seen[e.Number] = true
+		seen[strconv.Itoa(e.Number)] = true
 	}
 	for _, page := range first.Pages {
 		if len(page.Eps) == 0 {
@@ -263,10 +278,10 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 		}
 		// Page 1 is already in hand (first.Result above) — only fetch
 		// pages whose leading episode we have not seen.
-		if seen[page.Eps[0]] {
+		if seen[page.Eps[0].String()] {
 			continue
 		}
-		pu := fmt.Sprintf("%s/api/show/%s/episodes?ep=%d&lang=%s", p.kaaBase, slug, page.Eps[0], lang)
+		pu := fmt.Sprintf("%s/api/show/%s/episodes?ep=%s&lang=%s", p.kaaBase, slug, page.Eps[0].String(), lang)
 		var pd struct {
 			Result []kaaEpisode `json:"result"`
 		}
@@ -274,9 +289,9 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 			return nil, err
 		}
 		for _, e := range pd.Result {
-			if !seen[e.Number] {
+			if k := strconv.Itoa(e.Number); !seen[k] {
 				eps = append(eps, e)
-				seen[e.Number] = true
+				seen[k] = true
 			}
 		}
 	}
@@ -284,37 +299,41 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 	return eps, nil
 }
 
-// FindEpisodeSource resolves one episode. The result is cached WITHOUT lang
-// (dual-language rule): a dub request reuses the sub resolve and vice versa.
+// FindEpisodeSource resolves one episode for EXACTLY the requested lang
+// (strict per-lang rule): a sub request reads the ja-JP listing, a dub
+// request the en-US listing, and there is no cross-lang fallback — when the
+// dub page has no players, no dub server is listed even if sub resolves.
+// The resolve cache is keyed WITH lang for the same reason: a cached sub
+// result must never leak into a dub listing or vice versa.
+//
+// Dub sources still carry the SUB (ja-JP) page's subtitle files (operator
+// subtitle rule); that is a targeted subtitle fetch, not a manifest share.
 func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
 		return nil, fmt.Errorf("kaa: bad anilist id %q", anilistID)
 	}
-	langs := []string{kaaLangParam(lang), kaaLangParam(otherKaaLang(lang))}
+	langKey := "sub"
+	if strings.EqualFold(lang, "dub") {
+		langKey = "dub"
+	}
 
 	slug, _, err := p.resolveSlug(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	if got := p.loadResolved(slug, episode); got != nil {
+	if got := p.loadResolved(slug, episode, langKey); got != nil {
 		return got, nil
 	}
-	var lastErr error
-	for _, kl := range langs {
-		sr, err := p.resolveEpisode(ctx, id, slug, episode, kl, lang)
-		if err == nil && sr != nil && len(sr.Sources) > 0 {
-			p.storeResolved(slug, episode, sr)
-			return sr, nil
-		}
-		if err != nil {
-			lastErr = err
-		}
+	sr, err := p.resolveEpisode(ctx, id, slug, episode, kaaLangParam(lang), lang)
+	if err != nil {
+		return nil, err
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	if sr == nil || len(sr.Sources) == 0 {
+		return nil, fmt.Errorf("kaa: no sources for episode %d (%s)", episode, langKey)
 	}
-	return nil, fmt.Errorf("kaa: no sources for episode %d", episode)
+	p.storeResolved(slug, episode, langKey, sr)
+	return sr, nil
 }
 
 func kaaLangParam(lang string) string {
@@ -324,24 +343,19 @@ func kaaLangParam(lang string) string {
 	return "ja-JP"
 }
 
-func otherKaaLang(lang string) string {
-	if strings.EqualFold(lang, "dub") {
-		return "sub"
-	}
-	return "dub"
-}
-
-func (p *KaaProvider) loadResolved(slug string, episode int) *SourceResult {
+func (p *KaaProvider) loadResolved(slug string, episode int, lang string) *SourceResult {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	e, ok := p.resolved[kaaResolveKey{slug: slug, episode: episode}]
+	e, ok := p.resolved[kaaResolveKey{slug: slug, episode: episode, lang: lang}]
 	if !ok || time.Since(e.fetched) > kaaResolveTTL {
 		return nil
 	}
-	return e.result
+	// Deep copy: callers (quality filter, subtitle merge, proxy wrap) must
+	// never mutate the cached entry through the shared backing array.
+	return cloneSourceResult(e.result)
 }
 
-func (p *KaaProvider) storeResolved(slug string, episode int, sr *SourceResult) {
+func (p *KaaProvider) storeResolved(slug string, episode int, lang string, sr *SourceResult) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -361,7 +375,7 @@ func (p *KaaProvider) storeResolved(slug string, episode int, sr *SourceResult) 
 		}
 		delete(p.resolved, oldest)
 	}
-	p.resolved[kaaResolveKey{slug: slug, episode: episode}] = &kaaResolvedEntry{result: sr, fetched: now}
+	p.resolved[kaaResolveKey{slug: slug, episode: episode, lang: lang}] = &kaaResolvedEntry{result: cloneSourceResult(sr), fetched: now}
 }
 
 // resolveSlug maps an AniList ID to a kaa.lt slug (24h cache).
@@ -550,13 +564,19 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		"Referer": kaaKrussRef,
 		"Origin":  kaaKrussOrigin,
 	}
-	// Subtitle files always come from the SUB (ja-JP) player page: dub
-	// pages carry fewer/no subtitle links, and the operator rule is sub
-	// subs on dub sources. Best-effort — never fails the resolve.
-	dubSubs, err := p.kaaDubSubtitles(ctx, slug, episode)
-	if err != nil {
-		p.log.Warn().Err(err).Int("animeId", id).Int("episode", episode).Msg("kaa dub subtitles unavailable, using resolving page subs")
-		dubSubs = nil
+	// Subtitle files on dub resolves always come from the SUB (ja-JP)
+	// player page: dub pages carry fewer/no subtitle links, and the
+	// operator rule is sub subs on dub sources. Best-effort — never fails
+	// the resolve. Skipped entirely on sub resolves (nothing to add, and
+	// it would waste a listing + watch + player fetch per cache miss).
+	var dubSubs []string
+	if strings.EqualFold(reqLang, "dub") {
+		var err error
+		dubSubs, err = p.kaaDubSubtitles(ctx, slug, episode)
+		if err != nil {
+			p.log.Warn().Err(err).Int("animeId", id).Int("episode", episode).Msg("kaa dub subtitles unavailable, using resolving page subs")
+			dubSubs = nil
+		}
 	}
 	sr := &SourceResult{Headers: headers}
 	for i, h := range hits {
@@ -612,7 +632,7 @@ func (p *KaaProvider) kaaDubSubtitles(ctx context.Context, slug string, episode 
 		if err != nil {
 			continue
 		}
-		if vtts := kaaVTTRe.FindAllString(kaaUnescape(praw), -1); len(vtts) > 0 {
+		if vtts := kaaFindSubtitles(kaaUnescape(praw)); len(vtts) > 0 {
 			return vtts, nil
 		}
 	}
@@ -642,6 +662,51 @@ func kaaUnescape(s string) string {
 	return strings.ReplaceAll(s, "\\/", "/")
 }
 
+// kaaFixURL mirrors the reference scraper's _fix_url: krussdomi embeds
+// broken triple-slash URLs (https:///subbl...) and protocol-relative
+// masters (//bl.krussdomi.com/.../master.m3u8).
+func kaaFixURL(u string) string {
+	u = strings.ReplaceAll(u, "https:///", "https://")
+	u = strings.ReplaceAll(u, "http:///", "http://")
+	if strings.HasPrefix(u, "//") {
+		u = "https:" + u
+	}
+	return u
+}
+
+// kaaFindMasters extracts unique normalized master playlist URLs.
+func kaaFindMasters(txt string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range kaaM3U8Re.FindAllString(txt, -1) {
+		if u := kaaFixURL(m); !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+// kaaFindSubtitles extracts unique normalized subtitle file URLs (.vtt and
+// .srt, raw as the operator rule requires). Thumbnail tracks
+// (preview-*.vtt, served under the player's "thumbnails" key) are not
+// subtitles and are dropped.
+func kaaFindSubtitles(txt string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, m := range kaaSubRe.FindAllString(txt, -1) {
+		u := kaaFixURL(m)
+		if strings.Contains(strings.ToLower(u), "preview") {
+			continue
+		}
+		if !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
 // resolvePlayerMaster verifies one embedded player and returns its master
 // playlist URL plus the player page's subtitle links.
 func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, watchURL string) (string, []string, error) {
@@ -650,11 +715,11 @@ func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, wat
 		return "", nil, err
 	}
 	txt := kaaUnescape(raw)
-	masters := kaaM3U8Re.FindAllString(txt, -1)
+	masters := kaaFindMasters(txt)
 	if len(masters) == 0 {
 		return "", nil, fmt.Errorf("kaa: player %q has no m3u8", pl.name)
 	}
-	vtts := kaaVTTRe.FindAllString(txt, -1)
+	vtts := kaaFindSubtitles(txt)
 	var lastErr error
 	for _, master := range masters {
 		if _, ok := p.probeKaaMaster(ctx, master); !ok {

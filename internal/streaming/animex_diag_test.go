@@ -194,6 +194,17 @@ func TestAnimeXStaleCache(t *testing.T) {
 			t.Fatalf("key = %q", got)
 		}
 	})
+	t.Run("load returns an isolated copy", func(t *testing.T) {
+		t.Parallel()
+		p := NewAnimeXProvider(zerolog.Nop(), "")
+		p.storeStale("k", mkRes("http://x/a.m3u8"))
+		got := p.loadStale("k")
+		got.Sources[0].URL = "MUTATED"
+		again := p.loadStale("k")
+		if again == nil || again.Sources[0].URL != "http://x/a.m3u8" {
+			t.Fatalf("stale cache poisoned through loaded slice: %+v", again)
+		}
+	})
 }
 
 // TestAnimeXPlayableProvidersNotBlocked guards against future foot-guns:

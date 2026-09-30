@@ -956,8 +956,9 @@ func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, qu
 	return m.applyQualityFilter(source, quality), nil
 }
 
-// tryKaa resolves a kaa.lt stream (krussdomi HLS master; the decrypted
-// manifest serves sub and dub alike, shared from the provider cache).
+// tryKaa resolves a kaa.lt stream (krussdomi HLS master) for exactly the
+// requested lang — strict per-lang: no dub server is listed when the en-US
+// page has no players, even if sub resolves.
 func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	ka := m.getKaaProvider()
 	if ka == nil {

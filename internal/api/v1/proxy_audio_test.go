@@ -146,8 +146,7 @@ func TestProxySourcesAddsAudioLangParam(t *testing.T) {
 	} {
 		req := httptest.NewRequest("GET", "http://api.test/api/v1/servers?lang="+tc.lang, nil)
 		srcs := []core.Source{{URL: "https://cdn.example/master.m3u8", Type: "hls"}}
-		proxySources(req, srcs, map[string]string{"Referer": "https://x/"}, tc.lang)
-		u := srcs[0].URL
+		u := proxySources(req, srcs, map[string]string{"Referer": "https://x/"}, tc.lang)[0].URL
 		if !strings.Contains(u, "/api/v1/proxy?url=") {
 			t.Fatalf("lang=%q: source not wrapped: %s", tc.lang, u)
 		}
