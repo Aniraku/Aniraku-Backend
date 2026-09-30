@@ -1,8 +1,7 @@
 package streaming
 
 import (
-	"context"
-	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rs/zerolog"
@@ -10,182 +9,134 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// dubSubFakeProvider scripts FindEpisodeSource per lang and counts calls.
-type dubSubFakeProvider struct {
-	name     string
-	dub      *SourceResult
-	sub      *SourceResult
-	subErr   error
-	subCalls *int
+// Operator rule: EVERY dub source carries the nico (kaa) subtitle files,
+// never its own provider's sub files. These tests use the real kaa
+// fixture provider as the subtitle origin (anilist "20" ep1 sub resolves
+// one nico source with vtt-sub.vtt).
+func dubNicoTestManager(t *testing.T) (*Manager, *kaaFixture) {
+	t.Helper()
+	f := newKaaFixture(t)
+	return &Manager{log: zerolog.Nop(), providers: []Provider{newKaaTestProvider(f)}}, f
 }
 
-func (f *dubSubFakeProvider) Name() string { return f.name }
-func (f *dubSubFakeProvider) Search(ctx context.Context, title string) ([]SearchResult, error) {
-	return nil, nil
-}
-func (f *dubSubFakeProvider) FindEpisodes(ctx context.Context, providerID string) ([]Episode, error) {
-	return nil, nil
-}
-func (f *dubSubFakeProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
-	if lang == "sub" {
-		*f.subCalls++
-		return f.sub, f.subErr
-	}
-	return f.dub, nil
-}
-
-func dubSubTestManager(fake *dubSubFakeProvider) *Manager {
-	return &Manager{log: zerolog.Nop(), providers: []Provider{fake}}
-}
-
-func dubSubSrc(url string, subs ...core.Subtitle) core.Source {
+func dubSrc(url string, subs ...core.Subtitle) core.Source {
 	return core.Source{URL: url, Type: "hls", Quality: "auto", Subtitles: subs}
 }
 
-// Non-dub requests never trigger a sub fetch.
-func TestDubSubtitlesSubPassthrough(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{name: "flixcloud", subCalls: &calls}
-	m := dubSubTestManager(fake)
-	in := &SourceResult{Sources: []core.Source{dubSubSrc("u1")}}
-	if got := m.withDubSubtitles(context.Background(), "flixcloud", "sub", "1", 1, in); got != in {
-		t.Fatal("sub request must return the input untouched")
+// Dub sources with their own files get the nico files; input untouched.
+func TestDubSubtitlesNicoApplied(t *testing.T) {
+	m, _ := dubNicoTestManager(t)
+	in := &SourceResult{Sources: []core.Source{
+		dubSrc("https://dub.example/a.m3u8",
+			core.Subtitle{URL: "https://dub.example/a-eng.vtt", Lang: "en", Label: "English"}),
+		dubSrc("https://dub.example/b.m3u8"),
+	}}
+	got := m.withDubSubtitles(kaaTestCtx(t), "zoko", "dub", "20", 1, in)
+	if got == in {
+		t.Fatal("expected a rewritten copy, got the input pointer")
 	}
-	if calls != 0 {
-		t.Fatalf("sub fetch called %d times, want 0", calls)
-	}
-}
-
-// Dub sources whose files already equal the sub files cost one sub fetch
-// for the comparison but come back untouched (same pointer).
-func TestDubSubtitlesIdenticalNoCopy(t *testing.T) {
-	calls := 0
-	subs := []core.Subtitle{{URL: "a", Lang: "sub", Label: "sub"}}
-	fake := &dubSubFakeProvider{
-		name:     "kaa",
-		subCalls: &calls,
-		dub:      &SourceResult{Sources: []core.Source{dubSubSrc("u1", core.Subtitle{URL: "a", Lang: "dub", Label: "dub"})}},
-		sub:      &SourceResult{Sources: []core.Source{dubSubSrc("u1", subs...)}},
-	}
-	m := dubSubTestManager(fake)
-	in := fake.dub
-	if got := m.withDubSubtitles(context.Background(), "kaa", "dub", "1", 1, in); got != in {
-		t.Fatal("identical files must return the input untouched")
-	}
-	if calls != 1 {
-		t.Fatalf("sub fetch called %d times, want 1", calls)
-	}
-}
-
-// Same upstream URL on both sides: dub takes the sub source's files even
-// when it already had its own (operator rule: dub uses sub's files).
-func TestDubSubtitlesMatchedByURL(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{
-		name:     "zoko",
-		subCalls: &calls,
-		dub: &SourceResult{Sources: []core.Source{
-			dubSubSrc("u1", core.Subtitle{URL: "dub-only", Lang: "dub", Label: "dub"}),
-		}},
-		sub: &SourceResult{Sources: []core.Source{
-			dubSubSrc("u1", core.Subtitle{URL: "sub-file", Lang: "sub", Label: "sub"}),
-		}},
-	}
-	m := dubSubTestManager(fake)
-	in := fake.dub
-	got := m.withDubSubtitles(context.Background(), "zoko", "dub", "1", 1, in)
-	if calls != 1 {
-		t.Fatalf("sub fetch called %d times, want 1", calls)
-	}
-	if len(got.Sources[0].Subtitles) != 1 || got.Sources[0].Subtitles[0].URL != "sub-file" {
-		t.Fatalf("dub subs = %+v, want [sub-file]", got.Sources[0].Subtitles)
-	}
-	if len(in.Sources[0].Subtitles) != 1 || in.Sources[0].Subtitles[0].URL != "dub-only" {
-		t.Fatal("input mutated: provider-shared results must never be modified")
-	}
-}
-
-// Different upstream URLs (separate dub bundle): dub sources get the
-// merged sub file list, and the input is never mutated.
-func TestDubSubtitlesMergedFallback(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{
-		name:     "anikoto",
-		subCalls: &calls,
-		dub: &SourceResult{Sources: []core.Source{
-			dubSubSrc("dub-u1"),
-			dubSubSrc("dub-u2", core.Subtitle{URL: "keep", Lang: "dub", Label: "dub"}),
-		}},
-		sub: &SourceResult{Sources: []core.Source{
-			dubSubSrc("sub-u1",
-				core.Subtitle{URL: "a", Lang: "sub", Label: "sub"},
-				core.Subtitle{URL: "b", Lang: "sub", Label: "sub"},
-				core.Subtitle{URL: "a", Lang: "sub", Label: "dup"}),
-		}},
-	}
-	m := dubSubTestManager(fake)
-	in := fake.dub
-	got := m.withDubSubtitles(context.Background(), "anikoto", "dub", "1", 1, in)
-	if calls != 1 {
-		t.Fatalf("sub fetch called %d times, want 1", calls)
-	}
-	if len(got.Sources) != 2 {
-		t.Fatalf("sources = %d, want 2", len(got.Sources))
-	}
-	for si, src := range got.Sources {
-		if len(src.Subtitles) != 2 || src.Subtitles[0].URL != "a" || src.Subtitles[1].URL != "b" {
-			t.Fatalf("sources[%d] subs = %+v, want [a b]", si, src.Subtitles)
+	for i, src := range got.Sources {
+		if len(src.Subtitles) != 1 || !strings.HasSuffix(src.Subtitles[0].URL, "/vtt-sub.vtt") {
+			t.Fatalf("sources[%d] subs = %+v, want the single nico file vtt-sub.vtt", i, src.Subtitles)
 		}
 	}
-	if len(in.Sources[0].Subtitles) != 0 || len(in.Sources[1].Subtitles) != 1 {
+	if len(in.Sources[0].Subtitles) != 1 || len(in.Sources[1].Subtitles) != 0 {
 		t.Fatal("input mutated: provider-shared results must never be modified")
 	}
 }
 
-// Failed sub resolve keeps the dub result as-is.
-func TestDubSubtitlesSubFailureKeepsDub(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{
-		name:     "nin",
-		subCalls: &calls,
-		dub:      &SourceResult{Sources: []core.Source{dubSubSrc("u1")}},
-		subErr:   errors.New("boom"),
+// Dub sources already carrying the nico files come back untouched.
+func TestDubSubtitlesNicoIdenticalNoCopy(t *testing.T) {
+	m, _ := dubNicoTestManager(t)
+	ksub, err := m.providers[0].FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil || len(ksub.Sources) == 0 || len(ksub.Sources[0].Subtitles) == 0 {
+		t.Fatalf("nico resolve: %v %+v", err, ksub)
 	}
-	m := dubSubTestManager(fake)
-	in := fake.dub
-	if got := m.withDubSubtitles(context.Background(), "nin", "dub", "1", 1, in); got != in {
-		t.Fatal("failed sub fetch must return the input untouched")
+	in := &SourceResult{Sources: []core.Source{dubSrc("https://dub.example/a.m3u8", ksub.Sources[0].Subtitles...)}}
+	if got := m.withDubSubtitles(kaaTestCtx(t), "zoko", "dub", "20", 1, in); got != in {
+		t.Fatal("identical files must return the input untouched")
 	}
-	if calls != 1 {
-		t.Fatalf("sub fetch called %d times, want 1", calls)
+}
+
+// No kaa provider configured: dub untouched, no error.
+func TestDubSubtitlesNoKaaKeepsDub(t *testing.T) {
+	m := &Manager{log: zerolog.Nop(), providers: nil}
+	in := &SourceResult{Sources: []core.Source{dubSrc("https://dub.example/a.m3u8")}}
+	if got := m.withDubSubtitles(kaaTestCtx(t), "zoko", "dub", "20", 1, in); got != in {
+		t.Fatal("missing kaa must return the input untouched")
+	}
+}
+
+// kaa without a match (empty listing): dub untouched, no error.
+func TestDubSubtitlesNicoMissingKeepsDub(t *testing.T) {
+	f := newKaaFixture(t)
+	f.emptyEpisodes = true
+	m := &Manager{log: zerolog.Nop(), providers: []Provider{newKaaTestProvider(f)}}
+	in := &SourceResult{Sources: []core.Source{
+		dubSrc("https://dub.example/a.m3u8",
+			core.Subtitle{URL: "https://dub.example/a-eng.vtt", Lang: "en", Label: "English"}),
+	}}
+	if got := m.withDubSubtitles(kaaTestCtx(t), "zoko", "dub", "20", 1, in); got != in {
+		t.Fatal("unavailable nico must return the input untouched")
+	}
+}
+
+// Non-dub requests never touch kaa.
+func TestDubSubtitlesSubPassthrough(t *testing.T) {
+	m, _ := dubNicoTestManager(t)
+	in := &SourceResult{Sources: []core.Source{dubSrc("u1")}}
+	if got := m.withDubSubtitles(kaaTestCtx(t), "flixcloud", "sub", "20", 1, in); got != in {
+		t.Fatal("sub request must return the input untouched")
 	}
 }
 
 // Nil input stays nil without touching providers.
 func TestDubSubtitlesNil(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{name: "kaa", subCalls: &calls}
-	m := dubSubTestManager(fake)
-	if got := m.withDubSubtitles(context.Background(), "kaa", "dub", "1", 1, nil); got != nil {
+	m, _ := dubNicoTestManager(t)
+	if got := m.withDubSubtitles(kaaTestCtx(t), "kaa", "dub", "20", 1, nil); got != nil {
 		t.Fatal("nil input must stay nil")
-	}
-	if calls != 0 {
-		t.Fatalf("sub fetch called %d times, want 0", calls)
 	}
 }
 
-// Sub resolve with no subtitle files at all keeps dub as-is.
-func TestDubSubtitlesEmptySubKeepsDub(t *testing.T) {
-	calls := 0
-	fake := &dubSubFakeProvider{
-		name:     "flixcloud",
-		subCalls: &calls,
-		dub:      &SourceResult{Sources: []core.Source{dubSubSrc("u1", core.Subtitle{URL: "d", Lang: "dub", Label: "dub"})}},
-		sub:      &SourceResult{Sources: []core.Source{dubSubSrc("s1")}},
+// mergeNiNSubtitles on dub must preserve the nico files withDubSubtitles
+// attached and only fill sources that have none; sub keeps the legacy
+// overwrite-from-donor behavior.
+func TestMergeNiNSubtitlesDubPreservesNico(t *testing.T) {
+	nico := []core.Subtitle{{URL: "https://nico.example/s.vtt", Lang: "sub", Label: "sub"}}
+	donor := []core.Subtitle{{URL: "https://ak.example/d.vtt", Lang: "en", Label: "English"}}
+	nn := []core.Server{{
+		Name: "NiN", Provider: "nin", Lang: "dub",
+		Sources: []core.Source{dubSrc("https://nin.example/d.m3u8", nico...), dubSrc("https://nin.example/e.m3u8")},
+	}}
+	ak := []core.Server{{
+		Name: "Niko", Provider: "anikoto", Lang: "dub",
+		Sources: []core.Source{dubSrc("https://ak.example/d.m3u8", donor...)},
+	}}
+	got := mergeNiNSubtitles(nn, ak, nil, nil, "dub")
+	if len(got[0].Sources[0].Subtitles) != 1 || got[0].Sources[0].Subtitles[0].URL != "https://nico.example/s.vtt" {
+		t.Fatalf("nico subs overwritten on dub: %+v", got[0].Sources[0].Subtitles)
 	}
-	m := dubSubTestManager(fake)
-	in := fake.dub
-	if got := m.withDubSubtitles(context.Background(), "flixcloud", "dub", "1", 1, in); got != in {
-		t.Fatal("empty sub files must return the input untouched")
+	if len(got[0].Sources[1].Subtitles) != 1 || got[0].Sources[1].Subtitles[0].URL != "https://ak.example/d.vtt" {
+		t.Fatalf("empty dub source not filled from donor: %+v", got[0].Sources[1].Subtitles)
+	}
+	if &got[0].Sources[1].Subtitles[0] == &donor[0] {
+		t.Fatal("donor slice aliased into the server instead of copied")
+	}
+}
+
+func TestMergeNiNSubtitlesSubOverwrites(t *testing.T) {
+	own := []core.Subtitle{{URL: "https://nin.example/s.vtt", Lang: "en", Label: "English"}}
+	donor := []core.Subtitle{{URL: "https://ak.example/s.vtt", Lang: "en", Label: "English"}}
+	nn := []core.Server{{
+		Name: "NiN", Provider: "nin", Lang: "sub",
+		Sources: []core.Source{dubSrc("https://nin.example/s.m3u8", own...)},
+	}}
+	ak := []core.Server{{
+		Name: "Niko", Provider: "anikoto", Lang: "sub",
+		Sources: []core.Source{dubSrc("https://ak.example/s.m3u8", donor...)},
+	}}
+	got := mergeNiNSubtitles(nn, ak, nil, nil, "sub")
+	if len(got[0].Sources[0].Subtitles) != 1 || got[0].Sources[0].Subtitles[0].URL != "https://ak.example/s.vtt" {
+		t.Fatalf("sub donor overwrite changed: %+v", got[0].Sources[0].Subtitles)
 	}
 }

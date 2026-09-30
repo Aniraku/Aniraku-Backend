@@ -16,7 +16,7 @@ import (
 // untouched, so each request gets its own base + al.
 func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 	srcs := []core.Source{{
-		URL: "https://cdn.example/video/master.m3u8", Type: "hls", Quality: "auto",
+		URL: "https://hls.krussdomi.com/manifest/x/master.m3u8", Type: "hls", Quality: "auto",
 		Subtitles: []core.Subtitle{{URL: "https://cdn.example/subs/en.vtt", Lang: "en", Label: "English"}},
 	}}
 	headers := map[string]string{"Referer": "https://upstream.example/"}

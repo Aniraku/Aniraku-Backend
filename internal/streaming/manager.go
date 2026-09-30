@@ -500,7 +500,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// merge is skipped for hentai titles: it would send them to a gated
 	// provider.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
-	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers)
+	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers, lang)
 
 	allServers := append(append(append(append(append(akServers, axServers...), zkServers...), fcServers...), nnServers...), kaServers...)
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -688,10 +688,14 @@ func mergeZokoDownloads(ctx context.Context, m *Manager, zkServers, akServers []
 // the frontend's proxy hits the same walls), while the borrowed tracks point
 // at hosts the frontend already proxies fine — same episode, same timings.
 // Without a donor NiN simply ships no subs; it never resurrects its own.
-func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server) []core.Server {
+func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server, lang string) []core.Server {
 	if len(nnServers) == 0 {
 		return nnServers
 	}
+	// Dub listings already carry the nico subtitle files (withDubSubtitles)
+	// — never overwrite those with provider dub files; only fill sources
+	// that somehow have none (nico unavailable for the title).
+	fillEmptyOnly := strings.EqualFold(lang, "dub")
 	var donor []core.Subtitle
 	for _, pool := range [][]core.Server{akServers, axServers, zkServers} {
 		for _, s := range pool {
@@ -714,6 +718,9 @@ func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server)
 	}
 	for i := range nnServers {
 		for j := range nnServers[i].Sources {
+			if fillEmptyOnly && len(nnServers[i].Sources[j].Subtitles) > 0 {
+				continue
+			}
 			subs := make([]core.Subtitle, len(donor))
 			copy(subs, donor)
 			nnServers[i].Sources[j].Subtitles = subs
@@ -991,64 +998,52 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 	return nil
 }
 
-// withDubSubtitles enforces the operator rule: dub server sources carry the
-// SUB-language subtitle files — the same files the sub listing serves, not
-// the dub resolve's own. Per source, subtitles are matched by upstream URL
-// (same stream → identical files); dub sources with no sub-side match get
-// the merged sub subtitle list. The sub resolve is fetched whenever dub
-// sources exist, because a mismatch is only visible after comparing.
-// Failures keep the dub result as-is (best effort: subtitles must never
-// fail playback). The input is never mutated: provider caches may share
-// the pointed-to result.
+// withDubSubtitles enforces the operator rule: EVERY dub server source
+// carries the nico (kaa) subtitle files — never its own provider's sub
+// files. The kaa sub resolve is the single subtitle origin for dub across
+// all providers; per-source URL matching is gone because the origin is
+// fixed. kaa is fetched only on dub requests; when kaa is unconfigured,
+// has no match, or carries no subtitles, the dub result is kept as-is
+// (best effort: subtitles must never fail playback). The input is never
+// mutated: provider caches may share the pointed-to result.
 func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistID string, episode int, sr *SourceResult) *SourceResult {
 	if !strings.EqualFold(lang, "dub") || sr == nil || len(sr.Sources) == 0 {
 		return sr
 	}
-	var prov Provider
-	for _, p := range m.providers {
-		if p.Name() == provider {
-			prov = p
+	ka := m.getKaaProvider()
+	if ka == nil {
+		return sr
+	}
+	ksub, err := ka.FindEpisodeSource(ctx, anilistID, episode, "sub")
+	if err != nil || ksub == nil {
+		m.log.Warn().Err(err).Str("provider", provider).Str("anilistId", anilistID).
+			Int("episode", episode).Msg("dub subtitles: nico resolve unavailable, keeping dub as-is")
+		return sr
+	}
+	// nico is kaa's first positional server; prefer the source actually
+	// named nico, else the first source carrying subtitle files.
+	var nico []core.Subtitle
+	for i := range ksub.Sources {
+		if len(ksub.Sources[i].Subtitles) == 0 {
+			continue
+		}
+		if len(nico) == 0 {
+			nico = ksub.Sources[i].Subtitles
+		}
+		if i < len(ksub.ServerNames) && ksub.ServerNames[i] == "nico" {
+			nico = ksub.Sources[i].Subtitles
 			break
 		}
 	}
-	if prov == nil {
-		return sr
-	}
-	sub, err := prov.FindEpisodeSource(ctx, anilistID, episode, "sub")
-	if err != nil || sub == nil {
-		m.log.Warn().Err(err).Str("provider", provider).Str("anilistId", anilistID).
-			Int("episode", episode).Msg("dub subtitles: sub resolve unavailable, keeping dub as-is")
-		return sr
-	}
-	subByURL := map[string][]core.Subtitle{}
-	seen := map[string]bool{}
-	var merged []core.Subtitle
-	for i := range sub.Sources {
-		s := &sub.Sources[i]
-		if len(s.Subtitles) > 0 && s.URL != "" {
-			subByURL[s.URL] = s.Subtitles
-		}
-		for _, st := range s.Subtitles {
-			if st.URL == "" || seen[st.URL] {
-				continue
-			}
-			seen[st.URL] = true
-			merged = append(merged, st)
-		}
-	}
-	if len(merged) == 0 {
+	if len(nico) == 0 {
 		return sr
 	}
 	out := *sr
 	out.Sources = append([]core.Source(nil), sr.Sources...)
 	changed := false
 	for i := range out.Sources {
-		want, ok := subByURL[out.Sources[i].URL]
-		if !ok {
-			want = merged
-		}
-		if !sameSubtitleURLs(out.Sources[i].Subtitles, want) {
-			out.Sources[i].Subtitles = want
+		if !sameSubtitleURLs(out.Sources[i].Subtitles, nico) {
+			out.Sources[i].Subtitles = nico
 			changed = true
 		}
 	}
