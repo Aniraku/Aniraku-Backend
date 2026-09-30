@@ -55,8 +55,10 @@ import (
 // SERVER NAMES (operator): kaa servers are named by position — nico, robin,
 // D'Luff, then the same crew scheme — never raw player names.
 //
-// SUBTITLE RULE (operator): dub sources carry the SUB (ja-JP) player page's
-// subtitle files, resolved on dub cache-miss and shared from the cache.
+// SUBTITLE RULE (operator): dub sources carry the SUB (ja-JP) page's
+// subtitle files. Enforced centrally by Manager.withDubSubtitles (per
+// upstream URL match, merged-list fallback) across all providers —
+// kaa only extracts its resolving page's own files here.
 const (
 	kaaAPIBase     = "https://kaa.lt"
 	kaaKrussOrigin = "https://krussdomi.com"
@@ -307,7 +309,8 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 // result must never leak into a dub listing or vice versa.
 //
 // Dub sources still carry the SUB (ja-JP) page's subtitle files (operator
-// subtitle rule); that is a targeted subtitle fetch, not a manifest share.
+// subtitle rule), enforced centrally by withDubSubtitles — that is a
+// targeted subtitle fetch, not a manifest share.
 func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
@@ -564,28 +567,14 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		"Referer": kaaKrussRef,
 		"Origin":  kaaKrussOrigin,
 	}
-	// Subtitle files on dub resolves always come from the SUB (ja-JP)
-	// player page: dub pages carry fewer/no subtitle links, and the
-	// operator rule is sub subs on dub sources. Best-effort — never fails
-	// the resolve. Skipped entirely on sub resolves (nothing to add, and
-	// it would waste a listing + watch + player fetch per cache miss).
-	var dubSubs []string
-	if strings.EqualFold(reqLang, "dub") {
-		var err error
-		dubSubs, err = p.kaaDubSubtitles(ctx, slug, episode)
-		if err != nil {
-			p.log.Warn().Err(err).Int("animeId", id).Int("episode", episode).Msg("kaa dub subtitles unavailable, using resolving page subs")
-			dubSubs = nil
-		}
-	}
+	// Subtitles are the resolving page's own player-page files. The
+	// operator rule (dub sources carry the SUB page's files) is enforced
+	// centrally by Manager.withDubSubtitles, which matches per upstream
+	// URL — an in-provider fetch here would only duplicate that work.
 	sr := &SourceResult{Headers: headers}
 	for i, h := range hits {
-		vtts := h.vtts
-		if strings.EqualFold(reqLang, "dub") && len(dubSubs) > 0 {
-			vtts = dubSubs
-		}
 		var subs []core.Subtitle
-		for _, s := range vtts {
+		for _, s := range h.vtts {
 			p.learnURLHost(s)
 			subs = append(subs, core.Subtitle{URL: s, Lang: reqLang, Label: reqLang})
 		}
@@ -600,43 +589,6 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		sr.ServerNames = append(sr.ServerNames, kaaServerName(i))
 	}
 	return sr, nil
-}
-
-// kaaDubSubtitles fetches subtitle links from the SUB (ja-JP) episode page
-// for attachment to dub sources.
-func (p *KaaProvider) kaaDubSubtitles(ctx context.Context, slug string, episode int) ([]string, error) {
-	eps, err := p.listEpisodes(ctx, slug, "ja-JP", episode)
-	if err != nil {
-		return nil, err
-	}
-	var match *kaaEpisode
-	for i := range eps {
-		if eps[i].Number == episode {
-			match = &eps[i]
-			break
-		}
-	}
-	if match == nil || match.Slug == "" {
-		return nil, fmt.Errorf("kaa: sub episode %d not listed", episode)
-	}
-	watchURL := fmt.Sprintf("%s/%s/ep-%d-%s", p.kaaBase, slug, episode, match.Slug)
-	raw, err := p.doText(ctx, watchURL, p.kaaHeaders(p.kaaBase+"/"), 1<<20)
-	if err != nil {
-		return nil, err
-	}
-	for _, pl := range kaaExtractPlayers(raw) {
-		if strings.Contains(strings.ToLower(pl.src), "type=dash") {
-			continue
-		}
-		praw, err := p.doText(ctx, pl.src, p.kaaHeaders(watchURL), 1<<20)
-		if err != nil {
-			continue
-		}
-		if vtts := kaaFindSubtitles(kaaUnescape(praw)); len(vtts) > 0 {
-			return vtts, nil
-		}
-	}
-	return nil, fmt.Errorf("kaa: no sub subtitles for episode %d", episode)
 }
 
 func kaaExtractPlayers(raw string) []kaaPlayer {
