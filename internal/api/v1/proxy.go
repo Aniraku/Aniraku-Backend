@@ -95,15 +95,19 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	proxyBase := requestPublicBaseURL(r)
 	// Audio language for dual-audio masters: the proxy strips the wrong
 	// AUDIO rendition at rewrite time (see stripAudioRenditions in
-	// proxy_audio.go). Only a known lang qualifies.
-	alParam := ""
-	if lang == "sub" || lang == "dub" {
-		alParam = "&al=" + lang
-	}
+	// proxy_audio.go). Attached ONLY to krussdomi/kaa HLS sources
+	// (operator rule) — they are the only dual-audio masters in the
+	// catalog; every other provider serves single-audio muxed streams
+	// where the strip is a guaranteed no-op.
+	wantAl := lang == "sub" || lang == "dub"
 	for i := range out {
 		source := &out[i]
 		if strings.ToLower(source.Type) != "hls" || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
 			continue
+		}
+		alParam := ""
+		if wantAl && isKaaHLSSource(source.URL) {
+			alParam = "&al=" + lang
 		}
 		source.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s%s", proxyBase, url.QueryEscape(source.URL), headersParam, alParam)
 		// Subtitle URLs are delivered RAW: the web client wraps them with its
@@ -118,6 +122,20 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	// (observed: local 127.0.0.1 links and al=dub served on production sub
 	// requests). Callers use the returned copy.
 	return out
+}
+
+// isKaaHLSSource reports whether an upstream URL is a krussdomi/kaa HLS
+// source (hls/bl.krussdomi.com manifests, including animex-Sora's kaamx
+// mirrors). Only these carry dual-audio masters, so only these qualify
+// for the al=sub/dub audio strip. A false positive is harmless: the
+// strip leaves playlists without a matching AUDIO group byte-identical.
+func isKaaHLSSource(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return strings.Contains(host, "krussdomi") || strings.Contains(host, "kaa")
 }
 
 func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {

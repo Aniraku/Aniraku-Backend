@@ -145,7 +145,7 @@ func TestProxySourcesAddsAudioLangParam(t *testing.T) {
 		{lang: "", wantNoA: true},
 	} {
 		req := httptest.NewRequest("GET", "http://api.test/api/v1/servers?lang="+tc.lang, nil)
-		srcs := []core.Source{{URL: "https://cdn.example/master.m3u8", Type: "hls"}}
+		srcs := []core.Source{{URL: "https://hls.krussdomi.com/manifest/x/master.m3u8", Type: "hls"}}
 		u := proxySources(req, srcs, map[string]string{"Referer": "https://x/"}, tc.lang)[0].URL
 		if !strings.Contains(u, "/api/v1/proxy?url=") {
 			t.Fatalf("lang=%q: source not wrapped: %s", tc.lang, u)
@@ -157,6 +157,27 @@ func TestProxySourcesAddsAudioLangParam(t *testing.T) {
 		} else if !strings.Contains(u, tc.wantAl) {
 			t.Errorf("lang=%q: missing %s in %s", tc.lang, tc.wantAl, u)
 		}
+	}
+}
+
+// The al audio wrapper is kaa/krussdomi-only: any other provider's HLS
+// source is wrapped WITHOUT al (its streams are single-audio muxed, so
+// the strip would be a no-op anyway).
+func TestProxySourcesAlKaaOnly(t *testing.T) {
+	req := httptest.NewRequest("GET", "http://api.test/api/v1/servers?lang=sub", nil)
+	srcs := []core.Source{
+		{URL: "https://hls.dramahot.top/v/a/b/c/master.m3u8", Type: "hls"},
+		{URL: "https://bl.krussdomi.com/playlist/abc/master.m3u8", Type: "hls"},
+	}
+	got := proxySources(req, srcs, map[string]string{"Referer": "https://x/"}, "sub")
+	if strings.Contains(got[0].URL, "&al=") {
+		t.Errorf("non-kaa source must not carry al: %s", got[0].URL)
+	}
+	if !strings.Contains(got[1].URL, "&al=sub") {
+		t.Errorf("krussdomi source must carry al=sub: %s", got[1].URL)
+	}
+	if strings.Contains(srcs[0].URL, "/api/v1/proxy?") || strings.Contains(srcs[1].URL, "/api/v1/proxy?") {
+		t.Fatal("input mutated")
 	}
 }
 

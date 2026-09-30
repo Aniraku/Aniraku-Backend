@@ -187,7 +187,7 @@ func TestMergeNiNSubtitles(t *testing.T) {
 	out := mergeNiNSubtitles(nn(),
 		[]core.Server{mkNinServer("Niko", "anikoto", nikoSubs)},
 		[]core.Server{mkNinServer("Mochi", "animex", mochiSubs)},
-		[]core.Server{mkNinServer("Zoko", "zoko", zokoSubs)})
+		[]core.Server{mkNinServer("Zoko", "zoko", zokoSubs)}, "sub")
 	if got := out[0].Sources[0].Subtitles; len(got) != 1 || got[0].URL != nikoSubs[0].URL {
 		t.Fatalf("with Niko present: subs = %+v, want Niko's", got)
 	}
@@ -195,19 +195,19 @@ func TestMergeNiNSubtitles(t *testing.T) {
 	// Niko missing -> animex (Mochi) next.
 	out = mergeNiNSubtitles(nn(), nil,
 		[]core.Server{mkNinServer("Mochi", "animex", mochiSubs)},
-		[]core.Server{mkNinServer("Zoko", "zoko", zokoSubs)})
+		[]core.Server{mkNinServer("Zoko", "zoko", zokoSubs)}, "sub")
 	if got := out[0].Sources[0].Subtitles; len(got) != 1 || got[0].URL != mochiSubs[0].URL {
 		t.Fatalf("without Niko: subs = %+v, want Mochi's", got)
 	}
 
 	// Only Zoko left.
-	out = mergeNiNSubtitles(nn(), nil, nil, []core.Server{mkNinServer("Zoko", "zoko", zokoSubs)})
+	out = mergeNiNSubtitles(nn(), nil, nil, []core.Server{mkNinServer("Zoko", "zoko", zokoSubs)}, "sub")
 	if got := out[0].Sources[0].Subtitles; len(got) != 1 || got[0].URL != zokoSubs[0].URL {
 		t.Fatalf("only Zoko: subs = %+v, want Zoko's", got)
 	}
 
 	// No donor anywhere: NiN keeps shipping nothing (never its own).
-	out = mergeNiNSubtitles(nn(), nil, nil, nil)
+	out = mergeNiNSubtitles(nn(), nil, nil, nil, "sub")
 	if got := out[0].Sources[0].Subtitles; len(got) != 0 {
 		t.Fatalf("no donor: subs = %+v, want none", got)
 	}
