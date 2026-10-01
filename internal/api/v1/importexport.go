@@ -2004,7 +2004,7 @@ func isAniListRateLimitError(err error) bool {
 // anilistAuthed POSTs a GraphQL request to AniList with a user token.
 func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	payload, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.aniraku.tech", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}

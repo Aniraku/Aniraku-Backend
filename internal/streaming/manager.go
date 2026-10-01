@@ -177,7 +177,7 @@ func (m *Manager) isHentaiTitle(ctx context.Context, animeID int) bool {
 
 	isHentai := false
 	query := `{"query":"{ Media(id:` + strconv.Itoa(animeID) + `,type:ANIME){genres isAdult} }"}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", strings.NewReader(query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.aniraku.tech", strings.NewReader(query))
 	if err == nil {
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")

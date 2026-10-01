@@ -279,7 +279,7 @@ func fetchAniListMALID(ctx context.Context, client *http.Client, anilistID int) 
 		return 0
 	}
 	query := `{"query":"{ Media(id:` + strconv.Itoa(anilistID) + `,type:ANIME){ idMal } }"}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co", strings.NewReader(query))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.aniraku.tech", strings.NewReader(query))
 	if err != nil {
 		return 0
 	}
