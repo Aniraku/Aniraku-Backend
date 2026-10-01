@@ -102,7 +102,8 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	wantAl := lang == "sub" || lang == "dub"
 	for i := range out {
 		source := &out[i]
-		if strings.ToLower(source.Type) != "hls" || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
+		st := strings.ToLower(source.Type)
+		if (st != "hls" && st != "mp4") || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
 			continue
 		}
 		alParam := ""
