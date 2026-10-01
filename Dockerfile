@@ -27,7 +27,10 @@ WORKDIR /app
 COPY --from=gobuild /aniraku-server /app/aniraku-server
 COPY --from=gobuild /src/third_party/mkissa-engine /app/third_party/mkissa-engine
 COPY start.sh /start.sh
-RUN chmod +x /start.sh && chown -R appuser /app && /usr/local/bin/bun --version
+# Engine JS deps (wreq TLS binding) install at build time so the repo
+# stays free of vendored node_modules; bun needs HOME-writable cache
+# only during this root-owned step.
+RUN chmod +x /start.sh && /usr/local/bin/bun install --cwd /app/third_party/mkissa-engine --production --silent && chown -R appuser /app && /usr/local/bin/bun --version
 USER appuser
 EXPOSE 43211
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
