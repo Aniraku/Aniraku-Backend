@@ -609,14 +609,14 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 	if strings.EqualFold(lang, "dub") {
 		langKey = "dub"
 	}
-	showID, _, err := p.resolveShow(ctx, id, langKey)
+	showID, showTitle, err := p.resolveShow(ctx, id, langKey)
 	if err != nil {
 		return nil, err
 	}
 	if got := p.loadResolved(showID, episode, langKey); got != nil {
 		return got, nil
 	}
-	epStr, err := p.matchEpisode(ctx, showID, langKey, episode)
+	epStr, err := p.matchEpisode(ctx, showID, showTitle, langKey, episode)
 	if err != nil {
 		return nil, err
 	}
@@ -671,10 +671,11 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 
 // matchEpisode verifies the episode is listed for this audio track and
 // returns its exact episode string (fractional entries never match an int
-// request, mirroring the engine's exact-string lookup). The showId itself
-// matches textually, so one extra search round-trip confirms the listing.
-func (p *MkissaProvider) matchEpisode(ctx context.Context, showID, langKey string, episode int) (string, error) {
-	edges, err := p.searchShows(ctx, showID, langKey)
+// request, mirroring the engine's exact-string lookup). It re-searches by
+// the resolved show title and picks the ID-matching edge: the API has no
+// direct show-by-ID lookup, and a raw showId text query returns nothing.
+func (p *MkissaProvider) matchEpisode(ctx context.Context, showID, showTitle, langKey string, episode int) (string, error) {
+	edges, err := p.searchShows(ctx, showTitle, langKey)
 	if err != nil {
 		return "", err
 	}
