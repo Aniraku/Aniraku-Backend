@@ -21,6 +21,7 @@ func allowedOrigins() map[string]bool {
 		"https://aniraku.vercel.app": true,
 		"https://www.aniraku.tech":   true,
 		"https://test.aniraku.tech":  true,
+		"https://aniraku.runs-on.dev":  true,
 	}
 
 	// Comma-separated extra origins for production
