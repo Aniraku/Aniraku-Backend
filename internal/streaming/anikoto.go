@@ -1022,7 +1022,7 @@ func fetchAniListMetaFor(ctx context.Context, client *http.Client, anilistID str
 func fetchAniListMetaUpstream(ctx context.Context, client *http.Client, anilistID string) (anilistMeta, error) {
 	var out anilistMeta
 	query := `{"query":"{ Media(id:` + anilistID + `,type:ANIME){title{english romaji} synonyms episodes format} }"}`
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.anilist.co",
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://graphql.aniraku.tech",
 		strings.NewReader(query))
 	if err != nil {
 		return out, err

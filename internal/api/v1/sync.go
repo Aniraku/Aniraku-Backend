@@ -747,7 +747,7 @@ func (h *Handlers) anilistTokenRequest(ctx context.Context, form url.Values) (*o
 func (h *Handlers) fetchAniListUsername(ctx context.Context, accessToken string) (string, error) {
 	query := `query { Viewer { name } }`
 	payload, _ := json.Marshal(map[string]any{"query": query})
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.aniraku.tech", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -785,7 +785,7 @@ func (h *Handlers) updateAniListProgress(ctx context.Context, accessToken string
 			"id": anilistID, "progress": episode, "status": status,
 		},
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.aniraku.tech", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -932,7 +932,7 @@ func (h *Handlers) updateAniListScore(ctx context.Context, accessToken string, a
 			"mediaId": anilistID, "scoreRaw": float64(score) * 10,
 		},
 	})
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.aniraku.tech", bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}

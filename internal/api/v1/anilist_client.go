@@ -76,7 +76,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 	return &anilistClient{
 		h:          h,
 		client:     h.h2Client,
-		endpoint:   "https://graphql.anilist.co",
+		endpoint:   "https://graphql.aniraku.tech",
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,

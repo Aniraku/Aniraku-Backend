@@ -130,7 +130,7 @@ func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider
 		kaaBase = kaaAPIBase
 	}
 	if anilistURL == "" {
-		anilistURL = "https://graphql.anilist.co"
+		anilistURL = "https://graphql.aniraku.tech"
 	}
 	return &KaaProvider{
 		log:        log,
