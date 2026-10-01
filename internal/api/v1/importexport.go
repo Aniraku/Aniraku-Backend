@@ -26,12 +26,17 @@ import (
 //	         provider episodes only ever advance Aniraku's max episode,
 //	         provider scores only fill titles with no local ratings)
 //	export = push Aniraku favorites → provider library, writing progress
-//	         (num_watched_episodes), status (watching/completed) and score
-//	         in a single per-title write.
+//	         (num_watched_episodes), list status (all six AniList states:
+//	         CURRENT/PLANNING/COMPLETED/PAUSED/DROPPED/REPEATING — MAL's
+//	         closest mapping) and score in a single per-title write.
 //
-// Aniraku has no provider-style status column: "completed" is derived
-// from watch_history (highest episode fully watched AND at/above the
-// known episode total), everything else maps to watching/CURRENT.
+// Statuses live on the bookmark row (`status` column, canonical
+// uppercase): import persists the provider's status per title, local
+// watch events advance it (PLANNING → CURRENT → COMPLETED, post-
+// completion watches → REPEATING), and export writes it back — so a
+// round trip preserves the user's list phases exactly. Rows predating
+// the column fall back to the legacy derivation (completed from watch
+// history, else watching/CURRENT).
 // Planning-only titles import as bookmarks with no watch rows.
 //
 // All endpoints are idempotent (upsert) and capped so a single request
@@ -94,8 +99,10 @@ func (h *Handlers) requireProviderToken(ctx context.Context, userID, provider st
 
 // importFavoriteDiff inserts only the ids not already in the user's
 // bookmarks, returning (newly inserted, already present). Import stays
-// idempotent while the UI can show what actually changed.
-func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int) (int, int, error) {
+// idempotent while the UI can show what actually changed. Fresh rows
+// carry their provider status (statuses map, canonical); existing rows
+// keep whatever status they already have.
+func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int, statuses map[int]string) (int, int, error) {
 	if len(ids) == 0 {
 		return 0, 0, nil
 	}
@@ -120,7 +127,7 @@ func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []
 	if err != nil {
 		h.log.Warn().Err(err).Msg("import: media metadata fetch failed, importing with fallback titles")
 	}
-	inserted, err := h.insertBookmarks(ctx, userID, fresh, meta)
+	inserted, err := h.insertBookmarks(ctx, userID, fresh, meta, statuses)
 	if err != nil {
 		return 0, already, err
 	}
@@ -135,7 +142,20 @@ type mediaMeta struct {
 }
 
 // providerEntry is a normalized provider list entry, keyed by AniList ID.
-// Status is one of: completed | watching | planning | paused | dropped.
+// Canonical list statuses (AniList vocabulary, uppercase). providerEntry
+// and anilistListState carry these; provider wire formats convert at the
+// edges (normalize* on read, statusFor* on write).
+const (
+	listCurrent   = "CURRENT"
+	listPlanning  = "PLANNING"
+	listCompleted = "COMPLETED"
+	listPaused    = "PAUSED"
+	listDropped   = "DROPPED"
+	listRepeating = "REPEATING"
+)
+
+// Status is canonical (CURRENT | PLANNING | COMPLETED | PAUSED |
+// DROPPED | REPEATING).
 type providerEntry struct {
 	AnimeID  int
 	Progress int
@@ -147,32 +167,54 @@ type providerEntry struct {
 func normalizeMALStatus(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "completed":
-		return "completed"
+		return listCompleted
 	case "watching":
-		return "watching"
+		return listCurrent
 	case "on_hold":
-		return "paused"
+		return listPaused
 	case "dropped":
-		return "dropped"
+		return listDropped
 	case "plan_to_watch":
-		return "planning"
+		return listPlanning
 	default:
-		return "watching"
+		return listCurrent
 	}
 }
 
 func normalizeAniListStatus(s string) string {
+	// REPEATING is preserved (not folded into CURRENT) so rewatch state
+	// survives import → export round trips.
 	switch strings.ToUpper(strings.TrimSpace(s)) {
-	case "COMPLETED":
+	case listCompleted:
+		return listCompleted
+	case listRepeating:
+		return listRepeating
+	case listCurrent:
+		return listCurrent
+	case listPaused:
+		return listPaused
+	case listDropped:
+		return listDropped
+	case listPlanning:
+		return listPlanning
+	default:
+		return listCurrent
+	}
+}
+
+// statusForMAL maps a canonical status to the MAL my_list_status value
+// (MAL has no rewatching flag — REPEATING rides as `watching` with the
+// episode progress intact).
+func statusForMAL(status string) string {
+	switch status {
+	case listCompleted:
 		return "completed"
-	case "CURRENT", "REPEATING":
-		return "watching"
-	case "PAUSED":
-		return "paused"
-	case "DROPPED":
+	case listPaused:
+		return "on_hold"
+	case listDropped:
 		return "dropped"
-	case "PLANNING":
-		return "planning"
+	case listPlanning:
+		return "plan_to_watch"
 	default:
 		return "watching"
 	}
@@ -277,7 +319,12 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 	return meta, nil
 }
 
-func (h *Handlers) insertBookmarks(ctx context.Context, userID string, ids []int, meta map[int]mediaMeta) (int, error) {
+// insertBookmarks upserts bookmark rows with their canonical list status
+// and known episode total. Projects predating the `status` /
+// `total_episodes` columns answer the first write with a column error —
+// fall back to the legacy shape so import still lands (statuses apply on
+// the next import after the column migration).
+func (h *Handlers) insertBookmarks(ctx context.Context, userID string, ids []int, meta map[int]mediaMeta, statuses map[int]string) (int, error) {
 	inserted := 0
 	for start := 0; start < len(ids); start += importBatchSize {
 		end := start + importBatchSize
@@ -285,35 +332,86 @@ func (h *Handlers) insertBookmarks(ctx context.Context, userID string, ids []int
 			end = len(ids)
 		}
 		rows := make([]map[string]any, 0, end-start)
+		legacy := make([]map[string]any, 0, end-start)
 		for _, id := range ids[start:end] {
 			m := meta[id]
 			title := m.title
 			if title == "" {
 				title = fmt.Sprintf("Anime %d", id)
 			}
-			rows = append(rows, map[string]any{
+			status := statuses[id]
+			if !isCanonicalStatus(status) {
+				status = listCurrent
+			}
+			base := map[string]any{
 				"user_id":  userID,
 				"anime_id": id,
 				"title":    title,
 				"image":    m.image,
 				"added_at": time.Now().UnixMilli(),
-			})
+			}
+			legacy = append(legacy, base)
+			full := map[string]any{
+				"user_id":        userID,
+				"anime_id":       id,
+				"title":          title,
+				"image":          m.image,
+				"added_at":       base["added_at"],
+				"status":         status,
+				"total_episodes": m.episodes,
+			}
+			rows = append(rows, full)
 		}
-		raw, _ := json.Marshal(rows)
-		resp, err := h.supabaseRequest(ctx, "POST",
-			"/rest/v1/bookmarks?on_conflict=user_id,anime_id",
-			bytes.NewReader(raw),
-			map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
-		if err != nil {
-			return inserted, err
-		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			return inserted, fmt.Errorf("bookmarks insert returned %s", resp.Status)
+		if err := h.postBookmarkRows(ctx, rows); err != nil {
+			if !isMissingColumnMessage(err) {
+				return inserted, err
+			}
+			if lerr := h.postBookmarkRows(ctx, legacy); lerr != nil {
+				return inserted, lerr
+			}
 		}
 		inserted += end - start
 	}
 	return inserted, nil
+}
+
+func (h *Handlers) postBookmarkRows(ctx context.Context, rows []map[string]any) error {
+	raw, _ := json.Marshal(rows)
+	resp, err := h.supabaseRequest(ctx, "POST",
+		"/rest/v1/bookmarks?on_conflict=user_id,anime_id",
+		bytes.NewReader(raw),
+		map[string]string{"Prefer": "resolution=merge-duplicates,return=minimal"})
+	if err != nil {
+		return err
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("bookmarks insert returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return nil
+}
+
+// isMissingColumnMessage reports a PostgREST unknown-column failure so
+// callers can retry against the legacy schema.
+func isMissingColumnMessage(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "column") &&
+		(strings.Contains(msg, "does not exist") ||
+			strings.Contains(msg, "could not find") ||
+			strings.Contains(msg, "pgrst204"))
+}
+
+func isCanonicalStatus(s string) bool {
+	switch s {
+	case listCurrent, listPlanning, listCompleted, listPaused, listDropped, listRepeating:
+		return true
+	default:
+		return false
+	}
 }
 
 func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int, error) {
@@ -342,6 +440,54 @@ func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int,
 		}
 	}
 	return ids, nil
+}
+
+// loadUserBookmarkStatus returns the stored canonical list status per
+// anime for export targeting. Unknown rows (and projects predating the
+// `status` column) are absent — callers fall back to the legacy watch-
+// derived targeting. Never fails the export: schema errors yield an
+// empty map.
+func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) map[int]string {
+	resp, err := h.supabaseRequest(ctx, "GET",
+		"/rest/v1/bookmarks?select=anime_id,status&user_id=eq."+encodePath(userID)+"&limit=2000",
+		nil, nil)
+	if err != nil {
+		return map[int]string{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return map[int]string{}
+	}
+	var rows []struct {
+		AnimeID int     `json:"anime_id"`
+		Status  *string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return map[int]string{}
+	}
+	out := make(map[int]string, len(rows))
+	for _, r := range rows {
+		if r.AnimeID <= 0 || r.Status == nil {
+			continue
+		}
+		if isCanonicalStatus(*r.Status) {
+			out[r.AnimeID] = *r.Status
+		}
+	}
+	return out
+}
+
+// wantExportStatus resolves the export target: the stored bookmark status
+// when present, else the legacy watch-derived targeting (completed from
+// watch history, otherwise CURRENT).
+func wantExportStatus(stored string, done bool) string {
+	if isCanonicalStatus(stored) {
+		return stored
+	}
+	if done {
+		return listCompleted
+	}
+	return listCurrent
 }
 
 // loadUserWatchProgress returns the latest/highest Aniraku episode state for
@@ -548,13 +694,13 @@ func (h *Handlers) loadUserAnimeScores(ctx context.Context, userID string) (map[
 // bookmarks for every title, watch_history rows that only advance the
 // local max episode, and scores only for titles with no local ratings.
 // Returns (imported, already, episodesAdded, scoresAdded, limited).
-func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, bool) {
+func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, map[string]int, bool) {
 	// De-duplicate: keep the best entry per title (most progress wins,
-	// completed beats watching on ties, then highest score).
+	// completed beats other statuses on ties, then highest score).
 	best := make(map[int]providerEntry, len(entries))
 	rank := func(e providerEntry) (int, int, int) {
 		completed := 0
-		if e.Status == "completed" {
+		if e.Status == listCompleted {
 			completed = 1
 		}
 		return e.Progress, completed, e.Score
@@ -562,6 +708,9 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	for _, e := range entries {
 		if e.AnimeID <= 0 {
 			continue
+		}
+		if !isCanonicalStatus(e.Status) {
+			e.Status = listCurrent
 		}
 		cur, ok := best[e.AnimeID]
 		if !ok {
@@ -576,10 +725,14 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	}
 
 	ids := make([]int, 0, len(best))
-	for id := range best {
+	statuses := make(map[string]int, len(best))
+	statusByID := make(map[int]string, len(best))
+	for id, e := range best {
 		ids = append(ids, id)
+		statuses[e.Status]++
+		statusByID[id] = e.Status
 	}
-	imported, already, err := h.importFavoriteDiff(ctx, userID, ids)
+	imported, already, err := h.importFavoriteDiff(ctx, userID, ids, statusByID)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("import: favorites insert failed")
 	}
@@ -623,7 +776,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 			title = fmt.Sprintf("Anime %d", e.AnimeID)
 		}
 		want := e.Progress
-		if e.Status == "completed" && want <= 0 {
+		if e.Status == listCompleted && want <= 0 {
 			// Provider says completed but reports no count: fall back to
 			// the known episode total so the title still lands completed.
 			if e.Total > 0 {
@@ -701,7 +854,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 			scoresAdded = 0
 		}
 	}
-	return imported, already, episodesAdded, scoresAdded, limited
+	return imported, already, episodesAdded, scoresAdded, statuses, limited
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -831,7 +984,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	imported, already, episodes, scores, limited := h.runProviderImport(r.Context(), userID, entries, nil)
+	imported, already, episodes, scores, statuses, limited := h.runProviderImport(r.Context(), userID, entries, nil)
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"provider": "mal",
@@ -842,6 +995,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		"total":    len(entries),
 		"unmapped": unmapped,
 		"limited":  limited,
+		"statuses": statuses,
 	})
 }
 
@@ -994,7 +1148,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 		return
 	}
-	imported, already, episodes, scores, limited := h.runProviderImport(r.Context(), userID, entries, meta)
+	imported, already, episodes, scores, statuses, limited := h.runProviderImport(r.Context(), userID, entries, meta)
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":   "ok",
 		"provider": "anilist",
@@ -1004,6 +1158,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		"scores":   scores,
 		"total":    len(entries),
 		"limited":  limited,
+		"statuses": statuses,
 	})
 }
 
@@ -1207,6 +1362,11 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Skip titles already marked completed on MAL — no pointless writes.
+	// (Full exact-match diffing needs per-title remote state; MAL's list
+	// reads are paged and rate-limited, so the completed-set shortcut
+	// stays for COMPLETED targets and every other target is written —
+	// PUT is idempotent and carries the exact status + progress.)
+	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
 	watchProgress, progressErr := h.loadUserWatchProgress(r.Context(), userID)
 	if progressErr != nil {
 		h.log.Warn().Err(progressErr).Msg("mal export: watch history fetch failed, exporting without progress")
@@ -1231,6 +1391,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
+	exportedByStatus := map[string]int{}
 	limited := favoriteCount > importExportCap
 	processed := 0
 	for _, anilistID := range anilistIDs {
@@ -1256,7 +1417,8 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		}
 		state := watchProgress[anilistID]
 		done := exportCompleted(state, totals[anilistID].episodes)
-		if completed[malID] && (done || state.Episode == 0) {
+		wantStatus := wantExportStatus(bookmarkStatus[anilistID], done)
+		if wantStatus == listCompleted && completed[malID] && (done || state.Episode == 0) {
 			skipped++
 			continue
 		}
@@ -1264,11 +1426,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		if state.Episode > 0 {
 			form.Set("num_watched_episodes", fmt.Sprintf("%d", state.Episode))
 		}
-		if done {
-			form.Set("status", "completed")
-		} else {
-			form.Set("status", "watching")
-		}
+		form.Set("status", statusForMAL(wantStatus))
 		if s := scores[anilistID]; s >= 1 && s <= 10 {
 			form.Set("score", fmt.Sprintf("%d", s))
 		}
@@ -1289,6 +1447,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			exported++
+			exportedByStatus[wantStatus]++
 			if s := scores[anilistID]; s >= 1 && s <= 10 {
 				scoresSent++
 			}
@@ -1305,12 +1464,15 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		"scores":   scoresSent,
 		"total":    len(anilistIDs),
 		"limited":  limited,
+		"statuses": exportedByStatus,
 	})
 }
 
 // ExportAniList pushes Aniraku favorites into the user's connected AniList
-// library, writing progress, status (CURRENT/COMPLETED) and score
-// (scoreRaw) in a single per-title write.
+// library, writing progress, list status (all six states) and score
+// (scoreRaw) in a single per-title write. Titles whose remote status +
+// progress + score already match are skipped (exact-match, not merely
+// "completed").
 func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	liftExportWriteDeadline(w)
 	start := time.Now()
@@ -1343,6 +1505,9 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		h.log.Warn().Err(progressErr).Msg("anilist export: watch history fetch failed, exporting without progress")
 		watchProgress = map[int]animeWatchProgress{}
 	}
+	// Stored list statuses drive per-title targeting (import-saved or
+	// watch-advanced); absent rows fall back to watch-derived targeting.
+	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
 	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID)
 	if scoresErr != nil {
 		h.log.Warn().Err(scoresErr).Msg("anilist export: ratings fetch failed, exporting without scores")
@@ -1383,6 +1548,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
+	exportedByStatus := map[string]int{}
 	limited := favoriteCount > importExportCap
 	rateLimitedStop := false
 	var firstExportErr error
@@ -1397,18 +1563,18 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 		wp := watchProgress[id]
 		done := exportCompleted(wp, totals[id].episodes)
-		wantStatus := "watching"
-		if done {
-			wantStatus = "completed"
-		}
+		wantStatus := wantExportStatus(bookmarkStatus[id], done)
 		wantScore := scores[id]
 		if wantScore < 1 || wantScore > 10 {
 			wantScore = 0
 		}
 		if cur, ok := remote[id]; ok {
 			progressOK := cur.Progress >= wp.Episode
-			statusOK := (wantStatus == "completed" && cur.Status == "completed") ||
-				(wantStatus == "watching" && cur.Status == "watching")
+			// Exact-match skip: same status AND at least our progress
+			// AND same score. A remote COMPLETED with a different local
+			// target (e.g. REPEATING after a rewatch) is rewritten, not
+			// skipped — statuses round-trip exactly.
+			statusOK := cur.Status == wantStatus
 			scoreOK := wantScore == 0 || cur.Score == wantScore
 			if progressOK && statusOK && scoreOK {
 				skipped++
@@ -1421,11 +1587,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		if cur, ok := remote[id]; ok && cur.Progress > progress {
 			progress = cur.Progress
 		}
-		status := "CURRENT"
-		if done {
-			status = "COMPLETED"
-		}
-		w := anilistExportWrite{MediaID: id, Progress: progress, Status: status, WantScore: wantScore}
+		w := anilistExportWrite{MediaID: id, Progress: progress, Status: wantStatus, WantScore: wantScore}
 		if wantScore != 0 {
 			w.Score = float64(wantScore) * 10
 		}
@@ -1476,6 +1638,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			exported++
+			exportedByStatus[batch[i].Status]++
 			if batch[i].WantScore != 0 {
 				scoresSent++
 			}
@@ -1507,6 +1670,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		"total":        len(ids),
 		"limited":      limited,
 		"rate_limited": rateLimitedStop,
+		"statuses":     exportedByStatus,
 	})
 }
 
