@@ -98,17 +98,18 @@ func (h *Handlers) requireProviderToken(ctx context.Context, userID, provider st
 }
 
 // importFavoriteDiff inserts only the ids not already in the user's
-// bookmarks, returning (newly inserted, already present). Import stays
-// idempotent while the UI can show what actually changed. Fresh rows
-// carry their provider status (statuses map, canonical); existing rows
-// keep whatever status they already have.
-func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int, statuses map[int]string) (int, int, error) {
+// bookmarks, returning (newly inserted, already present, fresh ids).
+// Import stays idempotent while the UI can show what actually changed.
+// Fresh rows carry their provider status (statuses map, canonical);
+// existing rows keep whatever status they already have (status backfill
+// for those lives in runProviderImport).
+func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []int, statuses map[int]string) (int, int, []int, error) {
 	if len(ids) == 0 {
-		return 0, 0, nil
+		return 0, 0, nil, nil
 	}
 	existing, err := h.loadUserFavorites(ctx, userID)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, nil, err
 	}
 	have := make(map[int]bool, len(existing))
 	for _, id := range existing {
@@ -129,9 +130,9 @@ func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []
 	}
 	inserted, err := h.insertBookmarks(ctx, userID, fresh, meta, statuses)
 	if err != nil {
-		return 0, already, err
+		return 0, already, fresh, err
 	}
-	return inserted, already, nil
+	return inserted, already, fresh, nil
 }
 
 // mediaMeta holds the display fields the UI needs for a bookmarked title.
@@ -694,7 +695,7 @@ func (h *Handlers) loadUserAnimeScores(ctx context.Context, userID string) (map[
 // bookmarks for every title, watch_history rows that only advance the
 // local max episode, and scores only for titles with no local ratings.
 // Returns (imported, already, episodesAdded, scoresAdded, limited).
-func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, map[string]int, bool) {
+func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, map[string]int, int, bool) {
 	// De-duplicate: keep the best entry per title (most progress wins,
 	// completed beats other statuses on ties, then highest score).
 	best := make(map[int]providerEntry, len(entries))
@@ -732,9 +733,13 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		statuses[e.Status]++
 		statusByID[id] = e.Status
 	}
-	imported, already, err := h.importFavoriteDiff(ctx, userID, ids, statusByID)
+	imported, already, fresh, err := h.importFavoriteDiff(ctx, userID, ids, statusByID)
 	if err != nil {
 		h.log.Warn().Err(err).Msg("import: favorites insert failed")
+	}
+	freshSet := make(map[int]bool, len(fresh))
+	for _, id := range fresh {
+		freshSet[id] = true
 	}
 	// Fill display meta for the watch-history rows (bookmarks already
 	// fetched their own copy inside importFavoriteDiff).
@@ -762,6 +767,51 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		// titles are unrated, and upserting would overwrite local scores.
 		h.log.Warn().Err(err).Msg("import: ratings fetch failed, skipping score import")
 		rated = map[int]bool{}
+	}
+
+	// Status backfill for already-favorited rows: fresh inserts above
+	// carried their provider status, but pre-existing rows (including
+	// everything bookmarked before the `status` column migration) keep
+	// whatever they have. Update a stored status only when it is missing
+	// (never set) or when there is no local watch progress at all — local
+	// watch-advanced state (CURRENT/COMPLETED/REPEATING earned in-app)
+	// always wins over the provider snapshot.
+	statusesUpdated := 0
+	{
+		stored := h.loadUserBookmarkStatus(ctx, userID)
+		updates := []map[string]any{}
+		for id, e := range best {
+			if freshSet[id] {
+				continue // just inserted with the provider status
+			}
+			cur, ok := stored[id]
+			if ok && cur == e.Status {
+				continue
+			}
+			if ok && (!historyOK || watchMax[id] > 0) {
+				continue // real local state — provider must not clobber it
+			}
+			row := map[string]any{
+				"user_id":  userID,
+				"anime_id": id,
+				"status":   e.Status,
+			}
+			if m := meta[id]; m.episodes > 0 {
+				row["total_episodes"] = m.episodes
+			}
+			updates = append(updates, row)
+		}
+		for start := 0; start < len(updates); start += importBatchSize {
+			end := start + importBatchSize
+			if end > len(updates) {
+				end = len(updates)
+			}
+			if uerr := h.postBookmarkRows(ctx, updates[start:end]); uerr != nil {
+				h.log.Warn().Err(uerr).Msg("import: status backfill failed")
+				break
+			}
+			statusesUpdated += end - start
+		}
 	}
 
 	now := time.Now().UnixMilli()
@@ -854,7 +904,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 			scoresAdded = 0
 		}
 	}
-	return imported, already, episodesAdded, scoresAdded, statuses, limited
+	return imported, already, episodesAdded, scoresAdded, statuses, statusesUpdated, limited
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -984,18 +1034,19 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	imported, already, episodes, scores, statuses, limited := h.runProviderImport(r.Context(), userID, entries, nil)
+	imported, already, episodes, scores, statuses, statusesUpdated, limited := h.runProviderImport(r.Context(), userID, entries, nil)
 	h.respondJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
-		"provider": "mal",
-		"imported": imported,
-		"already":  already,
-		"episodes": episodes,
-		"scores":   scores,
-		"total":    len(entries),
-		"unmapped": unmapped,
-		"limited":  limited,
-		"statuses": statuses,
+		"status":           "ok",
+		"provider":         "mal",
+		"imported":         imported,
+		"already":          already,
+		"episodes":         episodes,
+		"scores":           scores,
+		"total":            len(entries),
+		"unmapped":         unmapped,
+		"limited":          limited,
+		"statuses":         statuses,
+		"statuses_updated": statusesUpdated,
 	})
 }
 
@@ -1148,17 +1199,18 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 		return
 	}
-	imported, already, episodes, scores, statuses, limited := h.runProviderImport(r.Context(), userID, entries, meta)
+	imported, already, episodes, scores, statuses, statusesUpdated, limited := h.runProviderImport(r.Context(), userID, entries, meta)
 	h.respondJSON(w, http.StatusOK, map[string]any{
-		"status":   "ok",
-		"provider": "anilist",
-		"imported": imported,
-		"already":  already,
-		"episodes": episodes,
-		"scores":   scores,
-		"total":    len(entries),
-		"limited":  limited,
-		"statuses": statuses,
+		"status":           "ok",
+		"provider":         "anilist",
+		"imported":         imported,
+		"already":          already,
+		"episodes":         episodes,
+		"scores":           scores,
+		"total":            len(entries),
+		"limited":          limited,
+		"statuses":         statuses,
+		"statuses_updated": statusesUpdated,
 	})
 }
 
