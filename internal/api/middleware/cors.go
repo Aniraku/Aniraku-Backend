@@ -16,12 +16,12 @@ func allowedOrigins() map[string]bool {
 		"http://localhost:43211": true,
 		"http://localhost:5173":  true,
 		// Miruro legacy dev port (kept for compat).
-		"http://127.0.0.1:5173":      true,
-		"https://aniraku.tech":       true,
-		"https://aniraku.vercel.app": true,
-		"https://www.aniraku.tech":   true,
-		"https://test.aniraku.tech":  true,
-		"https://aniraku.runs-on.dev":  true,
+		"http://127.0.0.1:5173":       true,
+		"https://aniraku.tech":        true,
+		"https://aniraku.vercel.app":  true,
+		"https://www.aniraku.tech":    true,
+		"https://test.aniraku.tech":   true,
+		"https://aniraku.runs-on.dev": true,
 	}
 
 	// Comma-separated extra origins for production
