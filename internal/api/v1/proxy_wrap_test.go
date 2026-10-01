@@ -26,7 +26,6 @@ func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 
 	prod := httptest.NewRequest("GET", "https://api.aniraku.tech/api/v1/servers?animeId=1&episode=1&lang=sub", nil)
 	sub := proxySources(prod, srcs, headers, "sub")
-
 	if strings.Contains(srcs[0].URL, "/api/v1/proxy?") {
 		t.Fatalf("input mutated: %q", srcs[0].URL)
 	}
@@ -43,5 +42,22 @@ func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 	again := proxySources(prod, sub, headers, "sub")
 	if strings.Count(again[0].URL, "/api/v1/proxy?") != 1 {
 		t.Fatalf("double wrap: %q", again[0].URL)
+	}
+}
+
+// mp4 direct sources (mkissa mp4upload, animex variants) wrap through the
+// proxy like hls — never raw — but carry no al (single-audio muxed).
+func TestProxySourcesWrapsMP4WithoutAl(t *testing.T) {
+	req := httptest.NewRequest("GET", "https://api.aniraku.tech/api/v1/servers?lang=dub", nil)
+	srcs := []core.Source{{URL: "https://www.mp4upload.com/file.mp4", Type: "mp4", Quality: "auto"}}
+	got := proxySources(req, srcs, map[string]string{"Referer": "https://x/"}, "dub")
+	if !strings.HasPrefix(got[0].URL, "https://api.aniraku.tech/api/v1/proxy?url=") {
+		t.Fatalf("mp4 not wrapped: %q", got[0].URL)
+	}
+	if strings.Contains(got[0].URL, "&al=") {
+		t.Fatalf("mp4 must not carry al: %q", got[0].URL)
+	}
+	if strings.Contains(srcs[0].URL, "/api/v1/proxy?") {
+		t.Fatal("input mutated")
 	}
 }
