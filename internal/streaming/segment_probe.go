@@ -89,8 +89,19 @@ func probePlaylistsLenient(ctx context.Context, client *http.Client, masterURL, 
 	return true
 }
 
-// probeMediaFileLenient verifies a direct media file (mp4 and friends) is
-// actually served from this egress: 2xx + non-HTML bytes judged by magic
+// isUpstreamGated reports whether err is an HTTP 403 from upstream — the
+// signature of IP-reputation blocks (Cloudflare challenge pages) rather
+// than a missing episode. Providers map it to a silent skip so a blocked
+// network never errors playback and auto-recovers when the block lifts.
+// Real failures (5xx, parse errors, missing data) still propagate as errors.
+func isUpstreamGated(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "HTTP 403")
+}
+
+// probeMediaFileLenient verifies a direct media file (mp4 and friends) is// actually served from this egress: 2xx + non-HTML bytes judged by magic
 // (ftyp/moof for mp4, TS sync, ID3). Redirects (signed ?for= tokens that
 // 302 to file hosts) are followed like a player follows them.
 func probeMediaFileLenient(ctx context.Context, client *http.Client, fileURL, referer, ua string) bool {
