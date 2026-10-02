@@ -36,6 +36,12 @@ import (
 //	-> /{epSlug} watch page (data-toggle=tab mirrors)
 //	-> /embed/{id} (var videoSources) -> direct mp4 360p-1080p.
 //
+// The /play/ mp4 URLs 302 to vidcache.net file hosts, and the media proxy
+// never follows redirects by design (it refuses 3xx rather than relaying
+// clients to unreviewed targets). The provider therefore resolves every
+// mp4 to its FINAL redirect target before shipping it — the server list
+// only ever carries the playable file URL, never the /play/ hop.
+//
 // SOURCE RULES (operator):
 //   - One source per mirror tab, always that tab's HIGHEST quality mp4.
 //     The frontend starts playback on the highest rendition, so shipping
@@ -864,6 +870,42 @@ func (p *AnimeGGProvider) absURL(file string) string {
 	return ""
 }
 
+// resolveMP4Final follows the /play/ redirect chain to the final file URL
+// (vidcache.net) and verifies it serves media bytes. The media proxy
+// refuses 3xx by design, so shipping the unredirected /play/ URL would only
+// produce "upstream media redirect blocked" at playback — the probe must
+// both verify AND resolve. Returns the final URL.
+func (p *AnimeGGProvider) resolveMP4Final(ctx context.Context, playURL string) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, playURL, nil)
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Referer", animeggReferer)
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return "", false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 32768))
+	if err != nil || !segmentBytesPlayable(body) {
+		return "", false
+	}
+	final := ""
+	if resp.Request != nil && resp.Request.URL != nil {
+		final = resp.Request.URL.String()
+	}
+	if final == "" {
+		final = playURL
+	}
+	return final, true
+}
+
 // ------------------------- resolve -------------------------
 
 func (p *AnimeGGProvider) loadResolved(key animeggResolveKey) *SourceResult {
@@ -1043,12 +1085,13 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 		if bestRank < 0 {
 			continue
 		}
-		if !probeMediaFileLenient(ctx, p.client, best.url, animeggReferer, browserUA) {
+		final, ok := p.resolveMP4Final(ctx, best.url)
+		if !ok {
 			p.log.Info().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
 				Str("quality", best.quality).Msg("animegg: mp4 probe failed, trying next mirror")
 			continue
 		}
-		hits = append(hits, tabHit{tab: tab, best: best})
+		hits = append(hits, tabHit{tab: tab, best: animeggStream{url: final, quality: best.quality}})
 	}
 	if len(hits) == 0 {
 		return nil, fmt.Errorf("animegg: no playable mirror for episode %d", providerEp)
