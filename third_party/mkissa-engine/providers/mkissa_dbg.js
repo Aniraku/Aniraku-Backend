@@ -5,7 +5,7 @@ const __name = (fn, _) => fn;
 
 const UA4 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 const REFERER = "https://mkissa.to";
-const API = "https://api.mkissa.net";
+const API = process.env.MKISSA_API || "https://api.mkissa.net";
 const API_URL = `${API}/api`;
 const CDN_ROOT = "https://cdn.mkissa.net/all/mk";
 const ANIZIP = "https://api.ani.zip/mappings";

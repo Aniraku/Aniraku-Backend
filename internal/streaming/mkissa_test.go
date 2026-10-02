@@ -237,6 +237,14 @@ func TestMkissaAniListID(t *testing.T) {
 	}
 }
 
+func TestMkissaRelayEnvOverride(t *testing.T) {
+	t.Setenv("MKISSA_API", "https://relay.example")
+	p := NewMkissaProvider(zerolog.Nop())
+	if p.apiBase != "https://relay.example/api" {
+		t.Fatalf("apiBase = %q, want relay host + /api", p.apiBase)
+	}
+}
+
 func TestMkissaThrottleBreaker(t *testing.T) {
 	b := &mkissaThrottleBreaker{cooldown: time.Hour, tripAfter: 2}
 	if b.blocked() {

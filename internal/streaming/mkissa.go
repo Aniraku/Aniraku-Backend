@@ -47,7 +47,7 @@ import (
 )
 
 const (
-	mkissaAPIBase = "https://api.mkissa.net/api"
+	mkissaAPIHost = "https://api.mkissa.net"
 	mkissaReferer = "https://mkissa.to/"
 	mkissaOrigin  = "https://mkissa.to"
 
@@ -116,10 +116,17 @@ type mkissaEdge struct {
 }
 
 func NewMkissaProvider(log zerolog.Logger) *MkissaProvider {
+	// MKISSA_API reroutes api.mkissa.net through a relay (e.g. a
+	// Cloudflare Worker) when the server egress IP is throttled to zero.
+	// Only API calls are relayed (kilobytes); video stays direct.
+	host := strings.TrimSpace(os.Getenv("MKISSA_API"))
+	if host == "" {
+		host = mkissaAPIHost
+	}
 	p := &MkissaProvider{
 		log:        log,
 		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
-		apiBase:    mkissaAPIBase,
+		apiBase:    strings.TrimRight(host, "/") + "/api",
 		anilistURL: "https://graphql.aniraku.tech",
 		slugs:      make(map[string]*mkissaSlugEntry),
 		resolved:   make(map[mkissaResolveKey]*mkissaResolvedEntry),

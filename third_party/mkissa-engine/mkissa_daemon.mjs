@@ -15,7 +15,7 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery, extractSource } from "./providers/mkissa_dbg.js";
 
-const API_URL = "https://api.mkissa.net/api";
+const API_URL = (process.env.MKISSA_API || "https://api.mkissa.net") + "/api";
 const LANE = "k7";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
