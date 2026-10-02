@@ -485,6 +485,57 @@ var (
 	mkissaRateRetries  = 1
 )
 
+// Throttle circuit breaker: the signed-call bucket is per egress IP,
+// shared by all traffic. Two consecutive throttle-class failures trip a
+// cooldown that skips engine spawns entirely (resolve cache still serves);
+// one success resets it. Without this the fan-out hammers a dry bucket
+// forever and the provider never recovers.
+var mkissaBreaker = &mkissaThrottleBreaker{cooldown: 20 * time.Minute, tripAfter: 2}
+
+type mkissaThrottleBreaker struct {
+	mu          sync.Mutex
+	cooldown    time.Duration
+	tripAfter   int
+	consecutive int
+	blockedUpTo time.Time
+}
+
+func (b *mkissaThrottleBreaker) blocked() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return time.Now().Before(b.blockedUpTo)
+}
+
+func (b *mkissaThrottleBreaker) record(success, throttled bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	switch {
+	case success:
+		b.consecutive = 0
+		b.blockedUpTo = time.Time{}
+	case throttled:
+		b.consecutive++
+		if b.consecutive >= b.tripAfter {
+			b.blockedUpTo = time.Now().Add(b.cooldown)
+		}
+	default:
+		b.consecutive = 0
+	}
+}
+
+// mkissaThrottleErr reports whether an engine error is throttle-class
+// (rate message or captcha challenge — both mean "back off this IP").
+func mkissaThrottleErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if mkissaRateRe.MatchString(msg) {
+		return true
+	}
+	return strings.Contains(msg, "NEED_CAPTCHA")
+}
+
 // ---------------------------------------------------------------- engine
 
 type mkissaEngineSource struct {
@@ -545,6 +596,10 @@ func (p *MkissaProvider) daemonCommand() (string, string, error) {
 // rate-limit retry). Whole runs stay serialized globally with a gap, and
 // the lane key persists daemon-side across requests.
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
+	// Breaker first: never spend fan-out time (or bucket) while cooling.
+	if mkissaBreaker.blocked() {
+		return nil, fmt.Errorf("mkissa: throttled cooldown")
+	}
 	mkissaEngineMu.Lock()
 	defer func() {
 		mkissaEngineFreeAt = time.Now().Add(mkissaEngineGap)
@@ -564,9 +619,15 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
 		srcs, err := p.daemon.Call(ctx, showID, audio, epStr)
 		if err == nil {
+			mkissaBreaker.record(true, false)
 			return srcs, nil
 		}
 		lastErr = err
+		throttled := mkissaThrottleErr(err)
+		mkissaBreaker.record(false, throttled)
+		if throttled && mkissaBreaker.blocked() {
+			return nil, err
+		}
 		secs := 0
 		if m := mkissaRateRe.FindStringSubmatch(err.Error()); len(m) == 2 {
 			secs, _ = strconv.Atoi(m[1])
