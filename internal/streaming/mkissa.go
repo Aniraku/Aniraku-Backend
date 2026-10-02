@@ -52,7 +52,7 @@ const (
 	mkissaOrigin  = "https://mkissa.to"
 
 	mkissaSlugTTL           = 24 * time.Hour
-	mkissaResolveTTL        = 10 * time.Minute
+	mkissaResolveTTL        = 30 * time.Minute
 	maxMkissaSlugEntries    = 500
 	maxMkissaResolveEntries = 500
 	mkissaEngineTimeout     = 40 * time.Second
@@ -467,18 +467,20 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 	return out, nil
 }
 
-// Engine spawn politeness: api.mkissa.net rate-limits bursts ("try again
-// in N seconds"). Concurrent collectors (sub+dub fan-out, stream) must
-// not spawn synchronized stampedes, so starts are staggered ≥1.2s apart
-// and rate-limit errors get one extra Go-side retry after N+1s (the
-// engine already retries 3x internally with shorter pauses).
+// Engine spawn politeness: api.mkissa.net throttles per egress IP ("try
+// again in N seconds"), a bucket shared by ALL our traffic. Concurrent
+// collectors must never stampede it, so whole engine runs are serialized
+// globally with a gap between them; rate-limit errors get one extra
+// Go-side retry after N+1s (the engine already retries 3x internally with
+// shorter pauses). Under deep concurrency later runs fail clean on the
+// fan-out deadline and the other providers cover.
 var (
-	mkissaSpawnMu     sync.Mutex
-	mkissaLastSpawn   time.Time
-	mkissaSpawnGap    = 1200 * time.Millisecond
-	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
-	mkissaRateExtra   = 1000 * time.Millisecond
-	mkissaRateRetries = 1
+	mkissaEngineMu     sync.Mutex
+	mkissaEngineFreeAt time.Time
+	mkissaEngineGap    = 1500 * time.Millisecond
+	mkissaRateRe       = regexp.MustCompile(`try again in (\d+) seconds?`)
+	mkissaRateExtra    = 1000 * time.Millisecond
+	mkissaRateRetries  = 1
 )
 
 // ---------------------------------------------------------------- engine
@@ -536,20 +538,25 @@ func (p *MkissaProvider) engineCommand() (string, string, error) {
 }
 
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
-	// Stagger concurrent spawns (see mkissaSpawnGap).
-	mkissaSpawnMu.Lock()
-	if wait := time.Until(mkissaLastSpawn.Add(mkissaSpawnGap)); wait > 0 {
-		mkissaSpawnMu.Unlock()
+	mkissaEngineMu.Lock()
+	defer func() {
+		mkissaEngineFreeAt = time.Now().Add(mkissaEngineGap)
+		mkissaEngineMu.Unlock()
+	}()
+	if wait := time.Until(mkissaEngineFreeAt); wait > 0 {
+		mkissaEngineMu.Unlock()
 		select {
 		case <-ctx.Done():
+			mkissaEngineMu.Lock()
 			return nil, ctx.Err()
 		case <-time.After(wait):
+			mkissaEngineMu.Lock()
 		}
-		mkissaSpawnMu.Lock()
 	}
-	mkissaLastSpawn = time.Now()
-	mkissaSpawnMu.Unlock()
+	return p.runEngineWithRetries(ctx, showID, audio, epStr)
+}
 
+func (p *MkissaProvider) runEngineWithRetries(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	var lastErr error
 	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
 		srcs, err := p.runEngineOnce(ctx, showID, audio, epStr)
