@@ -208,3 +208,47 @@ func TestAnimeGGLowQualityDubHidden(t *testing.T) {
 		t.Fatalf("360p-only dub must be hidden, got %+v", sr)
 	}
 }
+
+func TestAnimeGGDeletedTopFileFallsBack(t *testing.T) {
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/anilist", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{"Media":{"id":7,"title":{"english":"Show Seven","romaji":"","native":""},"synonyms":[],"status":"FINISHED","format":"TV","episodes":12,"seasonYear":2020,"startDate":{"year":2020},"relations":{"edges":[]}}}}`)
+	})
+	mux.HandleFunc("/search/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<a class="mse" href="/series/show-seven"><strong>Show Seven</strong></a>`)
+	})
+	mux.HandleFunc("/series/show-seven", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<li><a class="anm_det_pop" href="/ss-ep1"><strong>Episode 1</strong></a><span class="btn-subbed">SUB</span></li>`)
+	})
+	mux.HandleFunc("/ss-ep1", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<a data-toggle="tab" data-id="201" data-mirror="AnimeGG" data-version="subbed">S</a>`)
+	})
+	mux.HandleFunc("/embed/201", func(w http.ResponseWriter, r *http.Request) {
+		// 1080p deleted (404), 720p live: the mirror must survive on 720p.
+		fmt.Fprintf(w, `<script>var videoSources = [{file: "%s/play/gone.mp4", label: "1080p"},{file: "%s/play/ok.mp4", label: "720p"}];</script>`, base, base)
+	})
+	mux.HandleFunc("/play/ok.mp4", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		w.Write([]byte{0, 0, 0, 24, 'f', 't', 'y', 'p', 0, 1, 2, 3})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	base = srv.URL
+	p := NewAnimeGGProvider(zerolog.Nop(), srv.URL, srv.URL+"/anilist")
+	p.client = srv.Client()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sr, err := p.FindEpisodeSource(ctx, "7", 1, "sub")
+	if err != nil {
+		t.Fatalf("FindEpisodeSource: %v", err)
+	}
+	if sr == nil || len(sr.Sources) != 1 {
+		t.Fatalf("want 1 fallback source, got %+v", sr)
+	}
+	if got := sr.Sources[0].Quality; got != "720p" {
+		t.Fatalf("quality = %q, want 720p fallback for deleted 1080p", got)
+	}
+}

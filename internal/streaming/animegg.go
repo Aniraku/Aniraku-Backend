@@ -1071,27 +1071,33 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 		if err != nil {
 			continue
 		}
-		best := animeggStream{}
-		bestRank := -1
+		var cands []animeggStream
 		for _, s := range animeggParseVideoSources(embedHTML) {
 			abs := p.absURL(s.url)
 			if abs == "" {
 				continue
 			}
-			if r := animeggQualityRank(s.quality); r > bestRank {
-				best, bestRank = animeggStream{url: abs, quality: s.quality}, r
+			cands = append(cands, animeggStream{url: abs, quality: s.quality})
+		}
+		// Highest quality first; a deleted top file falls through to the
+		// next live one instead of killing the whole mirror.
+		sort.Slice(cands, func(i, j int) bool {
+			return animeggQualityRank(cands[i].quality) > animeggQualityRank(cands[j].quality)
+		})
+		placed := false
+		for _, c := range cands {
+			final, ok := p.resolveMP4Final(ctx, c.url)
+			if !ok {
+				continue
 			}
+			hits = append(hits, tabHit{tab: tab, best: animeggStream{url: final, quality: c.quality}})
+			placed = true
+			break
 		}
-		if bestRank < 0 {
-			continue
-		}
-		final, ok := p.resolveMP4Final(ctx, best.url)
-		if !ok {
+		if !placed {
 			p.log.Info().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
-				Str("quality", best.quality).Msg("animegg: mp4 probe failed, trying next mirror")
-			continue
+				Msg("animegg: mp4 probe failed, trying next mirror")
 		}
-		hits = append(hits, tabHit{tab: tab, best: animeggStream{url: final, quality: best.quality}})
 	}
 	if len(hits) == 0 {
 		return nil, fmt.Errorf("animegg: no playable mirror for episode %d", providerEp)

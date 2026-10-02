@@ -1052,6 +1052,54 @@ var (
 	aniwavesMP4Re     = regexp.MustCompile(`(?i)\.mp4(\?|$)`)
 )
 
+// probeAniWavesMaster verifies a master at segment depth: master -> a
+// variant media playlist -> first segment bytes must all serve media. A
+// master whose playlists serve but whose segments are egress-blocked or
+// deleted would otherwise list a server that can only spin at playback
+// (observed class: upstream file removals after listing). Variants are
+// tried highest-bandwidth first — the player's default path — so a dead
+// top rendition falls through to a live one instead of killing the mirror.
+func (p *AniWavesProvider) probeAniWavesMaster(ctx context.Context, master, referer string) bool {
+	mhead, ok := fetchURLCapped(ctx, p.client, master, referer, browserUA, 65536, 6*time.Second)
+	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
+		return false
+	}
+	VODCacheSet(master, mhead)
+	variants := kaaParseVariants(string(mhead), master)
+	if len(variants) == 0 {
+		// Single media playlist (no STREAM-INF): probe its segments direct.
+		seg := firstPlaylistURL(string(mhead), master)
+		if seg == "" {
+			return false
+		}
+		shead, ok := fetchURLCapped(ctx, p.client, seg, referer, browserUA, 8192, 8*time.Second)
+		return ok && !strings.Contains(strings.ToLower(string(shead)), "<html")
+	}
+	for _, v := range variants {
+		if ctx.Err() != nil {
+			return false
+		}
+		mbody, ok := fetchURLCapped(ctx, p.client, v.url, referer, browserUA, 262144, 6*time.Second)
+		if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
+			continue
+		}
+		VODCacheSet(v.url, mbody)
+		seg := firstPlaylistURL(string(mbody), v.url)
+		if seg == "" {
+			continue
+		}
+		shead, ok := fetchURLCapped(ctx, p.client, seg, referer, browserUA, 8192, 8*time.Second)
+		if !ok {
+			continue
+		}
+		if strings.Contains(strings.ToLower(string(shead)), "<html") {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (p *AniWavesProvider) resolveDirect(ctx context.Context, embedURL string) []aniwavesDirect {
 	if aniwavesEchoURLRe.MatchString(embedURL) {
 		return p.extractEchovideo(ctx, embedURL)
@@ -1257,7 +1305,7 @@ func (p *AniWavesProvider) resolveEpisode(ctx context.Context, id, episode int, 
 		}
 		var ok bool
 		if best.typ == "hls" {
-			ok = probePlaylistsLenient(ctx, p.client, best.url, aniwavesPlaybackReferer, browserUA)
+			ok = p.probeAniWavesMaster(ctx, best.url, aniwavesPlaybackReferer)
 		} else {
 			ok = probeMediaFileLenient(ctx, p.client, best.url, aniwavesPlaybackReferer, browserUA)
 		}
