@@ -509,42 +509,113 @@ func (p *TryEmbedProvider) buildSource(ctx context.Context, probeClient *http.Cl
 	}, true
 }
 
-// findViaRelay resolves through the operator relay (direct stream_data is
-// egress-gated). Minting happens relay-side; verification still runs here
-// from this egress before anything lists.
+// findViaRelay resolves with a split chain: page+bootstrap run direct
+// (both pass this egress) while stream_data goes through the relay (it
+// 403s datacenter egress). Session cookies minted direct travel to the
+// relay per call — it holds no state. Verification still runs here.
 func (p *TryEmbedProvider) findViaRelay(ctx context.Context, id, episode int, lang, pageURL string) (*SourceResult, error) {
-	mirrors, intro, outro, err := p.relay.TryEmbedResolve(ctx, id, episode, lang)
+	sess, err := p.newSession()
 	if err != nil {
 		return nil, err
 	}
-	probeClient := &http.Client{Timeout: 45 * time.Second, Transport: p.transport}
-	sr := &SourceResult{
-		Headers: map[string]string{"Referer": p.base + "/"},
-		Intro:   intro,
-		Outro:   outro,
+	if err := p.bootstrap(ctx, sess, id, episode, lang); err != nil {
+		return nil, err
 	}
-	for _, m := range mirrors {
+	var cookies []string
+	if u, err := url.Parse(sess.base); err == nil {
+		for _, c := range sess.client.Jar.Cookies(u) {
+			cookies = append(cookies, c.Name+"="+c.Value)
+		}
+	}
+	cookieHeader := strings.Join(cookies, "; ")
+	probeClient := &http.Client{Timeout: 45 * time.Second, Transport: p.transport}
+	var intro, outro *core.SkipTimestamp
+	sr := &SourceResult{Headers: map[string]string{"Referer": sess.base + "/"}}
+	for _, m := range tryembedServers {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		name := tryembedCuteName(m.Server)
-		if name == "" || strings.TrimSpace(m.URL) == "" {
+		body, err := p.relay.TryEmbedStreamData(ctx, cookieHeader, sess.nonce, id, episode, lang, m.id)
+		if err != nil {
+			if isUpstreamGated(err) {
+				// Egress gated, not a missing mirror: abort silently.
+				return nil, nil
+			}
 			continue
 		}
-		src, ok := p.buildSource(ctx, probeClient, pageURL, m.Server, m.Type, m.URL, m.Captions)
+		var data tryembedStreamData
+		if err := json.Unmarshal(body, &data); err != nil {
+			continue
+		}
+		var found *tryembedProviderBlock
+		for i := range data.Providers {
+			if data.Providers[i].ID == m.id {
+				found = &data.Providers[i]
+				break
+			}
+		}
+		if found == nil {
+			continue
+		}
+		if intro == nil {
+			intro = data.Intro
+		}
+		if outro == nil {
+			outro = data.Outro
+		}
+		pick := tryembedPickQuality(found.Qualities)
+		if pick == nil {
+			continue
+		}
+		ext := "m3u8"
+		if strings.EqualFold(strings.TrimSpace(found.Type), "mp4") {
+			ext = "mp4"
+		}
+		file, ferr := p.followSignedURL(ctx, sess, pick.Token, ext, pageURL)
+		if ferr != nil {
+			continue
+		}
+		src, ok := p.buildSource(ctx, probeClient, pageURL, m.id, ext, file, found.Captions)
 		if !ok {
 			continue
 		}
 		sr.Sources = append(sr.Sources, *src)
-		sr.ServerNames = append(sr.ServerNames, name)
+		sr.ServerNames = append(sr.ServerNames, m.name)
 	}
 	if len(sr.Sources) == 0 {
 		return nil, nil
 	}
+	sr.Intro, sr.Outro = intro, outro
 	if len(sr.ServerNames) > 0 {
 		sr.ServerName = sr.ServerNames[0]
 	}
 	p.log.Info().Int("animeId", id).Int("episode", episode).
 		Str("lang", lang).Int("mirrors", len(sr.Sources)).Msg("tryembed resolved via relay")
 	return sr, nil
+}
+
+// followSignedURL fetches /s/{token}.{ext} with the session cookies and
+// returns the final redirect target (302 to the signed file URL).
+func (p *TryEmbedProvider) followSignedURL(ctx context.Context, sess *tryembedSession, token, ext, pageURL string) (string, error) {
+	fileURL := fmt.Sprintf("%s/s/%s.%s", sess.base, token, ext)
+	actx, cancel := timeoutCtx(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return "", err
+	}
+	sess.setFetchHeaders(req)
+	req.Header.Set("Referer", pageURL)
+	resp, err := sess.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return "", fmt.Errorf("tryembed: /s/ HTTP %d", resp.StatusCode)
+	}
+	if resp.Request != nil && resp.Request.URL != nil {
+		return resp.Request.URL.String(), nil
+	}
+	return fileURL, nil
 }

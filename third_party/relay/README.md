@@ -24,9 +24,9 @@ blocked endpoints skip silently as before).
 ## Contract
 
 - `POST /vidnest {id, episode, lang}` → upstream API JSON verbatim.
-- `POST /tryembed {id, episode, lang}` →
-  `{mirrors: [{server, type, url, captions}], intro, outro}` with FINAL
-  (redirect-resolved) file URLs.
+- `POST /tryembed-stream {id, episode, lang, server, nonce, cookies}` →
+  upstream stream_data JSON verbatim (page+bootstrap run direct from the
+  backend; only this gated call relays, and the relay holds no state).
 - Every route requires the key (`?key=` or `X-Relay-Key`); only the two
   upstream flows above are ever fetched.
 

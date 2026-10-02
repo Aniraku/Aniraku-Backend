@@ -72,101 +72,40 @@ async function vidnestResolve(env, body) {
   });
 }
 
-const TRYEMBED_SERVERS = ["astra", "beta", "sora", "zen"];
-
-async function tryembedResolve(env, body) {
-  const { id, episode, lang } = body;
-  if (!id || !episode || !lang) {
+// stream_data only: the backend runs page+bootstrap itself (both pass its
+// egress) and relays just this gated call. Cookies travel in the request
+// body since the relay holds no session state.
+async function tryembedStream(env, body) {
+  const { id, episode, lang, server, nonce, cookies } = body;
+  if (!id || !episode || !lang || !server || !nonce) {
     return new Response("bad request", { status: 400 });
   }
-  const pageURL = `${TRYEMBED_BASE}/embed/anime/${id}/${episode}/${lang}`;
-  const jar = new Map();
-  const fetchHeaders = {
-    "User-Agent": UA,
-    Accept: "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-  };
-  const pageRes = await fetch(pageURL, { headers: fetchHeaders });
-  if (!pageRes.ok) {
-    return Response.json({ error: `page HTTP ${pageRes.status}` }, { status: 502 });
-  }
-  jarStore(jar, pageRes);
-  const page = await pageRes.text();
-  const ticket = /window\.BOOTSTRAP_TICKET="([^"]+)"/.exec(page)?.[1];
-  if (!ticket) {
-    return Response.json({ error: "no ticket" }, { status: 502 });
-  }
-  const bootRes = await fetch(`${TRYEMBED_BASE}/api/bootstrap`, {
-    method: "POST",
+  const q = new URLSearchParams({
+    id: String(id),
+    episode: String(episode),
+    audio: lang,
+    player: "jw",
+    server,
+    nonce,
+  });
+  const res = await fetch(`${TRYEMBED_BASE}/api/stream_data?${q}`, {
     headers: {
-      ...fetchHeaders,
-      Origin: TRYEMBED_BASE,
-      Referer: pageURL,
-      Cookie: jarHeader(jar),
-      "X-TryEmbed-Bootstrap": ticket,
+      "User-Agent": UA,
+      Accept: "*/*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Sec-Fetch-Dest": "empty",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Site": "same-origin",
+      Referer: `${TRYEMBED_BASE}/embed/anime/${id}/${episode}/${lang}`,
+      Cookie: cookies || "",
+      "X-Embed-Nonce": nonce,
     },
   });
-  jarStore(jar, bootRes);
-  if (!bootRes.ok) {
-    return Response.json({ error: `bootstrap HTTP ${bootRes.status}` }, { status: 502 });
-  }
-  const boot = await bootRes.json();
-  if (!boot.embedNonce) {
-    return Response.json({ error: "no nonce" }, { status: 502 });
-  }
-  const mirrors = [];
-  let intro = null;
-  let outro = null;
-  for (const server of TRYEMBED_SERVERS) {
-    try {
-      const q = new URLSearchParams({
-        id: String(id),
-        episode: String(episode),
-        audio: lang,
-        player: "jw",
-        server,
-        nonce: boot.embedNonce,
-      });
-      const sdRes = await fetch(`${TRYEMBED_BASE}/api/stream_data?${q}`, {
-        headers: {
-          ...fetchHeaders,
-          Referer: pageURL,
-          Cookie: jarHeader(jar),
-          "X-Embed-Nonce": boot.embedNonce,
-        },
-      });
-      if (!sdRes.ok) continue;
-      const sd = await sdRes.json();
-      if (!intro && sd.intro) intro = sd.intro;
-      if (!outro && sd.outro) outro = sd.outro;
-      const block = (sd.providers || []).find((p) => p.id === server);
-      if (!block) continue;
-      const cands = (block.qualities || []).filter((x) => x && x.token);
-      if (!cands.length) continue;
-      const pick =
-        cands.find((x) => String(x.name || "").toLowerCase() === "auto") ||
-        [...cands].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
-      const ext = String(block.type || "").toLowerCase() === "mp4" ? "mp4" : "m3u8";
-      const fileRes = await fetch(`${TRYEMBED_BASE}/s/${pick.token}.${ext}`, {
-        headers: { ...fetchHeaders, Referer: pageURL, Cookie: jarHeader(jar) },
-      });
-      if (!fileRes.ok && fileRes.status !== 206) continue;
-      const head = await fileRes.clone().arrayBuffer().then((b) => b.byteLength).catch(() => 0);
-      if (!head) continue;
-      mirrors.push({
-        server,
-        type: ext === "mp4" ? "mp4" : "hls",
-        url: fileRes.url,
-        captions: block.captions || [],
-      });
-    } catch {
-      continue;
-    }
-  }
-  return Response.json({ mirrors, intro, outro });
+  const text = await res.text();
+  return new Response(text, {
+    status: res.status,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 export default {
@@ -183,7 +122,7 @@ export default {
       return new Response("bad request", { status: 400 });
     }
     if (url.pathname === "/vidnest") return vidnestResolve(env, body);
-    if (url.pathname === "/tryembed") return tryembedResolve(env, body);
+    if (url.pathname === "/tryembed-stream") return tryembedStream(env, body);
     return new Response("not found", { status: 404 });
   },
 };
