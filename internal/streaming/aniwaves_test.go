@@ -176,6 +176,10 @@ func newAniWavesFixture(t *testing.T) *aniwavesFixture {
 	mux.HandleFunc("/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\nseg.ts\n")
 	})
+	mux.HandleFunc("/seg.ts", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "video/mp2t")
+		w.Write([]byte{0x47, 0x40, 0x00, 0x10, 0x00, 0x01, 0x02, 0x03})
+	})
 	srv := httptest.NewServer(mux)
 	base = srv.URL
 	t.Cleanup(srv.Close)
@@ -214,5 +218,42 @@ func TestAniWavesSubResolve(t *testing.T) {
 	}
 	if sr.Outro == nil || sr.Outro.Start != 1376 || sr.Outro.End != 1447 {
 		t.Errorf("Outro = %+v, want 1376..1447", sr.Outro)
+	}
+}
+
+func TestAniWavesDeadSegmentsDropped(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dead-master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n/dead-media.m3u8\n")
+	})
+	mux.HandleFunc("/dead-media.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/dead.ts\n")
+	})
+	mux.HandleFunc("/fallback-master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=5000,RESOLUTION=1920x1080\n/hi.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=500,RESOLUTION=640x360\n/lo.m3u8\n")
+	})
+	mux.HandleFunc("/hi.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/hi.ts\n")
+	})
+	mux.HandleFunc("/lo.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/lo.ts\n")
+	})
+	mux.HandleFunc("/lo.ts", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte{0x47, 0x40, 0x00, 0x10})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	p := NewAniWavesProvider(zerolog.Nop(), srv.URL, srv.URL)
+	p.client = srv.Client()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Playlists serve but segments 404: the mirror must not list.
+	if p.probeAniWavesMaster(ctx, srv.URL+"/dead-master.m3u8", "https://x/") {
+		t.Fatal("master with dead segments must fail the probe")
+	}
+	// Dead top rendition falls through to the live one.
+	if !p.probeAniWavesMaster(ctx, srv.URL+"/fallback-master.m3u8", "https://x/") {
+		t.Fatal("dead 1080p rendition must fall back to live 360p")
 	}
 }
