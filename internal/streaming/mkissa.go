@@ -56,7 +56,6 @@ const (
 	maxMkissaSlugEntries    = 500
 	maxMkissaResolveEntries = 500
 	mkissaEngineTimeout     = 40 * time.Second
-	mkissaEngineStdinLimit  = 4096
 )
 
 // mkissaServerNames maps engine source kinds to stable cute server names.
@@ -86,6 +85,7 @@ type MkissaProvider struct {
 	mu       sync.Mutex
 	slugs    map[string]*mkissaSlugEntry
 	resolved map[mkissaResolveKey]*mkissaResolvedEntry
+	daemon   *mkissaDaemon
 }
 
 type mkissaSlugEntry struct {
@@ -116,7 +116,7 @@ type mkissaEdge struct {
 }
 
 func NewMkissaProvider(log zerolog.Logger) *MkissaProvider {
-	return &MkissaProvider{
+	p := &MkissaProvider{
 		log:        log,
 		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		apiBase:    mkissaAPIBase,
@@ -124,6 +124,8 @@ func NewMkissaProvider(log zerolog.Logger) *MkissaProvider {
 		slugs:      make(map[string]*mkissaSlugEntry),
 		resolved:   make(map[mkissaResolveKey]*mkissaResolvedEntry),
 	}
+	p.daemon = newMkissaDaemon(log, p)
+	return p
 }
 
 func (p *MkissaProvider) Name() string { return "mkissa" }
@@ -494,6 +496,7 @@ type mkissaEngineSource struct {
 }
 
 type mkissaEngineOutput struct {
+	ID      uint64 `json:"id"`
 	ShowID  string `json:"showId"`
 	Audio   string `json:"audio"`
 	Results []struct {
@@ -505,9 +508,10 @@ type mkissaEngineOutput struct {
 	Code  any    `json:"code"`
 }
 
-// engineCommand resolves the runner: explicit override (tests), then
-// MKISSA_ENGINE env, then the vendored script with bun (node fallback).
-func (p *MkissaProvider) engineCommand() (string, string, error) {
+// daemonCommand resolves the persistent runner: explicit override
+// (tests), then MKISSA_ENGINE env, then the vendored daemon script with
+// bun (node fallback).
+func (p *MkissaProvider) daemonCommand() (string, string, error) {
 	if p.engineBin != "" {
 		return p.engineBin, p.engineScript, nil
 	}
@@ -516,8 +520,8 @@ func (p *MkissaProvider) engineCommand() (string, string, error) {
 		script = env
 	} else {
 		for _, c := range []string{
-			"/app/third_party/mkissa-engine/run_sources.mjs",
-			"third_party/mkissa-engine/run_sources.mjs",
+			"/app/third_party/mkissa-engine/mkissa_daemon.mjs",
+			"third_party/mkissa-engine/mkissa_daemon.mjs",
 		} {
 			if st, err := os.Stat(c); err == nil && !st.IsDir() {
 				script = c
@@ -537,6 +541,9 @@ func (p *MkissaProvider) engineCommand() (string, string, error) {
 	return "", "", fmt.Errorf("mkissa: neither bun nor node on PATH")
 }
 
+// runEngine sends one request to the persistent daemon (plus the Go-side
+// rate-limit retry). Whole runs stay serialized globally with a gap, and
+// the lane key persists daemon-side across requests.
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	mkissaEngineMu.Lock()
 	defer func() {
@@ -553,13 +560,9 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 			mkissaEngineMu.Lock()
 		}
 	}
-	return p.runEngineWithRetries(ctx, showID, audio, epStr)
-}
-
-func (p *MkissaProvider) runEngineWithRetries(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	var lastErr error
 	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
-		srcs, err := p.runEngineOnce(ctx, showID, audio, epStr)
+		srcs, err := p.daemon.Call(ctx, showID, audio, epStr)
 		if err == nil {
 			return srcs, nil
 		}
@@ -579,47 +582,6 @@ func (p *MkissaProvider) runEngineWithRetries(ctx context.Context, showID, audio
 		}
 	}
 	return nil, lastErr
-}
-
-func (p *MkissaProvider) runEngineOnce(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
-	bin, script, err := p.engineCommand()
-	if err != nil {
-		return nil, err
-	}
-	stdin, _ := json.Marshal(map[string]any{"showId": showID, "audio": audio, "episodes": []string{epStr}})
-	if len(stdin) > mkissaEngineStdinLimit {
-		return nil, fmt.Errorf("mkissa: engine input too large")
-	}
-	cctx, cancel := context.WithTimeout(ctx, mkissaEngineTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(cctx, bin, script)
-	cmd.Stdin = bytes.NewReader(stdin)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil && stdout.Len() == 0 {
-		msg := strings.TrimSpace(stderr.String())
-		if len(msg) > 500 {
-			msg = msg[:500]
-		}
-		return nil, fmt.Errorf("mkissa: engine failed: %v: %s", err, msg)
-	}
-	var out mkissaEngineOutput
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		return nil, fmt.Errorf("mkissa: engine output unparsable: %w", err)
-	}
-	if out.Error != "" {
-		return nil, fmt.Errorf("mkissa: engine error: %s", out.Error)
-	}
-	for _, r := range out.Results {
-		if r.Episode == epStr {
-			if r.Error != "" {
-				return nil, fmt.Errorf("mkissa: episode %s: %s", epStr, r.Error)
-			}
-			return r.Sources, nil
-		}
-	}
-	return nil, fmt.Errorf("mkissa: engine returned no result for episode %s", epStr)
 }
 
 // ---------------------------------------------------------------- resolve
