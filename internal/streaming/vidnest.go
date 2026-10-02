@@ -156,15 +156,20 @@ func (p *VidNestProvider) fetchAPI(ctx context.Context, anilistID string, episod
 	rawURL := fmt.Sprintf("%s/hianime/anime/%s/%d/%s/hd-2", p.api, url.PathEscape(anilistID), episode, lang)
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
+		// Per-attempt cap far below the client timeout: a tarpitted
+		// block page must never eat the fan-out budget.
+		actx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
+				cancel()
 				return nil, ctx.Err()
 			case <-time.After(time.Duration(attempt) * time.Second):
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+		req, err := http.NewRequestWithContext(actx, http.MethodGet, rawURL, nil)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 		req.Header.Set("User-Agent", browserUA)
@@ -172,12 +177,14 @@ func (p *VidNestProvider) fetchAPI(ctx context.Context, anilistID string, episod
 		req.Header.Set("Referer", referer)
 		resp, err := p.client.Do(req)
 		if err != nil {
+			cancel()
 			lastErr = err
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		status := resp.StatusCode
 		resp.Body.Close()
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue
