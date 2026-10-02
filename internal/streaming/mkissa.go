@@ -33,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -466,6 +467,20 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 	return out, nil
 }
 
+// Engine spawn politeness: api.mkissa.net rate-limits bursts ("try again
+// in N seconds"). Concurrent collectors (sub+dub fan-out, stream) must
+// not spawn synchronized stampedes, so starts are staggered ≥1.2s apart
+// and rate-limit errors get one extra Go-side retry after N+1s (the
+// engine already retries 3x internally with shorter pauses).
+var (
+	mkissaSpawnMu     sync.Mutex
+	mkissaLastSpawn   time.Time
+	mkissaSpawnGap    = 1200 * time.Millisecond
+	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
+	mkissaRateExtra   = 1000 * time.Millisecond
+	mkissaRateRetries = 1
+)
+
 // ---------------------------------------------------------------- engine
 
 type mkissaEngineSource struct {
@@ -521,6 +536,45 @@ func (p *MkissaProvider) engineCommand() (string, string, error) {
 }
 
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
+	// Stagger concurrent spawns (see mkissaSpawnGap).
+	mkissaSpawnMu.Lock()
+	if wait := time.Until(mkissaLastSpawn.Add(mkissaSpawnGap)); wait > 0 {
+		mkissaSpawnMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+		mkissaSpawnMu.Lock()
+	}
+	mkissaLastSpawn = time.Now()
+	mkissaSpawnMu.Unlock()
+
+	var lastErr error
+	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
+		srcs, err := p.runEngineOnce(ctx, showID, audio, epStr)
+		if err == nil {
+			return srcs, nil
+		}
+		lastErr = err
+		secs := 0
+		if m := mkissaRateRe.FindStringSubmatch(err.Error()); len(m) == 2 {
+			secs, _ = strconv.Atoi(m[1])
+		}
+		if secs <= 0 || attempt == mkissaRateRetries {
+			return nil, err
+		}
+		p.log.Info().Str("showId", showID).Int("waitS", secs).Msg("mkissa: rate-limited, retrying after pause")
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(secs)*time.Second + mkissaRateExtra):
+		}
+	}
+	return nil, lastErr
+}
+
+func (p *MkissaProvider) runEngineOnce(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	bin, script, err := p.engineCommand()
 	if err != nil {
 		return nil, err
