@@ -33,6 +33,9 @@ type kaaFixture struct {
 	// floatPages emulates page markers with fractional episode numbers
 	// (observed 14.5) that must not break episode listing.
 	floatPages bool
+	// fractionalEpisode emulates result entries with fractional episode
+	// numbers (observed 1004.5 on long runners).
+	fractionalEpisode bool
 }
 
 func newKaaFixture(t *testing.T) *kaaFixture {
@@ -63,7 +66,13 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 		if f.floatPages {
 			pages = `[{"number":1,"from":"01","to":"13","eps":[1,14.5]}]`
 		}
-		fmt.Fprintf(w, `{"result":[{"episode_number":1,"slug":%q,"title":"Enter"}],"pages":%s}`, slug, pages)
+		result := fmt.Sprintf(`[{"episode_number":1,"slug":%q,"title":"Enter"}]`, slug)
+		if f.fractionalEpisode {
+			// Long runners list fractional specials (observed 1004.5):
+			// they must not break the listing unmarshal.
+			result = `[{"episode_number":1004.5,"slug":"frac","title":"Special"},` + result[1:]
+		}
+		fmt.Fprintf(w, `{"result":%s,"pages":%s}`, result, pages)
 	})
 	mux.HandleFunc("/naruto-f3cf/ep-1-subslug", func(w http.ResponseWriter, r *http.Request) {
 		player := kaaURL + "/subplayer?id=1"
@@ -271,6 +280,28 @@ func TestKaaFindSubtitlesSrtAndPreview(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("subtitles = %v, want %v", got, want)
 		}
+	}
+}
+
+// Fractional result entries (observed 1004.5) must not break listing;
+// integer episodes still resolve, fractionals never match an int request.
+func TestKaaFractionalEpisodeNumber(t *testing.T) {
+	f := newKaaFixture(t)
+	f.fractionalEpisode = true
+	p := newKaaTestProvider(f)
+	sr, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil {
+		t.Fatalf("FindEpisodeSource with fractional entry: %v", err)
+	}
+	if len(sr.Sources) != 1 {
+		t.Fatalf("sources = %d, want 1", len(sr.Sources))
+	}
+	eps, err := p.FindEpisodes(kaaTestCtx(t), "naruto-f3cf")
+	if err != nil {
+		t.Fatalf("FindEpisodes: %v", err)
+	}
+	if len(eps) != 1 || eps[0].Number != 1 {
+		t.Fatalf("episodes = %+v, want [1]", eps)
 	}
 }
 
