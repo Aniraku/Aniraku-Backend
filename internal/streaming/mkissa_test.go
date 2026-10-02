@@ -1,7 +1,9 @@
 package streaming
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,12 +17,10 @@ import (
 )
 
 type mkissaFixture struct {
-	t      *testing.T
-	api    *httptest.Server
-	media  *httptest.Server
-	dubEp  []string
-	stub   string
-	engine string
+	t     *testing.T
+	api   *httptest.Server
+	media *httptest.Server
+	dubEp []string
 }
 
 const mkissaTestShowID = "ReooPAxPMsHM4KPMY"
@@ -28,7 +28,7 @@ const mkissaTestShowID = "ReooPAxPMsHM4KPMY"
 // Canned engine output: one direct Default m3u8, one mp4upload mp4,
 // one pure embed (skipped), one unknown kind (skipped).
 func mkissaStubOutput(mediaBase string) string {
-	return fmt.Sprintf(`{"showId":%q,"audio":"sub","results":[{"episode":"1","sources":[
+	return fmt.Sprintf(`{"id":0,"showId":%q,"audio":"sub","results":[{"episode":"1","sources":[
 {"name":"Default","url":"https://mkissa.to/e/x","extractedUrl":%q,"type":"player","priority":10},
 {"name":"Mp4","url":"https://mp4upload.com/embed-abc.html","extractedUrl":"%s/v.mp4","type":"file","priority":5},
 {"name":"Ss-Hls","url":"https://streamsb.net/e/abc.html","type":"embed","priority":4},
@@ -87,14 +87,43 @@ func newMkissaFixture(t *testing.T, dubEps []string, stubOut string) *mkissaFixt
 	if err := os.WriteFile(out, []byte(stubOut), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	stub := filepath.Join(dir, "stub.sh")
-	if err := os.WriteFile(stub, []byte("#!/bin/sh\ncat \"$MKISSA_STUB_OUT\"\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	f.stub = stub
 	t.Setenv("MKISSA_STUB_OUT", out)
 	t.Cleanup(func() { f.api.Close(); f.media.Close() })
 	return f
+}
+
+// TestMkissaDaemonStub is NOT a real test: the fixture re-executes the
+// test binary with this name to serve canned daemon responses over the
+// line protocol (shell text tools buffer pipes, so sh/awk/sed stubs hang;
+// a Go helper writes unbuffered). Canned output carries "id":0, replaced
+// with the request id per line.
+func TestMkissaDaemonStub(t *testing.T) {
+	if os.Getenv("GO_MKISSA_STUB") != "1" {
+		return
+	}
+	raw, err := os.ReadFile(os.Getenv("MKISSA_STUB_OUT"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "stub: read canned:", err)
+		os.Exit(2)
+	}
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	// Single line per response: the parent frames on newlines, so any
+	// pretty-printing in the canned file must go.
+	oneLine := strings.ReplaceAll(string(raw), "\n", "")
+	for sc.Scan() {
+		var req struct {
+			ID uint64 `json:"id"`
+		}
+		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
+			continue
+		}
+		resp := strings.Replace(oneLine, `"id":0`, fmt.Sprintf(`"id":%d`, req.ID), 1)
+		fmt.Fprintln(w, resp)
+		w.Flush()
+	}
 }
 
 var bytes1k = make([]byte, 1024)
@@ -104,8 +133,14 @@ func newMkissaTestProvider(f *mkissaFixture) *MkissaProvider {
 	p.apiBase = f.api.URL + "/api"
 	p.anilistURL = f.api.URL + "/anilist"
 	p.client = &http.Client{Timeout: 30 * time.Second}
-	p.engineBin = "sh"
-	p.engineScript = f.stub
+	// Re-execute the test binary as the daemon (see TestMkissaDaemonStub).
+	self, err := os.Executable()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	p.engineBin = self
+	p.engineScript = "-test.run=TestMkissaDaemonStub"
+	f.t.Setenv("GO_MKISSA_STUB", "1")
 	return p
 }
 
