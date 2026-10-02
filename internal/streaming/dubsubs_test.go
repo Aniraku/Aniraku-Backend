@@ -9,11 +9,11 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// Operator rule: ONLY Sora (animex) dub sources carry the nico (kaa)
-// subtitle files — Sora serves krussdomi streams, so nico subs are
+// Operator rule: ONLY Sora (animex) dub sources carry the Nico (kaa)
+// subtitle files — Sora serves krussdomi streams, so Nico subs are
 // timing-compatible. Every other provider's dub keeps its defaults.
 // These tests use the real kaa fixture provider as the subtitle origin
-// (anilist "20" ep1 sub resolves one nico source with vtt-sub.vtt).
+// (anilist "20" ep1 sub resolves one Nico source with vtt-sub.vtt).
 func dubNicoTestManager(t *testing.T) *Manager {
 	t.Helper()
 	f := newKaaFixture(t)
@@ -35,7 +35,7 @@ func soraDubResult() *SourceResult {
 	}
 }
 
-// Sora dub sources get the nico files; input untouched.
+// Sora dub sources get the Nico files; input untouched.
 func TestDubSubtitlesNicoAppliedToSora(t *testing.T) {
 	m := dubNicoTestManager(t)
 	in := soraDubResult()
@@ -45,7 +45,7 @@ func TestDubSubtitlesNicoAppliedToSora(t *testing.T) {
 	}
 	for i, src := range got.Sources {
 		if len(src.Subtitles) != 1 || !strings.HasSuffix(src.Subtitles[0].URL, "/vtt-sub.vtt") {
-			t.Fatalf("sources[%d] subs = %+v, want the single nico file vtt-sub.vtt", i, src.Subtitles)
+			t.Fatalf("sources[%d] subs = %+v, want the single Nico file vtt-sub.vtt", i, src.Subtitles)
 		}
 	}
 	if len(in.Sources[0].Subtitles) != 1 || len(in.Sources[1].Subtitles) != 0 {
@@ -74,7 +74,7 @@ func TestDubSubtitlesNonAnimexUntouched(t *testing.T) {
 		{"zoko", "Zoko"},
 		{"nin", "NiN"},
 		{"flixcloud", "Yuta"},
-		{"kaa", "nico"},
+		{"kaa", "Nico"},
 	} {
 		in := &SourceResult{
 			ServerName: tc.server,
@@ -87,12 +87,12 @@ func TestDubSubtitlesNonAnimexUntouched(t *testing.T) {
 	}
 }
 
-// Sora dub already carrying the nico files comes back untouched.
+// Sora dub already carrying the Nico files comes back untouched.
 func TestDubSubtitlesNicoIdenticalNoCopy(t *testing.T) {
 	m := dubNicoTestManager(t)
 	ksub, err := m.providers[0].FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
 	if err != nil || len(ksub.Sources) == 0 || len(ksub.Sources[0].Subtitles) == 0 {
-		t.Fatalf("nico resolve: %v %+v", err, ksub)
+		t.Fatalf("Nico resolve: %v %+v", err, ksub)
 	}
 	in := &SourceResult{
 		ServerName: "Sora",
@@ -119,7 +119,7 @@ func TestDubSubtitlesNicoMissingKeepsDub(t *testing.T) {
 	m := &Manager{log: zerolog.Nop(), providers: []Provider{newKaaTestProvider(f)}}
 	in := soraDubResult()
 	if got := m.withDubSubtitles(kaaTestCtx(t), "animex", "dub", "20", 1, in); got != in {
-		t.Fatal("unavailable nico must return the input untouched")
+		t.Fatal("unavailable Nico must return the input untouched")
 	}
 }
 

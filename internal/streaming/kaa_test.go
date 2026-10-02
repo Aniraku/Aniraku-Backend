@@ -158,8 +158,8 @@ func TestKaaFindEpisodeSource(t *testing.T) {
 	if sr.Headers["Origin"] != kaaKrussOrigin || sr.Headers["Referer"] != kaaKrussRef {
 		t.Fatalf("headers = %v, want Referer+Origin krussdomi", sr.Headers)
 	}
-	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "nico" {
-		t.Fatalf("server names = %v, want [nico]", sr.ServerNames)
+	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "Nico" {
+		t.Fatalf("server names = %v, want [Nico]", sr.ServerNames)
 	}
 	if len(s.Subtitles) != 1 || !strings.HasSuffix(s.Subtitles[0].URL, "/vtt-sub.vtt") {
 		t.Fatalf("subtitles = %+v, want the sub page vtt", s.Subtitles)
@@ -305,8 +305,32 @@ func TestKaaFractionalEpisodeNumber(t *testing.T) {
 	}
 }
 
+func TestKaaSubtitleTrack(t *testing.T) {
+	for _, tc := range []struct {
+		url       string
+		fallback  string
+		wantLang  string
+		wantLabel string
+	}{
+		{"https://subbl.krussdomi.com/abc/309567_en.srt", "sub", "en", "English"},
+		{"https://subbl.krussdomi.com/abc/60596_th.srt", "sub", "th", "Thai"},
+		{"https://subbl.krussdomi.com/abc/1617262191272_vi.srt", "dub", "vi", "Vietnamese"},
+		{"https://subbl.krussdomi.com/abc/1617629104889_id.srt", "sub", "id", "Indonesian"},
+		{"https://subbl.krussdomi.com/abc/1617629724071_ms.srt", "sub", "ms", "Malay"},
+		{"https://subbl.krussdomi.com/abc/278072_zh-Hans.srt", "sub", "zh-hans", "Chinese"},
+		{"https:///subbl.krussdomi.com/abc/309567_EN.srt", "sub", "en", "English"},
+		{"https://subst.krussdomi.com/abc/64b0e386970810335d81b379.vtt", "sub", "sub", "sub"},
+		{"https://subst.krussdomi.com/abc/64b0e386970810335d81b379.vtt", "dub", "dub", "dub"},
+	} {
+		got := kaaSubtitleTrack(tc.url, tc.fallback)
+		if got.URL != tc.url || got.Lang != tc.wantLang || got.Label != tc.wantLabel {
+			t.Errorf("kaaSubtitleTrack(%q) = %+v, want lang=%q label=%q", tc.url, got, tc.wantLang, tc.wantLabel)
+		}
+	}
+}
+
 func TestKaaServerName(t *testing.T) {
-	want := map[int]string{0: "nico", 1: "robin", 2: "D'Luff", 3: "zoro", 10: "jimbei", 11: "kaa-12", 25: "kaa-26"}
+	want := map[int]string{0: "Nico", 1: "robin", 2: "D'Luff", 3: "zoro", 10: "jimbei", 11: "kaa-12", 25: "kaa-26"}
 	for i, w := range want {
 		if got := kaaServerName(i); got != w {
 			t.Fatalf("kaaServerName(%d) = %q, want %q", i, got, w)

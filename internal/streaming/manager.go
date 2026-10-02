@@ -1080,8 +1080,8 @@ func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, ep
 }
 
 // withDubSubtitles enforces the operator rule: Sora (animex) dub sources
-// carry the nico (kaa) subtitle files. Sora serves krussdomi streams, so
-// nico subs are timing-compatible; every other provider's dub keeps its
+// carry the Nico (kaa) subtitle files. Sora serves krussdomi streams, so
+// Nico subs are timing-compatible; every other provider's dub keeps its
 // default subtitles. kaa is fetched only for Sora dub requests; when kaa
 // is unconfigured, has no match, or carries no subtitles, the dub result
 // is kept as-is (best effort: subtitles must never fail playback). The
@@ -1100,11 +1100,11 @@ func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistI
 	ksub, err := ka.FindEpisodeSource(ctx, anilistID, episode, "sub")
 	if err != nil || ksub == nil {
 		m.log.Warn().Err(err).Str("provider", provider).Str("anilistId", anilistID).
-			Int("episode", episode).Msg("dub subtitles: nico resolve unavailable, keeping dub as-is")
+			Int("episode", episode).Msg("dub subtitles: Nico resolve unavailable, keeping dub as-is")
 		return sr
 	}
-	// nico is kaa's first positional server; prefer the source actually
-	// named nico, else the first source carrying subtitle files.
+	// Nico is kaa's first positional server; prefer the source actually
+	// named Nico, else the first source carrying subtitle files.
 	var nico []core.Subtitle
 	for i := range ksub.Sources {
 		if len(ksub.Sources[i].Subtitles) == 0 {
@@ -1113,7 +1113,7 @@ func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistI
 		if len(nico) == 0 {
 			nico = ksub.Sources[i].Subtitles
 		}
-		if i < len(ksub.ServerNames) && ksub.ServerNames[i] == "nico" {
+		if i < len(ksub.ServerNames) && ksub.ServerNames[i] == "Nico" {
 			nico = ksub.Sources[i].Subtitles
 			break
 		}

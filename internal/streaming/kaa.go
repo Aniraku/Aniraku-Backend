@@ -55,7 +55,7 @@ import (
 // SERVER NAMES (operator): kaa servers are named by position — nico, robin,
 // D'Luff, then the same crew scheme — never raw player names.
 //
-// SUBTITLE RULE (operator): Sora (animex) dub sources carry the nico
+// SUBTITLE RULE (operator): Sora (animex) dub sources carry the Nico
 // subtitle files, enforced centrally by Manager.withDubSubtitles — every
 // other provider's dub keeps its default subtitles.
 const (
@@ -538,7 +538,7 @@ func kaaServerName(i int) string {
 }
 
 var kaaServerNames = []string{
-	"nico", "robin", "D'Luff",
+	"Nico", "robin", "D'Luff",
 	"zoro", "sanji", "nami", "usopp", "chopper", "franky", "brook", "jimbei",
 }
 
@@ -609,7 +609,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		var subs []core.Subtitle
 		for _, s := range h.vtts {
 			p.learnURLHost(s)
-			subs = append(subs, core.Subtitle{URL: s, Lang: reqLang, Label: reqLang})
+			subs = append(subs, kaaSubtitleTrack(s, reqLang))
 		}
 		p.learnURLHost(h.master)
 		sr.Sources = append(sr.Sources, core.Source{
@@ -645,6 +645,61 @@ func kaaUnescape(s string) string {
 	s = html.UnescapeString(s)
 	s = strings.ReplaceAll(s, "\\u002F", "/")
 	return strings.ReplaceAll(s, "\\/", "/")
+}
+
+// kaaSubNameRe extracts the language code from a subtitle filename
+// (309567_en.srt, 60596_th.srt, 278072_zh-Hans.srt).
+var kaaSubNameRe = regexp.MustCompile(`[_-]([A-Za-z]{2,8}(?:-[A-Za-z0-9]+)?)\.(?:srt|vtt)(?:[?#]|$)`)
+
+// kaaLangNames maps filename codes to display labels (English-name style
+// like the other providers' labels).
+var kaaLangNames = map[string]string{
+	"en": "English", "eng": "English",
+	"ar": "Arabic", "ara": "Arabic",
+	"th": "Thai", "tha": "Thai",
+	"vi": "Vietnamese", "vie": "Vietnamese",
+	"id": "Indonesian", "ind": "Indonesian",
+	"ms": "Malay", "may": "Malay",
+	"zh": "Chinese", "zh-hans": "Chinese", "zh-hant": "Chinese Traditional",
+	"fr": "French", "fre": "French", "fra": "French",
+	"de": "German", "ger": "German", "deu": "German",
+	"it": "Italian", "ita": "Italian",
+	"pt": "Portuguese", "por": "Portuguese",
+	"ru": "Russian", "rus": "Russian",
+	"es": "Spanish", "spa": "Spanish",
+	"hi": "Hindi", "hin": "Hindi",
+	"ja": "Japanese", "jpn": "Japanese",
+	"ko": "Korean", "kor": "Korean",
+	"nl": "Dutch", "nld": "Dutch",
+	"tr": "Turkish", "tur": "Turkish",
+	"pl": "Polish", "pol": "Polish",
+	"uk": "Ukrainian", "ukr": "Ukrainian",
+	"ro": "Romanian", "ron": "Romanian",
+	"hu": "Hungarian", "hun": "Hungarian",
+	"cs": "Czech", "ces": "Czech",
+	"el": "Greek", "ell": "Greek",
+	"he": "Hebrew", "heb": "Hebrew",
+	"sv": "Swedish", "swe": "Swedish",
+	"da": "Danish", "dan": "Danish",
+	"fi": "Finnish", "fin": "Finnish",
+	"no": "Norwegian", "nor": "Norwegian",
+}
+
+// kaaSubtitleTrack labels one subtitle file with its real language,
+// parsed from the filename code (309567_en.srt, 60596_th.srt,
+// 278072_zh-Hans.srt). Files without a known code (bare-hash .vtt)
+// keep the request lang as a fallback tag.
+func kaaSubtitleTrack(rawURL, fallback string) core.Subtitle {
+	base := rawURL
+	if i := strings.IndexAny(base, "?#"); i >= 0 {
+		base = base[:i]
+	}
+	if m := kaaSubNameRe.FindStringSubmatch(base); m != nil {
+		if name, ok := kaaLangNames[strings.ToLower(m[1])]; ok {
+			return core.Subtitle{URL: rawURL, Lang: strings.ToLower(m[1]), Label: name}
+		}
+	}
+	return core.Subtitle{URL: rawURL, Lang: fallback, Label: fallback}
 }
 
 // kaaFixURL mirrors the reference scraper's _fix_url: krussdomi embeds
