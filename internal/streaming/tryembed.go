@@ -74,6 +74,7 @@ type TryEmbedProvider struct {
 	log       zerolog.Logger
 	transport http.RoundTripper
 	base      string
+	relay     *RelayClient
 	learnHost func(host string)
 }
 
@@ -85,6 +86,7 @@ func NewTryEmbedProvider(log zerolog.Logger, base string) *TryEmbedProvider {
 		log:       log,
 		transport: netguard.NewTransport(),
 		base:      strings.TrimRight(base, "/"),
+		relay:     NewRelayClient(),
 	}
 }
 
@@ -276,18 +278,20 @@ type tryembedQuality struct {
 	JwDirectURL   string `json:"jwDirectUrl"`
 }
 
+type tryembedCaption struct {
+	Label  string `json:"label"`
+	Lang   string `json:"lang"`
+	URL    string `json:"url"`
+	Format string `json:"format"`
+}
+
 type tryembedProviderBlock struct {
 	ID        string            `json:"id"`
 	Name      string            `json:"name"`
 	Type      string            `json:"type"`
 	Status    string            `json:"status"`
 	Qualities []tryembedQuality `json:"qualities"`
-	Captions  []struct {
-		Label  string `json:"label"`
-		Lang   string `json:"lang"`
-		URL    string `json:"url"`
-		Format string `json:"format"`
-	} `json:"captions"`
+	Captions  []tryembedCaption `json:"captions"`
 }
 
 type tryembedStreamData struct {
@@ -404,6 +408,12 @@ func (p *TryEmbedProvider) FindEpisodeSource(ctx context.Context, anilistID stri
 	if strings.EqualFold(lang, "dub") {
 		langKey = "dub"
 	}
+	pageURL := fmt.Sprintf("%s/embed/anime/%d/%d/%s", p.base, id, episode, langKey)
+	// Relay first when configured: the relay mints the mirrors (direct
+	// stream_data is egress-gated); verification still runs here.
+	if p.relay != nil {
+		return p.findViaRelay(ctx, id, episode, langKey, pageURL)
+	}
 	sess, err := p.newSession()
 	if err != nil {
 		return nil, err
@@ -411,7 +421,6 @@ func (p *TryEmbedProvider) FindEpisodeSource(ctx context.Context, anilistID stri
 	if err := p.bootstrap(ctx, sess, id, episode, langKey); err != nil {
 		return nil, err
 	}
-	pageURL := fmt.Sprintf("%s/embed/anime/%d/%d/%s", sess.base, id, episode, langKey)
 	// One result per mirror that yields a verified file; mirrors the API
 	// does not offer for the title are skipped silently.
 	probeClient := &http.Client{Timeout: 45 * time.Second, Transport: p.transport}
@@ -438,45 +447,11 @@ func (p *TryEmbedProvider) FindEpisodeSource(ctx context.Context, anilistID stri
 		if outro == nil {
 			outro = out
 		}
-		typ := "hls"
-		if ext == "mp4" {
-			typ = "mp4"
-		}
-		var ok bool
-		if typ == "hls" {
-			ok = probePlaylistsLenient(ctx, probeClient, file, pageURL, browserUA)
-		} else {
-			ok = probeMediaFileLenient(ctx, probeClient, file, pageURL, browserUA)
-		}
+		src, ok := p.buildSource(ctx, probeClient, pageURL, m.id, ext, file, block.Captions)
 		if !ok {
-			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
-				Str("mirror", m.id).Msg("tryembed: probe failed, trying next mirror")
 			continue
 		}
-		p.learnURLHost(file)
-		var subs []core.Subtitle
-		for _, c := range block.Captions {
-			if strings.TrimSpace(c.URL) == "" {
-				continue
-			}
-			p.learnURLHost(c.URL)
-			code := strings.TrimSpace(c.Lang)
-			if code == "" {
-				code = mapSubtitleLang(c.Label)
-			}
-			label := strings.TrimSpace(c.Label)
-			if label == "" {
-				label = code
-			}
-			subs = append(subs, core.Subtitle{URL: c.URL, Lang: code, Label: label})
-		}
-		sr.Sources = append(sr.Sources, core.Source{
-			URL:          file,
-			Type:         typ,
-			Quality:      "auto",
-			Subtitles:    subs,
-			Verification: "proxy",
-		})
+		sr.Sources = append(sr.Sources, *src)
 		sr.ServerNames = append(sr.ServerNames, m.name)
 	}
 	if len(sr.Sources) == 0 {
@@ -488,5 +463,88 @@ func (p *TryEmbedProvider) FindEpisodeSource(ctx context.Context, anilistID stri
 	}
 	p.log.Info().Int("animeId", id).Int("episode", episode).
 		Str("lang", langKey).Int("mirrors", len(sr.Sources)).Msg("tryembed resolved")
+	return sr, nil
+}
+
+// buildSource verifies one mirror file from this egress and assembles its
+// server source (shared by the direct and relayed resolve paths).
+func (p *TryEmbedProvider) buildSource(ctx context.Context, probeClient *http.Client, pageURL, mirror, ext, file string, caps []tryembedCaption) (*core.Source, bool) {
+	typ := "hls"
+	if ext == "mp4" {
+		typ = "mp4"
+	}
+	var ok bool
+	if typ == "hls" {
+		ok = probePlaylistsLenient(ctx, probeClient, file, pageURL, browserUA)
+	} else {
+		ok = probeMediaFileLenient(ctx, probeClient, file, pageURL, browserUA)
+	}
+	if !ok {
+		p.log.Info().Str("mirror", mirror).Msg("tryembed: probe failed, trying next mirror")
+		return nil, false
+	}
+	p.learnURLHost(file)
+	var subs []core.Subtitle
+	for _, c := range caps {
+		if strings.TrimSpace(c.URL) == "" {
+			continue
+		}
+		p.learnURLHost(c.URL)
+		code := strings.TrimSpace(c.Lang)
+		if code == "" {
+			code = mapSubtitleLang(c.Label)
+		}
+		label := strings.TrimSpace(c.Label)
+		if label == "" {
+			label = code
+		}
+		subs = append(subs, core.Subtitle{URL: c.URL, Lang: code, Label: label})
+	}
+	return &core.Source{
+		URL:          file,
+		Type:         typ,
+		Quality:      "auto",
+		Subtitles:    subs,
+		Verification: "proxy",
+	}, true
+}
+
+// findViaRelay resolves through the operator relay (direct stream_data is
+// egress-gated). Minting happens relay-side; verification still runs here
+// from this egress before anything lists.
+func (p *TryEmbedProvider) findViaRelay(ctx context.Context, id, episode int, lang, pageURL string) (*SourceResult, error) {
+	mirrors, intro, outro, err := p.relay.TryEmbedResolve(ctx, id, episode, lang)
+	if err != nil {
+		return nil, err
+	}
+	probeClient := &http.Client{Timeout: 45 * time.Second, Transport: p.transport}
+	sr := &SourceResult{
+		Headers: map[string]string{"Referer": p.base + "/"},
+		Intro:   intro,
+		Outro:   outro,
+	}
+	for _, m := range mirrors {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		name := tryembedCuteName(m.Server)
+		if name == "" || strings.TrimSpace(m.URL) == "" {
+			continue
+		}
+		src, ok := p.buildSource(ctx, probeClient, pageURL, m.Server, m.Type, m.URL, m.Captions)
+		if !ok {
+			continue
+		}
+		sr.Sources = append(sr.Sources, *src)
+		sr.ServerNames = append(sr.ServerNames, name)
+	}
+	if len(sr.Sources) == 0 {
+		return nil, nil
+	}
+	if len(sr.ServerNames) > 0 {
+		sr.ServerName = sr.ServerNames[0]
+	}
+	p.log.Info().Int("animeId", id).Int("episode", episode).
+		Str("lang", lang).Int("mirrors", len(sr.Sources)).Msg("tryembed resolved via relay")
 	return sr, nil
 }

@@ -63,6 +63,7 @@ type VidNestProvider struct {
 	log       zerolog.Logger
 	client    *http.Client
 	api       string
+	relay     *RelayClient
 	learnHost func(host string)
 }
 
@@ -74,6 +75,7 @@ func NewVidNestProvider(log zerolog.Logger, api string) *VidNestProvider {
 		log:    log,
 		client: &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		api:    strings.TrimRight(api, "/"),
+		relay:  NewRelayClient(),
 	}
 }
 
@@ -152,8 +154,16 @@ type vidnestPayload struct {
 	Outro *core.SkipTimestamp `json:"outro"`
 }
 
-func (p *VidNestProvider) fetchAPI(ctx context.Context, anilistID string, episode int, lang, referer string) (*vidnestPayload, error) {
-	rawURL := fmt.Sprintf("%s/hianime/anime/%s/%d/%s/hd-2", p.api, url.PathEscape(anilistID), episode, lang)
+func (p *VidNestProvider) fetchAPI(ctx context.Context, id, episode int, lang, referer string) (*vidnestPayload, error) {
+	// Relay first when configured: the direct API 403s datacenter egress.
+	if p.relay != nil {
+		body, err := p.relay.VidNestFetch(ctx, id, episode, lang)
+		if err != nil {
+			return nil, err
+		}
+		return decodeVidNestEnvelope(body)
+	}
+	rawURL := fmt.Sprintf("%s/hianime/anime/%d/%d/%s/hd-2", p.api, id, episode, lang)
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
 		// Per-attempt cap far below the client timeout: a tarpitted
@@ -200,20 +210,34 @@ func (p *VidNestProvider) fetchAPI(ctx context.Context, anilistID string, episod
 		if err := json.Unmarshal(body, &env); err != nil {
 			return nil, fmt.Errorf("vidnest: envelope json: %w", err)
 		}
-		raw, err := vidnestDecode(env.Data)
-		if err != nil {
-			return nil, err
-		}
-		var payload vidnestPayload
-		if err := json.Unmarshal(raw, &payload); err != nil {
-			return nil, fmt.Errorf("vidnest: payload json: %w", err)
-		}
-		return &payload, nil
+		return decodeVidNestEnvelopeBody(env)
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("vidnest: request failed")
 	}
 	return nil, lastErr
+}
+
+// decodeVidNestEnvelope parses + decodes one API envelope body (shared by
+// the direct and relayed fetch paths).
+func decodeVidNestEnvelope(body []byte) (*vidnestPayload, error) {
+	var env vidnestAPIEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("vidnest: envelope json: %w", err)
+	}
+	return decodeVidNestEnvelopeBody(env)
+}
+
+func decodeVidNestEnvelopeBody(env vidnestAPIEnvelope) (*vidnestPayload, error) {
+	raw, err := vidnestDecode(env.Data)
+	if err != nil {
+		return nil, err
+	}
+	var payload vidnestPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("vidnest: payload json: %w", err)
+	}
+	return &payload, nil
 }
 
 // FindEpisodeSource resolves one episode for exactly the requested lang.
@@ -230,7 +254,7 @@ func (p *VidNestProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 		langKey = "dub"
 	}
 	referer := fmt.Sprintf("%s/anime/%d/%d/%s", vidnestPageBase, id, episode, langKey)
-	payload, err := p.fetchAPI(ctx, anilistID, episode, langKey, referer)
+	payload, err := p.fetchAPI(ctx, id, episode, langKey, referer)
 	if err != nil {
 		if isUpstreamGated(err) {
 			return nil, nil
