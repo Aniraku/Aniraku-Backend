@@ -120,10 +120,38 @@ type kaaSearchHit struct {
 }
 
 type kaaEpisode struct {
-	Number int    `json:"episode_number"`
-	Slug   string `json:"slug"`
-	Title  string `json:"title"`
+	Number kaaEpNum `json:"episode_number"`
+	Slug   string   `json:"slug"`
+	Title  string   `json:"title"`
 }
+
+// kaaEpNum tolerates fractional episode numbers (observed 1004.5 on long
+// runners, 14.5 specials) as JSON numbers or strings. Integer requests
+// match only whole values; fractional entries are unaddressable through
+// the int-episode API and never match.
+type kaaEpNum float64
+
+func (n *kaaEpNum) UnmarshalJSON(b []byte) error {
+	var f float64
+	if err := json.Unmarshal(b, &f); err == nil {
+		*n = kaaEpNum(f)
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(b, &s); err != nil {
+		return err
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
+	if err != nil {
+		return err
+	}
+	*n = kaaEpNum(f)
+	return nil
+}
+
+func (n kaaEpNum) equals(ep int) bool { return float64(n) == float64(ep) }
+
+func (n kaaEpNum) key() string { return strconv.FormatFloat(float64(n), 'f', -1, 64) }
 
 func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider {
 	if kaaBase == "" {
@@ -248,8 +276,14 @@ func (p *KaaProvider) FindEpisodes(ctx context.Context, providerID string) ([]Ep
 		return nil, err
 	}
 	out := make([]Episode, 0, len(eps))
+	seenEp := map[int]bool{}
 	for _, e := range eps {
-		out = append(out, Episode{Number: e.Number, Title: e.Title})
+		if f := float64(e.Number); f != float64(int(f)) || seenEp[int(f)] {
+			continue // fractional entries are unaddressable via the API
+		} else {
+			seenEp[int(f)] = true
+		}
+		out = append(out, Episode{Number: int(float64(e.Number)), Title: e.Title})
 	}
 	return out, nil
 }
@@ -271,7 +305,7 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 	eps := append([]kaaEpisode(nil), first.Result...)
 	seen := map[string]bool{}
 	for _, e := range eps {
-		seen[strconv.Itoa(e.Number)] = true
+		seen[e.Number.key()] = true
 	}
 	for _, page := range first.Pages {
 		if len(page.Eps) == 0 {
@@ -290,7 +324,7 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 			return nil, err
 		}
 		for _, e := range pd.Result {
-			if k := strconv.Itoa(e.Number); !seen[k] {
+			if k := e.Number.key(); !seen[k] {
 				eps = append(eps, e)
 				seen[k] = true
 			}
@@ -515,7 +549,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	}
 	var match *kaaEpisode
 	for i := range eps {
-		if eps[i].Number == episode {
+		if eps[i].Number.equals(episode) {
 			match = &eps[i]
 			break
 		}
