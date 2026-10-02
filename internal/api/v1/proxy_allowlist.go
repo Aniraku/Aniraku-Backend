@@ -24,6 +24,10 @@ var defaultCDNSuffixes = []string{
 	"fetch8.flixcloud.cc", "fetch9.flixcloud.cc", "fetch10.flixcloud.cc", "vault-95.atomic4cdn.top",
 	// Direct mp4 mirrors
 	"animegg.org",
+	// AnimeGG mp4 file host (302 target of /play/ URLs)
+	"vidcache.net",
+	// AniWaves site + echovideo extractors + savedly mp4 host
+	"aniwaves.ru", "echovideo.to", "echovideo.ru", "savedly.net",
 	// Wix-hosted video (repackager.wixmp.com)
 	"wixmp.com", "wixstatic.com",
 	// Miruro's own domains
