@@ -133,6 +133,12 @@ func (p *TryEmbedProvider) newSession() (*tryembedSession, error) {
 	}, nil
 }
 
+// timeoutCtx bounds one upstream hop far below the client timeout so a
+// tarpitted block page can never eat the fan-out budget.
+func timeoutCtx(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}
+
 func (s *tryembedSession) setFetchHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", browserUA)
 	req.Header.Set("Accept", "*/*")
@@ -143,7 +149,9 @@ func (s *tryembedSession) setFetchHeaders(req *http.Request) {
 }
 
 func (s *tryembedSession) getText(ctx context.Context, rawURL, referer string, limit int64) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	actx, cancel := timeoutCtx(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -167,7 +175,9 @@ func (s *tryembedSession) getText(ctx context.Context, rawURL, referer string, l
 }
 
 func (s *tryembedSession) getJSON(ctx context.Context, rawURL, referer, nonce string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	actx, cancel := timeoutCtx(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return err
 	}
@@ -214,8 +224,10 @@ func (p *TryEmbedProvider) bootstrap(ctx context.Context, s *tryembedSession, id
 			case <-time.After(time.Duration(attempt) * time.Second):
 			}
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(nil))
+		actx, cancel := timeoutCtx(ctx, 12*time.Second)
+		req, err := http.NewRequestWithContext(actx, http.MethodPost, rawURL, bytes.NewReader(nil))
 		if err != nil {
+			cancel()
 			return err
 		}
 		s.setFetchHeaders(req)
@@ -223,6 +235,7 @@ func (p *TryEmbedProvider) bootstrap(ctx context.Context, s *tryembedSession, id
 		req.Header.Set("Referer", pageURL)
 		req.Header.Set("X-TryEmbed-Bootstrap", m[1])
 		resp, err := s.client.Do(req)
+		cancel()
 		if err != nil {
 			lastErr = err
 			continue
@@ -343,7 +356,9 @@ func (p *TryEmbedProvider) resolveMirror(ctx context.Context, s *tryembedSession
 		fileExt = "mp4"
 	}
 	fileURL := fmt.Sprintf("%s/s/%s.%s", s.base, pick.Token, fileExt)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	actx, cancel := timeoutCtx(ctx, 12*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(actx, http.MethodGet, fileURL, nil)
 	if err != nil {
 		return "", "", nil, nil, nil, nil
 	}
