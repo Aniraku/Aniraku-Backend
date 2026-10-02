@@ -96,6 +96,12 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if ka, ok := p.(*KaaProvider); ok {
 			ka.SetHostLearner(fn)
 		}
+		if ag, ok := p.(*AnimeGGProvider); ok {
+			ag.SetHostLearner(fn)
+		}
+		if aw, ok := p.(*AniWavesProvider); ok {
+			aw.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -139,9 +145,11 @@ type SourceResult struct {
 // show resolve -> episode data-ids -> servers -> embed decrypt -> verified
 // m3u8); AnimeX (plyr API, XOR-decoded direct URLs) is second; Zoko
 // (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
-// playback. (Zenime removed 2026-09-30: arms API unreliable. OGFLix removed:
-// api.anizen.tr challenged every request and every resolved edge was blocked
-// — pure fan-out latency for nothing.)
+// playback; AnimeGG (direct mp4, highest quality per mirror) and AniWaves
+// (multi-rendition HLS masters) ride last in the chain. (Zenime removed
+// 2026-09-30: arms API unreliable. OGFLix removed: api.anizen.tr challenged
+// every request and every resolved edge was blocked — pure fan-out latency
+// for nothing.)
 //
 // NOTE (operator): kaa.lt decrypted stream URLs are dual-language — one
 // resolved URL serves both sub (ja-JP) and dub (en-US). A future kaa.lt
@@ -158,6 +166,8 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewFlixCloudProvider(log),
 			NewNiNProvider(log),
 			NewKaaProvider(log, "", ""),
+			NewAnimeGGProvider(log, "", ""),
+			NewAniWavesProvider(log, "", ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -231,6 +241,15 @@ const zokoPaused = false
 // slug is accepted for API compatibility; the Anikoto resolver maps AniList
 // IDs itself, so the slug is unused today.
 func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
+	// Cute server names double as provider aliases (the server list shows
+	// "Sunny", the explicit request sends "Sunny"): normalize them to the
+	// family before anything else so both forms resolve identically.
+	switch strings.ToLower(provider) {
+	case "animegg", "sunny", "yolky", "eggy":
+		provider = "animegg"
+	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
+		provider = "aniwaves"
+	}
 	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
 	// rejected before any upstream call, and the fallback chain below
@@ -240,7 +259,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -312,12 +331,33 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("kaa: no sources for this episode")
+	case "animegg", "sunny", "yolky", "eggy":
+		// Family plus cute aliases (normalization above already maps
+		// them; the aliases here cover direct switch hits).
+		result, err := m.tryAnimeGG(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("animegg: no sources for this episode")
+	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
+		result, err := m.tryAniWaves(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("aniwaves: no sources for this episode")
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "mkissa":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
-	// while paused), FlixCloud embed fourth, kaa.lt last. Hentai titles
+	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
+	// sixth, AniWaves HLS last. Hentai titles
 	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
 	// FlixCloud (Reanime embeds, covers hentai).
 	var candidates []func() (*core.StreamResult, error)
@@ -345,6 +385,10 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 		}, func() (*core.StreamResult, error) {
 			return m.tryKaa(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryAnimeGG(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryAniWaves(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -409,7 +453,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -428,9 +472,10 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		return out
 	}
 
-	wg.Add(7)
-	// Anikoto, AnimeX and NiN are never queried for hentai titles (hentai
-	// gate — Supaplay's API 502s them). Zoko and FlixCloud serve them:
+	wg.Add(9)
+	// Anikoto, AnimeX, NiN, AnimeGG and AniWaves are never queried for
+	// hentai titles (hentai gate — Supaplay's API 502s them). Zoko and
+	// FlixCloud serve them:
 	// Zoko only via its MAL-keyed path (its AniList index carries no
 	// hentai), FlixCloud via Reanime.
 	go func() {
@@ -481,6 +526,22 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	}()
 	go func() {
 		defer wg.Done()
+		if !hentai {
+			agServers = run("animegg", func() []core.Server {
+				return m.collectAnimeGGServers(ctx, anilistID, episode, lang)
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if !hentai {
+			awServers = run("aniwaves", func() []core.Server {
+				return m.collectAniWavesServers(ctx, anilistID, episode, lang)
+			})
+		}
+	}()
+	go func() {
+		defer wg.Done()
 		// Runs alongside the provider fan-out (not after it): a slow
 		// provider must never starve the download fetch of context
 		// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -502,7 +563,12 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers, lang)
 
-	allServers := append(append(append(append(append(akServers, axServers...), zkServers...), fcServers...), nnServers...), kaServers...)
+	// Provider merge order is fixed (direct first, embeds and the newest
+	// providers last); playback-verdict ranking below reorders by health.
+	allServers := akServers
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers} {
+		allServers = append(allServers, pool...)
+	}
 	// Kiwi download links (fetched in parallel above): attach to every
 	// non-embed server (embed players take no file links). Independent of
 	// the Zoko streaming provider and its pause flag.
@@ -1091,6 +1157,120 @@ func (m *Manager) collectKaaServers(ctx context.Context, anilistID string, episo
 		}
 		sr = m.withDubSubtitles(ctx, "kaa", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{"Kaa"}, "kaa", lang, sr)
+	}
+	return out
+}
+
+func (m *Manager) getAnimeGGProvider() *AnimeGGProvider {
+	for _, p := range m.providers {
+		if ag, ok := p.(*AnimeGGProvider); ok {
+			return ag
+		}
+	}
+	return nil
+}
+
+func (m *Manager) getAniWavesProvider() *AniWavesProvider {
+	for _, p := range m.providers {
+		if aw, ok := p.(*AniWavesProvider); ok {
+			return aw
+		}
+	}
+	return nil
+}
+
+// tryAnimeGG resolves an AnimeGG direct mp4 (highest quality per mirror;
+// dub below 720p never resolves — the provider hides it).
+func (m *Manager) tryAnimeGG(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	ag := m.getAnimeGGProvider()
+	if ag == nil {
+		return nil, fmt.Errorf("animegg provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying animegg")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := ag.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("animegg failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	// Dub keeps AnimeGG defaults (only Sora dub takes nico files).
+	source = m.withDubSubtitles(ctx, "animegg", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// tryAniWaves resolves an AniWaves direct stream (multi-rendition HLS
+// masters first, highest savedly mp4 as spare).
+func (m *Manager) tryAniWaves(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	aw := m.getAniWavesProvider()
+	if aw == nil {
+		return nil, fmt.Errorf("aniwaves provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying aniwaves")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := aw.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("aniwaves failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	// Dub keeps AniWaves defaults (only Sora dub takes nico files).
+	source = m.withDubSubtitles(ctx, "aniwaves", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectAnimeGGServers maps AnimeGG sources to Sunny/Yolky/Eggy servers.
+// The provider names its own sources positionally; the fallback guards the
+// append contract and is never hit in practice.
+func (m *Manager) collectAnimeGGServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		ag, ok := prov.(*AnimeGGProvider)
+		if !ok {
+			continue
+		}
+		sr, err := ag.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "animegg").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "animegg", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{"Sunny"}, "animegg", lang, sr)
+	}
+	return out
+}
+
+// collectAniWavesServers maps AniWaves sources to Nami/Coral/Pearl/... servers.
+func (m *Manager) collectAniWavesServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		aw, ok := prov.(*AniWavesProvider)
+		if !ok {
+			continue
+		}
+		sr, err := aw.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "aniwaves").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "aniwaves", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{"Nami"}, "aniwaves", lang, sr)
 	}
 	return out
 }

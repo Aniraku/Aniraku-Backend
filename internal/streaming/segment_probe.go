@@ -89,6 +89,18 @@ func probePlaylistsLenient(ctx context.Context, client *http.Client, masterURL, 
 	return true
 }
 
+// probeMediaFileLenient verifies a direct media file (mp4 and friends) is
+// actually served from this egress: 2xx + non-HTML bytes judged by magic
+// (ftyp/moof for mp4, TS sync, ID3). Redirects (signed ?for= tokens that
+// 302 to file hosts) are followed like a player follows them.
+func probeMediaFileLenient(ctx context.Context, client *http.Client, fileURL, referer, ua string) bool {
+	body, ok := fetchURLCapped(ctx, client, fileURL, referer, ua, 32768, 10*time.Second)
+	if !ok {
+		return false
+	}
+	return segmentBytesPlayable(body)
+}
+
 // probeSegmentsStrict verifies a resolved master playlist is actually
 // playable from this egress, end to end: master -> first media playlist ->
 // first segment must all serve media bytes judged by magic (TS sync,
