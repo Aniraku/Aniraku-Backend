@@ -94,13 +94,3 @@ func (r *RelayClient) VidNestFetch(ctx context.Context, id, episode int, lang st
 		"id": id, "episode": episode, "lang": lang,
 	})
 }
-
-// TryEmbedStreamData relays one stream_data call (direct stream_data 403s
-// datacenter egress). Returns the raw upstream JSON for the normal parse
-// path. Session cookies travel in the request — the relay holds no state.
-func (r *RelayClient) TryEmbedStreamData(ctx context.Context, cookies, nonce string, id, episode int, lang, server string) ([]byte, error) {
-	return r.postBytes(ctx, "/tryembed-stream", map[string]any{
-		"id": id, "episode": episode, "lang": lang, "server": server,
-		"nonce": nonce, "cookies": cookies,
-	})
-}

@@ -1,7 +1,7 @@
 // Aniraku upstream relay (Cloudflare Worker, free tier).
 //
 // WHY: some upstream API endpoints Cloudflare-block the backend's
-// datacenter egress (vidnest API, tryembed stream_data) while serving
+// datacenter egress (the VidNest API) while serving
 // residential/CF egress fine — and the minted file URLs play from the
 // backend egress with no IP binding (verified live). So ONLY the blocked
 // API calls route through here (kilobytes of JSON); every video byte and
@@ -20,7 +20,6 @@
 // hundreds.
 
 const VIDNEST_API = "https://new.vidnest.fun";
-const TRYEMBED_BASE = "https://tryembed.us.cc";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -32,22 +31,6 @@ function authorized(req, env) {
 
 function denied() {
   return new Response("forbidden", { status: 403 });
-}
-
-// Minimal cookie jar: upstream sessions are cookie-bound (tryembed_auth),
-// and Workers don't persist cookies between fetches.
-function jarStore(jar, res) {
-  const setCookies =
-    res.headers.getSetCookie?.() ||
-    (res.headers.get("set-cookie") ? [res.headers.get("set-cookie")] : []);
-  for (const line of setCookies) {
-    const m = /^\s*([^=;\s]+)=([^;]*)/.exec(line);
-    if (m) jar.set(m[1], m[2]);
-  }
-}
-
-function jarHeader(jar) {
-  return [...jar.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
 }
 
 async function vidnestResolve(env, body) {
@@ -72,42 +55,6 @@ async function vidnestResolve(env, body) {
   });
 }
 
-// stream_data only: the backend runs page+bootstrap itself (both pass its
-// egress) and relays just this gated call. Cookies travel in the request
-// body since the relay holds no session state.
-async function tryembedStream(env, body) {
-  const { id, episode, lang, server, nonce, cookies } = body;
-  if (!id || !episode || !lang || !server || !nonce) {
-    return new Response("bad request", { status: 400 });
-  }
-  const q = new URLSearchParams({
-    id: String(id),
-    episode: String(episode),
-    audio: lang,
-    player: "jw",
-    server,
-    nonce,
-  });
-  const res = await fetch(`${TRYEMBED_BASE}/api/stream_data?${q}`, {
-    headers: {
-      "User-Agent": UA,
-      Accept: "*/*",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Sec-Fetch-Dest": "empty",
-      "Sec-Fetch-Mode": "cors",
-      "Sec-Fetch-Site": "same-origin",
-      Referer: `${TRYEMBED_BASE}/embed/anime/${id}/${episode}/${lang}`,
-      Cookie: cookies || "",
-      "X-Embed-Nonce": nonce,
-    },
-  });
-  const text = await res.text();
-  return new Response(text, {
-    status: res.status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
 export default {
   async fetch(req, env) {
     if (!authorized(req, env)) return denied();
@@ -122,7 +69,6 @@ export default {
       return new Response("bad request", { status: 400 });
     }
     if (url.pathname === "/vidnest") return vidnestResolve(env, body);
-    if (url.pathname === "/tryembed-stream") return tryembedStream(env, body);
     return new Response("not found", { status: 404 });
   },
 };

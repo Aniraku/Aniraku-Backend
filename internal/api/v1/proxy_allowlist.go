@@ -30,8 +30,8 @@ var defaultCDNSuffixes = []string{
 	"aniwaves.ru", "echovideo.to", "echovideo.ru", "savedly.net",
 	// VidNest API + MegaPlay file host + subtitle host
 	"vidnest.fun", "new.vidnest.fun", "megap.shiora.top", "stellarfrontier.world",
-	// TryEmbed app + signed file proxy + dramahot CDN
-	"tryembed.us.cc", "god.anixx.cloud", "hls.dramahot.top",
+	// Zoko dramahot CDN (kept: still served by zoko)
+	"hls.dramahot.top",
 	// Wix-hosted video (repackager.wixmp.com)
 	"wixmp.com", "wixstatic.com",
 	// Miruro's own domains
