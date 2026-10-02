@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Aniraku/Aniraku-Backend/internal/core"
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
@@ -96,26 +95,12 @@ func (r *RelayClient) VidNestFetch(ctx context.Context, id, episode int, lang st
 	})
 }
 
-// TryEmbedMirror is one relay-minted mirror: final file URL plus tracks.
-type TryEmbedMirror struct {
-	Server   string            `json:"server"`
-	Type     string            `json:"type"`
-	URL      string            `json:"url"`
-	Captions []tryembedCaption `json:"captions"`
-}
-
-// TryEmbedResolve runs the whole ticket chain on the relay and returns
-// freshly minted mirrors (direct stream_data 403s datacenter egress).
-func (r *RelayClient) TryEmbedResolve(ctx context.Context, id, episode int, lang string) ([]TryEmbedMirror, *core.SkipTimestamp, *core.SkipTimestamp, error) {
-	var out struct {
-		Mirrors []TryEmbedMirror    `json:"mirrors"`
-		Intro   *core.SkipTimestamp `json:"intro"`
-		Outro   *core.SkipTimestamp `json:"outro"`
-	}
-	if err := r.post(ctx, "/tryembed", map[string]any{
-		"id": id, "episode": episode, "lang": lang,
-	}, &out); err != nil {
-		return nil, nil, nil, err
-	}
-	return out.Mirrors, out.Intro, out.Outro, nil
+// TryEmbedStreamData relays one stream_data call (direct stream_data 403s
+// datacenter egress). Returns the raw upstream JSON for the normal parse
+// path. Session cookies travel in the request — the relay holds no state.
+func (r *RelayClient) TryEmbedStreamData(ctx context.Context, cookies, nonce string, id, episode int, lang, server string) ([]byte, error) {
+	return r.postBytes(ctx, "/tryembed-stream", map[string]any{
+		"id": id, "episode": episode, "lang": lang, "server": server,
+		"nonce": nonce, "cookies": cookies,
+	})
 }
