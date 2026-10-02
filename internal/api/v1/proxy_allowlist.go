@@ -30,6 +30,8 @@ var defaultCDNSuffixes = []string{
 	"aniwaves.ru", "echovideo.to", "echovideo.ru", "savedly.net",
 	// VidNest API + MegaPlay file host + subtitle host
 	"vidnest.fun", "new.vidnest.fun", "megap.shiora.top", "stellarfrontier.world",
+	// ani.pm (Lee provider) + settlar file hosts
+	"ani.pm", "embed.settlar.io", "media.settlar.io",
 	// Zoko dramahot CDN (kept: still served by zoko)
 	"hls.dramahot.top",
 	// Wix-hosted video (repackager.wixmp.com)

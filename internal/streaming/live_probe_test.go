@@ -59,7 +59,7 @@ func TestLiveProviderProbe(t *testing.T) {
 		sources int
 		err     error
 	}
-	results := make(chan outcome, 8)
+	results := make(chan outcome, 9)
 
 	probe := func(name string, fn func() ([]core.Server, error)) {
 		servers, err := fn()
@@ -91,9 +91,12 @@ func TestLiveProviderProbe(t *testing.T) {
 	go probe("vidnest", func() ([]core.Server, error) {
 		return m.collectVidNestServers(ctx, anilistID, episode, lang), nil
 	})
+	go probe("lee", func() ([]core.Server, error) {
+		return m.collectLeeServers(ctx, anilistID, episode, lang), nil
+	})
 
 	okCount := 0
-	for i := 0; i < 7; i++ {
+	for i := 0; i < 8; i++ {
 		r := <-results
 		status := "FAIL"
 		if r.err == nil && r.sources > 0 {
@@ -102,5 +105,5 @@ func TestLiveProviderProbe(t *testing.T) {
 		}
 		t.Logf("provider %-9s %s servers=%d sources=%d err=%v", r.name, status, r.servers, r.sources, r.err)
 	}
-	t.Logf("probe result: %d/7 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
+	t.Logf("probe result: %d/8 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
 }

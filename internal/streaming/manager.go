@@ -105,6 +105,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if vn, ok := p.(*VidNestProvider); ok {
 			vn.SetHostLearner(fn)
 		}
+		if le, ok := p.(*LeeProvider); ok {
+			le.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -150,7 +153,7 @@ type SourceResult struct {
 // (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
 // playback; AnimeGG (direct mp4, highest quality per mirror) and AniWaves
 // (multi-rendition HLS masters) ride next; VidNest (MegaPlay HLS + subs)
-// rides last. (Zenime removed
+// rides last; Lee (ani.pm direct HLS) rides after VidNest. (Zenime removed
 // 2026-09-30: arms API unreliable. OGFLix removed: api.anizen.tr challenged
 // every request and every resolved edge was blocked — pure fan-out latency
 // for nothing.)
@@ -173,6 +176,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAnimeGGProvider(log, "", ""),
 			NewAniWavesProvider(log, "", ""),
 			NewVidNestProvider(log, ""),
+			NewLeeProvider(log, "", ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -256,6 +260,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		provider = "aniwaves"
 	case "vidnest", "animepahe", "pahe", "nest":
 		provider = "vidnest"
+	case "lee":
+		provider = "lee"
 	}
 	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
@@ -266,7 +272,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -358,6 +364,15 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("aniwaves: no sources for this episode")
+	case "lee", "Lee":
+		result, err := m.tryLee(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("lee: no sources for this episode")
 	case "vidnest", "animepahe", "pahe", "nest":
 		// animepahe pages hit the same VidNest API (verified
 		// byte-identical); the alias lands on the same resolve.
@@ -375,7 +390,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
 	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
-	// sixth, AniWaves HLS seventh, VidNest last. Hentai
+	// sixth, AniWaves HLS seventh, VidNest eighth, Lee last. Hentai
 	// titles
 	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
 	// FlixCloud (Reanime embeds, covers hentai).
@@ -410,6 +425,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryAniWaves(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryVidNest(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryLee(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -474,7 +491,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -565,6 +582,13 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
+			if !hentai {
+				leeServers = run("lee", func() []core.Server {
+					return m.collectLeeServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -597,7 +621,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers} {
 		allServers = append(allServers, pool...)
 	}
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -1358,6 +1382,61 @@ func (m *Manager) collectVidNestServers(ctx context.Context, anilistID string, e
 		}
 		sr = m.withDubSubtitles(ctx, "vidnest", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{vidnestServerName}, "vidnest", lang, sr)
+	}
+	return out
+}
+
+func (m *Manager) getLeeProvider() *LeeProvider {
+	for _, p := range m.providers {
+		if le, ok := p.(*LeeProvider); ok {
+			return le
+		}
+	}
+	return nil
+}
+
+// tryLee resolves an ani.pm direct HLS master (fresh token chain per call).
+func (m *Manager) tryLee(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	le := m.getLeeProvider()
+	if le == nil {
+		return nil, fmt.Errorf("lee provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying lee")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := le.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("lee failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	// Dub keeps Lee defaults (only Sora dub takes nico files).
+	source = m.withDubSubtitles(ctx, "lee", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectLeeServers maps Lee sources to the single "Lee" server.
+func (m *Manager) collectLeeServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		le, ok := prov.(*LeeProvider)
+		if !ok {
+			continue
+		}
+		sr, err := le.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "lee").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "lee", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{leeServerName}, "lee", lang, sr)
 	}
 	return out
 }
