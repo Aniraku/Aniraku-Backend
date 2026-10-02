@@ -514,9 +514,13 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 
 	// Check if this is an HLS playlist — use parsed path, not raw URL (query
 	// params break HasSuffix). pathLower is computed once before the dial.
+	// The RawQuery check covers query-suffixed masters (/cdn/<hash>?t.m3u8);
+	// the body sniff below covers extension-less legs served with a cloaked
+	// content type (echovideo serves everything as image/jpeg).
 	contentType := resp.Header.Get("Content-Type")
 	isHLS := strings.Contains(contentType, "mpegurl") || strings.Contains(contentType, "m3u8") ||
-		strings.HasSuffix(pathLower, ".m3u8") || strings.HasSuffix(pathLower, ".m3u")
+		strings.HasSuffix(pathLower, ".m3u8") || strings.HasSuffix(pathLower, ".m3u") ||
+		strings.Contains(strings.ToLower(parsed.RawQuery), "m3u8")
 
 	if isHLS {
 		body, err := io.ReadAll(resp.Body)
@@ -533,11 +537,36 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 			h.respondError(w, http.StatusBadGateway, "upstream returned "+strconv.Itoa(resp.StatusCode))
 			return
 		}
-		// Keep the RAW pre-rewrite body for the short VOD window: the next
-		// request for this URL (any lang, any proxyBase) rewrites it fresh.
-		streaming.VODCacheSet(decodedURL, body)
-		h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
-		return
+		// The query hint can misfire (a media file whose token happens to
+		// contain "m3u8"): never run binary through the playlist mangler.
+		// Re-attach the bytes and serve them opaque below instead.
+		if !isPlaylistBody(body) {
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		} else {
+			// Keep the RAW pre-rewrite body for the short VOD window: the next
+			// request for this URL (any lang, any proxyBase) rewrites it fresh.
+			streaming.VODCacheSet(decodedURL, body)
+			h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
+			return
+		}
+	}
+	// Extension-less playlist legs (echovideo variant/media URLs are bare
+	// /cdn/<hash>, cloaked as image/jpeg): no hint fires, so sniff the
+	// first bytes. Serving a playlist raw leaves its relative child URIs
+	// pointing at our own domain and playback blacks out — exactly the
+	// failure this guards.
+	if !isHLS && resp.StatusCode == http.StatusOK {
+		if peek, perr := io.ReadAll(io.LimitReader(resp.Body, 1024)); perr == nil {
+			if isPlaylistBody(peek) {
+				if rest, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20)); rerr == nil {
+					body := append(peek, rest...)
+					streaming.VODCacheSet(decodedURL, body)
+					h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
+					return
+				}
+			}
+			resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), resp.Body))
+		}
 	}
 	// Stream non-HLS content directly through the proxy.
 	// Force correct Content-Type for TS segments — CDN lies with "image/jpeg"
@@ -823,13 +852,6 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 	// stripAudioRenditions in proxy_audio.go).
 	content = stripAudioRenditions(content, al)
 	lines := strings.Split(content, "\n")
-	baseParts := strings.Split(baseURL, "/")
-	var basePrefix string
-	if len(baseParts) < 4 {
-		basePrefix = baseURL
-	} else {
-		basePrefix = strings.Join(baseParts[:len(baseParts)-1], "/")
-	}
 
 	// Only a playlist we fetched from an allowed host may vouch for the hosts
 	// it references. Proxy() gates on isAllowedProxyHost before fetching, so
@@ -909,7 +931,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 					return match
 				}
 				uri := strings.Trim(parts[1], "\"")
-				absoluteURL := resolveURL(uri, basePrefix)
+				absoluteURL := resolveURL(uri, baseURL)
 				if alreadyProxied(absoluteURL) {
 					return match
 				}
@@ -940,15 +962,10 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 			continue
 		}
 
-		// Resolve relative URLs for segment lines
-		var absoluteURL string
-		if strings.HasPrefix(original, "http") {
-			absoluteURL = original
-		} else if strings.HasPrefix(original, "//") {
-			absoluteURL = "https:" + original
-		} else {
-			absoluteURL = basePrefix + "/" + original
-		}
+		// Resolve child URLs exactly like a player (RFC 3986 against the
+		// playlist URL): root-relative (/cdn/x), relative (seg.ts),
+		// protocol-relative and absolute forms.
+		absoluteURL := resolveURL(original, baseURL)
 		if alreadyProxied(absoluteURL) {
 			lines[i] = original
 			continue
@@ -1029,12 +1046,33 @@ func hasKnownRewriteKeys(rawURL string) bool {
 		strings.Contains(lower, "185.237.106.79")
 }
 
-func resolveURL(uri, basePrefix string) string {
+// resolveURL absolutizes a playlist child URI against the playlist URL
+// per RFC 3986 (ResolveReference): root-relative (/cdn/x), relative
+// (seg.ts), protocol-relative (//h/x) and absolute forms all resolve like
+// a player resolves them. String concatenation got root-relative legs wrong
+// (echovideo variant legs /cdn/<hash> became host/cdn//cdn/<hash>).
+// isPlaylistBody reports whether raw bytes open with an HLS playlist
+// signature. The proxy uses it to catch playlist legs that no URL or
+// content-type hint identifies (query-suffixed masters, extension-less
+// variant URLs, cloaked image/jpeg types) — and to keep binary that trips
+// a hint (token containing "m3u8") out of the playlist rewriter.
+func isPlaylistBody(b []byte) bool {
+	return bytes.HasPrefix(bytes.TrimSpace(b), []byte("#EXTM3U"))
+}
+
+func resolveURL(uri, baseURL string) string {
 	if strings.HasPrefix(uri, "http") {
 		return uri
 	}
 	if strings.HasPrefix(uri, "//") {
 		return "https:" + uri
 	}
-	return basePrefix + "/" + uri
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		return uri
+	}
+	if ref, err := url.Parse(uri); err == nil {
+		return base.ResolveReference(ref).String()
+	}
+	return uri
 }
