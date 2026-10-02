@@ -493,93 +493,95 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		return out
 	}
 
-	wg.Add(11)
+	// Fan-out collectors as data: the WaitGroup count derives from the
+	// slice, never a hand-maintained number — adding or removing a
+	// provider cannot wedge wg.Wait() again (observed 2026-10-02: a stale
+	// Add(11) deadlocked every /servers call after a provider removal).
 	// Anikoto, AnimeX, NiN, AnimeGG, AniWaves and VidNest are never queried
 	// for hentai titles (hentai gate — Supaplay's API 502s them). Zoko and
 	// FlixCloud serve them:
 	// Zoko only via its MAL-keyed path (its AniList index carries no
 	// hentai), FlixCloud via Reanime.
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			akServers = run("anikoto", func() []core.Server {
-				return m.collectAnikotoServers(ctx, anilistID, episode, lang)
+	collectors := []func(){
+		func() {
+			if !hentai {
+				akServers = run("anikoto", func() []core.Server {
+					return m.collectAnikotoServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				axServers = run("animex", func() []core.Server {
+					return m.collectAnimeXServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !zokoPaused {
+				zkServers = run("zoko", func() []core.Server {
+					return m.collectZokoServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			fcServers = run("flixcloud", func() []core.Server {
+				return m.collectFlixServers(ctx, anilistID, episode, lang)
 			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			axServers = run("animex", func() []core.Server {
-				return m.collectAnimeXServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !zokoPaused {
-			zkServers = run("zoko", func() []core.Server {
-				return m.collectZokoServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		fcServers = run("flixcloud", func() []core.Server {
-			return m.collectFlixServers(ctx, anilistID, episode, lang)
-		})
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			nnServers = run("nin", func() []core.Server {
-				return m.collectNiNServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			kaServers = run("kaa", func() []core.Server {
-				return m.collectKaaServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			agServers = run("animegg", func() []core.Server {
-				return m.collectAnimeGGServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			awServers = run("aniwaves", func() []core.Server {
-				return m.collectAniWavesServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		if !hentai {
-			vnServers = run("vidnest", func() []core.Server {
-				return m.collectVidNestServers(ctx, anilistID, episode, lang)
-			})
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		// Runs alongside the provider fan-out (not after it): a slow
-		// provider must never starve the download fetch of context
-		// budget — observed 46s responses when the 45s fan-out cap trips.
-		start := time.Now()
-		kiwiLinks = fetchKiwiDownloads(ctx, m.httpClient, anilistID, episode, lang)
-		dmu.Lock()
-		collectorMs["kiwiDownloads"] = time.Since(start).Milliseconds()
-		dmu.Unlock()
-	}()
+		},
+		func() {
+			if !hentai {
+				nnServers = run("nin", func() []core.Server {
+					return m.collectNiNServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				kaServers = run("kaa", func() []core.Server {
+					return m.collectKaaServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				agServers = run("animegg", func() []core.Server {
+					return m.collectAnimeGGServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				awServers = run("aniwaves", func() []core.Server {
+					return m.collectAniWavesServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				vnServers = run("vidnest", func() []core.Server {
+					return m.collectVidNestServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			// Runs alongside the provider fan-out (not after it): a slow
+			// provider must never starve the download fetch of context
+			// budget — observed 46s responses when the 45s fan-out cap trips.
+			start := time.Now()
+			kiwiLinks = fetchKiwiDownloads(ctx, m.httpClient, anilistID, episode, lang)
+			dmu.Lock()
+			collectorMs["kiwiDownloads"] = time.Since(start).Milliseconds()
+			dmu.Unlock()
+		},
+	}
+	wg.Add(len(collectors))
+	for _, collect := range collectors {
+		go func(fn func()) {
+			defer wg.Done()
+			fn()
+		}(collect)
+	}
 	wg.Wait()
 
 	// Merged downloads for Zoko: Zoko's own link plus the already-fetched
