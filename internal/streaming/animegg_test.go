@@ -128,7 +128,7 @@ func newAnimeGGFixture(t *testing.T) *animeggFixture {
 			`<a data-toggle="tab" data-id="102" data-mirror="AnimeGG" data-version="dubbed">D</a>`)
 	})
 	mux.HandleFunc("/embed/101", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, `<script>var videoSources = [{file: "%s/play/360.mp4", label: "360p", bk: "", isBk: false },{file: "%s/play/1080.mp4", label: "1080p", bk: "", isBk: false }];</script>`, base, base)
+		fmt.Fprintf(w, `<script>var videoSources = [{file: "%s/play/360.mp4", label: "360p", bk: "", isBk: false },{file: "%s/play/redir.mp4", label: "1080p", bk: "", isBk: false }];</script>`, base, base)
 	})
 	mux.HandleFunc("/embed/102", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, `<script>var videoSources = [{file: "%s/play/360.mp4", label: "360p", bk: "", isBk: false }];</script>`, base)
@@ -139,6 +139,12 @@ func newAnimeGGFixture(t *testing.T) *animeggFixture {
 	}
 	mux.HandleFunc("/play/360.mp4", mp4)
 	mux.HandleFunc("/play/1080.mp4", mp4)
+	// /play/ hop 302s to the file host (vidcache in prod): the provider
+	// must ship the final URL since the media proxy refuses redirects.
+	mux.HandleFunc("/play/redir.mp4", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/file.mp4", http.StatusFound)
+	})
+	mux.HandleFunc("/file.mp4", mp4)
 	srv := httptest.NewServer(mux)
 	base = srv.URL
 	t.Cleanup(srv.Close)
@@ -166,8 +172,11 @@ func TestAnimeGGSubHighestQuality(t *testing.T) {
 		t.Fatalf("want 1 source, got %+v", sr)
 	}
 	src := sr.Sources[0]
-	if !strings.HasSuffix(src.URL, "/play/1080.mp4") {
-		t.Errorf("URL = %q, want highest-quality /play/1080.mp4", src.URL)
+	if !strings.HasSuffix(src.URL, "/file.mp4") {
+		t.Errorf("URL = %q, want final redirect target /file.mp4 (never the /play/ hop)", src.URL)
+	}
+	if strings.Contains(src.URL, "/play/") {
+		t.Errorf("URL = %q, must not contain the unredirected /play/ hop", src.URL)
 	}
 	if src.Type != "mp4" || src.Quality != "1080p" || src.Verification != "proxy" {
 		t.Errorf("meta = type %q quality %q verification %q", src.Type, src.Quality, src.Verification)
