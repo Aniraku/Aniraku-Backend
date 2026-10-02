@@ -236,3 +236,36 @@ func TestMkissaAniListID(t *testing.T) {
 		t.Fatalf("nil id = %q", got)
 	}
 }
+
+func TestMkissaThrottleBreaker(t *testing.T) {
+	b := &mkissaThrottleBreaker{cooldown: time.Hour, tripAfter: 2}
+	if b.blocked() {
+		t.Fatal("fresh breaker must not block")
+	}
+	b.record(false, true)
+	if b.blocked() {
+		t.Fatal("one throttle must not trip yet")
+	}
+	b.record(false, false) // unrelated failure resets the streak
+	b.record(false, true)
+	if b.blocked() {
+		t.Fatal("non-consecutive throttle must not trip")
+	}
+	b.record(false, true)
+	if !b.blocked() {
+		t.Fatal("two consecutive throttles must trip")
+	}
+	b.record(true, false)
+	if b.blocked() {
+		t.Fatal("success must reset the breaker")
+	}
+	if !mkissaThrottleErr(fmt.Errorf("mkissa: episode 1: Too many requests, please try again in 2 seconds.")) {
+		t.Fatal("rate message must classify as throttle")
+	}
+	if !mkissaThrottleErr(fmt.Errorf("mkissa: episode 1: NEED_CAPTCHA")) {
+		t.Fatal("captcha must classify as throttle")
+	}
+	if mkissaThrottleErr(fmt.Errorf("mkissa: no show match")) {
+		t.Fatal("resolve failure must not classify as throttle")
+	}
+}
