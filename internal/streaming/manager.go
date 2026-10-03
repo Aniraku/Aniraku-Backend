@@ -642,11 +642,11 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// provider.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers, lang)
-	// MegaVid language verification (operator rule): megavid sometimes
-	// serves the opposite audio for the requested lang. Proven swaps are
-	// dropped against Anikoto's same-episode files; unverifiable titles
-	// list as-is.
-	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang)
+	// MegaVid verification (operator rules): language checks plus the
+	// corroboration gate — Vidy lists only alongside another provider.
+	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang,
+		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
+			len(agServers)+len(awServers)+len(vnServers)+len(leeServers)+len(akServers) > 0)
 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
@@ -1501,7 +1501,9 @@ func (m *Manager) tryMegaVid(ctx context.Context, animeID int, episode int, lang
 	}
 	source = m.withDubSubtitles(ctx, "megavid", lang, anilistID, episode, source)
 	servers := appendNamedServers(nil, []string{megavidServerName}, "megavid", lang, source)
-	filtered := m.verifyMegaVidLang(ctx, servers, nil, anilistID, episode, lang)
+	// Explicit requests skip the corroboration gate (no fan-out room to
+	// consult); the three language layers still apply.
+	filtered := m.verifyMegaVidLang(ctx, servers, nil, anilistID, episode, lang, true)
 	if len(filtered) == 0 {
 		return nil, nil
 	}
@@ -1651,9 +1653,19 @@ func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer str
 // Anything unverifiable lists as-is — never drop blind. The other-lang
 // reference fetch runs only when some source misses the same-lang set,
 // so the common confirmed case costs zero extra upstream calls.
-func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []core.Server, anilistID string, episode int, lang string) []core.Server {
+func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []core.Server, anilistID string, episode int, lang string, hasOthers bool) []core.Server {
 	if len(mvServers) == 0 {
 		return mvServers
+	}
+	// Corroboration gate (operator): Vidy lists only alongside at least
+	// one other provider's server for the same episode+lang. A solo
+	// Vidy claim (nothing else carries the episode, e.g. an unreleased
+	// dub) is hidden rather than risk a hallucinated listing.
+	if !hasOthers {
+		m.log.Info().Str("provider", "megavid").
+			Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
+			Msg("megavid: solo claim, no corroborating provider — hiding Vidy")
+		return nil
 	}
 	want := wantAudioLang(lang)
 	other := "sub"
