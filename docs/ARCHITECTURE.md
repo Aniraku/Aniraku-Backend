@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → OGFLix → FlixCloud
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → VidNest → Lee → MegaVid
 ```
 
 ## Code layout (`internal/api/v1`)
@@ -73,15 +73,26 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | Browse/trending cache | 5 min | Same janitor. |
 | AES key cache | 5 min | Per playback session; `sn`/`iv`/`t` params stripped from the cache key. |
 | TMDB episode cache | package-level | Only non-empty results are cached (empty results poison hentai titles). |
-| Dynamic CDN allowlist | 1 h expiry | Hourly cleanup. |
+| Anikoto resolve | 5 min fresh + stale window | Served without re-contacting megaplay; stale backs failures. |
+| kaa slug / resolve | 24 h / 10 min (lang-keyed) | Strict per-lang keys; deep-copied on store and load. |
+| AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
+| VidNest / Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
+| VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
+| Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
+| Dynamic CDN allowlist | 24 h TTL | Learned hosts (playlist-vouched) expire on read past TTL; capped at 500 entries. |
 
 ## Streaming fan-out
 
-`GetServers` runs all providers concurrently (45 s hard cap), merges in fixed
-provider order, and ranks by playback verdict (`proxy > direct > embed > dead`).
-Hentai titles are gated to OGFLix + FlixCloud before any upstream call.
-`Stream` walks the provider chain sequentially; `?refresh=1` bypasses provider
-caches.
+`GetServers` fans out to all collectors concurrently (45 s hard cap,
+per-collector timings in `collectorMs`), merges in fixed provider order,
+applies the Zoko-download / NiN-subtitle / MegaVid-language merges, attaches
+Kiwi downloads, and stable-sorts by playback verdict (`proxy > direct >
+embed > dead` — ordering hint only, never a filter). The collector set is
+slice-driven so the WaitGroup count cannot drift. Hentai titles reach only
+Zoko (MAL-keyed) + FlixCloud before any other upstream call. `Stream`
+walks the fallback chain serially with per-request quality filtering;
+explicit `provider` accepts families and cute-name aliases; `?refresh=1`
+bypasses provider caches. Full rule list: [`docs/PROVIDERS.md`](./PROVIDERS.md).
 
 ## Observability
 

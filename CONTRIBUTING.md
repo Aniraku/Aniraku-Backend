@@ -4,27 +4,46 @@ Contributions should improve reliability, security, maintainability, or compatib
 
 ## Development Workflow
 
-Use Go 1.24 or newer. Run `go mod download`, keep local configuration outside commits, and use focused changes that are easy to review. When working on the auxiliary Python proxy, use an isolated virtual environment and the repository’s `requirements.txt`.
+Use Go 1.25 (see `go.mod`; the repo pins its toolchain). Run `go mod download`, keep local configuration outside commits, and use focused changes that are easy to review.
 
 ## Validation
 
-Run the relevant Go tests and build checks before opening a pull request:
+Mandatory before every push (mirrors CI):
 
 ```bash
-go test ./...
-go build ./cmd/aniraku-server/
+gofmt -l .
+go build ./...
+go vet ./...
+go test ./... -race -count=1
 ```
 
-For provider or proxy changes, exercise representative success, fallback, timeout, malformed-response, and unavailable-upstream cases. Do not weaken the network guard or authentication middleware to make a test pass.
+`gofmt` must print nothing; `go mod tidy` must leave `go.mod`/`go.sum`
+untouched. For provider or proxy changes, exercise representative
+success, fallback, timeout, malformed-response, and unavailable-upstream
+cases — preferably as `httptest` fixtures (override base URLs + plain
+client; `netguard` blocks fixture IPs) plus the env-guarded live probe:
 
-## Pull Requests
+```bash
+go test -c ./internal/streaming/ -o /tmp/streaming.test
+ANIRAKU_LIVE_PROBE=1 ANIRAKU_LIVE_PROBE_ID=<anilist> ANIRAKU_LIVE_PROBE_EP=<n> ANIRAKU_LIVE_PROBE_LANG=<sub|dub> /tmp/streaming.test -test.run TestLiveProviderProbe -v
+```
 
-Describe the behavior changed, the affected module, validation performed, and any upstream assumptions. Include API examples when route behavior changes. Never commit credentials, cookies, service keys, generated binaries, or private user data.
+Root-cause evidence (prod-egress probe output, log lines) comes before
+implementing a fix. Do not weaken the network guard or authentication
+middleware to make a test pass.
 
 ## Adding a Provider
 
-Keep provider-specific behavior inside `internal/streaming/`, follow the existing provider manager abstractions, and preserve cancellation, timeout, error normalization, and fallback behavior. Add tests for parsing and failure cases before requesting review.
+Follow [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — catalog, operator
+rules, and the 9-step wiring checklist. Keep provider-specific behavior
+inside `internal/streaming/`, preserve cancellation, timeout, error
+normalization, and fallback behavior, and add the allowlist entries for
+any new CDN host.
 
-## Reporting Security Issues
+## Pull Requests
 
-Do not disclose sensitive vulnerabilities in a public issue. Follow the repository’s security guidance and provide the smallest reproducible description needed for maintainers to investigate safely.
+Describe the behavior changed, the affected module, validation performed
+(including live-probe results for provider work), and any upstream
+assumptions. Include API examples when route behavior changes. Never
+commit credentials, cookies, service keys, generated binaries, or private
+user data. Rebase before push — another actor commits to this repo.
