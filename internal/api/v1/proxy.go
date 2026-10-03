@@ -351,8 +351,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 	// never answer a request the proxy would not have fetched itself.
 	if cachedBody, ok := streaming.VODCacheGet(decodedURL); ok {
 		if r.Method == http.MethodHead {
+			// No Content-Length: the GET representation is the REWRITTEN
+			// playlist whose length differs from these raw bytes —
+			// reporting the raw length lies to download managers.
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			w.Header().Set("Content-Length", strconv.Itoa(len(cachedBody)))
 			w.WriteHeader(http.StatusOK)
 			return
 		}
