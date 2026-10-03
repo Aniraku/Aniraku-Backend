@@ -1572,18 +1572,46 @@ func (m *Manager) anikotoFileKeys(ctx context.Context, anilistID string, episode
 	return serverFileKeys([]core.Server{{Sources: sr.Sources}})
 }
 
+// megavidMasterLangs returns the audio languages a master playlist
+// declares across its AUDIO renditions. Unknown (false) when the master
+// declares none (muxed single audio) or cannot be read — the file layer
+// decides those. Recently probed playlists come from the VOD cache, so the
+// common path costs zero upstream calls.
+func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer string) (map[string]bool, bool) {
+	if body, ok := VODCacheGet(masterURL); ok {
+		if langs := m3uAudioLangs(body); len(langs) > 0 {
+			return langs, true
+		}
+		return nil, false
+	}
+	body, ok := fetchURLCapped(ctx, m.httpClient, masterURL, referer, browserUA, 65536, 10*time.Second)
+	if !ok {
+		return nil, false
+	}
+	VODCacheSet(masterURL, body)
+	langs := m3uAudioLangs(body)
+	return langs, len(langs) > 0
+}
+
 // verifyMegaVidLang enforces the operator language rule: megavid sometimes
-// serves the opposite audio for the requested lang, so every source is
-// checked against Anikoto's same-episode files (same MegaPlay catalog,
-// identical file paths). Proven swaps are dropped with a Warn; anything
-// unverifiable (no Anikoto reference, or identical files both langs)
-// lists as-is. The other-lang reference fetch runs only when some source
-// misses the same-lang set — the common confirmed case costs zero extra
-// upstream calls.
+// serves the opposite audio for the requested lang. Two layers, first
+// decisive signal wins per source:
+//
+//  1. m3u audio declarations: a master whose AUDIO renditions name
+//     languages but not the requested one is a proven swap — dropped.
+//     Masters declaring nothing (muxed audio) fall through.
+//  2. file identity: the decoded file path compared against Anikoto's
+//     same-episode files (same MegaPlay catalog); a file proving to be
+//     the other lang's encode is dropped.
+//
+// Anything unverifiable lists as-is — never drop blind. The other-lang
+// reference fetch runs only when some source misses the same-lang set,
+// so the common confirmed case costs zero extra upstream calls.
 func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []core.Server, anilistID string, episode int, lang string) []core.Server {
 	if len(mvServers) == 0 {
 		return mvServers
 	}
+	want := wantAudioLang(lang)
 	other := "sub"
 	if strings.EqualFold(lang, "sub") {
 		other = "dub"
@@ -1592,36 +1620,48 @@ func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []
 	if len(same) == 0 {
 		same = m.anikotoFileKeys(ctx, anilistID, episode, lang)
 	}
-	needsOther := false
-	for _, s := range mvServers {
-		for _, src := range s.Sources {
-			if !same[megavidFileKey(src.URL)] {
-				needsOther = true
-			}
+	var otherSet map[string]bool
+	otherFetched := false
+	otherKeys := func() map[string]bool {
+		if !otherFetched {
+			otherFetched = true
+			otherSet = m.anikotoFileKeys(ctx, anilistID, episode, other)
 		}
+		return otherSet
 	}
-	if !needsOther {
-		return mvServers
-	}
-	otherSet := m.anikotoFileKeys(ctx, anilistID, episode, other)
-	if len(otherSet) == 0 {
-		return mvServers
+	drop := func(s core.Server, reason string) {
+		m.log.Warn().Str("server", s.Name).Str("provider", "megavid").Str("reason", reason).
+			Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
+			Msg("megavid: proven language swap, dropping server")
 	}
 	var out []core.Server
 	for _, s := range mvServers {
-		drop := false
+		keep := true
 		for _, src := range s.Sources {
-			if _, swapped := megavidVerdict(megavidFileKey(src.URL), same, otherSet); swapped {
-				drop = true
+			// Layer 1: declared playlist audio.
+			if strings.EqualFold(src.Type, "hls") {
+				if langs, known := m.megavidMasterLangs(ctx, src.URL, s.Headers["Referer"]); known {
+					if !langs[want] {
+						drop(s, "m3u declares no "+want+" audio")
+						keep = false
+					}
+					break
+				}
+			}
+			// Layer 2: file identity against the trusted catalog.
+			key := megavidFileKey(src.URL)
+			if confirmed, _ := megavidVerdict(key, same, nil); confirmed {
+				break
+			}
+			if _, swapped := megavidVerdict(key, same, otherKeys()); swapped {
+				drop(s, "file matches "+other+" encode")
+				keep = false
+				break
 			}
 		}
-		if drop {
-			m.log.Warn().Str("server", s.Name).Str("provider", "megavid").
-				Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
-				Msg("megavid: proven language swap, dropping server")
-			continue
+		if keep {
+			out = append(out, s)
 		}
-		out = append(out, s)
 	}
 	return out
 }

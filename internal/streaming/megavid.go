@@ -7,9 +7,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -35,13 +35,22 @@ import (
 // are deliberately skipped — the segment probe arbitrates playability.
 //
 // LANGUAGE RULE (operator): megavid sometimes serves the wrong audio for
-// the requested lang (dub file on a sub request and vice versa). The file
-// identity is therefore VERIFIED against Anikoto's same-episode files
-// (same catalog, same content hashes) at the fan-out and explicit layers
-// (Manager.verifyMegaVidLang): a proven swap is dropped, an unverifiable
-// title (no Anikoto reference, or identical files both langs) lists
-// as-is. The provider itself never guesses — it ships what upstream
-// returned, probe-verified.
+// the requested lang (dub file on a sub request and vice versa). Sources
+// are verified in two layers (Manager.verifyMegaVidLang) and a proven
+// mismatch is dropped:
+//  1. m3u audio declarations: #EXT-X-MEDIA TYPE=AUDIO LANGUAGE tags name
+//     the actual tracks; a master declaring audio but not the requested
+//     lang is a proven swap. Masters without declarations (muxed audio,
+//     the common MegaPlay shape) are unknown at this layer.
+//  2. file identity: the decoded file path is compared against Anikoto's
+//     same-episode files (same MegaPlay catalog, identical paths); a file
+//     proving to be the other lang's encode is dropped.
+//
+// Anything unverifiable lists as-is — never drop blind.
+//
+// FRESHNESS (operator): no resolve cache — /vid/ gateway URLs are
+// session tokens of unknown (short) lifetime, so every lookup re-runs
+// the API call. Single cheap GET per resolve.
 //
 // SERVER NAMES (operator): single fixed cute name — Vidy. Never raw
 // mirror ids (they collide with animex display names).
@@ -49,9 +58,6 @@ const (
 	megavidDefaultBase = "https://megavid.buzz"
 	megavidReferer     = "https://megavid.buzz/"
 	megavidServerName  = "Vidy"
-
-	megavidResolveTTL        = 5 * time.Minute
-	maxMegavidResolveEntries = 500
 )
 
 type MegaVidProvider struct {
@@ -59,21 +65,6 @@ type MegaVidProvider struct {
 	client    *http.Client
 	api       string
 	learnHost func(host string)
-
-	mu       sync.Mutex
-	resolved map[megavidResolveKey]*megavidResolvedEntry
-}
-
-type megavidResolveKey struct {
-	key     string // "ani" or "mal"
-	id      string
-	episode int
-	lang    string
-}
-
-type megavidResolvedEntry struct {
-	result  *SourceResult
-	fetched time.Time
 }
 
 func NewMegaVidProvider(log zerolog.Logger, api string) *MegaVidProvider {
@@ -81,10 +72,9 @@ func NewMegaVidProvider(log zerolog.Logger, api string) *MegaVidProvider {
 		api = megavidDefaultBase
 	}
 	return &MegaVidProvider{
-		log:      log,
-		client:   &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
-		api:      strings.TrimRight(api, "/"),
-		resolved: make(map[megavidResolveKey]*megavidResolvedEntry),
+		log:    log,
+		client: &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
+		api:    strings.TrimRight(api, "/"),
 	}
 }
 
@@ -190,37 +180,12 @@ func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episo
 	return nil, lastErr
 }
 
-func (p *MegaVidProvider) loadResolved(key megavidResolveKey) *SourceResult {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.resolved[key]
-	if !ok || time.Since(e.fetched) > megavidResolveTTL {
-		return nil
-	}
-	return cloneSourceResult(e.result)
-}
-
-func (p *MegaVidProvider) storeResolved(key megavidResolveKey, sr *SourceResult) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for k, e := range p.resolved {
-		if time.Since(e.fetched) > megavidResolveTTL {
-			delete(p.resolved, k)
-		}
-	}
-	if len(p.resolved) >= maxMegavidResolveEntries {
-		for k := range p.resolved {
-			delete(p.resolved, k)
-			break
-		}
-	}
-	p.resolved[key] = &megavidResolvedEntry{result: cloneSourceResult(sr), fetched: time.Now()}
-}
-
 // FindEpisodeSource resolves one episode for the requested lang: AniList
 // key first, MAL key fallback (same fallthrough shape as zoko — one Vidy
-// server either way). Language correctness is NOT decided here; the
-// manager verifies file identity against Anikoto (verifyMegaVidLang).
+// server either way). Fresh API call per resolve (operator rule): /vid/
+// gateway URLs are session tokens of unknown lifetime. Language
+// correctness is NOT decided here; the manager verifies in two layers
+// (verifyMegaVidLang).
 func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
@@ -230,14 +195,10 @@ func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 	if strings.EqualFold(lang, "dub") {
 		langKey = "dub"
 	}
-	if got := p.loadResolved(megavidResolveKey{key: "ani", id: anilistID, episode: episode, lang: langKey}); got != nil {
-		return got, nil
-	}
 	sr, err := p.resolveKey(ctx, "ani", anilistID, episode, langKey)
 	if err != nil {
 		return nil, err
 	}
-	usedKey := "ani"
 	if sr == nil || len(sr.Sources) == 0 {
 		malID := tmdb.FetchMalID(ctx, p.client, id)
 		if malID <= 0 {
@@ -245,22 +206,15 @@ func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 		}
 		if malID > 0 {
 			malStr := strconv.Itoa(malID)
-			if got := p.loadResolved(megavidResolveKey{key: "mal", id: malStr, episode: episode, lang: langKey}); got != nil {
-				return got, nil
-			}
 			sr, err = p.resolveKey(ctx, "mal", malStr, episode, langKey)
 			if err != nil {
 				return nil, err
 			}
-			usedKey = "mal"
-			if sr != nil && len(sr.Sources) > 0 {
-				p.storeResolved(megavidResolveKey{key: "mal", id: malStr, episode: episode, lang: langKey}, sr)
-				return sr, nil
-			}
 		}
-		return nil, nil
+		if sr == nil || len(sr.Sources) == 0 {
+			return nil, nil
+		}
 	}
-	p.storeResolved(megavidResolveKey{key: usedKey, id: anilistID, episode: episode, lang: langKey}, sr)
 	return sr, nil
 }
 
@@ -350,6 +304,116 @@ func hasMP4Suffix(rawURL string) bool {
 		lower = lower[:i]
 	}
 	return strings.HasSuffix(lower, ".mp4")
+}
+
+// m3uAudioLangRe matches audio rendition declarations in master
+// playlists: #EXT-X-MEDIA:TYPE=AUDIO,...,LANGUAGE="en",...
+var m3uAudioLangRe = regexp.MustCompile(`(?i)#EXT-X-MEDIA:[^\n\r]*TYPE=AUDIO[^\n\r]*LANGUAGE="([^"]+)"`)
+
+// normalizeAudioLang maps a playlist language tag to a two-letter code:
+// "en"/"eng"/"English" -> en, "ja"/"jpn"/"Japanese" -> ja, region
+// qualified ("es-419", "zh-Hans") folds to its base. Empty when unknown.
+func normalizeAudioLang(tag string) string {
+	s := strings.ToLower(strings.TrimSpace(tag))
+	if i := strings.IndexAny(s, "-_"); i >= 0 {
+		s = s[:i]
+	}
+	if len(s) == 2 {
+		ok := true
+		for _, r := range s {
+			if r < 'a' || r > 'z' {
+				ok = false
+			}
+		}
+		if ok {
+			return s
+		}
+	}
+	switch s {
+	case "eng", "english":
+		return "en"
+	case "jpn", "japanese":
+		return "ja"
+	case "spa", "spanish", "espanol", "español":
+		return "es"
+	case "fra", "fre", "french", "francais", "français":
+		return "fr"
+	case "deu", "ger", "german":
+		return "de"
+	case "por", "portuguese", "portugues", "português":
+		return "pt"
+	case "ara", "arabic":
+		return "ar"
+	case "hin", "hindi":
+		return "hi"
+	case "kor", "korean":
+		return "ko"
+	case "rus", "russian":
+		return "ru"
+	case "ita", "italian":
+		return "it"
+	case "tha", "thai":
+		return "th"
+	case "vie", "vietnamese":
+		return "vi"
+	case "ind", "indonesian":
+		return "id"
+	case "may", "malay", "melayu":
+		return "ms"
+	case "zho", "chi", "chinese":
+		return "zh"
+	case "tur", "turkish":
+		return "tr"
+	case "pol", "polish":
+		return "pl"
+	case "ukr", "ukrainian":
+		return "uk"
+	case "nld", "dutch", "nederlands":
+		return "nl"
+	case "swe", "swedish":
+		return "sv"
+	case "dan", "danish":
+		return "da"
+	case "fin", "finnish":
+		return "fi"
+	case "nor", "norwegian", "nob", "nno":
+		return "no"
+	case "ell", "greek":
+		return "el"
+	case "heb", "hebrew":
+		return "he"
+	case "ces", "czech":
+		return "cs"
+	case "hun", "hungarian":
+		return "hu"
+	case "ron", "romanian":
+		return "ro"
+	}
+	return ""
+}
+
+// m3uAudioLangs lists the normalized audio languages a master playlist
+// declares across its AUDIO renditions. Empty when the master declares
+// none (muxed single audio — unknowable at playlist level).
+func m3uAudioLangs(body []byte) map[string]bool {
+	out := map[string]bool{}
+	for _, m := range m3uAudioLangRe.FindAllSubmatch(body, -1) {
+		if len(m) == 2 {
+			if code := normalizeAudioLang(string(m[1])); code != "" {
+				out[code] = true
+			}
+		}
+	}
+	return out
+}
+
+// wantAudioLang maps our request lang to the playlist audio code:
+// sub carries Japanese audio, dub carries English.
+func wantAudioLang(lang string) string {
+	if strings.EqualFold(lang, "dub") {
+		return "en"
+	}
+	return "ja"
 }
 
 // megavidVerdict classifies one resolved file key against the trusted
