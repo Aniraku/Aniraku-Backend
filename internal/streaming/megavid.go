@@ -232,9 +232,10 @@ func (p *MegaVidProvider) resolveKey(ctx context.Context, key, id string, episod
 	if strings.TrimSpace(raw) == "" {
 		return nil, nil
 	}
-	if referer == "" {
-		referer = "https://megaplay.buzz/"
-	}
+	// Referer is per family: the /vid/ gateway only serves its own
+	// referer (anything else 403s); codec-decoded files carry their
+	// embedded referer (megaplay.buzz fallback).
+	referer = megavidRefererFor(raw, referer)
 	// The decoded URL is already the final direct file (verified live
 	// with its embedded referer) — never re-wrap it through the animex
 	// proxy codec: that only adds a third-party hop, and the segment
@@ -297,6 +298,21 @@ func (p *MegaVidProvider) resolveKey(ctx context.Context, key, id string, episod
 		Intro:       intro,
 		Outro:       outro,
 	}, nil
+}
+
+// megavidRefererFor picks the playback/probe referer for a resolved file:
+// embedded codec referers win, the /vid/ gateway needs its own origin,
+// anything else falls back to megaplay.buzz.
+func megavidRefererFor(raw, embedded string) string {
+	if strings.TrimSpace(embedded) != "" {
+		return embedded
+	}
+	if u, err := url.Parse(strings.TrimSpace(raw)); err == nil {
+		if strings.Contains(strings.ToLower(u.Host), "megavid.buzz") {
+			return megavidReferer
+		}
+	}
+	return "https://megaplay.buzz/"
 }
 
 // hasMP4Suffix reports a .mp4 file suffix, query-tolerant.

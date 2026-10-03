@@ -228,3 +228,17 @@ func TestVerifyNeverHidesWithoutReference(t *testing.T) {
 		t.Fatalf("Vidy must list without a same-lang reference, got %+v", got)
 	}
 }
+
+func TestMegaVidRefererFor(t *testing.T) {
+	cases := map[string]struct{ raw, embedded, want string }{
+		"vid gateway":    {"https://megavid.buzz/vid/abc/def", "", megavidReferer},
+		"embedded wins":  {"https://megavid.buzz/vid/abc", "https://zokoanime.video/", "https://zokoanime.video/"},
+		"codec fallback": {"https://hls.dramahot.top/v/x/master.m3u8", "", "https://megaplay.buzz/"},
+		"other host":     {"https://cdn.example/x.m3u8", "", "https://megaplay.buzz/"},
+	}
+	for name, tc := range cases {
+		if got := megavidRefererFor(tc.raw, tc.embedded); got != tc.want {
+			t.Errorf("%s: got %q want %q", name, got, tc.want)
+		}
+	}
+}
