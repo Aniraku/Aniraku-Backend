@@ -204,10 +204,10 @@ func TestVerifyM3uMismatchDrops(t *testing.T) {
 	}
 	// Master declares en+es only: sub (ja) is a proven mismatch, dub (en)
 	// is confirmed — decided at layer 1 with zero reference fetches.
-	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub"); len(got) != 0 {
+	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub", true); len(got) != 0 {
 		t.Fatalf("sub listing must drop en/es-only master, got %+v", got)
 	}
-	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub"); len(got) != 1 {
+	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub", true); len(got) != 1 {
 		t.Fatalf("dub listing must keep en-declaring master, got %+v", got)
 	}
 }
@@ -224,7 +224,7 @@ func TestVerifyNeverHidesWithoutReference(t *testing.T) {
 		Name: "Vidy", Provider: "megavid", Lang: "sub",
 		Sources: []core.Source{{URL: "https://cdn.example/dub-sounding-file.mp4", Type: "mp4"}},
 	}}
-	if got := m.verifyMegaVidLang(ctx, mv, nil, "7", 1, "sub"); len(got) != 1 {
+	if got := m.verifyMegaVidLang(ctx, mv, nil, "7", 1, "sub", true); len(got) != 1 {
 		t.Fatalf("Vidy must list without a same-lang reference, got %+v", got)
 	}
 }
@@ -270,10 +270,30 @@ func TestVerifySegmentMismatchDrops(t *testing.T) {
 	}
 	// Segments declare eng: dub keeps, sub drops — ground truth at layer 2
 	// with zero reference fetches.
-	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub"); len(got) != 1 {
+	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub", true); len(got) != 1 {
 		t.Fatalf("dub listing must keep eng segments, got %+v", got)
 	}
-	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub"); len(got) != 0 {
+	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub", true); len(got) != 0 {
 		t.Fatalf("sub listing must drop eng-only segments, got %+v", got)
+	}
+}
+
+func TestVerifyCorroborationGate(t *testing.T) {
+	// Solo Vidy claim (no other provider listed the episode): hidden even
+	// though the source itself is fine — hallucinated episodes must not
+	// list alone.
+	m := &Manager{log: zerolog.Nop(), hentaiCache: map[int]hentaiEntry{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	mv := []core.Server{{
+		Name: "Vidy", Provider: "megavid", Lang: "dub",
+		Sources: []core.Source{{URL: "https://cdn.example/x.mp4", Type: "mp4"}},
+	}}
+	if got := m.verifyMegaVidLang(ctx, mv, nil, "7", 1180, "dub", false); len(got) != 0 {
+		t.Fatalf("solo Vidy claim must hide, got %+v", got)
+	}
+	// Corroborated: same source lists alongside others.
+	if got := m.verifyMegaVidLang(ctx, mv, nil, "7", 1180, "dub", true); len(got) != 1 {
+		t.Fatalf("corroborated Vidy must list, got %+v", got)
 	}
 }
