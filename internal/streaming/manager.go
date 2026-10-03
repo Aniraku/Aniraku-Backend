@@ -108,6 +108,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if le, ok := p.(*LeeProvider); ok {
 			le.SetHostLearner(fn)
 		}
+		if mv, ok := p.(*MegaVidProvider); ok {
+			mv.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -153,7 +156,8 @@ type SourceResult struct {
 // (ZokoAnime, AniList-keyed) is third; FlixCloud is the fallback for embed
 // playback; AnimeGG (direct mp4, highest quality per mirror) and AniWaves
 // (multi-rendition HLS masters) ride next; VidNest (MegaPlay HLS + subs)
-// rides last; Lee (ani.pm direct HLS) rides after VidNest. (Zenime removed
+// rides last; Lee (ani.pm direct HLS) rides after VidNest; MegaVid
+// (verified-lang MegaPlay) rides after Lee. (Zenime removed
 // 2026-09-30: arms API unreliable. OGFLix removed: api.anizen.tr challenged
 // every request and every resolved edge was blocked — pure fan-out latency
 // for nothing.)
@@ -177,6 +181,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAniWavesProvider(log, "", ""),
 			NewVidNestProvider(log, ""),
 			NewLeeProvider(log, "", ""),
+			NewMegaVidProvider(log, ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -262,6 +267,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		provider = "vidnest"
 	case "lee":
 		provider = "lee"
+	case "megavid", "vidy":
+		provider = "megavid"
 	}
 	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
@@ -272,7 +279,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee", "megavid":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -373,6 +380,15 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("lee: no sources for this episode")
+	case "megavid", "vidy":
+		result, err := m.tryMegaVid(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("megavid: no sources for this episode")
 	case "vidnest", "animepahe", "pahe", "nest":
 		// animepahe pages hit the same VidNest API (verified
 		// byte-identical); the alias lands on the same resolve.
@@ -390,7 +406,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
 	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
-	// sixth, AniWaves HLS seventh, VidNest eighth, Lee last. Hentai
+	// sixth, AniWaves HLS seventh, VidNest eighth, Lee ninth, MegaVid last. Hentai
 	// titles
 	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
 	// FlixCloud (Reanime embeds, covers hentai).
@@ -427,6 +443,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryVidNest(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryLee(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -491,7 +509,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -589,6 +607,13 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
+			if !hentai {
+				mvServers = run("megavid", func() []core.Server {
+					return m.collectMegaVidServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -617,11 +642,16 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// provider.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers, lang)
+	// MegaVid language verification (operator rule): megavid sometimes
+	// serves the opposite audio for the requested lang. Proven swaps are
+	// dropped against Anikoto's same-episode files; unverifiable titles
+	// list as-is.
+	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang)
 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers} {
 		allServers = append(allServers, pool...)
 	}
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -1437,6 +1467,161 @@ func (m *Manager) collectLeeServers(ctx context.Context, anilistID string, episo
 		}
 		sr = m.withDubSubtitles(ctx, "lee", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{leeServerName}, "lee", lang, sr)
+	}
+	return out
+}
+
+func (m *Manager) getMegaVidProvider() *MegaVidProvider {
+	for _, p := range m.providers {
+		if mv, ok := p.(*MegaVidProvider); ok {
+			return mv
+		}
+	}
+	return nil
+}
+
+// tryMegaVid resolves a MegaVid source and verifies its audio language
+// against Anikoto's same-episode files (operator rule): a proven swap is
+// dropped, unverifiable titles list as-is.
+func (m *Manager) tryMegaVid(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	mv := m.getMegaVidProvider()
+	if mv == nil {
+		return nil, fmt.Errorf("megavid provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying megavid")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := mv.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("megavid failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	source = m.withDubSubtitles(ctx, "megavid", lang, anilistID, episode, source)
+	servers := appendNamedServers(nil, []string{megavidServerName}, "megavid", lang, source)
+	filtered := m.verifyMegaVidLang(ctx, servers, nil, anilistID, episode, lang)
+	if len(filtered) == 0 {
+		return nil, nil
+	}
+	var sources []core.Source
+	for _, s := range filtered {
+		sources = append(sources, s.Sources...)
+	}
+	if len(sources) == 0 {
+		return nil, nil
+	}
+	return m.applyQualityFilter(&SourceResult{
+		Sources:   sources,
+		Headers:   source.Headers,
+		Downloads: source.Downloads,
+		Intro:     source.Intro,
+		Outro:     source.Outro,
+	}, quality), nil
+}
+
+// collectMegaVidServers maps MegaVid sources to the single "Vidy" server.
+// Language verification runs after the merge (verifyMegaVidLang).
+func (m *Manager) collectMegaVidServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		mv, ok := prov.(*MegaVidProvider)
+		if !ok {
+			continue
+		}
+		sr, err := mv.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "megavid").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "megavid", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{megavidServerName}, "megavid", lang, sr)
+	}
+	return out
+}
+
+// serverFileKeys collects normalized content-identity keys for every
+// source across servers.
+func serverFileKeys(servers []core.Server) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range servers {
+		for _, src := range s.Sources {
+			out[megavidFileKey(src.URL)] = true
+		}
+	}
+	return out
+}
+
+// anikotoFileKeys resolves Anikoto's file keys for an episode+lang (empty
+// when Anikoto carries nothing). Anikoto's own 5-minute fresh cache makes
+// repeat lookups cheap.
+func (m *Manager) anikotoFileKeys(ctx context.Context, anilistID string, episode int, lang string) map[string]bool {
+	ak := m.getAnikotoProvider()
+	if ak == nil {
+		return nil
+	}
+	sr, err := ak.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil || sr == nil {
+		return nil
+	}
+	return serverFileKeys([]core.Server{{Sources: sr.Sources}})
+}
+
+// verifyMegaVidLang enforces the operator language rule: megavid sometimes
+// serves the opposite audio for the requested lang, so every source is
+// checked against Anikoto's same-episode files (same MegaPlay catalog,
+// identical file paths). Proven swaps are dropped with a Warn; anything
+// unverifiable (no Anikoto reference, or identical files both langs)
+// lists as-is. The other-lang reference fetch runs only when some source
+// misses the same-lang set — the common confirmed case costs zero extra
+// upstream calls.
+func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []core.Server, anilistID string, episode int, lang string) []core.Server {
+	if len(mvServers) == 0 {
+		return mvServers
+	}
+	other := "sub"
+	if strings.EqualFold(lang, "sub") {
+		other = "dub"
+	}
+	same := serverFileKeys(akServers)
+	if len(same) == 0 {
+		same = m.anikotoFileKeys(ctx, anilistID, episode, lang)
+	}
+	needsOther := false
+	for _, s := range mvServers {
+		for _, src := range s.Sources {
+			if !same[megavidFileKey(src.URL)] {
+				needsOther = true
+			}
+		}
+	}
+	if !needsOther {
+		return mvServers
+	}
+	otherSet := m.anikotoFileKeys(ctx, anilistID, episode, other)
+	if len(otherSet) == 0 {
+		return mvServers
+	}
+	var out []core.Server
+	for _, s := range mvServers {
+		drop := false
+		for _, src := range s.Sources {
+			if _, swapped := megavidVerdict(megavidFileKey(src.URL), same, otherSet); swapped {
+				drop = true
+			}
+		}
+		if drop {
+			m.log.Warn().Str("server", s.Name).Str("provider", "megavid").
+				Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
+				Msg("megavid: proven language swap, dropping server")
+			continue
+		}
+		out = append(out, s)
 	}
 	return out
 }
