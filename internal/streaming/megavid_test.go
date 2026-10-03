@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
 func TestMegaVidFileKey(t *testing.T) {
@@ -137,5 +139,75 @@ func TestMegaVidBadAnilistID(t *testing.T) {
 	defer cancel()
 	if _, err := p.FindEpisodeSource(ctx, "xx", 1, "sub"); err == nil {
 		t.Fatal("want error for bad anilist id")
+	}
+}
+
+func TestNormalizeAudioLang(t *testing.T) {
+	cases := map[string]string{
+		"en": "en", "eng": "en", "English": "en", "EN": "en",
+		"ja": "ja", "jpn": "ja", "Japanese": "ja",
+		"es-419": "es", "zh-Hans": "zh", "pt-BR": "pt",
+		"Latin": "", "": "", "und": "",
+	}
+	for in, want := range cases {
+		if got := normalizeAudioLang(in); got != want {
+			t.Errorf("normalizeAudioLang(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestM3uAudioLangs(t *testing.T) {
+	multi := []byte("#EXTM3U\n" +
+		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"en.m3u8\"\n" +
+		"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",LANGUAGE=\"es\",NAME=\"Espanol\",URI=\"es.m3u8\"\n" +
+		"#EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\nlow.m3u8\n")
+	got := m3uAudioLangs(multi)
+	if !got["en"] || !got["es"] || len(got) != 2 {
+		t.Fatalf("multi langs = %v", got)
+	}
+	muxed := []byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\nlow.m3u8\n")
+	if got := m3uAudioLangs(muxed); len(got) != 0 {
+		t.Fatalf("muxed master must declare nothing, got %v", got)
+	}
+	if got := m3uAudioLangs([]byte("<html>nope</html>")); len(got) != 0 {
+		t.Fatalf("block page must declare nothing, got %v", got)
+	}
+}
+
+func TestVerifyM3uMismatchDrops(t *testing.T) {
+	var base string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/lang/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n"+
+			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",LANGUAGE=\"en\",NAME=\"English\",DEFAULT=YES,URI=\"en.m3u8\"\n"+
+			"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",LANGUAGE=\"es\",NAME=\"Espanol\",URI=\"es.m3u8\"\n"+
+			"#EXT-X-STREAM-INF:BANDWIDTH=1000,AUDIO=\"a\"\n/m/media.m3u8\n")
+	})
+	mux.HandleFunc("/m/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/m/seg.ts\n")
+	})
+	mux.HandleFunc("/m/seg.ts", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte{0x47, 0x40, 0x00, 0x10})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	base = srv.URL
+
+	m := &Manager{log: zerolog.Nop(), httpClient: srv.Client(), hentaiCache: map[int]hentaiEntry{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mk := func(lang string) []core.Server {
+		return []core.Server{{
+			Name: "Vidy", Provider: "megavid", Lang: lang,
+			Sources: []core.Source{{URL: base + "/lang/master.m3u8", Type: "hls"}},
+		}}
+	}
+	// Master declares en+es only: sub (ja) is a proven mismatch, dub (en)
+	// is confirmed — decided at layer 1 with zero reference fetches.
+	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub"); len(got) != 0 {
+		t.Fatalf("sub listing must drop en/es-only master, got %+v", got)
+	}
+	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub"); len(got) != 1 {
+		t.Fatalf("dub listing must keep en-declaring master, got %+v", got)
 	}
 }
