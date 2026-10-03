@@ -43,10 +43,16 @@ Read the full [Support Guide](./SUPPORT.md).
 
 Aniraku-Backend keeps the client-facing API separate from provider-specific work. It handles API routing, authentication, episode metadata, playback coordination, account data, sync, and the network checks needed around upstream requests.
 
-The service is written entirely in **Go** — one static binary, no Node.js, no Python, no sidecars. Streaming resolution is fully in-process:
+The service is written entirely in **Go** — one static binary, no Node.js, no Python, no sidecars. Streaming resolution is fully in-process across 11 providers (see [the provider guide](docs/PROVIDERS.md)):
 
-- **Anikoto (primary)** — AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro.
+- **Anikoto (primary)** — AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro (Niko/Momo).
+- **AnimeX** — plyr API with XOR-decoded direct URLs (Mochi, Kira, Sora, …).
+- **Zoko, NiN, kaa.lt** — direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
+- **AnimeGG, AniWaves** — direct mp4 (highest per mirror) and multi-rendition HLS.
+- **VidNest, Lee, MegaVid** — direct HLS (MegaPlay catalog, ani.pm chain, verified-lang MegaPlay).
 - **FlixCloud (fallback)** — embed URLs for the client's embedded player.
+
+Every server list is freshly probed per request (no snapshot cache); sources play through the `/api/v1/proxy` media gateway.
 
 Episode titles/thumbnails are resolved via **AniZip + TMDB** (AniBridge verified mappings + Fribb fallback, bidirectional).
 
@@ -61,10 +67,10 @@ Aniraku web / Android client
     ┌─────────┼─────────┐
     ▼         ▼         ▼
   auth    episodes   streaming
- Supabase AniZip↔TMDB Anikoto (direct)
- JWT/JWKS  unlimited   + FlixCloud (embed)
-   │        │          │
-   ▼        ▼          ▼
+ Supabase AniZip↔TMDB 11 providers (fan-out)
+ JWT/JWKS  unlimited  Anikoto → … → MegaVid
+   │        │       + FlixCloud (embed)
+   ▼        ▼          │
      normalized API response
 ```
 
@@ -92,11 +98,13 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 | Server entrypoint | `cmd/aniraku-server/` |
 | HTTP routing | `internal/api/` |
 | API handlers | `internal/api/v1/` |
+| Media proxy | `internal/api/v1/proxy.go` (`Stream`, `GetServers`, `Proxy`, HLS rewrite, allowlist glue) |
+| Provider manager | `internal/streaming/manager.go` (fan-out/merge, fallback chain, aliases, gates, verification) |
 | Authentication | `internal/auth/` |
 | Configuration | `internal/config/` (`TMDB`, `Scraping` bases) |
 | Core models and errors | `internal/core/` |
 | Network safety | `internal/netguard/` (SSRF `Control` + `NoRedirects` + guarded `http.Client` factory) |
-| Streaming providers | `internal/streaming/` (`anikoto.go`, `flixcloud.go`, `manager.go`) |
+| Streaming providers | `internal/streaming/` (11 providers, see [provider guide](docs/PROVIDERS.md)) |
 | TMDB resolver | `internal/tmdb/` (`resolver.go` AniBridge+Fribb, `merge.go`) |
 | API contract | [`docs/openapi.yaml`](docs/openapi.yaml) |
 | Architecture deep-dive | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
