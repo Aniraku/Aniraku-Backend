@@ -1602,7 +1602,9 @@ func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer str
 //     Masters declaring nothing (muxed audio) fall through.
 //  2. file identity: the decoded file path compared against Anikoto's
 //     same-episode files (same MegaPlay catalog); a file proving to be
-//     the other lang's encode is dropped.
+//     the other lang's encode is dropped — but only when a same-lang
+//     reference exists. Without one, an other-lang match proves nothing
+//     (dual-audio single file) and never hides the server.
 //
 // Anything unverifiable lists as-is — never drop blind. The other-lang
 // reference fetch runs only when some source misses the same-lang set,
@@ -1648,9 +1650,16 @@ func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []
 					break
 				}
 			}
-			// Layer 2: file identity against the trusted catalog.
+			// Layer 2: file identity against the trusted catalog — but a
+			// drop needs a real same-lang reference behind it. Without
+			// one (Anikoto carries nothing here), an other-lang match
+			// proves nothing (dual-audio single file) and must not hide
+			// the server.
 			key := megavidFileKey(src.URL)
-			if confirmed, _ := megavidVerdict(key, same, nil); confirmed {
+			if same[key] {
+				break
+			}
+			if len(same) == 0 {
 				break
 			}
 			if _, swapped := megavidVerdict(key, same, otherKeys()); swapped {

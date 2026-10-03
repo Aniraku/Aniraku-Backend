@@ -44,7 +44,9 @@ import (
 //     the common MegaPlay shape) are unknown at this layer.
 //  2. file identity: the decoded file path is compared against Anikoto's
 //     same-episode files (same MegaPlay catalog, identical paths); a file
-//     proving to be the other lang's encode is dropped.
+//     proving to be the other lang's encode is dropped — but only when a
+//     same-lang reference exists, so the comparison can never hide Vidy
+//     on shaky grounds.
 //
 // Anything unverifiable lists as-is — never drop blind.
 //
