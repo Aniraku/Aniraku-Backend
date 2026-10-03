@@ -242,3 +242,38 @@ func TestMegaVidRefererFor(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifySegmentMismatchDrops(t *testing.T) {
+	seg := append(tsPacket(0x0000, true, patSection(1, 0x0100)),
+		tsPacket(0x0100, true, pmtSection(0x0101, "eng"))...)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/t/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n/t/media.m3u8\n")
+	})
+	mux.HandleFunc("/t/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/t/seg.ts\n")
+	})
+	mux.HandleFunc("/t/seg.ts", func(w http.ResponseWriter, r *http.Request) {
+		w.Write(seg)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	m := &Manager{log: zerolog.Nop(), httpClient: srv.Client(), hentaiCache: map[int]hentaiEntry{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	mk := func(lang string) []core.Server {
+		return []core.Server{{
+			Name: "Vidy", Provider: "megavid", Lang: lang,
+			Sources: []core.Source{{URL: srv.URL + "/t/master.m3u8", Type: "hls"}},
+		}}
+	}
+	// Segments declare eng: dub keeps, sub drops — ground truth at layer 2
+	// with zero reference fetches.
+	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub"); len(got) != 1 {
+		t.Fatalf("dub listing must keep eng segments, got %+v", got)
+	}
+	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub"); len(got) != 0 {
+		t.Fatalf("sub listing must drop eng-only segments, got %+v", got)
+	}
+}
