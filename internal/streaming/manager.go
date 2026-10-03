@@ -1572,10 +1572,49 @@ func (m *Manager) anikotoFileKeys(ctx context.Context, anilistID string, episode
 	return serverFileKeys([]core.Server{{Sources: sr.Sources}})
 }
 
+// megavidSegmentLangs resolves master -> first media playlist -> first
+// segment and reads the segment's TS audio language descriptors: ground
+// truth about the carried audio, independent of playlist labels (verified
+// live: an unreleased "dub" stream declared jpn here). Unknown for fmp4
+// or unreadable hops. Master/media bodies usually come from the VOD
+// cache the probe just warmed; only the 64KB segment head is a new fetch.
+func (m *Manager) megavidSegmentLangs(ctx context.Context, masterURL, referer string) (map[string]bool, bool) {
+	master, ok := VODCacheGet(masterURL)
+	if !ok {
+		var fetched bool
+		master, fetched = fetchURLCapped(ctx, m.httpClient, masterURL, referer, browserUA, 65536, 10*time.Second)
+		if !fetched {
+			return nil, false
+		}
+	}
+	mediaURL := firstPlaylistURL(string(master), masterURL)
+	if mediaURL == "" {
+		return nil, false
+	}
+	media, ok := VODCacheGet(mediaURL)
+	if !ok {
+		var fetched bool
+		media, fetched = fetchURLCapped(ctx, m.httpClient, mediaURL, referer, browserUA, 262144, 10*time.Second)
+		if !fetched {
+			return nil, false
+		}
+	}
+	segURL := firstPlaylistURL(string(media), mediaURL)
+	if segURL == "" {
+		return nil, false
+	}
+	seg, ok := fetchURLCapped(ctx, m.httpClient, segURL, referer, browserUA, 65536, 12*time.Second)
+	if !ok {
+		return nil, false
+	}
+	langs := tsAudioLangs(seg)
+	return langs, len(langs) > 0
+}
+
 // megavidMasterLangs returns the audio languages a master playlist
 // declares across its AUDIO renditions. Unknown (false) when the master
-// declares none (muxed single audio) or cannot be read — the file layer
-// decides those. Recently probed playlists come from the VOD cache, so the
+// declares none (muxed single audio) or cannot be read — deeper layers
+// decide those. Recently probed playlists come from the VOD cache, so the
 // common path costs zero upstream calls.
 func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer string) (map[string]bool, bool) {
 	if body, ok := VODCacheGet(masterURL); ok {
@@ -1594,13 +1633,16 @@ func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer str
 }
 
 // verifyMegaVidLang enforces the operator language rule: megavid sometimes
-// serves the opposite audio for the requested lang. Two layers, first
+// serves the opposite audio for the requested lang. Three layers, first
 // decisive signal wins per source:
 //
 //  1. m3u audio declarations: a master whose AUDIO renditions name
 //     languages but not the requested one is a proven swap — dropped.
 //     Masters declaring nothing (muxed audio) fall through.
-//  2. file identity: the decoded file path compared against Anikoto's
+//  2. segment audio descriptors: the first segment's TS PMT names the
+//     carried audio (ground truth, verified live against a mislabeled
+//     "dub"); a mismatch drops, unreadable segments fall through.
+//  3. file identity: the decoded file path compared against Anikoto's
 //     same-episode files (same MegaPlay catalog); a file proving to be
 //     the other lang's encode is dropped — but only when a same-lang
 //     reference exists. Without one, an other-lang match proves nothing
@@ -1640,17 +1682,29 @@ func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []
 	for _, s := range mvServers {
 		keep := true
 		for _, src := range s.Sources {
-			// Layer 1: declared playlist audio.
+			// Layers 1-2 need a playlist: mp4 goes straight to file
+			// identity below.
 			if strings.EqualFold(src.Type, "hls") {
-				if langs, known := m.megavidMasterLangs(ctx, src.URL, s.Headers["Referer"]); known {
+				referer := s.Headers["Referer"]
+				// Layer 1: declared playlist audio (usually VOD-cached).
+				if langs, known := m.megavidMasterLangs(ctx, src.URL, referer); known {
 					if !langs[want] {
 						drop(s, "m3u declares no "+want+" audio")
 						keep = false
 					}
 					break
 				}
+				// Layer 2: segment audio descriptors (ground truth, one
+				// segment head per source).
+				if langs, known := m.megavidSegmentLangs(ctx, src.URL, referer); known {
+					if !langs[want] {
+						drop(s, "segments carry no "+want+" audio")
+						keep = false
+					}
+					break
+				}
 			}
-			// Layer 2: file identity against the trusted catalog — but a
+			// Layer 3: file identity against the trusted catalog — but a
 			// drop needs a real same-lang reference behind it. Without
 			// one (Anikoto carries nothing here), an other-lang match
 			// proves nothing (dual-audio single file) and must not hide

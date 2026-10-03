@@ -195,3 +195,128 @@ func fetchURLCapped(ctx context.Context, client *http.Client, rawURL, referer, u
 	}
 	return body, true
 }
+
+// tsAudioLangs scans MPEG-TS segment bytes for ISO-639 audio language
+// descriptors (descriptor tag 0x0A in the PMT): the ground-truth answer to
+// which audio a stream carries, independent of playlist labels or file
+// names (verified live: a mislabeled "dub" stream declared jpn here).
+// Returns the normalized two-letter set; empty means unknown (not TS, no
+// PMT in the sampled bytes, or no language descriptors) — never a verdict
+// by itself.
+func tsAudioLangs(seg []byte) map[string]bool {
+	out := map[string]bool{}
+	packets := splitTS(seg)
+	if len(packets) == 0 {
+		return out
+	}
+	pmtPID := tsPMTPID(packets)
+	if pmtPID < 0 {
+		return out
+	}
+	pmt := tsSection(packets, pmtPID, 0x02)
+	if len(pmt) == 0 {
+		return out
+	}
+	// PMT body: skip to program_info, then walk elementary streams.
+	pos := 12
+	end := len(pmt) - 4 // trailing CRC
+	if pos > end {
+		return out
+	}
+	pos += int((int(pmt[10])&0x0F)<<8 | int(pmt[11]))
+	for pos+5 <= end {
+		infoLen := int((int(pmt[pos+3])&0x0F)<<8 | int(pmt[pos+4]))
+		dp, dend := pos+5, pos+5+infoLen
+		for dp+2 <= dend && dp+2 <= end {
+			tag, dlen := pmt[dp], int(pmt[dp+1])
+			if tag == 0x0A && dp+2+4 <= dend && dp+2+4 <= end {
+				if code := normalizeAudioLang(string(pmt[dp+2 : dp+5])); code != "" {
+					out[code] = true
+				}
+			}
+			dp += 2 + dlen
+		}
+		pos = dend
+	}
+	return out
+}
+
+// splitTS cuts raw bytes into 188-byte TS packets, resyncing on 0x47.
+func splitTS(data []byte) [][]byte {
+	var out [][]byte
+	i := 0
+	for i < len(data) {
+		if data[i] != 0x47 {
+			i++
+			continue
+		}
+		if i+188 > len(data) {
+			break
+		}
+		out = append(out, data[i:i+188])
+		i += 188
+	}
+	return out
+}
+
+// tsPayload returns a packet's PID and its payload bytes (past adaptation
+// field and pointer field), or nil when it carries none.
+func tsPayload(p []byte) (int, []byte) {
+	if len(p) < 188 || p[0] != 0x47 {
+		return -1, nil
+	}
+	pid := int(p[1]&0x1F)<<8 | int(p[2])
+	afc := (p[3] >> 4) & 0x03
+	if afc == 0 || afc == 2 {
+		return pid, nil
+	}
+	off := 4
+	if afc == 3 {
+		off += 1 + int(p[4])
+	}
+	if off >= len(p) {
+		return pid, nil
+	}
+	if p[1]&0x40 != 0 {
+		off += 1 + int(p[off])
+	}
+	if off >= len(p) {
+		return pid, nil
+	}
+	return pid, p[off:]
+}
+
+// tsSection reassembles one PSI section (tableID) for a PID across packets.
+func tsSection(packets [][]byte, pid int, tableID byte) []byte {
+	var buf []byte
+	for _, p := range packets {
+		got, pl := tsPayload(p)
+		if got != pid || len(pl) == 0 {
+			continue
+		}
+		buf = append(buf, pl...)
+		if len(buf) > 8 && buf[0] == tableID {
+			secLen := int(buf[1]&0x0F)<<8 | int(buf[2])
+			if len(buf) >= 3+secLen {
+				return buf[:3+secLen]
+			}
+		}
+	}
+	return nil
+}
+
+// tsPMTPID finds the PMT PID from the PAT (PID 0), or -1.
+func tsPMTPID(packets [][]byte) int {
+	pat := tsSection(packets, 0, 0x00)
+	if len(pat) < 12 {
+		return -1
+	}
+	pos, end := 8, len(pat)-4
+	for pos+4 <= end {
+		if pat[pos]|pat[pos+1] != 0 {
+			return int(pat[pos+2]&0x1F)<<8 | int(pat[pos+3])
+		}
+		pos += 4
+	}
+	return -1
+}

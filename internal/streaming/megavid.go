@@ -35,14 +35,18 @@ import (
 // are deliberately skipped — the segment probe arbitrates playability.
 //
 // LANGUAGE RULE (operator): megavid sometimes serves the wrong audio for
-// the requested lang (dub file on a sub request and vice versa). Sources
-// are verified in two layers (Manager.verifyMegaVidLang) and a proven
-// mismatch is dropped:
+// the requested lang (dub file on a sub request and vice versa — proven
+// live: an unreleased "dub" carried jpn segments). Sources are verified
+// in three layers (Manager.verifyMegaVidLang) and a proven mismatch is
+// dropped:
 //  1. m3u audio declarations: #EXT-X-MEDIA TYPE=AUDIO LANGUAGE tags name
 //     the actual tracks; a master declaring audio but not the requested
 //     lang is a proven swap. Masters without declarations (muxed audio,
 //     the common MegaPlay shape) are unknown at this layer.
-//  2. file identity: the decoded file path is compared against Anikoto's
+//  2. segment audio descriptors: the first segment's TS PMT names the
+//     carried audio (ground truth); a mismatch drops, unreadable
+//     segments fall through.
+//  3. file identity: the decoded file path is compared against Anikoto's
 //     same-episode files (same MegaPlay catalog, identical paths); a file
 //     proving to be the other lang's encode is dropped — but only when a
 //     same-lang reference exists, so the comparison can never hide Vidy
