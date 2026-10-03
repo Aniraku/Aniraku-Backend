@@ -89,6 +89,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.Use(jsonCompress)
 
 		r.Get("/api/v1/health", h.Health)
+		r.Get("/health", h.RootHealth)
 		r.Get("/api/v1/version", h.Version)
 		// Catalog reads are server-cached for 5 min; let shared/browser caches
 		// do the same. Streaming and proxy paths stay uncacheable.

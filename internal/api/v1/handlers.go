@@ -230,6 +230,18 @@ func (h *Handlers) Health(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// RootHealth answers GET /health (service root): same liveness signal as
+// the versioned endpoint for load balancers and uptime monitors that
+// probe the bare domain.
+func (h *Handlers) RootHealth(w http.ResponseWriter, r *http.Request) {
+	h.respondJSON(w, http.StatusOK, map[string]any{
+		"status":         "ok",
+		"message":        "we are alive bois",
+		"uptime_seconds": int64(time.Since(metricsStartedAt).Seconds()),
+		"version":        Version,
+	})
+}
+
 func (h *Handlers) Version(w http.ResponseWriter, r *http.Request) {
 	h.respondJSON(w, http.StatusOK, map[string]string{
 		"version": Version,

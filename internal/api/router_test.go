@@ -94,6 +94,27 @@ func TestRouterHealthPublic(t *testing.T) {
 	}
 }
 
+func TestRouterRootHealthPublic(t *testing.T) {
+	srv, _, _ := testEnv(t)
+
+	resp, err := srv.Client().Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("root health status = %d", resp.StatusCode)
+	}
+
+	var body map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body["status"] != "ok" || body["message"] != "we are alive bois" {
+		t.Errorf("root health body = %v", body)
+	}
+}
+
 func TestRouterAuthRequiredWithoutToken(t *testing.T) {
 	srv, _, _ := testEnv(t)
 
