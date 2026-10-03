@@ -212,6 +212,11 @@ func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 		}
 		if malID > 0 {
 			malStr := strconv.Itoa(malID)
+			// MAL numbering can follow a different season cut than
+			// AniList — a fallback resolve is correct only when the
+			// mapping is 1:1, so it always logs loudly.
+			p.log.Info().Str("anilistId", anilistID).Int("malId", malID).
+				Int("episode", episode).Msg("megavid: AniList key missed, trying MAL key")
 			sr, err = p.resolveKey(ctx, "mal", malStr, episode, langKey)
 			if err != nil {
 				return nil, err

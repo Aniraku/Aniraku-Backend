@@ -123,7 +123,7 @@ func newAnimeGGFixture(t *testing.T) *animeggFixture {
 		fmt.Fprint(w, `<li><a class="anm_det_pop" href="/one-piece-ep1"><strong>Episode 1</strong><i class="anititle">Romance Dawn</i></a><span class="btn-subbed">SUB</span><span class="btn-dubbed">DUB</span></li>`)
 	})
 	mux.HandleFunc("/one-piece-ep1", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, `<div class="info"><a>One Piece</a></div>`+
+		fmt.Fprint(w, `<html><head><title>Watch One Piece Episode 1 | Subbed</title></head><body><div class="info"><a>One Piece</a></div>`+
 			`<a data-toggle="tab" data-id="101" data-mirror="AnimeGG" data-version="subbed">S</a>`+
 			`<a data-toggle="tab" data-id="102" data-mirror="AnimeGG" data-version="dubbed">D</a>`)
 	})
@@ -250,5 +250,20 @@ func TestAnimeGGDeletedTopFileFallsBack(t *testing.T) {
 	}
 	if got := sr.Sources[0].Quality; got != "720p" {
 		t.Fatalf("quality = %q, want 720p fallback for deleted 1080p", got)
+	}
+}
+
+func TestAnimeGGWatchEpisode(t *testing.T) {
+	if n, ok := animeggWatchEpisode("<html><head><title>Watch One Piece Episode 5 | Subbed</title></head></html>"); !ok || n != 5 {
+		t.Fatalf("match = %d,%v want 5,true", n, ok)
+	}
+	if n, ok := animeggWatchEpisode("<title>Watch Naruto Episode 12 Dubbed</title>"); !ok || n != 12 {
+		t.Fatalf("match = %d,%v want 12,true", n, ok)
+	}
+	if _, ok := animeggWatchEpisode("<html><body>no title here</body></html>"); ok {
+		t.Fatal("unmarked page must be unverifiable, not mismatch")
+	}
+	if _, ok := animeggWatchEpisode(""); ok {
+		t.Fatal("empty page must be unverifiable")
 	}
 }

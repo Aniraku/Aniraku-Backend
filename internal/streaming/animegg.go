@@ -781,6 +781,23 @@ func animeggSelectSeries(cands []animeggCandidate, fetch func(string) []animeggE
 
 // ------------------------- watch -------------------------
 
+var animeggWatchTitleEpRe = regexp.MustCompile(`(?i)<title>[^<]*?\bepisode\s+(\d+)\b`)
+
+// animeggWatchEpisode extracts the episode number the watch page claims
+// to be ("Watch One Piece Episode 5 | ..."). Pages without a readable
+// marker return ok=false (unverifiable — never a failure by itself).
+func animeggWatchEpisode(watchHTML string) (int, bool) {
+	m := animeggWatchTitleEpRe.FindStringSubmatch(watchHTML)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n < 1 {
+		return 0, false
+	}
+	return n, true
+}
+
 type animeggTab struct {
 	embedID string
 	mirror  string
@@ -1053,6 +1070,15 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 	watchHTML, err := p.getText(ctx, p.base+"/"+strings.TrimLeft(ep.epSlug, "/"), p.base+"/", 1<<20)
 	if err != nil {
 		return nil, err
+	}
+	// Wrong-episode guard: the watch page names its own episode number.
+	// A positive mismatch means the listing pointed at the wrong content
+	// — never ship it. Unmarked pages skip the check.
+	if n, ok := animeggWatchEpisode(watchHTML); ok && n != providerEp {
+		p.log.Warn().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
+			Int("providerEp", providerEp).Int("pageEp", n).
+			Msg("animegg: watch page is a different episode, dropping mirror")
+		return nil, nil
 	}
 	tabs := animeggParseTabs(watchHTML, lang)
 	if len(tabs) == 0 {
