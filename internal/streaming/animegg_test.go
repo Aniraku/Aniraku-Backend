@@ -267,3 +267,81 @@ func TestAnimeGGWatchEpisode(t *testing.T) {
 		t.Fatal("empty page must be unverifiable")
 	}
 }
+
+func TestAnimeGGPartNumbers(t *testing.T) {
+	got := animeggPartNumbers([]string{
+		"BLEACH: Thousand-Year Blood War - The Calamity",
+		"BLEACH: Sennen Kessen-hen - Kashin-tan",
+		"BLEACH: Thousand-Year Blood War Part 4",
+		"JUJUTSU KAISEN Season 2",
+		"Attack on Titan 2nd Season",
+		"One Piece",
+	})
+	want := map[string]bool{"4": true, "2": true}
+	if len(got) != len(want) {
+		t.Fatalf("part numbers = %v, want %v", got, want)
+	}
+	for _, n := range got {
+		if !want[n] {
+			t.Fatalf("part numbers = %v, want %v", got, want)
+		}
+	}
+}
+
+func animeggCannedSeries(eps ...int) func(string) []animeggEpisode {
+	return func(string) []animeggEpisode {
+		var out []animeggEpisode
+		for _, n := range eps {
+			out = append(out, animeggEpisode{number: n, title: "Episode", epSlug: "x", hasSub: true, hasDub: true})
+		}
+		return out
+	}
+}
+
+func animeggRange(from, to int) []int {
+	var out []int
+	for i := from; i <= to; i++ {
+		out = append(out, i)
+	}
+	return out
+}
+
+// Calamity shape: numbered sequel query, unnumbered slug covering exactly
+// the prequel span, shifted range empty -> the prequel's listing, reject.
+func TestAnimeGGSelectRejectsPrequelShadow(t *testing.T) {
+	cands := []animeggCandidate{{slug: "bleach-sennen-kessen-hen", title: "bleach sennen kessen hen", score: 0.816}}
+	fetch := animeggCannedSeries(append(animeggRange(1, 14), 36, 37, 38)...)
+	if got := animeggSelectSeries(cands, fetch, 10, "RELEASING", 14, false, []string{"4"}); got != nil {
+		t.Fatalf("prequel shadow must be rejected, got %+v", got)
+	}
+}
+
+// Numbered slug matching the query trusts local mode.
+func TestAnimeGGSelectKeepsNumberedSlug(t *testing.T) {
+	cands := []animeggCandidate{{slug: "show-part-4", title: "show part 4", score: 0.8}}
+	fetch := animeggCannedSeries(animeggRange(1, 10)...)
+	got := animeggSelectSeries(cands, fetch, 10, "RELEASING", 14, false, []string{"4"})
+	if got == nil || got.mode != "local" || got.slug != "show-part-4" {
+		t.Fatalf("numbered slug must be kept, got %+v", got)
+	}
+}
+
+// JJK shape: local sequel numbering under a matching numbered slug.
+func TestAnimeGGSelectKeepsLocalSequel(t *testing.T) {
+	cands := []animeggCandidate{{slug: "jujutsu-kaisen-2nd-season", title: "jujutsu kaisen 2nd season", score: 0.9}}
+	fetch := animeggCannedSeries(animeggRange(1, 23)...)
+	got := animeggSelectSeries(cands, fetch, 23, "FINISHED", 24, false, []string{"2"})
+	if got == nil || got.mode != "local" {
+		t.Fatalf("local sequel must be kept, got %+v", got)
+	}
+}
+
+// Unnumbered queries never trigger the rule (today's behavior preserved).
+func TestAnimeGGSelectUnnumberedQuery(t *testing.T) {
+	cands := []animeggCandidate{{slug: "bleach-sennen-kessen-hen", title: "bleach", score: 0.816}}
+	fetch := animeggCannedSeries(append(animeggRange(1, 14), 36, 37, 38)...)
+	got := animeggSelectSeries(cands, fetch, 10, "RELEASING", 14, false, nil)
+	if got == nil || got.slug != "bleach-sennen-kessen-hen" {
+		t.Fatalf("unnumbered query must keep old behavior, got %+v", got)
+	}
+}

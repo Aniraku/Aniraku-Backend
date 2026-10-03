@@ -690,7 +690,41 @@ type animeggSeries struct {
 	episodes []animeggEpisode
 }
 
-func animeggSelectSeries(cands []animeggCandidate, fetch func(string) []animeggEpisode, expected int, status string, offset int, isMovie bool) *animeggSeries {
+var (
+	animeggPartNumRe = regexp.MustCompile(`(?i)(?:season|part|cour|chapter|movie|film)s?\s*(\d+)`)
+	animeggPartOrdRe = regexp.MustCompile(`(?i)\b(\d+)(?:st|nd|rd|th)\s*(?:season|part|cour|chapter)\b`)
+	animeggSlugNumRe = regexp.MustCompile(`\d+`)
+)
+
+// animeggPartNumbers extracts the season/part/cour/chapter/movie numbers
+// titles carry ("Season 2" -> 2, "Part 4" -> 4). Roman numerals
+// ("II") and unnumbered titles yield nothing — the shadow rule below
+// only fires on explicit digit qualifiers.
+func animeggPartNumbers(titles []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(n string) {
+		n = strings.TrimLeft(n, "0")
+		if n == "" {
+			n = "0"
+		}
+		if !seen[n] {
+			seen[n] = true
+			out = append(out, n)
+		}
+	}
+	for _, t := range titles {
+		for _, m := range animeggPartNumRe.FindAllStringSubmatch(t, -1) {
+			add(m[1])
+		}
+		for _, m := range animeggPartOrdRe.FindAllStringSubmatch(t, -1) {
+			add(m[1])
+		}
+	}
+	return out
+}
+
+func animeggSelectSeries(cands []animeggCandidate, fetch func(string) []animeggEpisode, expected int, status string, offset int, isMovie bool, queryNums []string) *animeggSeries {
 	minScore := 0.65
 	if isMovie {
 		minScore = 0.9
@@ -738,6 +772,33 @@ func animeggSelectSeries(cands []animeggCandidate, fetch func(string) []animeggE
 			hits := localHits
 			if offsetHits > localHits {
 				mode, hits = "offset", offsetHits
+			}
+			// Prequel-shadow rejection: a numbered sequel query ("Part 4")
+			// answered by an unnumbered slug operating in local mode whose
+			// episodes cover exactly the prequel span ([1,offset]) with
+			// nothing in the shifted range is the PREQUEL's listing, not
+			// the show's (observed: Calamity+14 served Conflict 1-10).
+			// Numbered slugs matching the query are trusted; unnumbered
+			// queries, zero offsets and unknown counts never trigger.
+			if offset > 0 && expected > 0 && mode == "local" && len(queryNums) > 0 {
+				shiftedEmpty := offsetHits == 0
+				slugNums := map[string]bool{}
+				for _, sn := range animeggSlugNumRe.FindAllString(cand.slug, -1) {
+					n := strings.TrimLeft(sn, "0")
+					if n == "" {
+						n = "0"
+					}
+					slugNums[n] = true
+				}
+				matched := false
+				for _, qn := range queryNums {
+					if slugNums[qn] {
+						matched = true
+					}
+				}
+				if !matched && shiftedEmpty {
+					return
+				}
 			}
 			countScore := 1.0
 			if expected >= 6 {
@@ -1044,7 +1105,7 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 		}
 		series = animeggSelectSeries(cands, func(slug string) []animeggEpisode {
 			return p.scrapeSeries(ctx, slug)
-		}, expected, media.Status, offset, isMovie)
+		}, expected, media.Status, offset, isMovie, animeggPartNumbers(titles))
 		if series == nil {
 			return nil, fmt.Errorf("animegg: no show match for anilist %d", id)
 		}
