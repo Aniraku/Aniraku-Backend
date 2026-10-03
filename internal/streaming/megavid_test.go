@@ -211,3 +211,20 @@ func TestVerifyM3uMismatchDrops(t *testing.T) {
 		t.Fatalf("dub listing must keep en-declaring master, got %+v", got)
 	}
 }
+
+func TestVerifyNeverHidesWithoutReference(t *testing.T) {
+	// No Anikoto anywhere (same-set empty): even an other-lang-shaped
+	// file must list — without a same-lang reference the comparison
+	// proves nothing and must not hide Vidy. Fully hermetic (mp4 skips
+	// the playlist layer, empty providers skip every reference fetch).
+	m := &Manager{log: zerolog.Nop(), hentaiCache: map[int]hentaiEntry{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	mv := []core.Server{{
+		Name: "Vidy", Provider: "megavid", Lang: "sub",
+		Sources: []core.Source{{URL: "https://cdn.example/dub-sounding-file.mp4", Type: "mp4"}},
+	}}
+	if got := m.verifyMegaVidLang(ctx, mv, nil, "7", 1, "sub"); len(got) != 1 {
+		t.Fatalf("Vidy must list without a same-lang reference, got %+v", got)
+	}
+}
