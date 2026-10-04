@@ -36,6 +36,12 @@ var defaultCDNSuffixes = []string{
 	"ani.pm", "embed.settlar.io", "media.settlar.io",
 	// Zoko dramahot CDN (kept: still served by zoko)
 	"hls.dramahot.top",
+	// Mkissa (Xoxo): ok.ru's signed CDN. ok.ru signs its HLS for the
+	// fetching IP+Chrome UA and serves master/variant/segment from the
+	// same vdNNN.okcdn.ru host; the proxy already sends that UA, but
+	// without this entry /servers listed a source the proxy then
+	// refused ("proxy target not allowed", 2026-10-04).
+	"okcdn.ru",
 	// Wix-hosted video (repackager.wixmp.com)
 	"wixmp.com", "wixstatic.com",
 	// Miruro's own domains
