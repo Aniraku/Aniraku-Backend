@@ -227,7 +227,11 @@ func (d *mkissaDaemon) readLoop(cmd *exec.Cmd, stdout io.Reader) {
 			if len(line) > 300 {
 				line = line[:300] + "…"
 			}
-			d.log.Warn().Str("line", line).Msg("mkissa: engine stdout is not JSON")
+			// The decode reason matters: a struct/field type mismatch
+			// reads exactly like malformed JSON and silently drops the
+			// reply (that is how the priority int/float bug hid).
+			d.log.Warn().Str("decodeErr", err.Error()).Str("line", line).
+				Msg("mkissa: engine stdout failed to decode")
 			continue
 		}
 		d.mu.Lock()

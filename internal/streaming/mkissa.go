@@ -588,7 +588,12 @@ type mkissaEngineSource struct {
 	URL          string `json:"url"`
 	ExtractedURL string `json:"extractedUrl"`
 	Type         string `json:"type"`
-	Priority     int    `json:"priority"`
+	// Priority is fractional in the real engine output ("ok": 3.5,
+	// "default": 10, "uv-mp4": 1). Declaring it int made Go reject the
+	// ENTIRE response line as malformed JSON, so no reply ever matched a
+	// pending call and every prod resolve burned the 40s engine timeout
+	// (2026-10-04) while the same script answered fine by hand.
+	Priority float64 `json:"priority"`
 }
 
 type mkissaEngineOutput struct {

@@ -1,0 +1,67 @@
+{
+ "id": 42,
+ "showId": "GtAbp5JCDWofKrGXj",
+ "audio": "sub",
+ "results": [
+  {
+   "episode": "1",
+   "sources": [
+    {
+     "name": "Ss-Hls",
+     "url": "https://example.invalid/e/nqe53veju78w.html",
+     "extractedUrl": null,
+     "extractedType": null,
+     "type": "iframe",
+     "priority": 5.5,
+     "headers": {
+      "Referer": "https://example.invalid",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+     },
+     "downloads": {
+      "sourceName": "StreamSB",
+      "downloadUrl": "https://example.invalid/d/nqe53veju78w.html"
+     }
+    },
+    {
+     "name": "Mp4",
+     "url": "https://example.invalid/embed-6xnnvosho2d9.html",
+     "extractedUrl": null,
+     "extractedType": null,
+     "type": "iframe",
+     "priority": 4,
+     "headers": {
+      "Referer": "https://example.invalid",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+     },
+     "downloads": null
+    },
+    {
+     "name": "Ok",
+     "url": "https://example.invalid/videoembed/4254761486994",
+     "extractedUrl": "https://example.invalid/expires/1791224845685/clientType/0/srcIp/118.179.204.81/type/2/mid/4254761486994/id/2867838454418/ms/178.237.23.37/srcAg/CHROME/urls/176.112.172.86/oq/0/pr/10/ct/28/sig/_GtoZrIcvHU/ondemand/hls4_2867838454418.CJKVsJzqe0CSscz99BBQCuZprn2jJ4Ia.m3u8",
+     "extractedType": "hls",
+     "type": "iframe",
+     "priority": 3.5,
+     "headers": {
+      "Referer": "https://example.invalid",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+     },
+     "downloads": null
+    },
+    {
+     "name": "Uv-mp4",
+     "url": "https://example.invalid/apivtwo/clock.json?id=7d2473746a243c246e727276753c29297375637475656a6973622865696b29636b6463622b6335773e67703367336b3774286e726b6a242a2475727463676b63744f62243c2453756374706f62242a2462677263243c24343634302b37362b363252373e3c34313c3636283636365c242a2472746768756a67726f6968527f7663243c24757364242a246d637f243c2463762b4172476476334c45425169604d74415e6c593759757364247b",
+     "extractedUrl": null,
+     "extractedType": null,
+     "type": "iframe",
+     "priority": 1,
+     "headers": {
+      "Referer": "https://example.invalid",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+     },
+     "downloads": null
+    }
+   ]
+  }
+ ]
+}
