@@ -2002,9 +2002,12 @@ func isAniListRateLimitError(err error) bool {
 }
 
 // anilistAuthed POSTs a GraphQL request to AniList with a user token.
+// ALWAYS the official API: the offline mirror is read-only (it rejects
+// mutations like SaveMediaListEntry) and carries no user data, so every
+// authenticated call — imports, exports, list-state reads — belongs here.
 func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	payload, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.aniraku.tech", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
