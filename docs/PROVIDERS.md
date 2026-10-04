@@ -24,9 +24,10 @@ fallback order and the `/servers` merge order.
 | `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
+| `mkissa` | Chuu (clock/wixmp), Mua, Kissy, Smooch, Peck, Xoxo (ok.ru) — by source kind | mkissa.to signed GraphQL → **direct m3u8/mp4 only**, probe-verified; JS engine daemon owns the crypto |
 
 Removed providers return a `removed` error naming them explicitly
-(`miruro`, `zenime`, `mkissa`, `tryembed`, …) — never silently fall
+(`miruro`, `zenime`, `tryembed`, …) — never silently fall
 through.
 
 ## Request flows
@@ -92,13 +93,40 @@ only — never wrapped URLs).
   declarations; (2) TS PMT ISO-639 segment descriptors (ground truth);
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
+- **Mkissa show matching — anti-mismatch** (`resolveShow`): an exact
+  `aniListId` match wins outright. The title-scored fallback is accepted
+  only when the edge records **no** `aniListId` *and* scores ≥ 80 (exact
+  name/English or a full-substring hit — never token overlap). An edge
+  that records a *different* `aniListId` is rejected outright: a
+  sub-only title searched in dub mode returns unrelated shows (Big X
+  dub → "Boonie Bears: The Big Top Secret", score 35, must not win).
+  A score-only match logs a Warn naming both sides; no match means no
+  mkissa server — never a wrong one. Episode existence is then checked
+  against that show's own `availableEpisodesDetail` for the requested
+  audio track (strict per-lang: missing dub list = no dub server).
+- **Mkissa engine daemon** (`third_party/mkissa-engine`, bun): the
+  signed-call crypto (lane key + AES-GCM `tobeparsed`) lives in JS and
+  cannot be re-derived in Go, so a long-lived `mkissa_daemon.mjs` keeps
+  the lane key and discovery warm across requests. It talks **POST
+  only** — GET from datacenter egress answers `NEED_CAPTCHA`, POST
+  does not (no captcha, no token, no relay). Go serializes runs with a
+  1.5 s gap, retries the rate message, and trips a breaker after two
+  consecutive throttle-class failures (20 min cool-down) instead of
+  stampeding a shared per-IP bucket.
+- **Mkissa is direct-only.** Only sources with a direct `extractedUrl`
+  (m3u8/mp4) are listed; pure embeds are skipped. ok.ru and the
+  allanime clock are the live extractors; mp4upload/streamsb/streamlare
+  return null and cost a fetch. Every kept URL is probe-verified
+  master → media → segment before it lists.
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
-  MegaVid never receive hentai titles.
+  MegaVid/mkissa never receive hentai titles (mkissa also forces
+  `allowAdult:false` in its own search).
 - **No server-list snapshot cache.** Tokenized URLs expire without a
   reliable invalidation signal; every request computes a fresh,
   honestly-probed list. Speed comes from provider resolve caches:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
-  (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
+  (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min, mkissa
+  show 24 h + resolve 30 min (lang-keyed),
   VidNest/Lee/MegaVid fresh per resolve (short-lived tokens).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
   rate limit) — never `graphql.anilist.co`.

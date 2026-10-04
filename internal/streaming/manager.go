@@ -182,6 +182,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewVidNestProvider(log, ""),
 			NewLeeProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
+			NewMkissaProvider(log),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -400,13 +401,25 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("vidnest: no sources for this episode")
-	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "mkissa", "tryembed", "astro", "beta", "skye", "zen":
+	case "mkissa":
+		// Explicit mkissa requests resolve direct m3u8/mp4 (never embeds).
+		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("mkissa: no sources for this episode")
+	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
 	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
-	// sixth, AniWaves HLS seventh, VidNest eighth, Lee ninth, MegaVid last. Hentai
+	// sixth, AniWaves HLS seventh, VidNest eighth, Lee ninth, MegaVid
+	// tenth, mkissa.to last (most upstream calls per resolve: search +
+	// signed episode call + per-source probe). Hentai
 	// titles
 	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
 	// FlixCloud (Reanime embeds, covers hentai).
@@ -445,6 +458,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryLee(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -509,7 +524,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -614,6 +629,15 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
+			// Mkissa search forces allowAdult:false, so hentai titles never
+			// match — the gate just saves the upstream round-trips.
+			if !hentai {
+				mkServers = run("mkissa", func() []core.Server {
+					return m.collectMkissaServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -651,7 +675,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers} {
 		allServers = append(allServers, pool...)
 	}
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -1148,6 +1172,62 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 		}
 	}
 	return nil
+}
+
+func (m *Manager) getMkissaProvider() *MkissaProvider {
+	for _, p := range m.providers {
+		if mk, ok := p.(*MkissaProvider); ok {
+			return mk
+		}
+	}
+	return nil
+}
+
+// tryMkissa resolves an mkissa.to direct stream (m3u8/mp4, never embeds).
+func (m *Manager) tryMkissa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	mk := m.getMkissaProvider()
+	if mk == nil {
+		return nil, fmt.Errorf("mkissa provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying mkissa")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("mkissa failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	// Dub keeps mkissa defaults (only Sora dub takes nico files).
+	source = m.withDubSubtitles(ctx, "mkissa", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectMkissaServers maps mkissa direct sources to per-kind servers
+// (Chuu/Xoxo/...). Each source already carries its kind name.
+func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		mk, ok := prov.(*MkissaProvider)
+		if !ok {
+			continue
+		}
+		sr, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "mkissa").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "mkissa", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{"Mkissa"}, "mkissa", lang, sr)
+	}
+	return out
 }
 
 // withDubSubtitles enforces the operator rule: Sora (animex) dub sources
