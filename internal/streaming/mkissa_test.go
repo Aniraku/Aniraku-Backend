@@ -32,13 +32,16 @@ type mkissaFixture struct {
 const mkissaTestShowID = "ReooPAxPMsHM4KPMY"
 
 // Canned engine output: one direct Default m3u8, one mp4upload mp4,
-// one pure embed (skipped), one unknown kind (skipped).
+// one pure embed (skipped), one unknown kind (skipped). Priorities are
+// fractional exactly like the real engine — an int-typed Priority field
+// makes Go reject the whole response line and hang until the call
+// timeout, so the fixture must keep them fractional.
 func mkissaStubOutput(mediaBase string) string {
 	return fmt.Sprintf(`{"id":0,"showId":%q,"audio":"sub","results":[{"episode":"1","sources":[
 {"name":"Default","url":"https://mkissa.to/e/x","extractedUrl":%q,"type":"player","priority":10},
-{"name":"Mp4","url":"https://mp4upload.com/embed-abc.html","extractedUrl":"%s/v.mp4","type":"file","priority":5},
-{"name":"Ss-Hls","url":"https://streamsb.net/e/abc.html","type":"embed","priority":4},
-{"name":"Weird","url":"https://x.example/e","extractedUrl":"https://x.example/e","type":"file","priority":3}
+{"name":"Mp4","url":"https://mp4upload.com/embed-abc.html","extractedUrl":"%s/v.mp4","type":"file","priority":4.5},
+{"name":"Ss-Hls","url":"https://streamsb.net/e/abc.html","type":"embed","priority":3.5},
+{"name":"Weird","url":"https://x.example/e","extractedUrl":"https://x.example/e","type":"file","priority":1}
 ]}]}`,
 		mkissaTestShowID, mediaBase+"/master.m3u8", mediaBase)
 }
@@ -257,6 +260,51 @@ func TestMkissaAniListID(t *testing.T) {
 // resolve failure is the only correct outcome: no mkissa server beats
 // the wrong anime on the list. The same fixture with the right aniListId
 // proves the guard costs no coverage.
+// TestMkissaRealEnginePayloadDecodes pins the decode contract against a
+// REAL daemon response (testdata/mkissa_engine_response.json, captured
+// from mkissa_daemon.mjs with URLs genericized). The engine emits
+// fractional priorities, null extracted URLs and headers/downloads
+// objects; when Priority was typed int, Go rejected the entire line as
+// malformed JSON, no reply matched a pending call, and every prod resolve
+// burned the 40s engine timeout — invisible to the canned stub, which
+// used integer priorities.
+func TestMkissaRealEnginePayloadDecodes(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("testdata", "mkissa_engine_response.json"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var out mkissaEngineOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("real engine payload must decode: %v", err)
+	}
+	if out.ID != 42 || out.ShowID != "GtAbp5JCDWofKrGXj" {
+		t.Fatalf("id/show = %d/%q, want 42/GtAbp5JCDWofKrGXj", out.ID, out.ShowID)
+	}
+	if len(out.Results) != 1 || out.Results[0].Episode != "1" {
+		t.Fatalf("results = %+v, want one episode 1", out.Results)
+	}
+	srcs := out.Results[0].Sources
+	if len(srcs) != 4 {
+		t.Fatalf("sources = %d, want 4 (real payload)", len(srcs))
+	}
+	byName := map[string]mkissaEngineSource{}
+	for _, s := range srcs {
+		byName[s.Name] = s
+	}
+	if p := byName["Ok"].Priority; p != 3.5 {
+		t.Fatalf("ok.ru priority = %v, want 3.5 (fractional)", p)
+	}
+	if byName["Ok"].ExtractedURL == "" {
+		t.Fatal("ok.ru source must carry its direct m3u8")
+	}
+	if byName["Mp4"].ExtractedURL != "" {
+		t.Fatalf("null extractedUrl must decode as empty, got %q", byName["Mp4"].ExtractedURL)
+	}
+	if byName["Ss-Hls"].ExtractedURL != "" || byName["Ss-Hls"].URL == "" {
+		t.Fatal("pure embed must keep its page URL and no extracted URL")
+	}
+}
+
 func TestMkissaRejectsUnrelatedShowMatch(t *testing.T) {
 	const (
 		bigXID = 9613
