@@ -24,6 +24,25 @@ const QUERY_HASH = crypto.createHash("sha256").update(QUERY).digest("hex");
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Watchdogs: a plain fetch() that never settles (a silently dropped SYN
+// from a hot rate bucket) used to stall the whole line protocol until the
+// backend's 40s call timeout killed the child with no diagnostic at all
+// (observed 2026-10-04: every prod call timed out, the same script
+// answered in 2s by hand). Bound every wait and answer with an error
+// instead of silence.
+const FETCH_TIMEOUT_MS = 15000;
+const REQUEST_TIMEOUT_MS = 35000;
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  // A late settle must not become an unhandled rejection after the race.
+  promise.catch(() => {});
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 let lane = null;
 async function ensureLane(force = false) {
   if (!lane || force) lane = await getLaneKey(LANE, force);
@@ -53,6 +72,7 @@ async function signedPost(variables) {
       Priority: "u=1, i",
     },
     body: JSON.stringify({ query: QUERY, variables, extensions }),
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   const text = await res.text();
   return { status: res.status, text };
@@ -107,11 +127,14 @@ rl.on("line", async (line) => {
   try {
     const audio = req.audio === "dub" ? "dub" : "sub";
     const episodes = (req.episodes || ["1"]).map(String);
-    const results = [];
-    for (const ep of episodes) {
-      results.push(await handleEpisode(req.showId, audio, ep));
-      await sleep(350);
-    }
+    const results = await withTimeout((async () => {
+      const out = [];
+      for (const ep of episodes) {
+        out.push(await handleEpisode(req.showId, audio, ep));
+        await sleep(350);
+      }
+      return out;
+    })(), REQUEST_TIMEOUT_MS, "engine request");
     process.stdout.write(JSON.stringify({ id: req.id ?? 0, showId: req.showId, audio, results }) + "\n");
   } catch (err) {
     process.stdout.write(JSON.stringify({ id: req?.id ?? 0, error: String(err?.message || err) }) + "\n");

@@ -170,6 +170,14 @@ func (p *MkissaProvider) doJSON(ctx context.Context, payload any, out any) error
 	if err != nil {
 		return err
 	}
+	// Every api.mkissa.net call spends the same per-IP bucket, so search
+	// POSTs line up behind the same slot + gap as the engine's signed
+	// calls instead of racing them (parallel calls are what earns the
+	// long rate penalties).
+	if err := acquireEngine(ctx); err != nil {
+		return err
+	}
+	defer releaseEngine()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase, bytes.NewReader(b))
 	if err != nil {
 		return err
@@ -516,12 +524,10 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 // shorter pauses). Under deep concurrency later runs fail clean on the
 // fan-out deadline and the other providers cover.
 var (
-	mkissaEngineMu     sync.Mutex
-	mkissaEngineFreeAt time.Time
-	mkissaEngineGap    = 1500 * time.Millisecond
-	mkissaRateRe       = regexp.MustCompile(`try again in (\d+) seconds?`)
-	mkissaRateExtra    = 1000 * time.Millisecond
-	mkissaRateRetries  = 1
+	mkissaEngineGap   = 1500 * time.Millisecond
+	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
+	mkissaRateExtra   = 1000 * time.Millisecond
+	mkissaRateRetries = 1
 )
 
 // Throttle circuit breaker: the signed-call bucket is per egress IP,
@@ -631,6 +637,49 @@ func (p *MkissaProvider) daemonCommand() (string, string, error) {
 	return "", "", fmt.Errorf("mkissa: neither bun nor node on PATH")
 }
 
+// mkissaEngineSlot serializes engine runs — api.mkissa.net throttles per
+// egress IP, so two concurrent signed POSTs are a self-inflicted penalty.
+// The slot is a channel (not a mutex) so a queued caller gives up when its
+// context ends instead of burning the whole fan-out budget waiting its
+// turn; the previous mutex-plus-gap code released the lock while waiting,
+// letting several callers enter at once.
+var (
+	mkissaEngineSlot    = make(chan struct{}, 1)
+	mkissaEngineStateMu sync.Mutex
+	mkissaEngineFreeAt  time.Time
+)
+
+// acquireEngine takes the engine slot, honouring the inter-call gap and
+// the caller's deadline.
+func acquireEngine(ctx context.Context) error {
+	for {
+		mkissaEngineStateMu.Lock()
+		wait := time.Until(mkissaEngineFreeAt)
+		mkissaEngineStateMu.Unlock()
+		if wait <= 0 {
+			select {
+			case mkissaEngineSlot <- struct{}{}:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// releaseEngine publishes the next allowed call time and frees the slot.
+func releaseEngine() {
+	mkissaEngineStateMu.Lock()
+	mkissaEngineFreeAt = time.Now().Add(mkissaEngineGap)
+	mkissaEngineStateMu.Unlock()
+	<-mkissaEngineSlot
+}
+
 // runEngine sends one request to the persistent daemon (plus the Go-side
 // rate-limit retry). Whole runs stay serialized globally with a gap, and
 // the lane key persists daemon-side across requests.
@@ -639,21 +688,10 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 	if mkissaBreaker.blocked() {
 		return nil, fmt.Errorf("mkissa: throttled cooldown")
 	}
-	mkissaEngineMu.Lock()
-	defer func() {
-		mkissaEngineFreeAt = time.Now().Add(mkissaEngineGap)
-		mkissaEngineMu.Unlock()
-	}()
-	if wait := time.Until(mkissaEngineFreeAt); wait > 0 {
-		mkissaEngineMu.Unlock()
-		select {
-		case <-ctx.Done():
-			mkissaEngineMu.Lock()
-			return nil, ctx.Err()
-		case <-time.After(wait):
-			mkissaEngineMu.Lock()
-		}
+	if err := acquireEngine(ctx); err != nil {
+		return nil, err
 	}
+	defer releaseEngine()
 	var lastErr error
 	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
 		srcs, err := p.daemon.Call(ctx, showID, audio, epStr)

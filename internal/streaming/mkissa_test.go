@@ -293,6 +293,30 @@ func TestMkissaRejectsUnrelatedShowMatch(t *testing.T) {
 	}
 }
 
+// The engine/search slot is the only thing standing between a hung call
+// and every caller behind it, so it must fail on the WAITER's context —
+// the old mutex had no deadline at all and one stuck run burned the whole
+// fan-out budget for the rest (observed 2026-10-04: mkissa collectors
+// always consumed the full 30-45s budget).
+func TestMkissaEngineSlotHonoursContext(t *testing.T) {
+	if err := acquireEngine(context.Background()); err != nil {
+		t.Fatalf("free slot must be acquirable: %v", err)
+	}
+	defer func() {
+		// Hand the slot back without leaving a gap behind: the gap is
+		// production pacing, not test state.
+		mkissaEngineStateMu.Lock()
+		mkissaEngineFreeAt = time.Time{}
+		mkissaEngineStateMu.Unlock()
+		<-mkissaEngineSlot
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := acquireEngine(ctx); err == nil {
+		t.Fatal("busy slot must return the caller's context error instead of blocking")
+	}
+}
+
 func TestMkissaRelayEnvOverride(t *testing.T) {
 	t.Setenv("MKISSA_API", "https://relay.example")
 	p := NewMkissaProvider(zerolog.Nop())
