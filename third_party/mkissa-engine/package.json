@@ -1,0 +1,14 @@
+{
+  "name": "all-api",
+  "version": "2.2.1",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@wreq-js/binding-linux-x64-gnu": "^3.2.0",
+    "dotenv": "^16.4.5",
+    "wreq-js": "^3.2.0"
+  }
+}
