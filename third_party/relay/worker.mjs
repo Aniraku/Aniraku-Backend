@@ -58,6 +58,30 @@ async function vidnestResolve(env, body) {
 export default {
   async fetch(req, env) {
     if (!authorized(req, env)) return denied();
+    const wurl = new URL(req.url);
+    // mkissa signed-API relay (option A test): preserves method, query,
+    // headers and body; only the mkissa API surface is reachable.
+    if (wurl.pathname === "/mkissa" || wurl.pathname.startsWith("/mkissa/")) {
+      const stripped = wurl.pathname.replace(/^\/mkissa/, "") || "/";
+      if (
+        stripped !== "/api" &&
+        !stripped.startsWith("/api?") &&
+        !stripped.startsWith("/client-crypto/")
+      ) {
+        return new Response("not found", { status: 404 });
+      }
+      const target = "https://api.mkissa.net" + stripped + wurl.search;
+      const headers = new Headers(req.headers);
+      headers.delete("host");
+      headers.delete("cf-connecting-ip");
+      headers.delete("cf-ipcountry");
+      const init = { method: req.method, headers };
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        init.body = req.body;
+      }
+      const res = await fetch(target, init);
+      return new Response(res.body, { status: res.status, headers: res.headers });
+    }
     if (req.method !== "POST") {
       return new Response("method not allowed", { status: 405 });
     }
