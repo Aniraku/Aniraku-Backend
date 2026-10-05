@@ -24,8 +24,8 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates wget python3 python3-venv \
         libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 \
-        libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 \
-        libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 \
+        libcups2 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 \
+        libnss3 libpango-1.0-0 libx11-6 libx11-xcb1 libxcb1 libxcomposite1 libxdamage1 \
         libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
     && rm -rf /var/lib/apt/lists/* && useradd -m -u 65532 appuser
 # Bun pinned to major 1 (official slim image): copied, not installed, so
@@ -49,6 +49,13 @@ COPY third_party/pahe-solver/solve_once.py third_party/pahe-solver/trim_fonts.py
 RUN HOME=/home/appuser /app/pahe-solver/venv/bin/python -m camoufox fetch \
     && HOME=/home/appuser python3 /app/pahe-solver/trim_fonts.py \
     && chown -R appuser:appuser /home/appuser/.cache/camoufox
+# Browser-lib completeness gate: every .so the baked browser ships must
+# resolve its DT_NEEDED deps from the apt set above. Without this, a
+# missing lib (2026-10-05: libX11-xcb.so.1) only surfaces as a silent
+# runtime solve failure — the provider self-disables and the fan-out
+# shows animepahe:0 with "no title match" for every title.
+RUN MISSING=$(find /home/appuser/.cache/camoufox/browsers -name '*.so' -exec ldd {} \; 2>/dev/null | grep 'not found' || true) \
+    && if [ -n "$MISSING" ]; then echo 'missing browser shared libs:'; echo "$MISSING"; exit 1; fi
 # -------------------------------------------------------------------------
 
 COPY --from=gobuild /aniraku-server /app/aniraku-server
