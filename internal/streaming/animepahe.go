@@ -126,6 +126,12 @@ var (
 	paheInlineM3U8  = regexp.MustCompile(`https?://[^\s'"<>\)]+\.m3u8[^\s'"<>\)]*`)
 )
 
+// paheAnilistLinkRe extracts the AniList ID from an anime page's external
+// links (the page exposes Synonyms/Japanese/Type/Season plus AniList,
+// AniDB, ANN, Kitsu and MAL links — the AniList one is the deterministic
+// ID bridge for fuzzy candidates).
+var paheAnilistLinkRe = regexp.MustCompile(`(?i)anilist\.co/anime/(\d+)`)
+
 // paheEvalReject: page scripts carrying any of these tokens are never
 // spawned (verified absent from the live kwik player). They are the only
 // ways the evaluated script could reach the host or the network.
@@ -209,19 +215,60 @@ type paheResolvedEntry struct {
 }
 
 type paheSearchHit struct {
-	ID       int     `json:"id"`
-	Title    string  `json:"title"`
-	Type     string  `json:"type"`
-	Episodes int     `json:"episodes"`
-	Year     int     `json:"year"`
-	Score    float64 `json:"score"`
-	Session  string  `json:"session"`
+	ID       int
+	Title    string
+	Type     string
+	Episodes int
+	Year     int
+	Score    float64 // animepahe's own rating, out of 5
+	Session  string
 }
 
-type paheSearchPage struct {
-	Total    int             `json:"total"`
-	LastPage int             `json:"last_page"`
-	Data     []paheSearchHit `json:"data"`
+// UnmarshalJSON tolerates field-shape drift (number vs string vs null):
+// one oddly-typed field must never fail the whole search into a silent
+// zero-hit result. Unknown fields are ignored.
+func (h *paheSearchHit) UnmarshalJSON(data []byte) error {
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*h = paheSearchHit{
+		ID:       paheFlexInt(raw["id"]),
+		Title:    paheFlexString(raw["title"]),
+		Type:     paheFlexString(raw["type"]),
+		Episodes: paheFlexInt(raw["episodes"]),
+		Year:     paheFlexInt(raw["year"]),
+		Score:    paheFlexFloat(raw["score"]),
+		Session:  paheFlexString(raw["session"]),
+	}
+	return nil
+}
+
+func paheFlexFloat(v any) float64 {
+	switch n := v.(type) {
+	case float64:
+		return n
+	case string:
+		if f, err := strconv.ParseFloat(strings.TrimSpace(n), 64); err == nil {
+			return f
+		}
+	case json.Number:
+		if f, err := n.Float64(); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+func paheFlexInt(v any) int {
+	return int(paheFlexFloat(v))
+}
+
+func paheFlexString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
 }
 
 type paheRelease struct {
@@ -586,8 +633,22 @@ func (p *AnimepaheProvider) fetchPAHE(ctx context.Context, target, accept string
 
 // ------------------------------------------------------------ anilist
 
-func (p *AnimepaheProvider) anilistTitles(ctx context.Context, id int) ([]string, error) {
-	gql := `query($id:Int){Media(id:$id,type:ANIME){title{romaji english}}}`
+// paheWant is what resolveShow matches against: the AniList titles plus
+// the metadata animepahe search hits carry (year, type, /5 rating) so a
+// remake and its original (same title, different year) can be told apart.
+// Metadata only orders title-passing (≥80) candidates — it never promotes
+// a below-floor title, so a wrong show still loses to no show.
+type paheWant struct {
+	titles  []string
+	year    int     // seasonYear, 0 unknown
+	format  string  // TV, MOVIE, ...
+	score45 float64 // averageScore/20, <0 unknown
+}
+
+func (p *AnimepaheProvider) anilistTitles(ctx context.Context, id int) (paheWant, error) {
+	var want paheWant
+	want.score45 = -1
+	gql := `query($id:Int){Media(id:$id,type:ANIME){title{romaji english} seasonYear format averageScore}}`
 	var out struct {
 		Data struct {
 			Media struct {
@@ -595,45 +656,52 @@ func (p *AnimepaheProvider) anilistTitles(ctx context.Context, id int) ([]string
 					Romaji  string `json:"romaji"`
 					English string `json:"english"`
 				} `json:"title"`
+				SeasonYear   int    `json:"seasonYear"`
+				Format       string `json:"format"`
+				AverageScore int    `json:"averageScore"`
 			} `json:"Media"`
 		} `json:"data"`
 	}
 	body, _ := json.Marshal(map[string]any{"query": gql, "variables": map[string]any{"id": id}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.anilistURL, strings.NewReader(string(body)))
 	if err != nil {
-		return nil, err
+		return want, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", browserUA)
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return nil, err
+		return want, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("animepahe: anilist titles -> HTTP %d", resp.StatusCode)
+		return want, fmt.Errorf("animepahe: anilist titles -> HTTP %d", resp.StatusCode)
 	}
 	rb, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return nil, err
+		return want, err
 	}
 	if err := json.Unmarshal(rb, &out); err != nil {
-		return nil, err
+		return want, err
 	}
-	var titles []string
 	// English first: it is the title animepahe's catalog mirrors most
 	// faithfully, so the exact hit usually lands on the first search.
 	if t := strings.TrimSpace(out.Data.Media.Title.English); t != "" {
-		titles = append(titles, t)
+		want.titles = append(want.titles, t)
 	}
 	if t := strings.TrimSpace(out.Data.Media.Title.Romaji); t != "" {
-		titles = append(titles, t)
+		want.titles = append(want.titles, t)
 	}
-	if len(titles) == 0 {
-		return nil, fmt.Errorf("animepahe: anilist %d has no titles", id)
+	if len(want.titles) == 0 {
+		return want, fmt.Errorf("animepahe: anilist %d has no titles", id)
 	}
-	return titles, nil
+	want.year = out.Data.Media.SeasonYear
+	want.format = out.Data.Media.Format
+	if out.Data.Media.AverageScore > 0 {
+		want.score45 = float64(out.Data.Media.AverageScore) / 20
+	}
+	return want, nil
 }
 
 // ------------------------------------------------------------ search
@@ -644,11 +712,40 @@ func (p *AnimepaheProvider) search(ctx context.Context, q string) ([]paheSearchH
 	if err != nil {
 		return nil, err
 	}
-	var page paheSearchPage
-	if err := json.Unmarshal(body, &page); err != nil {
+	return decodePaheSearch(body)
+}
+
+// decodePaheSearch is pure (unit-tested): paginated object first
+// ({"data": [...]}, tolerant of a "results" key), then a bare array. A
+// valid-but-empty page returns zero hits without error; anything else
+// (challenge HTML, status pages) is a decode error the caller surfaces.
+func decodePaheSearch(body []byte) ([]paheSearchHit, error) {
+	var page struct {
+		Data    []paheSearchHit `json:"data"`
+		Results []paheSearchHit `json:"results"`
+	}
+	if err := json.Unmarshal(body, &page); err == nil {
+		if len(page.Data) > 0 {
+			return page.Data, nil
+		}
+		if len(page.Results) > 0 {
+			return page.Results, nil
+		}
+		var probe map[string]json.RawMessage
+		if json.Unmarshal(body, &probe) == nil {
+			if _, ok := probe["data"]; ok {
+				return page.Data, nil
+			}
+			if _, ok := probe["results"]; ok {
+				return page.Results, nil
+			}
+		}
+	}
+	var bare []paheSearchHit
+	if err := json.Unmarshal(body, &bare); err != nil {
 		return nil, fmt.Errorf("animepahe: search decode: %w", err)
 	}
-	return page.Data, nil
+	return bare, nil
 }
 
 // paheTokens splits a title into the same token shape mkissa uses.
@@ -720,6 +817,71 @@ func paheScoreHit(candidate string, want []string) float64 {
 	return score
 }
 
+// paheScored is one title-passing search hit with its title score and its
+// metadata rank, kept separate so selection can sort by rank while the
+// exact-short-circuit still keys on the raw title score.
+type paheScored struct {
+	hit   paheSearchHit
+	score float64
+	rank  paheCandidate
+}
+
+// paheCandidate orders title-passing (≥80) hits: AniList year first
+// (remake vs original), then title score, then type, then /5-rating
+// closeness. Episode counts are deliberately unused — absolute vs cour
+// numbering differs between sources and would mislead.
+type paheCandidate struct {
+	titleScore float64
+	yearMatch  bool
+	typeMatch  bool
+	rateKnown  bool
+	rateDiff   float64
+}
+
+func paheRankCandidate(h paheSearchHit, want paheWant, titleScore float64) paheCandidate {
+	c := paheCandidate{titleScore: titleScore}
+	c.yearMatch = want.year != 0 && h.Year == want.year
+	c.typeMatch = paheTypeMatch(h.Type, want.format)
+	if want.score45 >= 0 && h.Score > 0 {
+		c.rateKnown = true
+		c.rateDiff = h.Score - want.score45
+		if c.rateDiff < 0 {
+			c.rateDiff = -c.rateDiff
+		}
+	}
+	return c
+}
+
+func (c paheCandidate) better(o paheCandidate) bool {
+	if c.yearMatch != o.yearMatch {
+		return c.yearMatch
+	}
+	if c.titleScore != o.titleScore {
+		return c.titleScore > o.titleScore
+	}
+	if c.typeMatch != o.typeMatch {
+		return c.typeMatch
+	}
+	if c.rateKnown != o.rateKnown {
+		return c.rateKnown
+	}
+	return c.rateDiff < o.rateDiff
+}
+
+// paheTypeMatch compares animepahe's catalog type against AniList's format.
+// TV_SHORT airs as TV-length catalog entries, so it matches TV.
+func paheTypeMatch(hitType, wantFormat string) bool {
+	h := strings.ToLower(strings.TrimSpace(hitType))
+	w := strings.ToLower(strings.TrimSpace(wantFormat))
+	if h == "" || w == "" {
+		return false
+	}
+	if h == w {
+		return true
+	}
+	return w == "tv_short" && h == "tv"
+}
+
 func sortedTokenSet(m map[string]bool) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
@@ -743,30 +905,37 @@ func (p *AnimepaheProvider) resolveShow(ctx context.Context, id int) (string, st
 	}
 	p.mu.Unlock()
 
-	titles, err := p.anilistTitles(ctx, id)
+	want, err := p.anilistTitles(ctx, id)
 	if err != nil {
 		return "", "", err
 	}
 	var best *paheSearchHit
-	bestScore := -1.0
+	var bestCand paheCandidate
+	bestExact := false
 	exact := false
-	for _, t := range titles {
+	seenHits := 0
+	seenSess := map[string]bool{}
+	var lastErr error
+	var cands []paheScored
+	for _, t := range want.titles {
 		hits, err := p.search(ctx, t)
-		if err != nil || len(hits) == 0 {
+		if err != nil {
+			lastErr = err
 			continue
 		}
 		for i := range hits {
 			if hits[i].Session == "" {
 				continue
 			}
-			s := paheScoreHit(hits[i].Title, titles)
+			if !seenSess[hits[i].Session] {
+				seenSess[hits[i].Session] = true
+				seenHits++
+			}
+			s := paheScoreHit(hits[i].Title, want.titles)
 			if s < paheFuzzyMin {
 				continue
 			}
-			if s > bestScore {
-				h := hits[i]
-				best, bestScore = &h, s
-			}
+			cands = append(cands, paheScored{hit: hits[i], score: s, rank: paheRankCandidate(hits[i], want, s)})
 			if s == 100 {
 				exact = true
 			}
@@ -775,15 +944,47 @@ func (p *AnimepaheProvider) resolveShow(ctx context.Context, id int) (string, st
 			break
 		}
 	}
-	if best == nil {
-		return "", "", fmt.Errorf("animepahe: no title match for anilist %d (%s)",
-			id, strings.Join(titles, " / "))
+	if len(cands) == 0 {
+		if lastErr != nil {
+			return "", "", fmt.Errorf("animepahe: no title match for anilist %d (%s; saw %d sessioned hits, last search error: %v)",
+				id, strings.Join(want.titles, " / "), seenHits, lastErr)
+		}
+		return "", "", fmt.Errorf("animepahe: no title match for anilist %d (%s; saw %d sessioned hits, none ≥80)",
+			id, strings.Join(want.titles, " / "), seenHits)
 	}
-	if !exact {
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].rank.better(cands[j].rank) })
+	if cands[0].score == 100 {
+		// Exact title: the string itself is the guarantee, so the common
+		// path costs zero extra fetches.
+		best, bestCand, bestExact = &cands[0].hit, cands[0].rank, true
+	} else {
+		// No exact hit: confirm the ranked winner against its anime
+		// page's AniList link. A positive ID mismatch disqualifies the
+		// candidate and the next one is tried; anything else (no link,
+		// fetch failure) is fail-open so markup drift can never break
+		// title-approved resolution.
+		pick := -1
+		for i, c := range cands {
+			if p.verifyPaheSession(ctx, c.hit.Session, id) {
+				pick = i
+				break
+			}
+			p.log.Warn().Int("anilistId", id).Str("session", c.hit.Session).
+				Str("showTitle", c.hit.Title).Float64("score", c.score).
+				Msg("animepahe: candidate disqualified by anime-page AniList link")
+		}
+		if pick < 0 {
+			return "", "", fmt.Errorf("animepahe: no title match for anilist %d (%s; saw %d sessioned hits, none verified)",
+				id, strings.Join(want.titles, " / "), seenHits)
+		}
+		best, bestCand = &cands[pick].hit, cands[pick].rank
+	}
+	if !bestExact {
 		// Kept loud on purpose: this path is the only way a non-exact
 		// show can ever be selected, so it must be visible in prod logs.
 		p.log.Warn().Int("anilistId", id).Str("session", best.Session).
-			Str("showTitle", best.Title).Float64("score", bestScore).
+			Str("showTitle", best.Title).Float64("score", bestCand.titleScore).
+			Bool("yearMatch", bestCand.yearMatch).Bool("typeMatch", bestCand.typeMatch).
 			Msg("animepahe: matched by fuzzy title score (no exact hit)")
 	}
 	p.mu.Lock()
@@ -802,6 +1003,26 @@ func (p *AnimepaheProvider) resolveShow(ctx context.Context, id int) (string, st
 	}
 	p.shows[id] = &paheShowEntry{session: best.Session, title: best.Title, fetched: now}
 	return best.Session, best.Title, nil
+}
+
+// verifyPaheSession confirms a fuzzy candidate against its anime page's
+// AniList external link. Only a POSITIVE ID mismatch disqualifies; a
+// missing link or fetch failure is fail-open (returns true) so markup
+// drift can never break title-approved resolution.
+func (p *AnimepaheProvider) verifyPaheSession(ctx context.Context, session string, anilistID int) bool {
+	body, err := p.fetchPAHE(ctx, p.base+"/anime/"+url.QueryEscape(session), "text/html")
+	if err != nil {
+		return true
+	}
+	m := paheAnilistLinkRe.FindSubmatch(body)
+	if m == nil {
+		return true
+	}
+	id, err := strconv.Atoi(string(m[1]))
+	if err != nil || id <= 0 {
+		return true
+	}
+	return id == anilistID
 }
 
 // Search maps a title to animepahe sessions (tooling parity), best score

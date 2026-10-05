@@ -148,7 +148,12 @@ only — never wrapped URLs).
   Shippuden" for "Naruto"). Search + release pick are single-flight and
   sources list best-first with honest `%dp` quality labels; no match
   means no animepahe server — never a wrong one. Strict per-lang: a
-  missing dub release lists no dub server.
+  missing dub release lists no dub server. Among passing hits the AniList
+  year breaks remake ties, then catalog type, then /5-rating closeness
+  (episode counts ignored: absolute vs cour numbering differs per
+  source). A non-exact winner is confirmed against its anime page's
+  AniList external link — a positive ID mismatch disqualifies it, while
+  exact-title hits skip verification (zero extra fetches).
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
   MegaVid/mkissa/animepahe never receive hentai titles (mkissa also forces
   `allowAdult:false` in its own search).
