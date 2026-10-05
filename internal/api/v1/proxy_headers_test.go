@@ -22,12 +22,19 @@ func TestApplyProxyQueryHeadersReferer(t *testing.T) {
 		}
 	}
 
-	// Client headers take priority over the force-set.
-	req := httptest.NewRequest("GET", "/api/v1/proxy?url=https://a6.mp4upload.com/x.mp4", nil)
+	// Client headers take priority over the force-set, except on
+	// hotlink-locked hosts (mp4upload) where the site referer is mandatory.
+	req := httptest.NewRequest("GET", "/api/v1/proxy?url=https://vault-69.aniwatchtv.site/x.mp4", nil)
 	req.Header.Set("Referer", "https://custom.example/")
 	applyProxyQueryHeaders(req, "")
 	if got := req.Header.Get("Referer"); got != "https://custom.example/" {
 		t.Fatalf("client referer overridden: %q", got)
+	}
+	req = httptest.NewRequest("GET", "/api/v1/proxy?url=https://a6.mp4upload.com/x.mp4", nil)
+	req.Header.Set("Referer", "https://mkissa.to/")
+	applyProxyQueryHeaders(req, "")
+	if got := req.Header.Get("Referer"); got != "https://mp4upload.com/" {
+		t.Fatalf("mp4upload provider referer not replaced: %q", got)
 	}
 
 	// Kwik branch untouched.

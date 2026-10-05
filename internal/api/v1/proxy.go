@@ -838,11 +838,16 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 			req.Header.Set("Origin", "https://kwik.cx")
 		} else if strings.Contains(u, "flixcloud") {
 			req.Header.Set("Referer", "https://flixcloud.cc/")
-		} else if strings.Contains(u, "mp4upload") {
-			req.Header.Set("Referer", "https://mp4upload.com/")
 		} else if strings.Contains(u, "ninstream") {
 			req.Header.Set("Referer", "https://ninstream.com")
 		}
+	}
+	// Hotlink-locked file hosts always take the site referer, even over a
+	// provider-default one: mkissa stamps Referer mkissa.to on all its
+	// results, and mp4upload answers that (or empty) with 403 while the
+	// site referer gets 206 for the same token (measured 2026-10-05).
+	if strings.Contains(strings.ToLower(req.URL.String()), "mp4upload") {
+		req.Header.Set("Referer", "https://mp4upload.com/")
 	}
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
