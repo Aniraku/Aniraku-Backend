@@ -54,7 +54,13 @@ RUN HOME=/home/appuser /app/pahe-solver/venv/bin/python -m camoufox fetch \
 # missing lib (2026-10-05: libX11-xcb.so.1) only surfaces as a silent
 # runtime solve failure — the provider self-disables and the fan-out
 # shows animepahe:0 with "no title match" for every title.
-RUN MISSING=$(find /home/appuser/.cache/camoufox/browsers -name '*.so' -exec ldd {} \; 2>/dev/null | grep 'not found' || true) \
+# LD_LIBRARY_PATH mimics the real launcher (the camoufox-bin wrapper sets it
+# to the browser dir): bundled libs (libmozsqlite3, libgkcodecs, ...) and
+# the bundled libnss3 copy resolve from there, so only genuinely missing
+# SYSTEM libs fail the build.
+RUN BDIR=$(dirname "$(find /home/appuser/.cache/camoufox/browsers -maxdepth 3 -name camoufox-bin | head -1)") \
+    && export LD_LIBRARY_PATH="$BDIR" \
+    && MISSING=$(find "$BDIR" -maxdepth 1 -name '*.so' -exec ldd {} \; 2>/dev/null | grep 'not found' || true) \
     && if [ -n "$MISSING" ]; then echo 'missing browser shared libs:'; echo "$MISSING"; exit 1; fi
 # -------------------------------------------------------------------------
 
