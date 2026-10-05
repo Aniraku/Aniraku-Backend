@@ -53,6 +53,7 @@ RUN HOME=/home/appuser /app/pahe-solver/venv/bin/python -m camoufox fetch \
 
 COPY --from=gobuild /aniraku-server /app/aniraku-server
 COPY --from=gobuild /src/third_party/mkissa-engine /app/third_party/mkissa-engine
+COPY --from=gobuild /src/third_party/animepahe-engine /app/third_party/animepahe-engine
 COPY start.sh /start.sh
 # Engine JS deps (wreq TLS binding) install at build time so the repo
 # stays free of vendored node_modules; bun needs HOME-writable cache

@@ -291,6 +291,7 @@ func paheResolveSolver() (string, string) {
 		return "", ""
 	}
 	for _, c := range []string{
+		"/app/pahe-solver/solve_once.py",
 		"/app/third_party/pahe-solver/solve_once.py",
 		"third_party/pahe-solver/solve_once.py",
 	} {
