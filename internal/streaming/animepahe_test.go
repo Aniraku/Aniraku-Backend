@@ -501,6 +501,43 @@ func TestAnimepahePageVerification(t *testing.T) {
 	}
 }
 
+// A permanently-403 egress must not burn a solve per request forever:
+// after paheBreakerTrips consecutive all-403 fetches the breaker opens
+// (fail fast, zero solves) until the cool-down lapses.
+func TestAnimepaheBreakerOpens(t *testing.T) {
+	f := newPaheFixture(t)
+	f.acceptUA = "ua-good" // stub mints ua-solved -> every fetch 403s
+	p := newPaheTestProvider(t, f)
+	t.Setenv("GO_PAHE_SOLVER_UA", "ua-solved")
+	countFile := os.Getenv("GO_PAHE_STUB_COUNT")
+	for i := 0; i < paheBreakerTrips; i++ {
+		if _, err := p.search(paheTestCtx(t), "Naruto"); err == nil || !isUpstreamGated(err) {
+			t.Fatalf("search %d: err = %v, want gated 403", i, err)
+		}
+	}
+	solves := solverSolveCount(t, countFile)
+	if solves != 2*paheBreakerTrips {
+		t.Fatalf("solver spawned %d times, want %d", solves, 2*paheBreakerTrips)
+	}
+	// Breaker open: fails fast with zero new solves.
+	if _, err := p.search(paheTestCtx(t), "Naruto"); err == nil || !strings.Contains(err.Error(), "breaker open") {
+		t.Fatalf("err = %v, want breaker-open error", err)
+	}
+	if n := solverSolveCount(t, countFile); n != solves {
+		t.Fatalf("solver spawned %d times after open, want %d (fail fast)", n, solves)
+	}
+	// Force cool-down expiry deterministically: brkUntil was stamped with
+	// the 20 min default, and shrinking the var can't retroactively shorten
+	// it — moving the stamp to the past exercises the same expiry branch.
+	p.brkUntil = time.Now().Add(-time.Second)
+	if _, err := p.search(paheTestCtx(t), "Naruto"); err == nil || !isUpstreamGated(err) {
+		t.Fatalf("after cool-down: err = %v, want gated 403 (solves again)", err)
+	}
+	if n := solverSolveCount(t, countFile); n != solves+2 {
+		t.Fatalf("solver spawned %d times, want %d (resumed after cool-down)", n, solves+2)
+	}
+}
+
 // A solve that outlives the caller's deadline keeps running detached:
 // the waiter fails fast with a not-ready error, and a later call finds
 // the finished session instead of paying for another solve (this is the
