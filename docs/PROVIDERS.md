@@ -24,7 +24,6 @@ fallback order and the `/servers` merge order.
 | `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
-| `animepahe` | Pocky, Linda, Minto, Yuzu (positional per quality) | animepahe.pw/.com/.org search → releases → play page → kwik → **direct m3u8 only**; Cloudflare clearance from an on-demand Camoufox solver |
 | `mkissa` | Chuu (clock/wixmp), Mua, Kissy, Smooch, Peck, Xoxo (ok.ru) — by source kind | mkissa.to signed GraphQL → **direct m3u8/mp4 only**, probe-verified; JS engine daemon owns the crypto |
 
 Removed providers return a `removed` error naming them explicitly
@@ -51,7 +50,7 @@ collector is skipped before any upstream call.
 
 ### `POST /api/v1/stream` — explicit / fallback resolve
 With `provider` set (family **or** cute name — `Sunny`, `Nami`, `Nest`,
-`Lee`, `Pocky`, `animegg` sub-ids like `yuki` all route), only that provider
+`Lee`, `animegg` sub-ids like `yuki` all route), only that provider
 resolves. Empty `provider` walks the fallback chain serially, first hit
 wins. `quality` filters provider-returned labels (`auto` = all).
 
@@ -119,58 +118,15 @@ only — never wrapped URLs).
   allanime clock are the live extractors; mp4upload/streamsb/streamlare
   return null and cost a fetch. Every kept URL is probe-verified
   master → media → segment before it lists.
-- **Animepahe — official domains only.** `animepahe.pw` (canonical),
-  `animepahe.com`, `animepahe.org`; every mirror/clone domain is out of
-  scope. Direct m3u8 only — never an embed.
-- **Animepahe solver is exec-on-demand, never resident.**
-  `third_party/pahe-solver/solve_once.py` (Camoufox) runs only when the
-  clearance is missing or a 403 drops it, is single-flighted, prints one
-  `PAHE_SOLVE_RESULT` marker line and exits (~453 MB peak, zero steady
-  cost). The result is persisted to `PAHE_CLEARANCE_FILE` with a 20-min
-  re-read grace. Solves run detached from requests (boot warmup +
-  background completion): the ~46 s solve outlives the 45 s fan-out,
-  so a caller that gives up never kills work a later request needs.
-  Same-origin API calls carry the site's XHR header shape (Referer,
-  X-Requested-With, Sec-Fetch-*) — bare-TLS calls score as bots on some
-  Cloudflare policies even with a valid clearance. Every 403 is logged
-  with its endpoint kind, and after 3 consecutive all-403 fetches a
-  breaker opens for 20 min (fail fast, zero solves; any 200 resets it),
-  so a blocked egress can't burn a solve per request forever. `ANIRAKU_PAHE_SOLVER=0` disables the provider before
-  any upstream call.
-- **Animepahe cookie handoff is browser-shaped or it 403s.** The
-  clearance only works with Firefox-impersonated TLS (tls-client profile
-  `firefox_148`), the exact solver-issued UA and the full cookie jar — a
-  plain transport with a valid `cf_clearance` still gets 403. Every 403
-  re-solves instead of retrying, so the clearance TTL never matters.
-- **Kwik player scripts run in a bun sandbox**
-  (`third_party/animepahe-engine/kwik_resolve.js`): fetch/XHR/WebSocket
-  stubbed, `process`/`require` removed, output only on the marker line.
-  Segment probes must send `Referer: https://kwik.cx/` (any other
-  referer, or none, answers 403). Directories are never written: the
-  engine script is read-only, and server URLs are learned via
-  `learnURLHost`.
-- **Animepahe show matching — anti-mismatch, stricter than mkissa.**
-  Score 100 exact / 90 equal tokens / 80 clean containment *without
-  added words*; the 80 floor rejects season supersets ("Naruto
-  Shippuden" for "Naruto"). Search + release pick are single-flight and
-  sources list best-first with honest `%dp` quality labels; no match
-  means no animepahe server — never a wrong one. Strict per-lang: a
-  missing dub release lists no dub server. Among passing hits the AniList
-  year breaks remake ties, then catalog type, then /5-rating closeness
-  (episode counts ignored: absolute vs cour numbering differs per
-  source). A non-exact winner is confirmed against its anime page's
-  AniList external link — a positive ID mismatch disqualifies it, while
-  exact-title hits skip verification (zero extra fetches).
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
-  MegaVid/mkissa/animepahe never receive hentai titles (mkissa also forces
+  MegaVid/mkissa never receive hentai titles (mkissa also forces
   `allowAdult:false` in its own search).
 - **No server-list snapshot cache.** Tokenized URLs expire without a
   reliable invalidation signal; every request computes a fresh,
   honestly-probed list. Speed comes from provider resolve caches:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min, mkissa
-  show 24 h + resolve 30 min (lang-keyed), animepahe show 24 h +
-  releases 6 h + kwik resolve 30 min (lang-keyed), VidNest/Lee/MegaVid
+  show 24 h + resolve 30 min (lang-keyed), VidNest/Lee/MegaVid
   fresh per resolve (short-lived tokens).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
   rate limit) — never `graphql.anilist.co`.
