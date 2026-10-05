@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,6 +154,9 @@ func newPaheFixture(t *testing.T) *paheFixture {
 func TestAnimepaheSolverStub(t *testing.T) {
 	if os.Getenv("GO_PAHE_SOLVER_STUB") != "1" {
 		return
+	}
+	if ms, _ := strconv.Atoi(os.Getenv("GO_PAHE_STUB_SLEEP_MS")); ms > 0 {
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	if p := os.Getenv("GO_PAHE_STUB_COUNT"); p != "" {
 		if fh, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
@@ -494,6 +498,46 @@ func TestAnimepahePageVerification(t *testing.T) {
 	}
 	if session != "anime-sess-1" {
 		t.Fatalf("session = %q, want anime-sess-1", session)
+	}
+}
+
+// A solve that outlives the caller's deadline keeps running detached:
+// the waiter fails fast with a not-ready error, and a later call finds
+// the finished session instead of paying for another solve (this is the
+// 46s-solve vs 45s-fan-out production shape).
+func TestAnimepaheDetachedSolveSurvivesDeadline(t *testing.T) {
+	f := newPaheFixture(t)
+	p := newPaheTestProvider(t, f)
+	t.Setenv("GO_PAHE_STUB_SLEEP_MS", "1500")
+	ctx, cancel := context.WithTimeout(paheTestCtx(t), 200*time.Millisecond)
+	defer cancel()
+	if err := p.ensureSession(ctx); err == nil || !strings.Contains(err.Error(), "continues in background") {
+		t.Fatalf("err = %v, want background-continuation error", err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if err := p.ensureSession(paheTestCtx(t)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("detached solve never installed its session")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	countFile := os.Getenv("GO_PAHE_STUB_COUNT")
+	if n := solverSolveCount(t, countFile); n != 1 {
+		t.Fatalf("solver spawned %d times, want 1 (waiters attach, never duplicate)", n)
+	}
+}
+
+// Boot warmup leaves the session ready: no solver, no wait, no upstream
+// calls on the request path afterwards.
+func TestAnimepaheWarmup(t *testing.T) {
+	f := newPaheFixture(t)
+	p := newPaheTestProvider(t, f)
+	p.Warmup(paheTestCtx(t))
+	if err := p.ensureSession(paheTestCtx(t)); err != nil {
+		t.Fatalf("session not ready after warmup: %v", err)
 	}
 }
 
