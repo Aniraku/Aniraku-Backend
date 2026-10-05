@@ -24,7 +24,7 @@ fallback order and the `/servers` merge order.
 | `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
-| `mkissa` | Chuu (clock/wixmp), Mua, Kissy, Smooch, Peck, Xoxo (ok.ru) — by source kind | mkissa.to signed GraphQL → **direct m3u8/mp4 only**, probe-verified; JS engine daemon owns the crypto |
+| `mkissa` | Chuu (clock/wixmp), Mua, Kissy, Smooch, Peck, Xoxo (ok.ru), Umi (uns.bio) — by source kind | mkissa.to signed GraphQL → **direct m3u8/mp4 only**, probe-verified; JS engine daemon owns the crypto |
 
 Removed providers return a `removed` error naming them explicitly
 (`miruro`, `zenime`, `tryembed`, …) — never silently fall

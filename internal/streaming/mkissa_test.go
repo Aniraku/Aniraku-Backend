@@ -31,19 +31,20 @@ type mkissaFixture struct {
 
 const mkissaTestShowID = "ReooPAxPMsHM4KPMY"
 
-// Canned engine output: one direct Default m3u8, one mp4upload mp4,
-// one pure embed (skipped), one unknown kind (skipped). Priorities are
-// fractional exactly like the real engine — an int-typed Priority field
-// makes Go reject the whole response line and hang until the call
-// timeout, so the fixture must keep them fractional.
+// Canned engine output: one direct Default m3u8, one Uni (uns.bio) m3u8,
+// one mp4upload mp4, one pure embed (skipped), one unknown kind (skipped).
+// Priorities are fractional exactly like the real engine — an int-typed
+// Priority field makes Go reject the whole response line and hang until
+// the call timeout, so the fixture must keep them fractional.
 func mkissaStubOutput(mediaBase string) string {
 	return fmt.Sprintf(`{"id":0,"showId":%q,"audio":"sub","results":[{"episode":"1","sources":[
 {"name":"Default","url":"https://mkissa.to/e/x","extractedUrl":%q,"type":"player","priority":10},
+{"name":"Uni","url":"https://watchanime.uns.bio/#x","extractedUrl":%q,"type":"file","priority":5.2},
 {"name":"Mp4","url":"https://mp4upload.com/embed-abc.html","extractedUrl":"%s/v.mp4","type":"file","priority":4.5},
 {"name":"Ss-Hls","url":"https://streamsb.net/e/abc.html","type":"embed","priority":3.5},
 {"name":"Weird","url":"https://x.example/e","extractedUrl":"https://x.example/e","type":"file","priority":1}
 ]}]}`,
-		mkissaTestShowID, mediaBase+"/master.m3u8", mediaBase)
+		mkissaTestShowID, mediaBase+"/master.m3u8", mediaBase+"/uni.m3u8", mediaBase)
 }
 
 func newMkissaFixture(t *testing.T, dubEps []string, stubOut string) *mkissaFixture {
@@ -76,6 +77,10 @@ func newMkissaFixture(t *testing.T, dubEps []string, stubOut string) *mkissaFixt
 	f.api = httptest.NewServer(mux)
 	mmux := http.NewServeMux()
 	mmux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100,RESOLUTION=640x360\nq/playlist.m3u8\n")
+	})
+	mmux.HandleFunc("/uni.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100,RESOLUTION=640x360\nq/playlist.m3u8\n")
 	})
@@ -164,8 +169,8 @@ func mkissaTestCtx(t *testing.T) context.Context {
 	return ctx
 }
 
-// Full sub chain through the stub engine: direct m3u8 + mp4 kept with
-// cute names, embeds and unknown kinds skipped.
+// Full sub chain through the stub engine: direct m3u8 + Uni m3u8 + mp4
+// kept with cute names, embeds and unknown kinds skipped.
 func TestMkissaFindEpisodeSource(t *testing.T) {
 	f := newMkissaFixture(t, []string{"1"}, "")
 	p := newMkissaTestProvider(f)
@@ -173,14 +178,17 @@ func TestMkissaFindEpisodeSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FindEpisodeSource: %v", err)
 	}
-	if len(sr.Sources) != 2 {
-		t.Fatalf("sources = %d, want 2 (Chuu + Kissy)", len(sr.Sources))
+	if len(sr.Sources) != 3 {
+		t.Fatalf("sources = %d, want 3 (Chuu + Umi + Kissy)", len(sr.Sources))
 	}
 	if sr.Sources[0].Type != "hls" || sr.ServerNames[0] != "Chuu" {
 		t.Fatalf("source[0] = %+v name %q, want hls/Chuu", sr.Sources[0], sr.ServerNames[0])
 	}
-	if sr.Sources[1].Type != "mp4" || sr.ServerNames[1] != "Kissy" {
-		t.Fatalf("source[1] = %+v name %q, want mp4/Kissy", sr.Sources[1], sr.ServerNames[1])
+	if sr.Sources[1].Type != "hls" || sr.ServerNames[1] != "Umi" {
+		t.Fatalf("source[1] = %+v name %q, want hls/Umi", sr.Sources[1], sr.ServerNames[1])
+	}
+	if sr.Sources[2].Type != "mp4" || sr.ServerNames[2] != "Kissy" {
+		t.Fatalf("source[2] = %+v name %q, want mp4/Kissy", sr.Sources[2], sr.ServerNames[2])
 	}
 	if sr.Headers["Referer"] != mkissaReferer {
 		t.Fatalf("headers = %v, want mkissa Referer", sr.Headers)
@@ -231,9 +239,24 @@ func TestMkissaServerNames(t *testing.T) {
 	for kind, want := range map[string]string{
 		"default": "Chuu", "uv-mp4": "Mua", "mp4": "Kissy",
 		"ss-hls": "Smooch", "sl-mp4": "Peck", "ok": "Xoxo",
+		"uni": "Umi",
 	} {
 		if got := mkissaServerNames[kind]; got != want {
 			t.Fatalf("kind %q = %q, want %q", kind, got, want)
+		}
+	}
+}
+
+func TestMkissaProbeReferer(t *testing.T) {
+	for url, want := range map[string]string{
+		"https://a6.mp4upload.com:183/d/x/video.mp4": "https://mp4upload.com/",
+		"https://www.mp4upload.com/embed-abc.html":   "https://mp4upload.com/",
+		"https://repackager.wixmp.com/master.m3u8":   mkissaReferer,
+		"https://94.131.217.174/v4/x/master.m3u8":    mkissaReferer,
+		"://bad-url": mkissaReferer,
+	} {
+		if got := mkissaProbeReferer(url); got != want {
+			t.Fatalf("referer(%q) = %q, want %q", url, got, want)
 		}
 	}
 }
