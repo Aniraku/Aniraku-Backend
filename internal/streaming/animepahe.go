@@ -109,7 +109,12 @@ const (
 	paheFetchMax    = 2 << 20
 	paheFuzzyMin    = 80
 	paheProfileName = "firefox_148"
+
+	paheBreakerTrips = 3 // consecutive all-403 fetches before the breaker opens
 )
+
+// paheBreakerCooldown is a var (not const) so tests can shrink it.
+var paheBreakerCooldown = 20 * time.Minute
 
 // paheKwikReferer: the ONLY referer kwik's media layer accepts (measured:
 // segment 200 with it, 403 without / with animepahe). The proxy force-sets
@@ -190,8 +195,13 @@ type AnimepaheProvider struct {
 	// mints the clearance, and no request would ever get one.
 	solveDone    chan struct{}
 	lastSolveErr error
-	paheHTTP     tlsclient.HttpClient
-	ua           string
+	// Clearance breaker state (mkissa pattern): brkCount consecutive
+	// all-403 fetches trip brkUntil; any 200 resets both. Guarded by
+	// sessMu.
+	brkCount int
+	brkUntil time.Time
+	paheHTTP tlsclient.HttpClient
+	ua       string
 
 	mu       sync.Mutex
 	shows    map[int]*paheShowEntry
@@ -643,13 +653,23 @@ func newPaheHTTPClient(base *url.URL, cookies map[string]string, ua string) (tls
 	)
 }
 
-// fetchPAHE performs one authenticated GET against the animepahe origin.
-// A 403 (expired/invalidated clearance) invalidates the session and is
-// retried exactly once with a fresh solve; the final error text always
-// contains "HTTP 403" so the fan-out's isUpstreamGated treats an expired
-// challenge as a silent skip instead of an error.
+// fetchPAHE performs one authenticated GET against the animepahe origin
+// (all call sites are same-origin: search, anime page, releases, play
+// page — kwik pages use the plain client). A 403 (expired/invalidated
+// clearance) invalidates the session and is retried exactly once with a
+// fresh solve; the final error text always contains "HTTP 403" so the
+// fan-out's isUpstreamGated treats an expired challenge as a silent skip
+// instead of an error. Every 403 is Warn-logged with its endpoint kind:
+// a clearance that mints fine but 403s on use means the egress IP itself
+// is blocked, and that must be visible, not silent.
 func (p *AnimepaheProvider) fetchPAHE(ctx context.Context, target, accept string) ([]byte, error) {
+	if until, ok := p.breakerOpen(); ok {
+		return nil, fmt.Errorf("animepahe: HTTP 403 (clearance breaker open until %s)", until.Format(time.Kitchen))
+	}
+	kind := paheEndpointKind(target)
+	sameOrigin := strings.HasPrefix(target, p.base)
 	var lastErr error
+	forbidden := 0
 	for attempt := 0; attempt < 2; attempt++ {
 		if err := p.ensureSession(ctx); err != nil {
 			return nil, err
@@ -667,6 +687,16 @@ func (p *AnimepaheProvider) fetchPAHE(ctx context.Context, target, accept string
 		req.Header.Set("User-Agent", ua)
 		req.Header.Set("Accept", accept)
 		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		if sameOrigin {
+			// Same-origin XHR shape (what the site's own JS sends for
+			// api?m=*): some Cloudflare policies score bare-TLS API calls
+			// as bots even with a valid clearance.
+			req.Header.Set("Referer", p.base+"/")
+			req.Header.Set("X-Requested-With", "XMLHttpRequest")
+			req.Header.Set("Sec-Fetch-Dest", "empty")
+			req.Header.Set("Sec-Fetch-Mode", "cors")
+			req.Header.Set("Sec-Fetch-Site", "same-origin")
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			// Transport-level failure: re-solving cannot help.
@@ -678,6 +708,9 @@ func (p *AnimepaheProvider) fetchPAHE(ctx context.Context, target, accept string
 			return nil, fmt.Errorf("animepahe: read %s: %w", target, rerr)
 		}
 		if resp.StatusCode == http.StatusForbidden {
+			forbidden++
+			p.log.Warn().Str("kind", kind).Int("attempt", attempt+1).
+				Msg("animepahe: upstream rejected clearance (HTTP 403)")
 			p.invalidateSession()
 			lastErr = fmt.Errorf("animepahe: HTTP 403")
 			continue
@@ -685,12 +718,67 @@ func (p *AnimepaheProvider) fetchPAHE(ctx context.Context, target, accept string
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("animepahe: HTTP %d", resp.StatusCode)
 		}
+		p.breakerReset()
 		return body, nil
+	}
+	if forbidden == 2 {
+		p.breakerTrip()
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("animepahe: no clearance")
 	}
 	return nil, lastErr
+}
+
+// paheEndpointKind names the fetchPAHE target for 403 logging (search,
+// release, play page, anime page, other).
+func paheEndpointKind(target string) string {
+	switch {
+	case strings.Contains(target, "m=search"):
+		return "search"
+	case strings.Contains(target, "m=release"):
+		return "release"
+	case strings.Contains(target, "/play/"):
+		return "play"
+	case strings.Contains(target, "/anime/"):
+		return "animepage"
+	default:
+		return "other"
+	}
+}
+
+// Clearance breaker (mkissa pattern): a 403 wipes the session and
+// re-solves, so a permanently-blocked egress would burn a ~46s solve per
+// request forever. After paheBreakerTrips consecutive all-403 fetches the
+// breaker opens for paheBreakerCooldown (fail fast, zero solves); any 200
+// resets it.
+func (p *AnimepaheProvider) breakerOpen() (time.Time, bool) {
+	p.sessMu.Lock()
+	defer p.sessMu.Unlock()
+	if p.brkCount < paheBreakerTrips {
+		return time.Time{}, false
+	}
+	if time.Now().Before(p.brkUntil) {
+		return p.brkUntil, true
+	}
+	p.brkCount = 0
+	return time.Time{}, false
+}
+
+func (p *AnimepaheProvider) breakerTrip() {
+	p.sessMu.Lock()
+	defer p.sessMu.Unlock()
+	p.brkCount++
+	if p.brkCount >= paheBreakerTrips {
+		p.brkUntil = time.Now().Add(paheBreakerCooldown)
+		p.log.Warn().Int("trips", p.brkCount).Msg("animepahe: clearance breaker open (upstream blocks this egress)")
+	}
+}
+
+func (p *AnimepaheProvider) breakerReset() {
+	p.sessMu.Lock()
+	defer p.sessMu.Unlock()
+	p.brkCount, p.brkUntil = 0, time.Time{}
 }
 
 // ------------------------------------------------------------ anilist
