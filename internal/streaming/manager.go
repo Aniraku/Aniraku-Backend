@@ -111,9 +111,6 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if mv, ok := p.(*MegaVidProvider); ok {
 			mv.SetHostLearner(fn)
 		}
-		if ap, ok := p.(*AnimepaheProvider); ok {
-			ap.SetHostLearner(fn)
-		}
 	}
 }
 
@@ -186,19 +183,9 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewLeeProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
 			NewMkissaProvider(log),
-			NewAnimepaheProvider(log),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
-	}
-	// Animepahe clearance warmup: a cold solve takes ~46s (past the 45s
-	// fan-out), so without this every early request would start a solve
-	// it cannot live to see. The warmup runs detached; in-request solves
-	// are detached the same way (see ensureSession).
-	for _, prov := range m.providers {
-		if ap, ok := prov.(*AnimepaheProvider); ok {
-			go ap.Warmup(context.Background())
-		}
 	}
 	return m
 }
@@ -278,14 +265,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		provider = "animegg"
 	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
 		provider = "aniwaves"
-	case "vidnest", "nest":
+	// "animepahe"/"pahe" alias VidNest (it scrapes animepahe pages).
+	case "vidnest", "nest", "animepahe", "pahe":
 		provider = "vidnest"
-	// "animepahe"/"pahe" used to alias VidNest (it scrapes animepahe
-	// pages); since the real animepahe provider shipped (2026-10-05) the
-	// name resolves to the real site. VidNest stays reachable as
-	// "vidnest"/"nest". The cute server names double as aliases.
-	case "animepahe", "pahe", "pocky", "linda", "minto", "yuzu":
-		provider = "animepahe"
 	case "lee":
 		provider = "lee"
 	case "megavid", "vidy":
@@ -300,7 +282,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "animepahe", "lee", "megavid":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee", "megavid":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -419,17 +401,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("vidnest: no sources for this episode")
-	case "animepahe", "pahe", "pocky", "linda", "minto", "yuzu":
-		// Official animepahe domains only: direct m3u8 resolved through
-		// the solver sidecar's clearance (never embeds).
-		result, err := m.tryAnimepahe(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("animepahe: no sources for this episode")
 	case "mkissa":
 		// Explicit mkissa requests resolve direct m3u8/mp4 (never embeds).
 		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
@@ -440,7 +411,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("mkissa: no sources for this episode")
-	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen":
+	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto", "yuzu":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
@@ -487,8 +458,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryLee(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
-			return m.tryAnimepahe(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		})
@@ -555,7 +524,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers, apServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -669,16 +638,6 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
-			// animepahe skips itself when the solver sidecar is not
-			// configured (zero upstream calls), and the hentai gate keeps
-			// adult titles away like every other catalog provider.
-			if !hentai {
-				apServers = run("animepahe", func() []core.Server {
-					return m.collectAnimepaheServers(ctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -716,7 +675,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers, apServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, mkServers} {
 		allServers = append(allServers, pool...)
 	}
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -1267,76 +1226,6 @@ func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, ep
 		}
 		sr = m.withDubSubtitles(ctx, "mkissa", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, []string{"Mkissa"}, "mkissa", lang, sr)
-	}
-	return out
-}
-
-func (m *Manager) getAnimepaheProvider() *AnimepaheProvider {
-	for _, p := range m.providers {
-		if ap, ok := p.(*AnimepaheProvider); ok {
-			return ap
-		}
-	}
-	return nil
-}
-
-// tryAnimepahe resolves an official-animepahe direct stream (m3u8/mp4,
-// never embeds). Unconfigured (no solver URL) it fails fast with zero
-// upstream calls, so deployments without the sidecar lose nothing.
-func (m *Manager) tryAnimepahe(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
-	ap := m.getAnimepaheProvider()
-	if ap == nil {
-		return nil, fmt.Errorf("animepahe provider not configured")
-	}
-	if !ap.Configured() {
-		return nil, fmt.Errorf("animepahe: solver not configured")
-	}
-
-	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying animepahe")
-
-	anilistID := fmt.Sprintf("%d", animeID)
-	source, err := ap.FindEpisodeSource(ctx, anilistID, episode, lang)
-	if err != nil {
-		return nil, fmt.Errorf("animepahe failed: %w", err)
-	}
-	if source == nil || len(source.Sources) == 0 {
-		return nil, nil
-	}
-	// Dub keeps animepahe defaults (only Sora dub takes nico files).
-	source = m.withDubSubtitles(ctx, "animepahe", lang, anilistID, episode, source)
-
-	return m.applyQualityFilter(source, quality), nil
-}
-
-// collectAnimepaheServers maps animepahe's per-quality sources onto their
-// cute server names (Pocky/Linda/... carried in sr.ServerNames).
-func (m *Manager) collectAnimepaheServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
-	var out []core.Server
-	for _, prov := range m.providers {
-		ap, ok := prov.(*AnimepaheProvider)
-		if !ok {
-			continue
-		}
-		if !ap.Configured() {
-			return out // no sidecar: zero upstream calls
-		}
-		sr, err := ap.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil {
-			// An expired-clearance 403 is a silent skip, not noise.
-			if isUpstreamGated(err) {
-				m.log.Warn().Err(err).Str("provider", "animepahe").Str("anilistId", anilistID).
-					Int("episode", episode).Str("lang", lang).Msg("servers: provider gated")
-			} else {
-				m.log.Warn().Err(err).Str("provider", "animepahe").Str("anilistId", anilistID).
-					Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
-			}
-			continue
-		}
-		if sr == nil || len(sr.Sources) == 0 {
-			continue
-		}
-		sr = m.withDubSubtitles(ctx, "animepahe", lang, anilistID, episode, sr)
-		out = appendNamedServers(out, []string{"Animepahe"}, "animepahe", lang, sr)
 	}
 	return out
 }

@@ -1,3 +1,0 @@
-# pahe-solver runtime. camoufox pulls its own deps (playwright sync API,
-# fpgen, ...); pin the version the clearance flow was verified with.
-camoufox==0.5.7
