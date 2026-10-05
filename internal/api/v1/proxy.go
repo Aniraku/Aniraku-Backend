@@ -838,6 +838,8 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 			req.Header.Set("Origin", "https://kwik.cx")
 		} else if strings.Contains(u, "flixcloud") {
 			req.Header.Set("Referer", "https://flixcloud.cc/")
+		} else if strings.Contains(u, "mp4upload") {
+			req.Header.Set("Referer", "https://mp4upload.com/")
 		} else if strings.Contains(u, "ninstream") {
 			req.Header.Set("Referer", "https://ninstream.com")
 		}

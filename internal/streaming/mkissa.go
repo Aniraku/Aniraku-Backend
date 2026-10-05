@@ -75,6 +75,7 @@ var mkissaServerNames = map[string]string{
 	"ss-hls":  "Smooch", // streamsb
 	"sl-mp4":  "Peck",   // streamlare
 	"ok":      "Xoxo",   // ok.ru
+	"uni":     "Umi",    // uns.bio direct file
 }
 
 type MkissaProvider struct {
@@ -911,6 +912,19 @@ func (p *MkissaProvider) probeMkissaMaster(ctx context.Context, master string) (
 	return master, true
 }
 
+// mkissaProbeReferer picks the hotlink referer the file host demands
+// (measured 2026-10-05: mp4upload file servers answer 403 to mkissa.to
+// and empty referers, 206 with the site referer). Unknown hosts keep the
+// mkissa.to referer.
+func mkissaProbeReferer(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil {
+		if h := strings.ToLower(u.Hostname()); h == "mp4upload.com" || strings.HasSuffix(h, ".mp4upload.com") {
+			return "https://mp4upload.com/"
+		}
+	}
+	return mkissaReferer
+}
+
 // probeMkissaMP4 verifies a direct mp4 with a byte-range GET.
 func (p *MkissaProvider) probeMkissaMP4(ctx context.Context, rawURL string) bool {
 	cctx, cancel := context.WithTimeout(ctx, 12*time.Second)
@@ -920,7 +934,7 @@ func (p *MkissaProvider) probeMkissaMP4(ctx context.Context, rawURL string) bool
 		return false
 	}
 	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("Referer", mkissaReferer)
+	req.Header.Set("Referer", mkissaProbeReferer(rawURL))
 	req.Header.Set("Range", "bytes=0-2047")
 	resp, err := p.client.Do(req)
 	if err != nil {
