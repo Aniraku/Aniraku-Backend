@@ -181,10 +181,17 @@ type AnimepaheProvider struct {
 
 	// Clearance session: rebuilt wholesale on every solve so a stale jar
 	// can never leak into a new session.
-	solveMu  sync.Mutex // serializes solves (double-checked below)
-	sessMu   sync.Mutex
-	paheHTTP tlsclient.HttpClient
-	ua       string
+	solveMu sync.Mutex // guards solveDone only; never held across a solve
+	sessMu  sync.Mutex
+	// solveDone is non-nil while a detached solve runs (closed on finish);
+	// lastSolveErr carries its outcome to waiters. A solve's lifetime is
+	// detached from any request (context.Background + paheSolveTO): the
+	// 45s fan-out would otherwise kill every ~46s solve just before it
+	// mints the clearance, and no request would ever get one.
+	solveDone    chan struct{}
+	lastSolveErr error
+	paheHTTP     tlsclient.HttpClient
+	ua           string
 
 	mu       sync.Mutex
 	shows    map[int]*paheShowEntry
@@ -409,15 +416,69 @@ func (p *AnimepaheProvider) ensureSession(ctx context.Context) error {
 	if ready {
 		return nil
 	}
-	p.solveMu.Lock()
-	defer p.solveMu.Unlock()
+	done := p.solveStartDetached()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// Our deadline gave up, not the solve: it keeps running detached
+		// and installs the session/file for the next request.
+		return fmt.Errorf("animepahe: clearance not ready (solve continues in background): %w", ctx.Err())
+	}
 	p.sessMu.Lock()
 	ready = p.paheHTTP != nil && p.ua != ""
+	solveErr := p.lastSolveErr
 	p.sessMu.Unlock()
 	if ready {
-		return nil // another caller solved while we waited
+		return nil // the detached solve finished while we waited
 	}
-	return p.solveSessionLocked(ctx)
+	if solveErr != nil {
+		return solveErr
+	}
+	return fmt.Errorf("animepahe: solver produced no clearance")
+}
+
+// solveStartDetached returns the current solve's done channel, starting
+// one (request-independent lifetime) if none runs. solveMu is only ever
+// held for the field check — never across the solve — so a request
+// deadline abandons its wait without killing work later requests need.
+func (p *AnimepaheProvider) solveStartDetached() <-chan struct{} {
+	p.solveMu.Lock()
+	defer p.solveMu.Unlock()
+	if p.solveDone != nil {
+		return p.solveDone
+	}
+	done := make(chan struct{})
+	p.solveDone = done
+	go func() {
+		defer close(done)
+		sctx, cancel := context.WithTimeout(context.Background(), paheSolveTO)
+		defer cancel()
+		err := p.solveSessionLocked(sctx)
+		p.sessMu.Lock()
+		p.lastSolveErr = err // nil on success clears stale failures
+		p.sessMu.Unlock()
+		if err != nil {
+			p.log.Warn().Err(err).Msg("animepahe: background solve failed")
+		}
+		p.solveMu.Lock()
+		p.solveDone = nil
+		p.solveMu.Unlock()
+	}()
+	return done
+}
+
+// Warmup solves once in the background (called at boot). No-op without
+// the baked solver. Failures only log — requests trigger detached solves
+// the same way, so a failed warmup costs nothing but one log line.
+func (p *AnimepaheProvider) Warmup(ctx context.Context) {
+	if !p.Configured() {
+		return
+	}
+	if err := p.ensureSession(ctx); err != nil {
+		p.log.Warn().Err(err).Msg("animepahe: warmup solve not ready (requests will retry in background)")
+		return
+	}
+	p.log.Info().Msg("animepahe: warmup clearance ready")
 }
 
 // invalidateSession drops the clearance so the next fetch re-solves. Called
@@ -434,11 +495,12 @@ func (p *AnimepaheProvider) invalidateSession() {
 	}
 }
 
-// solveSessionLocked installs a clearance session. Order matters:
-//   - fresh on-disk result first (a solve that outlived its caller's
-//     fan-out deadline finished writing the file — free to reuse);
-//   - otherwise exec solve_once.py (single-flight: callers already hold
-//     solveMu), which spawns camoufox, clears the challenge and exits.
+// solveSessionLocked installs a clearance session. It runs exactly once
+// per solve (guarded by solveDone) on a request-independent context.
+// Order matters:
+//   - fresh on-disk result first (a previous solve's file — free to reuse);
+//   - otherwise exec solve_once.py, which spawns camoufox, clears the
+//     challenge and exits.
 func (p *AnimepaheProvider) solveSessionLocked(ctx context.Context) error {
 	if sr, ok := p.readClearanceFile(); ok {
 		if err := p.installSession(sr); err != nil {

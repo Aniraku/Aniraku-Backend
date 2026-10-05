@@ -171,7 +171,7 @@ type SourceResult struct {
 // per-lang. Reference scraper: /home/ichigoat/kaa_stream_scraper.py
 // (episodes API takes lang=ja-JP|en-US; the decrypted m3u8 covers both).
 func NewManager(log zerolog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		log: log,
 		providers: []Provider{
 			NewAnikotoProvider(log),
@@ -191,6 +191,16 @@ func NewManager(log zerolog.Logger) *Manager {
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
 	}
+	// Animepahe clearance warmup: a cold solve takes ~46s (past the 45s
+	// fan-out), so without this every early request would start a solve
+	// it cannot live to see. The warmup runs detached; in-request solves
+	// are detached the same way (see ensureSession).
+	for _, prov := range m.providers {
+		if ap, ok := prov.(*AnimepaheProvider); ok {
+			go ap.Warmup(context.Background())
+		}
+	}
+	return m
 }
 
 // isHentaiTitle reports whether the AniList title carries the Hentai genre

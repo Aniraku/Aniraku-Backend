@@ -127,8 +127,9 @@ only — never wrapped URLs).
   clearance is missing or a 403 drops it, is single-flighted, prints one
   `PAHE_SOLVE_RESULT` marker line and exits (~453 MB peak, zero steady
   cost). The result is persisted to `PAHE_CLEARANCE_FILE` with a 20-min
-  re-read grace so a solve cut short by the 45 s fan-out deadline is
-  never paid twice. `ANIRAKU_PAHE_SOLVER=0` disables the provider before
+  re-read grace. Solves run detached from requests (boot warmup +
+  background completion): the ~46 s solve outlives the 45 s fan-out,
+  so a caller that gives up never kills work a later request needs. `ANIRAKU_PAHE_SOLVER=0` disables the provider before
   any upstream call.
 - **Animepahe cookie handoff is browser-shaped or it 403s.** The
   clearance only works with Firefox-impersonated TLS (tls-client profile
