@@ -31,9 +31,13 @@ type paheFixture struct {
 	releaseRows  string // JSON array for /api?m=release data
 	romaji       string
 	english      string
+	year         int               // AniList seasonYear (0 = unknown, metadata-neutral)
+	format       string            // AniList format ("" = unknown, metadata-neutral)
+	avgScore     int               // AniList averageScore /100 (0 = unknown, neutral)
 	acceptUA     string            // when set, /api 403s any other UA
 	kwikInline   map[string]string // kwik id -> inline m3u8 URL ("" = eval page)
 	kwikReject   bool              // serve a player script the safety filter must drop
+	animeLinks   map[string]string // anime session -> AniList id in its page links (absent = no link)
 	learnedHosts []string
 }
 
@@ -85,7 +89,8 @@ func newPaheFixture(t *testing.T) *paheFixture {
 	})
 	mux.HandleFunc("/anilist", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"data":{"Media":{"title":{"romaji":%q,"english":%q}}}}`, f.romaji, f.english)
+		fmt.Fprintf(w, `{"data":{"Media":{"title":{"romaji":%q,"english":%q},"seasonYear":%d,"format":%q,"averageScore":%d}}}`,
+			f.romaji, f.english, f.year, f.format, f.avgScore)
 	})
 	mux.HandleFunc("/play/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
@@ -125,9 +130,19 @@ func newPaheFixture(t *testing.T) *paheFixture {
 	mux.HandleFunc("/q/playlist.m3u8", gated([]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\nseg.ts\n"),
 		"application/vnd.apple.mpegurl"))
 	mux.HandleFunc("/q/seg.ts", gated(append([]byte{0x47}, bytes1k...), "video/mp2t"))
+	mux.HandleFunc("/anime/", func(w http.ResponseWriter, r *http.Request) {
+		sess := strings.TrimPrefix(r.URL.Path, "/anime/")
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, `<html><body><div class="info"><span>Synonyms: OP</span><span>Type: TV</span><span>Season: Fall 1999</span></div><div>External Links: `)
+		if aid, ok := f.animeLinks[sess]; ok {
+			fmt.Fprintf(w, `<a href="https://anilist.co/anime/%s">AniList</a>`, aid)
+		}
+		fmt.Fprint(w, `</div></body></html>`)
+	})
 
 	f.srv = httptest.NewServer(mux)
 	f.kwikInline = map[string]string{"kw360": f.srv.URL + "/master.m3u8"}
+	f.animeLinks = map[string]string{}
 	t.Cleanup(f.srv.Close)
 	return f
 }
@@ -338,6 +353,147 @@ func TestAnimepaheRejectsMismatchedTitles(t *testing.T) {
 	}
 	if session != "anime-sess-1" || title != "Naruto" {
 		t.Fatalf("resolved %q (%q), want anime-sess-1 / Naruto", session, title)
+	}
+}
+
+// Search decoding tolerates live shape drift: {"data"} / {"results"} /
+// bare array all parse, string-typed numbers (animepahe's /5 score arrives
+// either way) coerce, nulls stay zero, and non-JSON (challenge HTML) is an
+// error the caller surfaces — never a silent zero-hit result.
+func TestAnimepaheSearchDecodeShapes(t *testing.T) {
+	hits, err := decodePaheSearch([]byte(`{"total":2,"last_page":1,"data":[
+ {"id":1,"title":"One Piece","type":"TV","episodes":1000,"year":1999,"score":"4.36","session":"s1"},
+ {"id":"2","title":null,"type":"TV","episodes":null,"year":null,"score":null,"session":""}
+ ]}`))
+	if err != nil {
+		t.Fatalf("data shape: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("data shape: %d hits, want 2", len(hits))
+	}
+	if hits[0].Session != "s1" || hits[0].Year != 1999 || hits[0].Score != 4.36 || hits[0].ID != 1 {
+		t.Fatalf("string score did not coerce: %+v", hits[0])
+	}
+	if hits[1].ID != 2 || hits[1].Title != "" || hits[1].Episodes != 0 {
+		t.Fatalf("string id / nulls did not coerce: %+v", hits[1])
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want int
+	}{
+		{"results key", `{"results":[{"id":3,"title":"X","session":"s3"}]}`, 1},
+		{"bare array", `[{"id":4,"title":"Y","session":"s4"}]`, 1},
+		{"empty data", `{"total":0,"data":[]}`, 0},
+	} {
+		hits, err := decodePaheSearch([]byte(tc.body))
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if len(hits) != tc.want {
+			t.Fatalf("%s: %d hits, want %d", tc.name, len(hits), tc.want)
+		}
+	}
+
+	if _, err := decodePaheSearch([]byte(`<html><head><title>Just a moment...</title></head></html>`)); err == nil {
+		t.Fatal("challenge HTML must be a decode error, not zero hits")
+	}
+	if _, err := decodePaheSearch([]byte(`{}`)); err == nil {
+		t.Fatal("keyless object must be a decode error (keeps shape drift visible), not silent zero hits")
+	}
+}
+
+// Metadata disambiguation: two equal-title-score (90, punctuation-only)
+// hits from different years — the AniList year picks the remake-safe one,
+// and the miss still surfaces counts instead of swallowing the cause.
+func TestAnimepaheMetadataRanking(t *testing.T) {
+	f := newPaheFixture(t)
+	f.romaji, f.english = "Naruto", "Naruto"
+	f.year = 2002
+	f.animeLinks["sess-right-year"] = "1"
+	f.searchData = `[
+ {"id":1,"title":"Naruto!","type":"TV","episodes":220,"year":2007,"score":3.9,"session":"sess-wrong-year"},
+ {"id":2,"title":"Naruto?","type":"TV","episodes":220,"year":2002,"score":4.1,"session":"sess-right-year"}
+]`
+	p := newPaheTestProvider(t, f)
+	session, _, err := p.resolveShow(paheTestCtx(t), 1)
+	if err != nil {
+		t.Fatalf("resolveShow: %v", err)
+	}
+	if session != "sess-right-year" {
+		t.Fatalf("session = %q, want sess-right-year (AniList year 2002)", session)
+	}
+
+	// Unknown AniList year: metadata-neutral, first-seen wins the tie.
+	f2 := newPaheFixture(t)
+	f2.searchData = f.searchData
+	p2 := newPaheTestProvider(t, f2)
+	session2, _, err := p2.resolveShow(paheTestCtx(t), 1)
+	if err != nil {
+		t.Fatalf("resolveShow without year: %v", err)
+	}
+	if session2 != "sess-wrong-year" {
+		t.Fatalf("session = %q, want sess-wrong-year (stable first-seen order)", session2)
+	}
+
+	// Nothing passing: the error reports what was seen, not just "no match".
+	f3 := newPaheFixture(t)
+	f3.searchData = `[{"id":9,"title":"Unrelated Show","type":"TV","year":2020,"session":"sess-x"}]`
+	p3 := newPaheTestProvider(t, f3)
+	_, _, err = p3.resolveShow(paheTestCtx(t), 1)
+	if err == nil || !strings.Contains(err.Error(), "no title match") {
+		t.Fatalf("err = %v, want a no-title-match error", err)
+	}
+	if !strings.Contains(err.Error(), "saw 1 sessioned hits") {
+		t.Fatalf("err = %v, want the seen-hit count for diagnosis", err)
+	}
+}
+
+// Anime-page verification: the top fuzzy candidate carrying another
+// show's AniList link is disqualified in favor of the ID-matching one;
+// when every candidate mismatches, nothing resolves (no match beats a
+// wrong show). Exact hits skip verification — the string is the guarantee.
+func TestAnimepahePageVerification(t *testing.T) {
+	f := newPaheFixture(t)
+	f.searchData = `[
+ {"id":1,"title":"Naruto!","type":"TV","episodes":220,"year":2002,"score":4.0,"session":"sess-impostor"},
+ {"id":2,"title":"Naruto?","type":"TV","episodes":220,"year":2002,"score":4.0,"session":"sess-real"}
+]`
+	f.animeLinks["sess-impostor"] = "999"
+	f.animeLinks["sess-real"] = "1"
+	p := newPaheTestProvider(t, f)
+	session, _, err := p.resolveShow(paheTestCtx(t), 1)
+	if err != nil {
+		t.Fatalf("resolveShow: %v", err)
+	}
+	if session != "sess-real" {
+		t.Fatalf("session = %q, want sess-real (impostor links AniList 999)", session)
+	}
+
+	// Every candidate mismatched: no match, and the error says so.
+	f2 := newPaheFixture(t)
+	f2.searchData = f.searchData
+	f2.animeLinks["sess-impostor"] = "999"
+	f2.animeLinks["sess-real"] = "1000"
+	p2 := newPaheTestProvider(t, f2)
+	_, _, err = p2.resolveShow(paheTestCtx(t), 1)
+	if err == nil || !strings.Contains(err.Error(), "none verified") {
+		t.Fatalf("err = %v, want a none-verified no-match error", err)
+	}
+
+	// Exact hit with a WRONG link still resolves: exact skips verification
+	// (zero extra fetches on the common path).
+	f3 := newPaheFixture(t)
+	f3.searchData = `[{"id":1571,"title":"Naruto","type":"TV","session":"anime-sess-1"}]`
+	f3.animeLinks["anime-sess-1"] = "999"
+	p3 := newPaheTestProvider(t, f3)
+	session, _, err = p3.resolveShow(paheTestCtx(t), 1)
+	if err != nil {
+		t.Fatalf("exact hit must resolve without verification: %v", err)
+	}
+	if session != "anime-sess-1" {
+		t.Fatalf("session = %q, want anime-sess-1", session)
 	}
 }
 
