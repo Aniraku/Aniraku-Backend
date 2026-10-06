@@ -97,6 +97,11 @@ func TestControlHookBlocksPrivateDials(t *testing.T) {
 		{"[::1]:9000", true},
 		{"[fd00::5]:443", true},
 		{"not-an-ip:80", true}, // unresolved address must fail closed
+		// Trusted relay subnet (deploy/mkissa-warp splice): allowed.
+		{"10.77.0.2:443", false},
+		// One address past the /30 is ordinary private space again.
+		{"10.77.0.4:443", true},
+		{"10.77.1.2:443", true},
 	}
 
 	for _, c := range cases {
@@ -104,6 +109,20 @@ func TestControlHookBlocksPrivateDials(t *testing.T) {
 		if (err != nil) != c.wantErr {
 			t.Errorf("Control(%q) error = %v, wantErr %v", c.address, err, c.wantErr)
 		}
+	}
+}
+
+// TestTrustedRelayIsNotPublicButIsDialable pins the split: IsPublicIP keeps
+// its strict answer for the mkissa relay address (it is RFC1918), while the
+// dial hook alone grants the exception.
+func TestTrustedRelayIsNotPublicButIsDialable(t *testing.T) {
+	t.Parallel()
+	ip := net.ParseIP("10.77.0.2")
+	if IsPublicIP(ip) {
+		t.Fatal("IsPublicIP(10.77.0.2) = true; the trusted-relay exception must not weaken the pure predicate")
+	}
+	if err := Control("tcp", "10.77.0.2:443", nil); err != nil {
+		t.Fatalf("Control(\"tcp\", \"10.77.0.2:443\") = %v, want nil (trusted relay)", err)
 	}
 }
 
