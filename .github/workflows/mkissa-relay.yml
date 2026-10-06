@@ -4,30 +4,43 @@ name: mkissa-relay
 # bridge queue (deploy/mkissa-relay-worker/worker.mjs), executes signed
 # engine calls with this runner's gate-clean US egress, and posts raw
 # engine lines back. One worker run loops for 5h45 (GitHub caps jobs at
-# 6h); the */5 schedule plus the concurrency chain below (exactly one
-# running + one queued) boots the successor within seconds of the
-# previous window, so the worker is nearly always live. Small scheduling
-# gaps are expected and covered: the backend falls back to the local
-# daemon whenever no worker answers in time.
+# 6h) and ARMS ITS OWN SUCCESSOR near the end of that window (the worker
+# POSTs workflow_dispatch with this job's GITHUB_TOKEN), so the chain
+# sustains itself without GitHub's scheduler — which is unreliable here
+# (an */5 cron measurably delivers only every few hours on this repo).
+# The */5 schedule below stays as a harmless backup; the concurrency
+# chain (1 running + 1 queued, never cancelled mid-window) boots the
+# successor within seconds. Scheduling holes are covered anyway: the
+# backend falls back to the local daemon whenever no worker answers.
 #
 # Secrets (repo, not in the tree): BRIDGE_URL, BRIDGE_TOKEN.
 # Dispatch manually with `gh workflow run mkissa-relay` to start a window
-# immediately; scheduled runs keep the chain going afterwards.
+# immediately. `gh workflow run mkissa-relay -f window_ms=180000` starts
+# a 3-minute test window whose self-arm proves the chain end to end.
 
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      window_ms:
+        description: "Worker window in ms (test hook; empty = default 5h45)"
+        required: false
+        default: ""
 
 # Never cancel the RUNNING worker (a killed window = a hole until the
-# next boot); newer scheduled runs only replace the queued spare, which
+# next boot); newer dispatches only replace the queued spare, which
 # GitHub does automatically at one pending job per group.
 concurrency:
   group: mkissa-relay
   cancel-in-progress: false
 
+# contents: read for checkout; actions: write so the worker can arm its
+# own successor via workflow_dispatch (GITHUB_TOKEN is allowed to create
+# workflow_dispatch runs — that event is exempt from anti-recursion).
 permissions:
   contents: read
+  actions: write
 
 jobs:
   worker:
@@ -46,4 +59,5 @@ jobs:
         env:
           BRIDGE_URL: ${{ secrets.BRIDGE_URL }}
           BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+          MAX_RUNTIME_MS: ${{ inputs.window_ms }}
         run: bun deploy/mkissa-relay-worker/worker.mjs
