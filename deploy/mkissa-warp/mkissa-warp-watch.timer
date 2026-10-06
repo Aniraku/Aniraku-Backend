@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the mkissa WARP watchdog every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+Persistent=true
+AccuracySec=1min
+Unit=mkissa-warp-watch.service
+
+[Install]
+WantedBy=timers.target
