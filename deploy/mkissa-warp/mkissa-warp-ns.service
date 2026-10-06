@@ -1,0 +1,13 @@
+[Unit]
+Description=mkissa WARP netns scaffolding (veth + forwarding rules + wg in ns)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/mkissa-warp-setup.sh
+ExecStop=/bin/sh -c '/usr/bin/ip netns del mkissawg 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target

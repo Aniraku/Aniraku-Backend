@@ -151,11 +151,20 @@ routes **only those API calls** through `third_party/relay/worker.mjs`
 (key-gated, path-restricted — never an open proxy). Video bytes, probes
 and playback stay direct. Unset = direct with silent skip on 403.
 Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
-Mkissa: set `MKISSA_API=https://<worker>/mkissa` (auth reuses
-`ANIRAKU_RELAY_KEY`); Go searches and the daemon's signed + bootstrap
-calls ride the existing `/mkissa` route transparently
-(method/headers/body preserved). Extractor file fetches stay direct.
-See `third_party/relay/README.md` for deploy.
+Mkissa: the gated signed calls ride a **local WARP splice** instead of the
+worker. The engine's `api.mkissa.net` resolves to `10.77.0.2` via compose
+`extra_hosts`; a Python TLS splice in the `mkissawg` network namespace
+(`deploy/mkissa-warp/`) pumps bytes to the real origin through a WARP
+tunnel that exists **only** inside that namespace. A dead tunnel can never
+blackhole shared Cloudflare anycast IPs for other providers (the
+2026-10-06 incident) — it just falls back to direct egress, where the
+breaker + resolve cache absorb the rate limit, and a watchdog flips routes
+back the moment a `warp=on` trace proves the data plane works again.
+`netguard.Control` exempts exactly `10.77.0.0/30` (this host's veth pair)
+so Go's search POSTs can dial the splice; `IsPublicIP` itself stays strict
+and every other private range stays blocked. `MKISSA_API` is retired (still
+honored if set). Extractor file fetches stay direct.
+See `deploy/mkissa-warp/README.md`.
 
 ## Adding a provider — checklist
 
