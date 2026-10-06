@@ -151,6 +151,10 @@ routes **only those API calls** through `third_party/relay/worker.mjs`
 (key-gated, path-restricted — never an open proxy). Video bytes, probes
 and playback stay direct. Unset = direct with silent skip on 403.
 Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
+Mkissa: set `MKISSA_API=https://<worker>/mkissa` (auth reuses
+`ANIRAKU_RELAY_KEY`); Go searches and the daemon's signed + bootstrap
+calls ride the existing `/mkissa` route transparently
+(method/headers/body preserved). Extractor file fetches stay direct.
 See `third_party/relay/README.md` for deploy.
 
 ## Adding a provider — checklist

@@ -94,6 +94,12 @@ type MkissaProvider struct {
 	slugs    map[string]*mkissaSlugEntry
 	resolved map[mkissaResolveKey]*mkissaResolvedEntry
 	daemon   *mkissaDaemon
+
+	// relayKey/relayed route api.mkissa.net through the operator relay
+	// (MKISSA_API + ANIRAKU_RELAY_KEY). The key is attached ONLY to relay
+	// calls — never to direct api.mkissa.net or file-host traffic.
+	relayKey string
+	relayed  bool
 }
 
 type mkissaSlugEntry struct {
@@ -126,7 +132,9 @@ type mkissaEdge struct {
 func NewMkissaProvider(log zerolog.Logger) *MkissaProvider {
 	// MKISSA_API reroutes api.mkissa.net through a relay (e.g. a
 	// Cloudflare Worker) when the server egress IP is throttled to zero.
-	// Only API calls are relayed (kilobytes); video stays direct.
+	// Only API calls are relayed (kilobytes); video stays direct. The
+	// worker key comes from ANIRAKU_RELAY_KEY and is attached solely to
+	// these relay calls (see doJSON + the daemon's signedPost).
 	host := strings.TrimSpace(os.Getenv("MKISSA_API"))
 	if host == "" {
 		host = mkissaAPIHost
@@ -138,6 +146,8 @@ func NewMkissaProvider(log zerolog.Logger) *MkissaProvider {
 		anilistURL: "https://graphql.aniraku.tech",
 		slugs:      make(map[string]*mkissaSlugEntry),
 		resolved:   make(map[mkissaResolveKey]*mkissaResolvedEntry),
+		relayKey:   strings.TrimSpace(os.Getenv("ANIRAKU_RELAY_KEY")),
+		relayed:    strings.TrimRight(host, "/") != mkissaAPIHost,
 	}
 	p.daemon = newMkissaDaemon(log, p)
 	return p
@@ -187,6 +197,9 @@ func (p *MkissaProvider) doJSON(ctx context.Context, payload any, out any) error
 		req.Header.Set(k, v)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if p.relayed && p.relayKey != "" {
+		req.Header.Set("X-Relay-Key", p.relayKey)
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return err

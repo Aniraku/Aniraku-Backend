@@ -13,7 +13,7 @@
 
 import crypto from "node:crypto";
 import readline from "node:readline";
-import { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery, extractSource } from "./providers/mkissa_dbg.js";
+import { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery, extractSource, relayKeyHeaders } from "./providers/mkissa_dbg.js";
 
 const API_URL = (process.env.MKISSA_API || "https://api.mkissa.net") + "/api";
 const LANE = "k7";
@@ -64,6 +64,7 @@ async function signedPost(variables) {
       Referer: "https://mkissa.to/",
       Origin: "https://mkissa.to",
       "x-build-id": String(l.buildId),
+      ...relayKeyHeaders(),
       Accept: "*/*",
       "Accept-Language": "en-US,en;q=0.9",
       "sec-fetch-dest": "empty",

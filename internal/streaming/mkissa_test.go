@@ -396,6 +396,48 @@ func TestMkissaRelayEnvOverride(t *testing.T) {
 	}
 }
 
+// Relay key plumbing: with MKISSA_API pointed at a worker, doJSON carries
+// X-Relay-Key; direct mode never sends it even when ANIRAKU_RELAY_KEY set
+// (the key must not leak to api.mkissa.net or file hosts).
+func TestMkissaRelayKeyHeader(t *testing.T) {
+	var gotKey, gotPath string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("X-Relay-Key")
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"data":{}}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	t.Setenv("MKISSA_API", srv.URL)
+	t.Setenv("ANIRAKU_RELAY_KEY", "k-relay")
+	p := NewMkissaProvider(zerolog.Nop())
+	p.client = srv.Client()
+	if p.apiBase != srv.URL+"/api" {
+		t.Fatalf("apiBase = %q, want relay + /api", p.apiBase)
+	}
+	var out map[string]any
+	if err := p.doJSON(mkissaTestCtx(t), map[string]any{"q": 1}, &out); err != nil {
+		t.Fatalf("doJSON via relay: %v", err)
+	}
+	if gotKey != "k-relay" || gotPath != "/api" {
+		t.Fatalf("key/path = %q/%q, want k-relay + /api", gotKey, gotPath)
+	}
+	// Direct mode: no key even with ANIRAKU_RELAY_KEY set.
+	t.Setenv("MKISSA_API", "")
+	gotKey = "unset-check"
+	p2 := NewMkissaProvider(zerolog.Nop())
+	p2.client = srv.Client()
+	p2.apiBase = srv.URL + "/api"
+	if err := p2.doJSON(mkissaTestCtx(t), map[string]any{"q": 1}, &out); err != nil {
+		t.Fatalf("doJSON direct: %v", err)
+	}
+	if gotKey != "" {
+		t.Fatalf("key %q leaked to direct endpoint", gotKey)
+	}
+}
+
 func TestMkissaThrottleBreaker(t *testing.T) {
 	b := &mkissaThrottleBreaker{cooldown: time.Hour, tripAfter: 2}
 	if b.blocked() {
