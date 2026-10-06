@@ -1,0 +1,184 @@
+name: mkissa-egress-probe
+
+# Manual probe: does a Cloudflare WARP egress pass mkissa's episode gate?
+#
+# Runs ONLY on workflow_dispatch. Three phases, all hitting
+# https://api.mkissa.net DIRECTLY (no relay worker involved):
+#   1. control  — unsigned episode probe from the runner's native egress.
+#   2. warp     — bring up a real WARP WireGuard tunnel (wgcf), route ONLY
+#                 api.mkissa.net + cloudflare trace IPs through it, probe,
+#                 rotating up to 3 fresh WARP exit IPs on failure.
+#   3. signed   — if (2) is clean, confirm with a SIGNED episode call via
+#                 the real engine code (bun) so we know sources come back.
+#
+# Every probe is unsigned/cheap (the gate answers without spending the
+# signed-call bucket); only the final confirmation spends signed calls,
+# and only when the gate already said yes.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: WARP egress probe (direct)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Probe native egress, then WARP tunnel (direct)
+        id: probe
+        run: |
+          set -uo pipefail
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+          BODY='{"query":"query($showId:String!,$translationType:VaildTranslationTypeEnumType!,$episodeString:String!){episode(showId:$showId,translationType:$translationType,episodeString:$episodeString){episodeString sourceUrls}}","variables":{"showId":"28bqqbrrcXyWyjFdk","translationType":"sub","episodeString":"8"}}'
+
+          classify() {
+            local b="$1"
+            case "$b" in
+              *NEED_CAPTCHA*) echo GATED_CAPTCHA ;;
+              *"Too many requests"*) echo GATED_RATE ;;
+              *CURL_FAIL*) echo CURL_FAIL ;;
+              *'"episode":null'*) echo OTHER ;;
+              *episodeString*) echo CLEAN ;;
+              *) echo UNKNOWN ;;
+            esac
+          }
+
+          probe() { # $1 = tag; verdict on stdout, log on stderr
+            local tag="$1" resp v
+            resp=$(curl -sS --max-time 25 -X POST https://api.mkissa.net/api \
+              -H 'Content-Type: application/json' \
+              -H "User-Agent: $UA" \
+              -H 'Referer: https://mkissa.to/' \
+              -H 'Origin: https://mkissa.to' \
+              -d "$BODY" 2>&1) || resp="CURL_FAIL:$resp"
+            resp="${resp:0:900}"
+            v=$(classify "$resp")
+            echo "=== [$tag] verdict=$v" >&2
+            echo "=== [$tag] body: $resp" >&2
+            printf '%s' "$v"
+          }
+
+          # ---- phase 1: control (native runner egress, no tunnel) ----
+          CTRL=$(probe native)
+          echo "RESULT_NATIVE=$CTRL"
+
+          # ---- phase 2: WARP tunnel ----
+          command -v wg-quick >/dev/null || sudo apt-get update -qq && sudo apt-get install -y -qq wireguard-tools
+
+          mkdir -p "$HOME/warp" && cd "$HOME/warp"
+
+          WURL=$(curl -s https://api.github.com/repos/ViRb3/wgcf/releases/latest | grep -oE 'https://[^"]+linux_amd64' | head -1) || true
+          if [ -n "${WURL:-}" ]; then
+            curl -sL -o wgcf "$WURL"
+          else
+            for v in v2.2.22 v2.2.15 v2.2.10; do
+              curl -sfL -o wgcf "https://github.com/ViRb3/wgcf/releases/download/$v/wgcf_${v#v}_linux_amd64" && break
+            done
+          fi
+          if [ ! -s wgcf ]; then
+            echo "WGCF_DOWNLOAD_FAIL"
+            echo "final_warp=NO_WGCF" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          chmod +x wgcf
+
+          register() {
+            rm -f wgcf-account.toml
+            local i
+            for i in 1 2 3; do
+              ./wgcf register --accept-tos && return 0
+              sleep 5
+            done
+            return 1
+          }
+
+          MK_IPS=$(getent ahostsv4 api.mkissa.net | awk '{print $1}' | sort -u)
+          CF_IPS=$(getent ahostsv4 www.cloudflare.com | awk '{print $1}' | sort -u | head -4)
+          ALLOWED=""
+          for ip in $MK_IPS $CF_IPS; do ALLOWED="$ALLOWED $ip/32,"; done
+          ALLOWED=${ALLOWED%,}
+          echo "routing through WARP:$ALLOWED"
+
+          FINAL=UNKNOWN
+          for attempt in 1 2 3; do
+            echo "--- WARP attempt $attempt"
+            if ! register; then echo "REGISTER_FAIL attempt=$attempt"; FINAL=REGISTER_FAIL; break; fi
+            ./wgcf generate || { echo WGCF_GENERATE_FAIL; FINAL=REGISTER_FAIL; break; }
+            sed -i "s|^AllowedIPs.*|AllowedIPs = $ALLOWED|" wgcf-profile.conf
+            sed -i '/^DNS/d' wgcf-profile.conf
+            sudo wg-quick up ./wgcf-profile.conf || { echo WG_UP_FAIL; FINAL=WG_UP_FAIL; break; }
+            sleep 2
+            echo "route check: $(ip route get $(echo "$MK_IPS" | awk '{print $1}'))"
+            echo "trace: $(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp=|^ip=|loc=' | tr '\n' ' ')"
+            V=$(probe "warp-try$attempt")
+            if [ "$V" = "CLEAN" ]; then FINAL=CLEAN; break; fi
+            sudo wg-quick down ./wgcf-profile.conf >/dev/null 2>&1 || true
+            sleep 3
+          done
+          echo "RESULT_WARP=$FINAL"
+          echo "final_warp=$FINAL" >> "$GITHUB_OUTPUT"
+
+          # ---- phase 3: signed confirmation (only when gate said yes) ----
+          if [ "$FINAL" = "CLEAN" ]; then
+            echo "gate passed — running SIGNED episode call via engine code"
+            cd "$GITHUB_WORKSPACE/third_party/mkissa-engine"
+            cat > probe_signed.mjs <<'JS'
+          import crypto from "node:crypto";
+          import { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery } from "./providers/mkissa_dbg.js";
+          (async () => {
+            const API = "https://api.mkissa.net";
+            const QUERY = episodeQuery();
+            const QH = crypto.createHash("sha256").update(QUERY).digest("hex");
+            let lane;
+            try { lane = await getLaneKey("k7"); console.log("LANE ok"); }
+            catch (e) { console.log("LANE FAIL " + (e.message || e)); return; }
+            const ext = { persistedQuery: { version: 1, sha256Hash: QH }, k: "k7", aaReq: makeAaReq(lane.key, lane.epoch, lane.buildId, QH, "k7") };
+            const ctl = new AbortController();
+            const t = setTimeout(() => ctl.abort(), 25000);
+            let res;
+            try {
+              res = await fetch(API + "/api", {
+                method: "POST",
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                  "Content-Type": "application/json",
+                  Referer: "https://mkissa.to/",
+                  Origin: "https://mkissa.to",
+                  "x-build-id": String(lane.buildId),
+                  Accept: "*/*",
+                },
+                body: JSON.stringify({ query: QUERY, variables: { showId: "28bqqbrrcXyWyjFdk", translationType: "sub", episodeString: "8" }, extensions: ext }),
+                signal: ctl.signal,
+              });
+            } catch (e) { console.log("POST FAIL " + e.name + ":" + e.message); return; } finally { clearTimeout(t); }
+            const text = await res.text();
+            console.log("EP-STATUS=" + res.status + " LEN=" + text.length);
+            try {
+              const j = JSON.parse(text);
+              console.log("ERRORS=" + (((j.errors || []).map((e) => e.message).join(" | ")) || "(none)"));
+              if (j.data?.tobeparsed) {
+                const p = decryptTobeparsed(j.data.tobeparsed, lane.key);
+                const arr = (p.episode && p.episode.sourceUrls) || p.sourceUrls || [];
+                console.log("SOURCES=" + arr.length);
+                for (const s of arr) console.log("  - " + (s.sourceName || s.type || "?"));
+              } else if (j.data?.episode) {
+                console.log("CLEARTEXT episode: " + JSON.stringify(j.data.episode).slice(0, 300));
+              }
+            } catch (e) { console.log("BODY-HEAD=" + text.slice(0, 300)); }
+          })();
+          JS
+            timeout 120 bun probe_signed.mjs || echo "SIGNED_PROBE_EXIT:$?"
+            rm -f probe_signed.mjs
+          fi
+
+      - name: Teardown
+        if: always()
+        run: sudo wg-quick down "$HOME/warp/wgcf-profile.conf" >/dev/null 2>&1 || true
