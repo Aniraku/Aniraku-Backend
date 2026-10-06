@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
@@ -39,15 +40,80 @@ type mkissaDaemon struct {
 	stdin   io.WriteCloser
 	pending map[uint64]chan mkissaDaemonResp
 	nextID  uint64
+	// bridgeQ holds signed jobs waiting for the relay worker (see
+	// mkissa_bridge.go); guarded by mu like pending.
+	bridgeQ []mkissaBridgeJob
 }
 
 func newMkissaDaemon(log zerolog.Logger, p *MkissaProvider) *mkissaDaemon {
-	return &mkissaDaemon{log: log, provider: p, pending: map[uint64]chan mkissaDaemonResp{}}
+	d := &mkissaDaemon{log: log, provider: p, pending: map[uint64]chan mkissaDaemonResp{}}
+	// Publish for the bridge's poll/deliver entry points (last daemon wins
+	// — prod constructs exactly one provider).
+	registerMkissaBridgeDaemon(d)
+	return d
 }
 
-// Call sends one episode request to the daemon, starting (or restarting)
-// it on demand.
+// Call resolves one episode, preferring the relay bridge when
+// ANIRAKU_BRIDGE_TOKEN enables it: the signed call then leaves from the
+// GitHub runner's gate-clean US egress instead of this host. Transport
+// trouble of any kind (queue full, silent worker, garbage answer) falls
+// back to the local daemon; a decoded engine verdict does not — the
+// engine said what it said. Only a caller whose own context is done
+// skips the fallback (there is no time left for a local attempt either).
 func (d *mkissaDaemon) Call(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
+	if MkissaBridgeToken() != "" {
+		resp, err := d.callBridge(ctx, showID, audio, epStr)
+		if err == nil {
+			srcs, derr := decodeDaemonResp(resp, epStr)
+			switch {
+			case derr == nil:
+				return srcs, nil
+			case ctx.Err() != nil:
+				return nil, derr
+			case errors.Is(derr, errBridgeMalformed), errors.Is(derr, errBridgeWorker):
+				d.log.Warn().Err(derr).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+					Msg("mkissa: relay bridge trouble, falling back to local engine")
+			default:
+				return nil, derr
+			}
+		} else if ctx.Err() != nil {
+			return nil, err
+		} else {
+			d.log.Warn().Err(err).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+				Msg("mkissa: relay bridge unavailable, falling back to local engine")
+		}
+	}
+	return d.callLocal(ctx, showID, audio, epStr)
+}
+
+// callBridge queues the signed job and waits for the worker's answer,
+// bounded by the caller's context and mkissaBridgeWait.
+func (d *mkissaDaemon) callBridge(ctx context.Context, showID, audio, epStr string) (mkissaDaemonResp, error) {
+	started := time.Now()
+	id, ch, err := d.bridgeSend(ctx, showID, audio, epStr)
+	if err != nil {
+		return mkissaDaemonResp{}, err
+	}
+	bctx, cancel := context.WithTimeout(ctx, mkissaBridgeWait)
+	defer cancel()
+	select {
+	case <-bctx.Done():
+		d.abandon(id)
+		if ctx.Err() != nil {
+			return mkissaDaemonResp{}, ctx.Err()
+		}
+		return mkissaDaemonResp{}, fmt.Errorf("mkissa: relay worker did not answer within %s", mkissaBridgeWait)
+	case r := <-ch:
+		d.log.Info().Uint64("callId", id).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+			Int64("ms", time.Since(started).Milliseconds()).
+			Str("engineErr", firstNonEmpty(r.out.Error, errText(r.err))).Msg("mkissa: engine call returned (bridge)")
+		return r, nil
+	}
+}
+
+// callLocal is the pre-bridge path: one request straight to the persistent
+// local daemon, starting (or restarting) it on demand.
+func (d *mkissaDaemon) callLocal(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	started := time.Now()
 	id, ch, err := d.send(ctx, showID, audio, epStr)
 	if err != nil {
@@ -69,22 +135,29 @@ func (d *mkissaDaemon) Call(ctx context.Context, showID, audio, epStr string) ([
 		d.log.Info().Uint64("callId", id).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
 			Int64("ms", time.Since(started).Milliseconds()).
 			Str("engineErr", firstNonEmpty(r.out.Error, errText(r.err))).Msg("mkissa: engine call returned")
-		if r.err != nil {
-			return nil, r.err
-		}
-		if r.out.Error != "" {
-			return nil, fmt.Errorf("mkissa: engine error: %s", r.out.Error)
-		}
-		for _, res := range r.out.Results {
-			if res.Episode == epStr {
-				if res.Error != "" {
-					return nil, fmt.Errorf("mkissa: episode %s: %s", epStr, res.Error)
-				}
-				return res.Sources, nil
-			}
-		}
-		return nil, fmt.Errorf("mkissa: engine returned no result for episode %s", epStr)
+		return decodeDaemonResp(r, epStr)
 	}
+}
+
+// decodeDaemonResp turns one daemon/bridge response into episode sources.
+// Shared by both transports so a bridge answer is interpreted exactly
+// like a local one.
+func decodeDaemonResp(r mkissaDaemonResp, epStr string) ([]mkissaEngineSource, error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	if r.out.Error != "" {
+		return nil, fmt.Errorf("mkissa: engine error: %s", r.out.Error)
+	}
+	for _, res := range r.out.Results {
+		if res.Episode == epStr {
+			if res.Error != "" {
+				return nil, fmt.Errorf("mkissa: episode %s: %s", epStr, res.Error)
+			}
+			return res.Sources, nil
+		}
+	}
+	return nil, fmt.Errorf("mkissa: engine returned no result for episode %s", epStr)
 }
 
 func errText(err error) string {

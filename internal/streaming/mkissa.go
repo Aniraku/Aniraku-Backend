@@ -542,35 +542,37 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 // Engine spawn politeness: api.mkissa.net throttles per egress IP ("try
 // again in N seconds"), a bucket shared by ALL our traffic. Concurrent
 // collectors must never stampede it, so whole engine runs are serialized
-// globally with a gap between them; rate-limit errors get one extra
-// Go-side retry after N+1s (the engine also retries internally, each
-// attempt now paced at the demanded N plus a 1.5s margin). Under deep
-// concurrency later runs fail clean on the fan-out deadline and the
-// other providers cover.
+// globally with a gap between them. There is deliberately NO Go-side
+// rate-limit retry (mkissaRateRetries=0): one attempt per run, with the
+// engine's own internal retries staying paced at the demanded N plus a
+// 1.5s margin. Under deep concurrency runs fail clean on the fan-out
+// deadline and the other providers cover.
 //
 // The gap must be >= mkissa's own demanded spacing: production's literal
 // message is "try again in 2 seconds", and the previous 1500ms gap sat
 // under it — calls kept colliding, two consecutive hits tripped the
-// breaker, and mkissa vanished for the whole 20-minute cooldown even
-// though single calls demonstrably succeed from this egress.
+// breaker, and mkissa vanished for the whole cooldown even though single
+// calls demonstrably succeed from this egress. 4000ms keeps even a
+// cold local daemon comfortably above the demanded 2s.
 var (
-	mkissaEngineGap   = 2500 * time.Millisecond
+	mkissaEngineGap   = 4000 * time.Millisecond
 	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
 	mkissaRateExtra   = 1000 * time.Millisecond
-	mkissaRateRetries = 1
+	mkissaRateRetries = 0
 )
 
 // Throttle circuit breaker: the signed-call bucket is per egress IP,
-// shared by all traffic. Three consecutive throttle-class RUN failures
-// (a run = up to two whole engine Calls, never single attempts) trip a
-// short cooldown that skips engine spawns entirely (resolve cache still
-// serves); one success resets it. Without this the fan-out hammers a dry
-// bucket forever and the provider never recovers. The cooldown used to be
-// 20 minutes with tripAfter=2, but production showed mkissa's own penalty
-// is 1-2 seconds and the bucket recovers within a minute — it was the
-// long self-imposed rest, not the upstream throttle, that kept Kissy
-// absent most of the time (2026-10-06).
-var mkissaBreaker = &mkissaThrottleBreaker{cooldown: 5 * time.Minute, tripAfter: 3}
+// shared by all traffic. Two consecutive throttle-class RUN failures
+// (a run = one whole engine Call now that Go-side retries are off) trip a
+// 10-minute cooldown that skips engine calls entirely (resolve cache
+// still serves); one success resets it. Without this the fan-out hammers
+// a dry bucket forever and the provider never recovers. The knobs moved
+// a lot on 2026-10-06: 20 minutes was far longer than mkissa's own
+// 1-2 second penalty and kept Kissy absent for hours; 5 minutes/3 was too
+// forgiving and let a flapping bucket churn. 10 minutes/2 rests on the
+// first unlucky pair and forgets quickly — the relay bridge now carries
+// the hot path off-runner, so the local path only needs to be polite.
+var mkissaBreaker = &mkissaThrottleBreaker{cooldown: 10 * time.Minute, tripAfter: 2}
 
 type mkissaThrottleBreaker struct {
 	mu          sync.Mutex
@@ -720,9 +722,10 @@ func releaseEngine() {
 	<-mkissaEngineSlot
 }
 
-// runEngine sends one request to the persistent daemon (plus the Go-side
-// rate-limit retry). Whole runs stay serialized globally with a gap, and
-// the lane key persists daemon-side across requests.
+// runEngine sends one request through daemon.Call (relay bridge first
+// when enabled, local daemon otherwise). Whole runs stay serialized
+// globally with a gap, and the lane key persists daemon-side across
+// requests.
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
 	// Breaker first: never spend fan-out time (or bucket) while cooling.
 	if mkissaBreaker.blocked() {
@@ -760,11 +763,11 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 		case <-time.After(time.Duration(secs)*time.Second + mkissaRateExtra):
 		}
 	}
-	// Record exactly ONCE per run. The old per-attempt recording let a
-	// single call whose internal retries all hit the shared per-IP
-	// throttle trip the breaker by itself, blacking mkissa out for the
-	// whole cooldown; three whole runs failing back-to-back is what a
-	// genuinely dry bucket looks like.
+	// Record exactly ONCE per run. Per-attempt recording let a single
+	// call whose internal retries all hit the shared per-IP throttle trip
+	// the breaker by itself, blacking mkissa out for the whole cooldown;
+	// two whole runs failing back-to-back is what a genuinely dry bucket
+	// looks like.
 	mkissaBreaker.record(false, mkissaThrottleErr(lastErr))
 	return nil, lastErr
 }
