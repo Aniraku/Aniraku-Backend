@@ -17,6 +17,9 @@ name: mkissa-relay
 # Dispatch manually with `gh workflow run mkissa-relay` to start a window
 # immediately. `gh workflow run mkissa-relay -f window_ms=180000` starts
 # a 3-minute test window whose self-arm proves the chain end to end.
+# GITHUB_TOKEN must be passed into the step explicitly — it is NOT part
+# of the runner's default environment, and without it the worker cannot
+# arm its successor.
 
 on:
   schedule:
@@ -60,4 +63,7 @@ jobs:
           BRIDGE_URL: ${{ secrets.BRIDGE_URL }}
           BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
           MAX_RUNTIME_MS: ${{ inputs.window_ms }}
+          # Not a default step env — without it the worker can't arm
+          # its successor and the chain would die with this window.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bun deploy/mkissa-relay-worker/worker.mjs
