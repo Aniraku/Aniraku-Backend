@@ -4,7 +4,8 @@
 # Runs on the host but performs EVERY state change inside the mkissawg
 # namespace:
 #   1. refresh api.mkissa.net IPs (Cloudflare rotates DNS answers)
-#   2. prove the tunnel with a real warp=on trace from inside the namespace
+#   2. prove the tunnel with a real HTTP round trip to api.mkissa.net
+#      from inside the namespace (its only AllowedIPs traffic)
 #   3. flip mkissa routes: tunnel when healthy, direct fallback otherwise
 #   4. rate-limited WARP re-registration when Cloudflare stops answering
 #
@@ -66,15 +67,25 @@ bounce_wg() {
   sleep 1
 }
 
-tunnel_healthy() {
-  # full data-plane proof from inside the namespace
-  local tip out
-  tip=$(getent ahostsv4 www.cloudflare.com 2>/dev/null | awk '{print $1}' | sort -u | head -1)
-  [ -n "$tip" ] || return 1
-  ns ip route replace "${tip}/32" dev wgcf 2>/dev/null || return 1
-  out=$(ns curl -s -m 6 -w '|code:%{http_code}' "https://$tip/cdn-cgi/trace" \
-        -H 'Host: www.cloudflare.com' 2>&1) || true
-  case "$out" in *warp=on*) return 0 ;; *) return 1 ;; esac
+tunnel_healthy() { # $1 = mkissa IPs
+  # Full data-plane proof for the ONLY traffic this tunnel carries: a real
+  # HTTP round trip to api.mkissa.net with its routes pinned to wgcf.
+  # The old test curled a Cloudflare trace IP that is NOT in AllowedIPs;
+  # WireGuard drops such packets itself, so the test could never pass and
+  # every run reported "unhealthy" no matter what Cloudflare did (proven
+  # 2026-10-06: same session, mkissa IPs routed into the tunnel -> HTTP
+  # 403 + application response, transfer counters moving).
+  local ip out
+  [ -n "${1// /}" ] || return 1
+  for ip in $1; do
+    # shellcheck disable=SC2086
+    ns ip route replace "${ip}/32" dev wgcf 2>/dev/null || return 1
+  done
+  out=$(ns curl -s -m 8 -o /dev/null -w '%{http_code}' "https://$MK_HOST/" 2>&1) || true
+  case "$out" in
+    [1-5][0-9][0-9]) return 0 ;;  # any HTTP status proves data crossed the tunnel
+    *) return 1 ;;
+  esac
 }
 
 reg_allowed() {
@@ -126,17 +137,17 @@ main() {
   sync_allowedips "$ips" || log "AllowedIPs sync failed (continuing)"
   refresh_endpoint
 
-  if tunnel_healthy; then
+  if tunnel_healthy "$ips"; then
     mode=tunnel
   else
     log "tunnel unhealthy on first test; bouncing"
     bounce_wg
-    if tunnel_healthy; then
+    if tunnel_healthy "$ips"; then
       mode=tunnel
     else
       log "still unhealthy; attempting paced rotation"
       rotate_warp "$ips"
-      if tunnel_healthy; then
+      if tunnel_healthy "$ips"; then
         mode=tunnel
       else
         mode=direct
