@@ -276,7 +276,9 @@ try {
 } catch {}
 // Inside Actions a window that failed to arm its successor means the
 // chain dies with it — exit red so the break is visible, not silent.
-if (armAvailable && !armed) {
+// GITHUB_ACTIONS is the runner's own marker: local runs (no token to
+// arm with) still exit 0.
+if (process.env.GITHUB_ACTIONS && !armed) {
   console.error("[worker] FAILED to arm the next window — chain broken, dispatch manually: gh workflow run mkissa-relay");
   process.exit(4);
 }
