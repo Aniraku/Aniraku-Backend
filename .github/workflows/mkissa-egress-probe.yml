@@ -45,6 +45,10 @@ jobs:
               *NEED_CAPTCHA*) echo GATED_CAPTCHA ;;
               *"Too many requests"*) echo GATED_RATE ;;
               *CURL_FAIL*) echo CURL_FAIL ;;
+              # AA_CRYPTO_MISSING = the IP risk check PASSED and the server
+              # is now only asking for the aaReq signature our unsigned
+              # probe deliberately omits. Gate open.
+              *AA_CRYPTO_MISSING*) echo GATE_OPEN ;;
               *'"episode":null'*) echo OTHER ;;
               *episodeString*) echo CLEAN ;;
               *) echo UNKNOWN ;;
@@ -127,7 +131,7 @@ jobs:
           echo "final_warp=$FINAL" >> "$GITHUB_OUTPUT"
 
           # ---- phase 3: signed confirmation (only when gate said yes) ----
-          if [ "$FINAL" = "CLEAN" ]; then
+          if [ "$FINAL" = "CLEAN" ] || [ "$FINAL" = "GATE_OPEN" ]; then
             echo "gate passed — running SIGNED episode call via engine code"
             cd "$GITHUB_WORKSPACE/third_party/mkissa-engine"
             cat > probe_signed.mjs <<'JS'
