@@ -103,7 +103,11 @@ async function handleEpisode(showId, audio, ep) {
     } catch (err) {
       lastErr = err;
       const rate = /try again in (\d+) seconds?/.exec(err.raw || err.message || "");
-      if (rate) await sleep(Number(rate[1]) * 1000 + 250);
+      // mkissa's "try again in N seconds" understates the real spacing:
+      // N+250ms kept getting throttled again in prod (2026-10-06), each
+      // wasted retry draining the shared per-IP bucket further. Wait the
+      // demanded N plus a comfortable margin before the internal retry.
+      if (rate) await sleep(Number(rate[1]) * 1000 + 1500);
       else if (err.code === "NEED_CAPTCHA" || err.code?.startsWith("HTTP_")) {
         await sleep(1200 + attempt * 800);
         try { await ensureLane(true); } catch {}
