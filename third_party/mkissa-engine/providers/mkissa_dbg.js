@@ -6,6 +6,19 @@ const __name = (fn, _) => fn;
 const UA4 = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 const REFERER = "https://mkissa.to";
 const API = process.env.MKISSA_API || "https://api.mkissa.net";
+const MKISSA_DEFAULT_API = "https://api.mkissa.net";
+// relayKeyHeaders attaches the worker auth header only when api.mkissa.net
+// is explicitly rerouted through the relay (MKISSA_API set to a non-default
+// endpoint) and the key is present. Spread solely into the api.* wrappers
+// and the bootstrap call — generic fetchers hitting file hosts (mp4upload,
+// ok.ru, …) must never carry this key.
+function relayKeyHeaders() {
+  const api = (process.env.MKISSA_API || "").trim().replace(/\/+$/, "");
+  const key = (process.env.ANIRAKU_RELAY_KEY || "").trim();
+  if (api && api !== MKISSA_DEFAULT_API && key) return { "X-Relay-Key": key };
+  return {};
+}
+__name(relayKeyHeaders, "relayKeyHeaders");
 const API_URL = `${API}/api`;
 const CDN_ROOT = "https://cdn.mkissa.net/all/mk";
 const ANIZIP = "https://api.ani.zip/mappings";
@@ -127,9 +140,11 @@ async function sessionFetch(url, options = {}) {
 __name(sessionFetch, "sessionFetch");
 
 async function apiSessionFetch(url, options = {}) {
+  const headers = { ...relayKeyHeaders(), ...(options.headers || {}) };
   try {
     const res = await wreqFetch(url, {
       ...options,
+      headers,
       warm: [{
         url: `${REFERER}/`,
         headers: { Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" },
@@ -708,6 +723,7 @@ async function fetchBootstrap(lane = CONTENT_LANE, force = false) {
     for (const epoch of currentEpochs()) {
       const res = await sessionFetch(`${API}/client-crypto/v1/bootstrap?buildId=${encodeURIComponent(config.buildId)}&k=${encodeURIComponent(lane)}`, {
         headers: {
+          ...relayKeyHeaders(),
           "Referer": `${REFERER}/`,
           "Origin": REFERER,
           "x-build-id": config.buildId,
@@ -1734,4 +1750,4 @@ const mkissaDefault = {
 export default mkissaDefault;
 export { handleEpisodes as getEpisodes };
 
-export { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery, discoverEpisodeQuery, extractSource, resolveMkissaId, searchMkissa, getEpisodeSources, apiEpisode };
+export { getLaneKey, makeAaReq, decryptTobeparsed, episodeQuery, discoverEpisodeQuery, extractSource, resolveMkissaId, searchMkissa, getEpisodeSources, apiEpisode, relayKeyHeaders };
