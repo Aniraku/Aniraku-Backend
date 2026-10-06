@@ -110,9 +110,12 @@ only — never wrapped URLs).
   the lane key and discovery warm across requests. It talks **POST
   only** — GET from datacenter egress answers `NEED_CAPTCHA`, POST
   does not (no captcha, no token, no relay). Go serializes runs with a
-  1.5 s gap, retries the rate message, and trips a breaker after two
-  consecutive throttle-class failures (20 min cool-down) instead of
-  stampeding a shared per-IP bucket.
+  4 s gap (mkissa demands ≥ 2 s), performs a single attempt per run (the
+  engine's own internal retries stay paced at the demanded N + 1.5 s),
+  and trips a breaker after two consecutive throttle-class failures
+  (10 min cool-down) instead of stampeding a shared per-IP bucket. The
+  signed call itself prefers the relay bridge below; the local daemon is
+  its fallback.
 - **Mkissa is direct-only.** Only sources with a direct `extractedUrl`
   (m3u8/mp4) are listed; pure embeds are skipped. ok.ru and the
   allanime clock are the live extractors; mp4upload/streamsb/streamlare
@@ -151,8 +154,9 @@ routes **only those API calls** through `third_party/relay/worker.mjs`
 (key-gated, path-restricted — never an open proxy). Video bytes, probes
 and playback stay direct. Unset = direct with silent skip on 403.
 Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
-Mkissa: the gated signed calls ride a **local WARP splice** instead of the
-worker. The engine's `api.mkissa.net` resolves to `10.77.0.2` via compose
+Mkissa's gated signed calls prefer the **relay bridge** (next section);
+the WARP splice below is their local fallback. The engine's
+`api.mkissa.net` resolves to `10.77.0.2` via compose
 `extra_hosts`; a Python TLS splice in the `mkissawg` network namespace
 (`deploy/mkissa-warp/`) pumps bytes to the real origin through a WARP
 tunnel that exists **only** inside that namespace. A dead tunnel can never
@@ -167,6 +171,41 @@ so Go's search POSTs can dial the splice; `IsPublicIP` itself stays strict
 and every other private range stays blocked. `MKISSA_API` is retired (still
 honored if set). Extractor file fetches stay direct.
 See `deploy/mkissa-warp/README.md`.
+
+## The mkissa relay bridge (GitHub Actions pull-worker)
+
+mkissa's signed-call gate is per egress IP: the VPS (and every WARP exit
+from this region) escalates to `NEED_CAPTCHA`, while the GitHub Actions
+runner's native US egress answered `GATE_OPEN` with signed sources on
+every probe (2026-10-06). Runners accept no inbound traffic, so the call
+is *pulled* instead:
+
+1. `runEngine` → `daemon.Call` enqueues `{id, showId, audio, ep}` on an
+   in-process queue (`internal/streaming/mkissa_bridge.go`; cap 32,
+   90 s TTL) and waits up to 15 s.
+2. The worker (`deploy/mkissa-relay-worker/worker.mjs`, kept alive by
+   `.github/workflows/mkissa-relay.yml` — 5 h 45 m windows re-armed by a
+   `*/5 min` schedule plus a 1-running/1-queued concurrency chain) polls
+   `POST /api/v1/internal/mkissa/poll` about once a second, pipes the
+   job through the vendored `mkissa_daemon.mjs` on the runner's egress,
+   and posts the raw response line to
+   `POST /api/v1/internal/mkissa/result`.
+3. The matching pending entry wakes and the sources flow out. Typical
+   round trip: 2-8 s.
+
+Both endpoints are Bearer-gated with `ANIRAKU_BRIDGE_TOKEN` and answer
+404 while it is unset; the GitHub side stores `BRIDGE_URL` and
+`BRIDGE_TOKEN` as repo secrets (never in the tree). Every bridge failure
+— queue full, silent worker, malformed answer — falls back to the local
+daemon above (WARP splice/direct, breaker + resolve cache absorbing), so
+a scheduling gap in the worker chain costs latency, not availability. A
+decoded engine verdict such as `NEED_CAPTCHA` is never re-tried across
+transports; only transport-level trouble triggers the fallback. Jobs are
+delivered at-least-once (a worker dying mid-job is covered by the next),
+with late/duplicate answers dropped by id. The vidnest relay
+(`ANIRAKU_RELAY_URL/KEY`, `third_party/relay/worker.mjs`) is a separate
+mechanism and untouched by all of this.
+See `deploy/mkissa-relay-worker/README.md` for the runbook.
 
 ## Adding a provider — checklist
 

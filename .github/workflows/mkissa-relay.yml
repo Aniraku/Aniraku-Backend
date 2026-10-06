@@ -1,0 +1,49 @@
+name: mkissa-relay
+
+# Persistent pull-worker: the GitHub runner polls the backend's mkissa
+# bridge queue (deploy/mkissa-relay-worker/worker.mjs), executes signed
+# engine calls with this runner's gate-clean US egress, and posts raw
+# engine lines back. One worker run loops for 5h45 (GitHub caps jobs at
+# 6h); the */5 schedule plus the concurrency chain below (exactly one
+# running + one queued) boots the successor within seconds of the
+# previous window, so the worker is nearly always live. Small scheduling
+# gaps are expected and covered: the backend falls back to the local
+# daemon whenever no worker answers in time.
+#
+# Secrets (repo, not in the tree): BRIDGE_URL, BRIDGE_TOKEN.
+# Dispatch manually with `gh workflow run mkissa-relay` to start a window
+# immediately; scheduled runs keep the chain going afterwards.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# Never cancel the RUNNING worker (a killed window = a hole until the
+# next boot); newer scheduled runs only replace the queued spare, which
+# GitHub does automatically at one pending job per group.
+concurrency:
+  group: mkissa-relay
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    name: Bridge worker (pull)
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install engine deps
+        run: bun install --cwd third_party/mkissa-engine --production --silent
+
+      - name: Run pull-worker
+        env:
+          BRIDGE_URL: ${{ secrets.BRIDGE_URL }}
+          BRIDGE_TOKEN: ${{ secrets.BRIDGE_TOKEN }}
+        run: bun deploy/mkissa-relay-worker/worker.mjs
