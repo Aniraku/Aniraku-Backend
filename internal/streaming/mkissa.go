@@ -537,11 +537,17 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 // Go-side retry after N+1s (the engine already retries 3x internally with
 // shorter pauses). Under deep concurrency later runs fail clean on the
 // fan-out deadline and the other providers cover.
+//
+// The gap must be >= mkissa's own demanded spacing: production's literal
+// message is "try again in 2 seconds", and the previous 1500ms gap sat
+// under it — calls kept colliding, two consecutive hits tripped the
+// breaker, and mkissa vanished for the whole 20-minute cooldown even
+// though single calls demonstrably succeed from this egress.
 var (
-	mkissaEngineGap   = 1500 * time.Millisecond
+	mkissaEngineGap   = 2500 * time.Millisecond
 	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
 	mkissaRateExtra   = 1000 * time.Millisecond
-	mkissaRateRetries = 1
+	mkissaRateRetries = 2
 )
 
 // Throttle circuit breaker: the signed-call bucket is per egress IP,
