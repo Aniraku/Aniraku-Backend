@@ -31,7 +31,20 @@ const POLL_MS = 1000;
 const HEARTBEAT_EVERY = 30; // ~30s of idle polls between log lines
 const RESULT_TIMEOUT_MS = 45_000; // engine self-answers within 35s
 const POLL_LIMIT = 4;
-const MAX_RUNTIME_MS = Number(process.env.MAX_RUNTIME_MS || 5.75 * 60 * 60 * 1000); // 5h45
+// Worker window: default 5h45 (under GitHub's 6h job cap), overridable
+// for chain tests. Guarded against NaN so a bad input can't zero it.
+const rawMax = Number(process.env.MAX_RUNTIME_MS);
+const MAX_RUNTIME_MS = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 5.75 * 60 * 60 * 1000;
+// Self-re-arm: the repo's GitHub-schedule delivery is unreliable (an
+// */5 cron measurably fires only every few hours here), so the worker
+// dispatches its OWN successor ~2min before its window ends using the
+// job's GITHUB_TOKEN (workflow_dispatch is exempt from GitHub's
+// GITHUB_TOKEN anti-recursion rule). The successor inherits no inputs
+// => default full-length window => the chain sustains itself with no
+// dependence on GitHub's scheduler at all.
+const ARM_LEAD_MS = 2 * 60 * 1000;
+const ARM_RETRY_MS = 30_000;
+const WORKFLOW_FILE = "mkissa-relay.yml";
 
 if (!BASE || !TOKEN) {
   console.error("[worker] BRIDGE_URL and BRIDGE_TOKEN are required");
@@ -160,6 +173,38 @@ async function postResult(id, line, errMsg) {
   }
 }
 
+// armNextWindow asks GitHub for one more worker run (workflow_dispatch,
+// no inputs => default full window). Returns false on transient failure
+// so the loop can retry; a run that ends without arming exits 4 (a red
+// run is the alarm that the chain is broken).
+async function armNextWindow() {
+  const token = process.env.GITHUB_TOKEN;
+  const repo = process.env.GITHUB_REPOSITORY;
+  if (!token || !repo) return null; // local run: nothing to arm
+  try {
+    const res = await fetch(`https://api.github.com/repos/${repo}/actions/workflows/${WORKFLOW_FILE}/dispatches`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/vnd.github+json",
+        "content-type": "application/json",
+        "x-github-api-version": "2022-11-28",
+      },
+      body: JSON.stringify({ ref: "main" }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (res.status === 204) {
+      console.log("[worker] armed the next window (workflow_dispatch accepted)");
+      return true;
+    }
+    console.error(`[worker] arm dispatch failed: HTTP ${res.status} ${(await res.text().catch(() => "")).slice(0, 200)}`);
+    return false;
+  } catch (e) {
+    console.error(`[worker] arm dispatch error: ${e?.message || e}`);
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------- loop
 
 const startedAt = Date.now();
@@ -167,10 +212,21 @@ const deadline = startedAt + MAX_RUNTIME_MS;
 let polls = 0;
 let jobsDone = 0;
 let lastDisabledLog = 0;
+let armed = false;
+let nextArmAt = 0;
+let armAvailable = true; // false once we know no token exists (local runs)
 
 console.log(`[worker] start bridge=${BASE} window=${Math.round(MAX_RUNTIME_MS / 60000)}m`);
 
 while (Date.now() < deadline) {
+  // Self-re-arm near the end of the window (also immediate for tiny
+  // test windows whose whole span is under the lead time).
+  if (!armed && armAvailable && Date.now() >= deadline - ARM_LEAD_MS && Date.now() >= nextArmAt) {
+    const res = await armNextWindow();
+    if (res === null) armAvailable = false;
+    else if (res) armed = true;
+    else nextArmAt = Date.now() + ARM_RETRY_MS;
+  }
   let data;
   try {
     data = await post("/poll", { limit: POLL_LIMIT });
@@ -218,4 +274,10 @@ console.log(`[worker] window complete (${Math.round((Date.now() - startedAt) / 6
 try {
   if (daemon) daemon.kill();
 } catch {}
+// Inside Actions a window that failed to arm its successor means the
+// chain dies with it — exit red so the break is visible, not silent.
+if (armAvailable && !armed) {
+  console.error("[worker] FAILED to arm the next window — chain broken, dispatch manually: gh workflow run mkissa-relay");
+  process.exit(4);
+}
 process.exit(0);

@@ -184,11 +184,14 @@ is *pulled* instead:
    in-process queue (`internal/streaming/mkissa_bridge.go`; cap 32,
    90 s TTL) and waits up to 15 s.
 2. The worker (`deploy/mkissa-relay-worker/worker.mjs`, kept alive by
-   `.github/workflows/mkissa-relay.yml` — 5 h 45 m windows re-armed by a
-   `*/5 min` schedule plus a 1-running/1-queued concurrency chain) polls
-   `POST /api/v1/internal/mkissa/poll` about once a second, pipes the
-   job through the vendored `mkissa_daemon.mjs` on the runner's egress,
-   and posts the raw response line to
+   `.github/workflows/mkissa-relay.yml` — 5 h 45 m windows that **arm
+   their own successor** at T−2 min via `workflow_dispatch` with the
+   job's `GITHUB_TOKEN`; GitHub's own `*/5 min` schedule is only a
+   backup because this repo's cron delivery runs hours late, and a
+   1-running/1-queued concurrency chain boots the successor within
+   seconds) polls `POST /api/v1/internal/mkissa/poll` about once a
+   second, pipes the job through the vendored `mkissa_daemon.mjs` on
+   the runner's egress, and posts the raw response line to
    `POST /api/v1/internal/mkissa/result`.
 3. The matching pending entry wakes and the sources flow out. Typical
    round trip: 2-8 s.
