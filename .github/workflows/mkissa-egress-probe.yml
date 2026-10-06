@@ -123,7 +123,7 @@ jobs:
             echo "route check: $(ip route get $(echo "$MK_IPS" | awk '{print $1}'))"
             echo "trace: $(curl -s --max-time 15 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'warp=|^ip=|loc=' | tr '\n' ' ')"
             V=$(probe "warp-try$attempt")
-            if [ "$V" = "CLEAN" ]; then FINAL=CLEAN; break; fi
+            if [ "$V" = "CLEAN" ] || [ "$V" = "GATE_OPEN" ]; then FINAL=$V; break; fi
             sudo wg-quick down ./wgcf-profile.conf >/dev/null 2>&1 || true
             sleep 3
           done
