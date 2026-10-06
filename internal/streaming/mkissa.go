@@ -386,7 +386,16 @@ func (p *MkissaProvider) resolveShow(ctx context.Context, id int, langKey string
 	var best *mkissaEdge
 	bestScore := -1.0
 	exact := false
+	// Romaji and English titles are often identical ("ONE PIECE / ONE
+	// PIECE" in prod logs) — an exact-duplicate search is a wasted spend
+	// of the shared per-IP throttle bucket, so search each title once.
+	seen := make(map[string]bool, len(titles))
 	for _, t := range titles {
+		key := strings.ToLower(strings.TrimSpace(t))
+		if key == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
 		edges, err := p.searchShows(ctx, t, langKey)
 		if err != nil || len(edges) == 0 {
 			continue
@@ -725,25 +734,32 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 			return srcs, nil
 		}
 		lastErr = err
-		throttled := mkissaThrottleErr(err)
-		mkissaBreaker.record(false, throttled)
-		if throttled && mkissaBreaker.blocked() {
+		// Another run may have tripped the breaker while we were waiting.
+		if mkissaBreaker.blocked() {
 			return nil, err
 		}
 		secs := 0
 		if m := mkissaRateRe.FindStringSubmatch(err.Error()); len(m) == 2 {
 			secs, _ = strconv.Atoi(m[1])
 		}
-		if secs <= 0 || attempt == mkissaRateRetries {
-			return nil, err
+		if !mkissaThrottleErr(err) || secs <= 0 || attempt == mkissaRateRetries {
+			break
 		}
 		p.log.Info().Str("showId", showID).Int("waitS", secs).Msg("mkissa: rate-limited, retrying after pause")
 		select {
 		case <-ctx.Done():
+			// A run cut short by the fan-out deadline says nothing about
+			// the bucket; don't feed the breaker with it.
 			return nil, ctx.Err()
 		case <-time.After(time.Duration(secs)*time.Second + mkissaRateExtra):
 		}
 	}
+	// Record exactly ONCE per run. The old per-attempt recording let a
+	// single call whose internal retries all hit the shared per-IP
+	// throttle trip tripAfter=2 by itself, blacking mkissa out for the
+	// whole 20-minute cooldown; two whole runs failing back-to-back is
+	// what a genuinely dry bucket looks like.
+	mkissaBreaker.record(false, mkissaThrottleErr(lastErr))
 	return nil, lastErr
 }
 
