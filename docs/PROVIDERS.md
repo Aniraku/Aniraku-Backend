@@ -159,7 +159,9 @@ tunnel that exists **only** inside that namespace. A dead tunnel can never
 blackhole shared Cloudflare anycast IPs for other providers (the
 2026-10-06 incident) — it just falls back to direct egress, where the
 breaker + resolve cache absorb the rate limit, and a watchdog flips routes
-back the moment a `warp=on` trace proves the data plane works again.
+back the moment an HTTP round trip to `api.mkissa.net` crosses the tunnel
+(a Cloudflare trace IP is *not* in the tunnel's AllowedIPs, so a trace
+test can never pass — WireGuard drops it itself).
 `netguard.Control` exempts exactly `10.77.0.0/30` (this host's veth pair)
 so Go's search POSTs can dial the splice; `IsPublicIP` itself stays strict
 and every other private range stays blocked. `MKISSA_API` is retired (still
