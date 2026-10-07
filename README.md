@@ -43,14 +43,13 @@ Read the full [Support Guide](./SUPPORT.md).
 
 Aniraku-Backend keeps the client-facing API separate from provider-specific work. It handles API routing, authentication, episode metadata, playback coordination, account data, sync, and the network checks needed around upstream requests.
 
-The service is written entirely in **Go** — one binary in one container, no external services to run. Streaming resolution is fully in-process across 12 providers (see [the provider guide](docs/PROVIDERS.md)):
+The service is written entirely in **Go** — one binary in one container, no external services to run. Streaming resolution is fully in-process across 11 providers (see [the provider guide](docs/PROVIDERS.md)):
 
 - **Anikoto (primary)** — AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro (Niko/Momo).
 - **AnimeX** — plyr API with XOR-decoded direct URLs (Mochi, Kira, Sora, …).
 - **Zoko, NiN, kaa.lt** — direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
 - **AnimeGG, AniWaves** — direct mp4 (highest per mirror) and multi-rendition HLS.
 - **VidNest, Lee, MegaVid** — direct HLS (MegaPlay catalog, ani.pm chain, verified-lang MegaPlay).
-- **Mkissa** — direct m3u8 from signed GraphQL (JS engine owns the crypto; Chuu/Mua/Kissy/…).
 - **FlixCloud (fallback)** — embed URLs for the client's embedded player.
 
 Every server list is freshly probed per request (no snapshot cache); sources play through the `/api/v1/proxy` media gateway.

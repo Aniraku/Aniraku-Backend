@@ -28,9 +28,6 @@ func TestIsAllowedProxyHost(t *testing.T) {
 		"a1.mp4upload.com",
 		"vidtub.kotocdn.site",
 		"vivibebe.site",
-		// Mkissa (Xoxo) ok.ru CDN — media must be proxyable, otherwise
-		// /servers lists a source the proxy refuses at playback time.
-		"vd423.okcdn.ru",
 	}
 	blocked := []string{
 		"example.com",
