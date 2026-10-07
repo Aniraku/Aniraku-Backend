@@ -7,44 +7,15 @@ import (
 	"syscall"
 )
 
-// trustedRelayNets are the point-to-point subnets of splice relays this
-// server runs on itself — currently just the mkissa WARP namespace relay the
-// api container is pointed at via extra_hosts (deploy/mkissa-warp). Dialing
-// one is not SSRF: it is this host's own infrastructure, a pure TLS splice
-// to a fixed upstream (api.mkissa.net), and it exists so the mkissa engine
-// stays reachable when the datacenter egress IP is throttled. The list stays
-// minimal on purpose — a single /30 of veth, unroutable anywhere else.
-// IsPublicIP itself is untouched and keeps its strict semantics.
-var trustedRelayNets = parseCIDRs("10.77.0.0/30")
-
-func parseCIDRs(cidrs ...string) []*net.IPNet {
-	nets := make([]*net.IPNet, 0, len(cidrs))
-	for _, c := range cidrs {
-		_, n, err := net.ParseCIDR(c)
-		if err != nil {
-			panic("netguard: bad trusted relay CIDR " + c)
-		}
-		nets = append(nets, n)
-	}
-	return nets
-}
-
-func isTrustedRelay(ip net.IP) bool {
-	for _, n := range trustedRelayNets {
-		if n.Contains(ip) {
-			return true
-		}
-	}
-	return false
-}
-
 // Control is a net.Dialer.Control hook. It runs after DNS resolution,
 // immediately before the socket connects, and inspects the concrete IP the OS
 // is about to dial. Validating here — rather than on the hostname — is what
 // makes it robust: DNS rebinding, HTTP redirects, and alternate IP encodings
 // all funnel through this same check, because they all must eventually connect
-// to an actual address. The only private addresses that pass are the
-// trustedRelayNets above (this server's own splice relays).
+// to an actual address. No private address passes: the mkissa WARP splice
+// exemption (10.77.0.0/30) retired with that namespace on 2026-10-07 — the
+// engine child now reaches its egress proxy in a separate process that never
+// uses this dial hook.
 func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -53,9 +24,6 @@ func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return fmt.Errorf("ssrf guard: unresolved address %q", host)
-	}
-	if isTrustedRelay(ip) {
-		return nil
 	}
 	if !IsPublicIP(ip) {
 		return fmt.Errorf("ssrf guard: blocked non-public address %s", ip)

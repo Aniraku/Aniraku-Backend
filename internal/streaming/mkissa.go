@@ -542,11 +542,13 @@ func (p *MkissaProvider) FindEpisodes(ctx context.Context, providerID string) ([
 // Engine spawn politeness: api.mkissa.net throttles per egress IP ("try
 // again in N seconds"), a bucket shared by ALL our traffic. Concurrent
 // collectors must never stampede it, so whole engine runs are serialized
-// globally with a gap between them. There is deliberately NO Go-side
-// rate-limit retry (mkissaRateRetries=0): one attempt per run, with the
-// engine's own internal retries staying paced at the demanded N plus a
-// 1.5s margin. Under deep concurrency runs fail clean on the fan-out
-// deadline and the other providers cover.
+// globally with a gap between them. Rate verdicts get ONE Go-side
+// re-attempt (mkissaRateRetries=1) after the demanded N plus a 1s
+// margin: the engine's own internal retry already waits its turn, and a
+// single "try again in 2s" surfacing as a run failure both lost the
+// request AND fed the breaker — under multi-egress reality (runner IPs
+// get 429 storms) a polite second call converts most of those into
+// successes. Two clean attempts per run, then the other providers cover.
 //
 // The gap must be >= mkissa's own demanded spacing: production's literal
 // message is "try again in 2 seconds", and the previous 1500ms gap sat
@@ -558,21 +560,44 @@ var (
 	mkissaEngineGap   = 4000 * time.Millisecond
 	mkissaRateRe      = regexp.MustCompile(`try again in (\d+) seconds?`)
 	mkissaRateExtra   = 1000 * time.Millisecond
-	mkissaRateRetries = 0
+	mkissaRateRetries = 1
 )
 
-// Throttle circuit breaker: the signed-call bucket is per egress IP,
-// shared by all traffic. Two consecutive throttle-class RUN failures
-// (a run = one whole engine Call now that Go-side retries are off) trip a
-// 10-minute cooldown that skips engine calls entirely (resolve cache
-// still serves); one success resets it. Without this the fan-out hammers
-// a dry bucket forever and the provider never recovers. The knobs moved
-// a lot on 2026-10-06: 20 minutes was far longer than mkissa's own
-// 1-2 second penalty and kept Kissy absent for hours; 5 minutes/3 was too
-// forgiving and let a flapping bucket churn. 10 minutes/2 rests on the
-// first unlucky pair and forgets quickly — the relay bridge now carries
-// the hot path off-runner, so the local path only needs to be polite.
-var mkissaBreaker = &mkissaThrottleBreaker{cooldown: 10 * time.Minute, tripAfter: 2}
+// Throttle circuit breaker — one instance PER EGRESS, because the
+// signed-call bucket is per egress IP: the runner's bucket and the local
+// (optionally proxied) bucket are independent resources. A 429 storm on
+// the runner must rest the bridge without resting the local path, and a
+// dry local bucket must not blind the bridge; before this split a single
+// local captcha pair blacked mkissa out entirely for 10 minutes even
+// though the relay was serving fine (2026-10-07). Per breaker: two
+// consecutive throttle-class RUN failures trip a 10-minute cooldown that
+// skips that path (resolve cache still serves); one success resets it.
+// The knobs moved a lot on 2026-10-06: 20 minutes was far longer than
+// mkissa's own 1-2 second penalty and kept Kissy absent for hours; 5
+// minutes/3 was too forgiving and let a flapping bucket churn; 10
+// minutes/2 rests on the first unlucky pair and forgets quickly.
+var (
+	mkissaBridgeBreaker = &mkissaThrottleBreaker{cooldown: 10 * time.Minute, tripAfter: 2}
+	mkissaLocalBreaker  = &mkissaThrottleBreaker{cooldown: 10 * time.Minute, tripAfter: 2}
+)
+
+// mkissaBreakerFor routes a verdict to the bucket that produced it.
+func mkissaBreakerFor(path string) *mkissaThrottleBreaker {
+	if path == "bridge" {
+		return mkissaBridgeBreaker
+	}
+	return mkissaLocalBreaker
+}
+
+// mkissaNoPathUsable reports whether every egress we could try is
+// resting — the fail-fast gate that saves fan-out time when nothing
+// would run anyway.
+func mkissaNoPathUsable() bool {
+	if MkissaBridgeToken() != "" && !mkissaBridgeBreaker.blocked() {
+		return false
+	}
+	return mkissaLocalBreaker.blocked()
+}
 
 type mkissaThrottleBreaker struct {
 	mu          sync.Mutex
@@ -722,13 +747,15 @@ func releaseEngine() {
 	<-mkissaEngineSlot
 }
 
-// runEngine sends one request through daemon.Call (relay bridge first
-// when enabled, local daemon otherwise). Whole runs stay serialized
-// globally with a gap, and the lane key persists daemon-side across
-// requests.
+// runEngine sends one request through daemon.callPath (relay bridge first
+// when enabled and rested, local daemon otherwise). Whole runs stay
+// serialized globally with a gap, and the lane key persists daemon-side
+// across requests. Breaker verdicts land on the bucket of the egress that
+// produced them (bridge vs local), never across the two.
 func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
-	// Breaker first: never spend fan-out time (or bucket) while cooling.
-	if mkissaBreaker.blocked() {
+	// Breaker first: never spend fan-out time (or a dry bucket) while
+	// every usable path is cooling. One rested path is enough to try.
+	if mkissaNoPathUsable() {
 		return nil, fmt.Errorf("mkissa: throttled cooldown")
 	}
 	if err := acquireEngine(ctx); err != nil {
@@ -736,15 +763,18 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 	}
 	defer releaseEngine()
 	var lastErr error
+	var lastPath string
 	for attempt := 0; attempt <= mkissaRateRetries; attempt++ {
-		srcs, err := p.daemon.Call(ctx, showID, audio, epStr)
+		srcs, path, err := p.daemon.callPath(ctx, showID, audio, epStr)
+		lastPath = path
 		if err == nil {
-			mkissaBreaker.record(true, false)
+			mkissaBreakerFor(path).record(true, false)
 			return srcs, nil
 		}
 		lastErr = err
-		// Another run may have tripped the breaker while we were waiting.
-		if mkissaBreaker.blocked() {
+		// Another run may have tripped the last breaker while we were
+		// waiting — only bail out when no path remains at all.
+		if mkissaNoPathUsable() {
 			return nil, err
 		}
 		secs := 0
@@ -763,12 +793,12 @@ func (p *MkissaProvider) runEngine(ctx context.Context, showID, audio, epStr str
 		case <-time.After(time.Duration(secs)*time.Second + mkissaRateExtra):
 		}
 	}
-	// Record exactly ONCE per run. Per-attempt recording let a single
-	// call whose internal retries all hit the shared per-IP throttle trip
-	// the breaker by itself, blacking mkissa out for the whole cooldown;
-	// two whole runs failing back-to-back is what a genuinely dry bucket
-	// looks like.
-	mkissaBreaker.record(false, mkissaThrottleErr(lastErr))
+	// Record exactly ONCE per run, on the egress that failed. Per-attempt
+	// recording let a single call whose internal retries all hit the
+	// shared per-IP throttle trip the breaker by itself, blacking that
+	// path out for the whole cooldown; two whole runs failing back-to-
+	// back is what a genuinely dry bucket looks like.
+	mkissaBreakerFor(lastPath).record(false, mkissaThrottleErr(lastErr))
 	return nil, lastErr
 }
 

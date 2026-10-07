@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -60,30 +61,51 @@ func newMkissaDaemon(log zerolog.Logger, p *MkissaProvider) *mkissaDaemon {
 // back to the local daemon; a decoded engine verdict does not — the
 // engine said what it said. Only a caller whose own context is done
 // skips the fallback (there is no time left for a local attempt either).
-func (d *mkissaDaemon) Call(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
+// callPath is Call with transport attribution: it reports which egress
+// served (or failed) so the breaker can police each per-IP bucket
+// independently — a dry runner bucket must rest the bridge without
+// resting the local proxy path, and vice versa. Call stays as the
+// transport-agnostic wrapper for tests and simple callers.
+func (d *mkissaDaemon) callPath(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, string, error) {
 	if MkissaBridgeToken() != "" {
-		resp, err := d.callBridge(ctx, showID, audio, epStr)
-		if err == nil {
-			srcs, derr := decodeDaemonResp(resp, epStr)
-			switch {
-			case derr == nil:
-				return srcs, nil
-			case ctx.Err() != nil:
-				return nil, derr
-			case errors.Is(derr, errBridgeMalformed), errors.Is(derr, errBridgeWorker):
-				d.log.Warn().Err(derr).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
-					Msg("mkissa: relay bridge trouble, falling back to local engine")
-			default:
-				return nil, derr
-			}
-		} else if ctx.Err() != nil {
-			return nil, err
+		if mkissaBridgeBreaker.blocked() {
+			d.log.Debug().Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+				Msg("mkissa: relay bridge resting (throttled cooldown), using local engine")
 		} else {
-			d.log.Warn().Err(err).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
-				Msg("mkissa: relay bridge unavailable, falling back to local engine")
+			resp, err := d.callBridge(ctx, showID, audio, epStr)
+			if err == nil {
+				srcs, derr := decodeDaemonResp(resp, epStr)
+				switch {
+				case derr == nil:
+					return srcs, "bridge", nil
+				case ctx.Err() != nil:
+					return nil, "bridge", derr
+				case errors.Is(derr, errBridgeMalformed), errors.Is(derr, errBridgeWorker):
+					d.log.Warn().Err(derr).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+						Msg("mkissa: relay bridge trouble, falling back to local engine")
+				default:
+					// A decoded engine verdict (429, captcha, …) rides the
+					// bridge's bucket: the runner's egress produced it.
+					return nil, "bridge", derr
+				}
+			} else if ctx.Err() != nil {
+				return nil, "bridge", err
+			} else {
+				d.log.Warn().Err(err).Str("showId", showID).Str("audio", audio).Str("ep", epStr).
+					Msg("mkissa: relay bridge unavailable, falling back to local engine")
+			}
 		}
 	}
-	return d.callLocal(ctx, showID, audio, epStr)
+	if mkissaLocalBreaker.blocked() {
+		return nil, "local", fmt.Errorf("mkissa: local engine resting (throttled cooldown)")
+	}
+	srcs, err := d.callLocal(ctx, showID, audio, epStr)
+	return srcs, "local", err
+}
+
+func (d *mkissaDaemon) Call(ctx context.Context, showID, audio, epStr string) ([]mkissaEngineSource, error) {
+	srcs, _, err := d.callPath(ctx, showID, audio, epStr)
+	return srcs, err
 }
 
 // callBridge queues the signed job and waits for the worker's answer,
@@ -241,6 +263,22 @@ func (d *mkissaDaemon) ensureStartedLocked() error {
 		return err
 	}
 	cmd := exec.Command(bin, script)
+	// Egress proxy scope: ONLY the engine child gets proxy env. The API
+	// process must never see it — http.DefaultTransport honors
+	// HTTP(S)_PROXY, so a process-wide setting would drag playback
+	// relays and every other provider through the slow egress hop.
+	// bun's NODE_USE_ENV_PROXY covers the engine's plain-fetch calls
+	// (bootstrap/discovery; http proxies only) and MKISSA_PROXY is read
+	// natively by wreq for the signed gate calls (socks4/socks5/http).
+	if proxy := strings.TrimSpace(os.Getenv("MKISSA_PROXY")); proxy != "" {
+		cmd.Env = append(os.Environ(),
+			"MKISSA_PROXY="+proxy,
+			"NODE_USE_ENV_PROXY=1",
+			"HTTP_PROXY="+proxy,
+			"HTTPS_PROXY="+proxy,
+			"ALL_PROXY="+proxy,
+		)
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("mkissa: engine stdin: %w", err)

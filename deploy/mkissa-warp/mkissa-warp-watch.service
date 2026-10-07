@@ -1,6 +1,0 @@
-[Unit]
-Description=mkissa WARP tunnel watchdog (health check + route flip + paced rotation)
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/mkissa-warp-watch.sh
