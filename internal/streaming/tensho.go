@@ -21,15 +21,16 @@ import (
 
 // Tensho resolves zangetsu.cc (the Zangetsu hianime-family catalog),
 // verified end-to-end from VPS egress 2026-10-07. The site guards its
-// episode endpoints with a page-bound AJAX token that is minted in the
-// watch page HTML and rejected with 403 once it goes stale, so every
-// resolve fetches a fresh watch page first and calls the ajax endpoints
-// immediately after (a minutes-old token fails — measured):
+// episode endpoints with a session-bound pair: the watch page mints both a
+// PHPSESSID cookie and a window.AJAX_TOKEN, and /ajax/* answers 403 unless
+// the same session cookie + token arrive together (measured: token without
+// cookie = 403, pair = 200). Every resolve fetches a fresh watch page and
+// calls the ajax endpoints immediately after with both halves:
 //
 //	/search?keyword=<title>                      -> poster anchors + titles
-//	/watch/<slug>-<id>?ep=1                      -> window.AJAX_TOKEN = "<hex>"
-//	/ajax/episodes?animeId=<id>                  -> episode list (needs token)
-//	/ajax/server?episodeId=<id>&sub=&dub=        -> server slots (needs token)
+//	/watch/<slug>-<id>?ep=1                      -> Set-Cookie PHPSESSID + AJAX_TOKEN
+//	/ajax/episodes?animeId=<id>                  -> episode list (cookie + token)
+//	/ajax/server?episodeId=<id>&sub=&dub=        -> server slots (cookie + token)
 //
 // The ajax responses carry no playable media: server slots map to flixera.co
 // and cdn.4animo.xyz embed pages (the site's own loadPlayer switch), so
@@ -82,10 +83,19 @@ type tenshoEpisode struct {
 }
 
 type tenshoEpisodesEntry struct {
-	list    []tenshoEpisode
+	list []tenshoEpisode
+	// sess is the watch-page pair the ajax endpoints require — token
+	// without the session cookie is rejected with 403.
+	sess    tenshoSession
+	expires time.Time
+}
+
+// tenshoSession is one watch-page fetch's credentials: AJAX token, the
+// page URL (ajax Referer) and the PHPSESSID cookie from Set-Cookie.
+type tenshoSession struct {
 	token   string
 	referer string
-	expires time.Time
+	cookie  string
 }
 
 type tenshoServerSlot struct {
@@ -143,12 +153,13 @@ func (p *TenshoProvider) learnURLHost(raw string) {
 	p.learnHost(u.Hostname())
 }
 
-// get fetches a page (browser headers). status 403 is returned, not an
-// error — the caller refreshes the token and retries.
-func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, string, error) {
+// get fetches a page (browser headers) and returns its Set-Cookie pairs —
+// the watch page's PHPSESSID is required by the ajax endpoints. status
+// 403 is returned, not an error, so the caller can refresh and retry.
+func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, string, []*http.Cookie, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return 0, "", err
+		return 0, "", nil, err
 	}
 	req.Header.Set("User-Agent", browserUA)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
@@ -158,18 +169,20 @@ func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, 
 	}
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return 0, "", err
+		return 0, "", nil, err
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
-		return resp.StatusCode, "", err
+		return resp.StatusCode, "", nil, err
 	}
-	return resp.StatusCode, string(body), nil
+	return resp.StatusCode, string(body), resp.Cookies(), nil
 }
 
-// ajaxGet calls one /ajax endpoint with the token trio the page JS sends.
-func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL, token, referer string) (int, string, error) {
+// ajaxGet calls one /ajax endpoint with the session pair the page JS
+// sends: X-Page-Token + the PHPSESSID cookie from the same watch fetch
+// (token without cookie = 403 — measured).
+func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL string, sess tenshoSession) (int, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, "", err
@@ -177,8 +190,11 @@ func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL, token, referer str
 	req.Header.Set("User-Agent", browserUA)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
-	req.Header.Set("X-Page-Token", token)
-	req.Header.Set("Referer", referer)
+	req.Header.Set("X-Page-Token", sess.token)
+	req.Header.Set("Referer", sess.referer)
+	if sess.cookie != "" {
+		req.Header.Set("Cookie", sess.cookie)
+	}
 	resp, err := p.client.Do(req)
 	if err != nil {
 		return 0, "", err
@@ -191,11 +207,22 @@ func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL, token, referer str
 	return resp.StatusCode, string(body), nil
 }
 
+// joinCookies flattens Set-Cookie pairs into one Cookie request header.
+func joinCookies(cookies []*http.Cookie) string {
+	parts := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		if c.Name != "" {
+			parts = append(parts, c.Name+"="+c.Value)
+		}
+	}
+	return strings.Join(parts, "; ")
+}
+
 // Search lists zangetsu shows by keyword. SearchResult.ID is the watch
 // path (slug-id) — what FindEpisodes and the watch URL consume.
 func (p *TenshoProvider) Search(ctx context.Context, title string) ([]SearchResult, error) {
 	rawURL := p.base + "/search?keyword=" + url.QueryEscape(title)
-	status, body, err := p.get(ctx, rawURL, p.base+"/")
+	status, body, _, err := p.get(ctx, rawURL, p.base+"/")
 	if err != nil {
 		return nil, err
 	}
@@ -261,29 +288,30 @@ func (p *TenshoProvider) FindEpisodes(ctx context.Context, providerID string) ([
 	return out, nil
 }
 
-// fetchToken loads a watch page and returns its fresh AJAX token with the
-// page URL (the ajax endpoints require it as Referer).
-func (p *TenshoProvider) fetchToken(ctx context.Context, show *tenshoShowEntry) (token, watchURL string, err error) {
-	watchURL = p.base + "/watch/" + show.path + "?ep=1"
-	status, body, err := p.get(ctx, watchURL, p.base+"/")
+// fetchSession loads a watch page and returns its fresh credentials:
+// AJAX token, the page URL (ajax Referer) and the PHPSESSID cookie.
+func (p *TenshoProvider) fetchSession(ctx context.Context, show *tenshoShowEntry) (tenshoSession, error) {
+	watchURL := p.base + "/watch/" + show.path + "?ep=1"
+	status, body, cookies, err := p.get(ctx, watchURL, p.base+"/")
 	if err != nil {
-		return "", "", err
+		return tenshoSession{}, err
 	}
 	if status == http.StatusForbidden {
-		return "", "", fmt.Errorf("tensho: watch page HTTP 403")
+		return tenshoSession{}, fmt.Errorf("tensho: watch page HTTP 403")
 	}
 	if status != http.StatusOK {
-		return "", "", fmt.Errorf("tensho: watch page HTTP %d", status)
+		return tenshoSession{}, fmt.Errorf("tensho: watch page HTTP %d", status)
 	}
 	m := tenshoTokenRe.FindStringSubmatch(body)
 	if m == nil {
-		return "", "", fmt.Errorf("tensho: no AJAX token on watch page %s", show.path)
+		return tenshoSession{}, fmt.Errorf("tensho: no AJAX token on watch page %s", show.path)
 	}
-	return m[1], watchURL, nil
+	return tenshoSession{token: m[1], referer: watchURL, cookie: joinCookies(cookies)}, nil
 }
 
-// episodeList returns the cached episode list + token, or fetches a fresh
-// watch page and calls /ajax/episodes immediately (stale tokens 403).
+// episodeList returns the cached episode list + session, or fetches a
+// fresh watch page and calls /ajax/episodes immediately (stale sessions
+// 403).
 func (p *TenshoProvider) episodeList(ctx context.Context, show *tenshoShowEntry, force bool) (*tenshoEpisodesEntry, error) {
 	if !force {
 		p.mu.Lock()
@@ -294,11 +322,11 @@ func (p *TenshoProvider) episodeList(ctx context.Context, show *tenshoShowEntry,
 		p.mu.Unlock()
 	}
 
-	token, watchURL, err := p.fetchToken(ctx, show)
+	sess, err := p.fetchSession(ctx, show)
 	if err != nil {
 		return nil, err
 	}
-	status, body, err := p.ajaxGet(ctx, p.base+"/ajax/episodes?animeId="+show.id, token, watchURL)
+	status, body, err := p.ajaxGet(ctx, p.base+"/ajax/episodes?animeId="+show.id, sess)
 	if err != nil {
 		return nil, err
 	}
@@ -317,8 +345,7 @@ func (p *TenshoProvider) episodeList(ctx context.Context, show *tenshoShowEntry,
 
 	entry := &tenshoEpisodesEntry{
 		list:    resp.Episodes,
-		token:   token,
-		referer: watchURL,
+		sess:    sess,
 		expires: time.Now().Add(tenshoEpisodesTTL),
 	}
 	p.mu.Lock()
@@ -329,8 +356,8 @@ func (p *TenshoProvider) episodeList(ctx context.Context, show *tenshoShowEntry,
 	return entry, nil
 }
 
-// serverSlots calls /ajax/server with the cached token; on 403 (stale
-// token) it refreshes the watch page once and retries.
+// serverSlots calls /ajax/server with the cached session; on 403 (stale
+// session) it refreshes the watch page once and retries.
 func (p *TenshoProvider) serverSlots(ctx context.Context, show *tenshoShowEntry, ep tenshoEpisode) (sub, dub []tenshoServerSlot, err error) {
 	entry, err := p.episodeList(ctx, show, false)
 	if err != nil {
@@ -339,12 +366,12 @@ func (p *TenshoProvider) serverSlots(ctx context.Context, show *tenshoShowEntry,
 	for attempt := 0; attempt < 2; attempt++ {
 		rawURL := fmt.Sprintf("%s/ajax/server?episodeId=%s&sub=%t&dub=%t",
 			p.base, url.QueryEscape(ep.ID), ep.Sub, ep.Dub)
-		status, body, err := p.ajaxGet(ctx, rawURL, entry.token, entry.referer)
+		status, body, err := p.ajaxGet(ctx, rawURL, entry.sess)
 		if err != nil {
 			return nil, nil, err
 		}
 		if status == http.StatusForbidden && attempt == 0 {
-			// Stale token: refresh the watch page + episode list, retry once.
+			// Stale session: refresh the watch page + episode list, retry once.
 			if refreshed, rerr := p.episodeList(ctx, show, true); rerr == nil {
 				entry = refreshed
 				continue
