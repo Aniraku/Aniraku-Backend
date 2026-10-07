@@ -7,6 +7,7 @@ package streaming
 // exactly one polite Go-side retry.
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +115,64 @@ func TestMkissaAllPathsRestingFailsFast(t *testing.T) {
 	_, err := p.runEngine(mkissaTestCtx(t), mkissaTestShowID, "sub", "1")
 	if err == nil || !strings.Contains(err.Error(), "throttled cooldown") {
 		t.Fatalf("err = %v, want throttled cooldown", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("fail-fast took %s", elapsed)
+	}
+}
+
+// mkissaThrottleErr classifies hang-class failures as throttle verdicts
+// for the egress (persistent 429 → engine budget exhaustion → timeout),
+// while genuine transport trouble stays non-throttle.
+func TestMkissaTimeoutClassifiedAsThrottle(t *testing.T) {
+	cases := []struct {
+		msg  string
+		want bool
+	}{
+		{"mkissa: engine error: engine request timed out after 35000ms", true},
+		{"mkissa: engine timeout", true},
+		{"mkissa: episode 1: Too many requests, please try again in 2 seconds.", true},
+		{"mkissa: episode 1: NEED_CAPTCHA", true},
+		{"mkissa: relay worker did not answer within 15s", false},
+		{"mkissa: engine exited", false},
+		{"mkissa: engine error: something else", false},
+	}
+	for _, tc := range cases {
+		if got := mkissaThrottleErr(errors.New(tc.msg)); got != tc.want {
+			t.Errorf("mkissaThrottleErr(%q) = %v, want %v", tc.msg, got, tc.want)
+		}
+	}
+	if mkissaThrottleErr(nil) {
+		t.Error("mkissaThrottleErr(nil) = true, want false")
+	}
+}
+
+// Two consecutive hang timeouts rest the local path (bridge off): the
+// third run fails fast instead of burning another 35s on a dry egress.
+func TestMkissaTimeoutVerdictRestsLocalPath(t *testing.T) {
+	t.Setenv("ANIRAKU_BRIDGE_TOKEN", "")
+	oldLocal := mkissaLocalBreaker
+	mkissaLocalBreaker = mkissaFreshBreaker()
+	defer func() { mkissaLocalBreaker = oldLocal }()
+	oldGap := mkissaEngineGap
+	mkissaEngineGap = time.Millisecond
+	defer func() { mkissaEngineGap = oldGap }()
+
+	f := newMkissaFixture(t, nil, `{"id":0,"error":"engine request timed out after 35000ms"}`)
+	p := newMkissaTestProvider(f)
+
+	for run := 1; run <= 2; run++ {
+		if _, err := p.runEngine(mkissaTestCtx(t), mkissaTestShowID, "sub", "1"); err == nil || !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("run %d: err = %v, want the hang verdict", run, err)
+		}
+	}
+	if !mkissaNoPathUsable() {
+		t.Fatal("two consecutive timeouts must rest the only path")
+	}
+	p.engineBin = "/bin/false" // fail-fast must never reach the engine
+	start := time.Now()
+	if _, err := p.runEngine(mkissaTestCtx(t), mkissaTestShowID, "sub", "1"); err == nil || !strings.Contains(err.Error(), "throttled cooldown") {
+		t.Fatalf("run 3: err = %v, want throttled cooldown", err)
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("fail-fast took %s", elapsed)
