@@ -99,6 +99,10 @@ func newMkissaFixture(t *testing.T, dubEps []string, stubOut string) *mkissaFixt
 	f.media = httptest.NewServer(mmux)
 	if stubOut == "" {
 		stubOut = mkissaStubOutput(f.media.URL)
+	} else {
+		// {{media}} placeholder lets a test script multi-line canned
+		// output (throttle-then-succeed) before the media URL exists.
+		stubOut = strings.ReplaceAll(stubOut, "{{media}}", f.media.URL)
 	}
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.json")
@@ -114,7 +118,11 @@ func newMkissaFixture(t *testing.T, dubEps []string, stubOut string) *mkissaFixt
 // test binary with this name to serve canned daemon responses over the
 // line protocol (shell text tools buffer pipes, so sh/awk/sed stubs hang;
 // a Go helper writes unbuffered). Canned output carries "id":0, replaced
-// with the request id per line.
+// with the request id per line. Canned files are pretty-printed, so every
+// segment is collapsed to one line (the parent frames on newlines);
+// segments separated by a "===NEXT===" marker line answer successive
+// requests (the last repeats) so a test can script e.g. throttle-then-
+// succeed sequences.
 func TestMkissaDaemonStub(t *testing.T) {
 	if os.Getenv("GO_MKISSA_STUB") != "1" {
 		return
@@ -128,9 +136,11 @@ func TestMkissaDaemonStub(t *testing.T) {
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	w := bufio.NewWriter(os.Stdout)
 	defer w.Flush()
-	// Single line per response: the parent frames on newlines, so any
-	// pretty-printing in the canned file must go.
-	oneLine := strings.ReplaceAll(string(raw), "\n", "")
+	segs := strings.Split(string(raw), "\n===NEXT===\n")
+	for i, seg := range segs {
+		segs[i] = strings.ReplaceAll(seg, "\n", "")
+	}
+	var served int
 	for sc.Scan() {
 		var req struct {
 			ID uint64 `json:"id"`
@@ -138,7 +148,12 @@ func TestMkissaDaemonStub(t *testing.T) {
 		if err := json.Unmarshal(sc.Bytes(), &req); err != nil {
 			continue
 		}
-		resp := strings.Replace(oneLine, `"id":0`, fmt.Sprintf(`"id":%d`, req.ID), 1)
+		idx := served
+		if idx >= len(segs) {
+			idx = len(segs) - 1
+		}
+		served++
+		resp := strings.Replace(segs[idx], `"id":0`, fmt.Sprintf(`"id":%d`, req.ID), 1)
 		fmt.Fprintln(w, resp)
 		w.Flush()
 	}
