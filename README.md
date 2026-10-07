@@ -50,7 +50,7 @@ The service is written entirely in **Go** — one binary in one container, no ex
 - **Zoko, NiN, kaa.lt** — direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
 - **AnimeGG, AniWaves** — direct mp4 (highest per mirror) and multi-rendition HLS.
 - **VidNest, Lee, MegaVid** — direct HLS (MegaPlay catalog, ani.pm chain, verified-lang MegaPlay).
-- **Heave, Tensho** — animeheaven.me cookie-gated direct mp4 mirrors; zangetsu.cc flixera/4animo embeds decrypted to direct HLS (Tsuki/Kaze/Hoshi).
+- **Tensho** — zangetsu.cc flixera/4animo embeds decrypted to direct HLS (Tsuki/Kaze/Hoshi).
 - **FlixCloud (fallback)** — embed URLs for the client's embedded player.
 
 Every server list is freshly probed per request (no snapshot cache); sources play through the `/api/v1/proxy` media gateway.
@@ -68,8 +68,8 @@ Aniraku web / Android client
     ┌─────────┼─────────┐
     ▼         ▼         ▼
   auth    episodes   streaming
- Supabase AniZip↔TMDB 12 providers (fan-out)
- JWT/JWKS  unlimited  Anikoto → … → MegaVid → Heave/Tensho
+ Supabase AniZip↔TMDB 11 providers (fan-out)
+ JWT/JWKS  unlimited  Anikoto → … → MegaVid → Tensho
    │        │       + FlixCloud (embed)
    ▼        ▼          │
      normalized API response

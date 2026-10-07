@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → VidNest → Lee → MegaVid → Heave → Tensho
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → VidNest → Lee → MegaVid → Tensho
 ```
 
 ## Code layout (`internal/api/v1`)
@@ -77,7 +77,6 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | kaa slug / resolve | 24 h / 10 min (lang-keyed) | Strict per-lang keys; deep-copied on store and load. |
 | AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
 | VidNest / Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
-| Heave show / resolve | 10 min / 10 min (lang-keyed) | Plain HTTP, stateless gate; mirrors probe-verified on resolve; deep-copied on store and load. |
 | Tensho show / episodes+token | 10 min / 3 min | Watch-page `AJAX_TOKEN` 403s when stale — refreshed once and retried. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
