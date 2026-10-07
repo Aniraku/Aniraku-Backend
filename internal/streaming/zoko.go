@@ -27,7 +27,7 @@ const (
 )
 
 // zokoBase is a var (not const) so tests can point the provider at a fake
-// server. The Kiwi download fetcher shares it: same backend, same base.
+// server.
 var zokoBase = "https://zokoanime.video"
 
 // zokoPayload matches the deobfuscated window.__P blob the ZokoAnime embed

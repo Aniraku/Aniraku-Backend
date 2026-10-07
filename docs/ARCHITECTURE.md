@@ -78,6 +78,7 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
 | VidNest / Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
 | Tensho show / episodes+token | 10 min / 3 min | Watch-page `AJAX_TOKEN` 403s when stale — refreshed once and retried. |
+| AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s — no in-request retries. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
 | Dynamic CDN allowlist | 24 h TTL | Learned hosts (playlist-vouched) expire on read past TTL; capped at 500 entries. |
@@ -87,7 +88,8 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 `GetServers` fans out to all collectors concurrently (45 s hard cap,
 per-collector timings in `collectorMs`), merges in fixed provider order,
 applies the Zoko-download / NiN-subtitle / MegaVid-language merges, attaches
-Kiwi downloads, and stable-sorts by playback verdict (`proxy > direct >
+AnimeDL downloads (all sources but FlixCloud), and stable-sorts by playback
+verdict (`proxy > direct >
 embed > dead` — ordering hint only, never a filter). The collector set is
 slice-driven so the WaitGroup count cannot drift. Hentai titles reach only
 Zoko (MAL-keyed) + FlixCloud before any other upstream call. `Stream`

@@ -13,8 +13,8 @@ import (
 )
 
 // errTransport fails every request instantly: the manager under test must
-// never touch the network outside its fixture-pointed providers (kiwi
-// downloads, hentai lookups).
+// never touch the network outside its fixture-pointed providers (download
+// fetches, hentai lookups).
 type errTransport struct{}
 
 func (errTransport) RoundTrip(*http.Request) (*http.Response, error) {
