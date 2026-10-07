@@ -22,8 +22,12 @@ var defaultCDNSuffixes = []string{
 	// FlixCloud embed CDN
 	"flixcloud.cc", "flixcloud.com",
 	"fetch8.flixcloud.cc", "fetch9.flixcloud.cc", "fetch10.flixcloud.cc", "vault-95.atomic4cdn.top",
+	// Tensho embed players (flixera.co + 4animo ReCloud CDN)
+	"flixera.co", "4animo.xyz",
 	// Direct mp4 mirrors
 	"animegg.org",
+	// Heave direct mp4 mirrors (ck/ct/rx.animeheaven.me)
+	"animeheaven.me",
 	// AnimeGG mp4 file host (302 target of /play/ URLs)
 	"vidcache.net",
 	// AniWaves site + echovideo extractors + savedly mp4 host
