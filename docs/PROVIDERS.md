@@ -25,7 +25,7 @@ fallback order and the `/servers` merge order.
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
 | `heave` | Heave | animeheaven.me plain-PHP catalog: `fastsearch` → `anime.php` → `gate.php` (Cookie `key=`) → **direct mp4** mirrors, probe-verified; single-track site, both lanes |
-| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → **flixera/4animo embeds** (sub+dub) |
+| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **decrypted to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer) (sub+dub) |
 
 Removed providers return a `removed` error naming them explicitly
 (`miruro`, `zenime`, `tryembed`, `mkissa`, …) — never silently fall

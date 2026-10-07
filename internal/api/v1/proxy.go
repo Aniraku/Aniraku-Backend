@@ -764,20 +764,52 @@ func proxyRedirectBlocked(status int) bool {
 // stripProxyNonce removes the cache-busting "rn" query parameter from a
 // proxied URL. The playlist rewrite adds it so every playback session uses
 // fresh edge-cache keys; it must never reach the upstream CDN.
+//
+// The query is only rebuilt when "rn" is actually present, and the rebuild
+// keeps the surviving params' original bytes and order. A ParseQuery+Encode
+// round-trip would sort the params and append "=" to nameless ones, which
+// breaks CDNs that sign the raw query verbatim — animeheaven signs
+// ?<md5>&<md5> order-sensitively and answers 404 to the re-encoded form.
 func stripProxyNonce(u string) string {
 	idx := strings.IndexByte(u, '?')
 	if idx < 0 {
 		return u
 	}
-	q, err := url.ParseQuery(u[idx+1:])
-	if err != nil {
+	raw := u[idx+1:]
+	hasRN := false
+	kept := make([]string, 0, 8)
+	for _, part := range strings.Split(raw, "&") {
+		if part == "" {
+			continue
+		}
+		name := part
+		if eq := strings.IndexByte(part, '='); eq >= 0 {
+			name = part[:eq]
+		}
+		// rn is appended literally (&rn=<unixnano>), but accept an
+		// encoded form too so a stray %72n= cannot leak upstream.
+		if name == "rn" || strings.EqualFold(mustQueryUnescape(name), "rn") {
+			hasRN = true
+			continue
+		}
+		kept = append(kept, part)
+	}
+	if !hasRN {
 		return u
 	}
-	q.Del("rn")
-	if enc := q.Encode(); enc != "" {
-		return u[:idx+1] + enc
+	if len(kept) == 0 {
+		return u[:idx]
 	}
-	return u[:idx]
+	return u[:idx+1] + strings.Join(kept, "&")
+}
+
+// mustQueryUnescape decodes name for the rn comparison, falling back to the
+// raw form when it is not valid percent-encoding.
+func mustQueryUnescape(name string) string {
+	if dec, err := url.QueryUnescape(name); err == nil {
+		return dec
+	}
+	return name
 }
 
 func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, error) {

@@ -33,9 +33,26 @@ import (
 //	/ajax/server?episodeId=<id>&sub=&dub=        -> server slots (cookie + token)
 //
 // The ajax responses carry no playable media: server slots map to flixera.co
-// and cdn.4animo.xyz embed pages (the site's own loadPlayer switch), so
-// Tensho returns embed-type sources exactly like FlixCloud — no probe, no
-// m3u8 extraction. Both embed hosts answer 200 without a Referer (measured).
+// and cdn.4animo.xyz embed pages (the site's own loadPlayer switch — s-1
+// FlixEra, s-2 M-Cloud/hd-1, s-3 R-Cloud/hd-2). Tensho never ships those
+// embed URLs: each player page is decrypted to the direct stream the player
+// itself would play (every provider returns decrypted URLs; FlixCloud is the
+// only embed exception):
+//
+//	flixera:  embed page -> window.__EMBED_PROXY__ = "/p?t=..." -> HLS master;
+//	          window.__EMBED_TRACKS__ = [...] -> subtitle tracks
+//	4animo:   embed page -> var sourcesUrl = '/stream/getSources?t=...'
+//	          -> GET with the embed page as Referer (404 without — measured)
+//	          -> JSON: sources[].file = "/p?t=..." (HLS master), tracks[],
+//	          intro/outro skip segments
+//
+// Both players' /p?t= URLs are ReCloud proxy paths answering
+// application/vnd.apple.mpegurl masters with absolute child URLs (measured
+// 200; playback itself needs no Referer). Every master is probed at segment
+// depth before shipping and blocked slots are dropped. The site's episodes
+// ajax already carries "<aniId>/<ep>" in its ani/mal fields (e.g. "16498/1"),
+// which is what puts the episode number into the flixera/hd-2 path — a
+// bare id serves a playback-less shell page (measured).
 
 const (
 	tenshoDefaultBase = "https://zangetsu.cc"
@@ -64,7 +81,41 @@ var (
 	tenshoSearchRe = regexp.MustCompile(`(?s)<a[^>]*class=["']film-poster-ahref["'][^>]*href=["']/([^"'/]+)["'][^>]*title=["']([^"']+)["']`)
 	// <script>window.AJAX_TOKEN = "254640a56e0bdfad8233fa93a051de1a";</script>
 	tenshoTokenRe = regexp.MustCompile(`window\.AJAX_TOKEN\s*=\s*["']([A-Za-z0-9]+)["']`)
+
+	// 4animo (ReCloud) embed: var sourcesUrl = '/stream/getSources?t=<token>';
+	tenshoSourcesURLRe = regexp.MustCompile(`sourcesUrl\s*=\s*['"]([^'"]*getSources[^'"]*)['"]`)
+	// FlixEra embed: window.__EMBED_PROXY__ = "/p?t=<token>";
+	tenshoFlixProxyRe = regexp.MustCompile(`window\.__EMBED_PROXY__\s*=\s*"(/p\?t=[^"]+)"`)
+	// Marker before the inline subtitle array: window.__EMBED_TRACKS__ = [...];
+	tenshoFlixTracksMark = "window.__EMBED_TRACKS__"
 )
+
+// tenshoTrack is one player track (both players share the shape).
+type tenshoTrack struct {
+	File  string `json:"file"`
+	Label string `json:"label"`
+}
+
+// tenshoSkip is a player intro/outro segment in seconds.
+type tenshoSkip struct {
+	Start float64 `json:"start"`
+	End   float64 `json:"end"`
+}
+
+func (s tenshoSkip) toCore() *core.SkipTimestamp {
+	if s.End <= s.Start || s.Start < 0 {
+		return nil
+	}
+	return &core.SkipTimestamp{Start: s.Start, End: s.End}
+}
+
+// tenshoEmbed is one player embed decrypted to the stream it would play.
+type tenshoEmbed struct {
+	m3u8  string
+	subs  []core.Subtitle
+	intro *core.SkipTimestamp
+	outro *core.SkipTimestamp
+}
 
 type tenshoShowEntry struct {
 	path    string // watch path: "naruto-shippuden-1493"
@@ -114,25 +165,39 @@ type TenshoProvider struct {
 	client     *http.Client
 	base       string
 	anilistURL string
-	learnHost  func(string)
+	// flixera/animo are the two player hosts. They default to the live
+	// sites; tests inject one fixture server for all of them (the
+	// NewLeeProvider embedBase precedent) so the whole decrypt flow —
+	// embed page -> token -> stream JSON -> m3u8 probe — runs locally.
+	flixera   string
+	animo     string
+	learnHost func(string)
 
 	mu       sync.Mutex
 	shows    map[string]*tenshoShowEntry     // anilistID -> watch path + id
 	episodes map[string]*tenshoEpisodesEntry // show path -> episode list + token
 }
 
-func NewTenshoProvider(log zerolog.Logger, base, anilistURL string) *TenshoProvider {
+func NewTenshoProvider(log zerolog.Logger, base, anilistURL, flixeraBase, animoBase string) *TenshoProvider {
 	if strings.TrimSpace(base) == "" {
 		base = tenshoDefaultBase
 	}
 	if strings.TrimSpace(anilistURL) == "" {
 		anilistURL = tenshoAnilistURL
 	}
+	if strings.TrimSpace(flixeraBase) == "" {
+		flixeraBase = tenshoFlixera
+	}
+	if strings.TrimSpace(animoBase) == "" {
+		animoBase = tenshoCDN
+	}
 	return &TenshoProvider{
 		log:        log,
 		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
 		anilistURL: anilistURL,
+		flixera:    strings.TrimRight(flixeraBase, "/"),
+		animo:      strings.TrimRight(animoBase, "/"),
 		shows:      make(map[string]*tenshoShowEntry),
 		episodes:   make(map[string]*tenshoEpisodesEntry),
 	}
@@ -389,38 +454,180 @@ func (p *TenshoProvider) serverSlots(ctx context.Context, show *tenshoShowEntry,
 	return nil, nil, fmt.Errorf("tensho: server ajax rejected token twice")
 }
 
-// tenshoEmbedURL mirrors the site's loadPlayer switch: s-1 (and any
-// unknown slot) is the flixera player keyed by the episode's ani/mal ids,
-// s-2 is the 4animo hd-1 player keyed by episode id, s-3 is the 4animo
-// hd-2 player keyed by ani/mal.
-func tenshoEmbedURL(slot string, ep tenshoEpisode, lang string) string {
+// embedURL mirrors the site's loadPlayer switch: s-1 (and any unknown
+// slot) is the flixera player keyed by the episode's ani/mal ids, s-2 is
+// the 4animo hd-1 player keyed by episode id, s-3 is the 4animo hd-2
+// player keyed by ani/mal. The ani/mal fields carry "<id>/<ep>" (e.g.
+// "16498/1"), which is what puts the episode number in the path — flixera
+// serves a playback-less shell for a bare id (measured 7504-byte page).
+func (p *TenshoProvider) embedURL(slot string, ep tenshoEpisode, lang string) string {
 	switch slot {
 	case "s-2":
-		return tenshoCDN + "/embed/hd-1/" + ep.ID + "/" + lang + tenshoAnimoQuery
+		return p.animo + "/embed/hd-1/" + ep.ID + "/" + lang + tenshoAnimoQuery
 	case "s-3":
 		switch {
 		case ep.ANI != "":
-			return tenshoCDN + "/embed/hd-2/ani/" + ep.ANI + "/" + lang + tenshoAnimoQuery
+			return p.animo + "/embed/hd-2/ani/" + ep.ANI + "/" + lang + tenshoAnimoQuery
 		case ep.MAL != "":
-			return tenshoCDN + "/embed/hd-2/mal/" + ep.MAL + "/" + lang + tenshoAnimoQuery
+			return p.animo + "/embed/hd-2/mal/" + ep.MAL + "/" + lang + tenshoAnimoQuery
 		default:
-			return tenshoCDN + "/embed/hd-2/" + ep.ID + "/" + lang + tenshoAnimoQuery
+			return p.animo + "/embed/hd-2/" + ep.ID + "/" + lang + tenshoAnimoQuery
 		}
 	default: // s-1 and anything new the site adds
 		switch {
 		case ep.ANI != "":
-			return tenshoFlixera + "/embed/ani/" + ep.ANI + "/" + lang + tenshoFlixeraQuery
+			return p.flixera + "/embed/ani/" + ep.ANI + "/" + lang + tenshoFlixeraQuery
 		case ep.MAL != "":
-			return tenshoFlixera + "/embed/mal/" + ep.MAL + "/" + lang + tenshoFlixeraQuery
+			return p.flixera + "/embed/mal/" + ep.MAL + "/" + lang + tenshoFlixeraQuery
 		default:
-			return tenshoFlixera + "/embed/ani/" + ep.ID + "/" + lang + tenshoFlixeraQuery
+			return p.flixera + "/embed/ani/" + ep.ID + "/" + lang + tenshoFlixeraQuery
 		}
 	}
 }
 
-// FindEpisodeSource resolves one episode to its embed lineup for lang.
-// Returns nil (no error) when the show, episode, language or server list
-// is absent — the fan-out treats that as "this provider has nothing".
+// resolveEmbed fetches one player embed page and decrypts it to the direct
+// stream the player would play. Dispatch is by embed path (the site's own
+// s-1/s-2/s-3 switch), never by host, so fixtures can serve both players
+// from one origin.
+func (p *TenshoProvider) resolveEmbed(ctx context.Context, embedURL string) (*tenshoEmbed, error) {
+	status, page, _, err := p.get(ctx, embedURL, "")
+	if err != nil {
+		return nil, fmt.Errorf("tensho: embed fetch %s: %w", embedURL, err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("tensho: embed %s HTTP %d", embedURL, status)
+	}
+	base, err := url.Parse(embedURL)
+	if err != nil || base.Host == "" {
+		return nil, fmt.Errorf("tensho: bad embed url %q", embedURL)
+	}
+	if strings.Contains(base.Path, "/embed/hd-") {
+		return p.resolveReCloud(ctx, base, page)
+	}
+	return p.resolveFlixera(base, page)
+}
+
+// resolveReCloud decrypts a 4animo (ReCloud) embed: the page names its
+// getSources endpoint, which answers the HLS master + subtitle tracks +
+// intro/outro. The endpoint 404s unless the embed page arrives as Referer
+// (measured: with = 200, without = 404).
+func (p *TenshoProvider) resolveReCloud(ctx context.Context, embed *url.URL, page string) (*tenshoEmbed, error) {
+	m := tenshoSourcesURLRe.FindStringSubmatch(page)
+	if m == nil {
+		return nil, fmt.Errorf("tensho: no getSources token on %s", embed.Path)
+	}
+	src, err := embed.Parse(m[1])
+	if err != nil {
+		return nil, fmt.Errorf("tensho: bad getSources reference %q: %w", m[1], err)
+	}
+	status, body, _, err := p.get(ctx, src.String(), embed.String())
+	if err != nil {
+		return nil, fmt.Errorf("tensho: getSources fetch: %w", err)
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("tensho: getSources HTTP %d", status)
+	}
+	var payload struct {
+		Sources []struct {
+			File string `json:"file"`
+			Type string `json:"type"`
+		} `json:"sources"`
+		Tracks []tenshoTrack `json:"tracks"`
+		Intro  tenshoSkip    `json:"intro"`
+		Outro  tenshoSkip    `json:"outro"`
+	}
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		return nil, fmt.Errorf("tensho: getSources decode: %w", err)
+	}
+	master := ""
+	for _, s := range payload.Sources {
+		abs := tenshoAbs(embed, s.File)
+		if abs == "" {
+			continue
+		}
+		if strings.EqualFold(s.Type, "hls") || strings.Contains(s.File, ".m3u8") {
+			master = abs
+			break
+		}
+		if master == "" {
+			master = abs
+		}
+	}
+	if master == "" {
+		return nil, fmt.Errorf("tensho: getSources has no source file")
+	}
+	return &tenshoEmbed{
+		m3u8:  master,
+		subs:  tenshoSubs(payload.Tracks, embed),
+		intro: payload.Intro.toCore(),
+		outro: payload.Outro.toCore(),
+	}, nil
+}
+
+// resolveFlixera decrypts a FlixEra embed: the page inlines the playback
+// proxy path (the HLS master) and the subtitle tracks directly.
+func (p *TenshoProvider) resolveFlixera(embed *url.URL, page string) (*tenshoEmbed, error) {
+	m := tenshoFlixProxyRe.FindStringSubmatch(page)
+	if m == nil {
+		return nil, fmt.Errorf("tensho: no playback token on flixera embed %s", embed.Path)
+	}
+	master := tenshoAbs(embed, m[1])
+	if master == "" {
+		return nil, fmt.Errorf("tensho: unusable playback token on %s", embed.Path)
+	}
+	out := &tenshoEmbed{m3u8: master}
+	// window.__EMBED_TRACKS__ = [ ... ] — a JSON array; decode it with the
+	// streaming decoder so labels containing brackets cannot truncate a
+	// regex.
+	if i := strings.Index(page, tenshoFlixTracksMark); i >= 0 {
+		if j := strings.IndexByte(page[i:], '['); j >= 0 {
+			var tracks []tenshoTrack
+			if err := json.NewDecoder(strings.NewReader(page[i+j:])).Decode(&tracks); err == nil {
+				out.subs = tenshoSubs(tracks, embed)
+			}
+		}
+	}
+	return out, nil
+}
+
+// tenshoAbs resolves a player-relative reference ("/p?t=...") against the
+// embed page's origin.
+func tenshoAbs(base *url.URL, ref string) string {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return ""
+	}
+	u, err := url.Parse(ref)
+	if err != nil {
+		return ""
+	}
+	return base.ResolveReference(u).String()
+}
+
+// tenshoSubs converts player tracks to core subtitles (label -> lang code).
+func tenshoSubs(tracks []tenshoTrack, base *url.URL) []core.Subtitle {
+	var subs []core.Subtitle
+	for _, t := range tracks {
+		u := tenshoAbs(base, t.File)
+		if u == "" {
+			continue
+		}
+		label := strings.TrimSpace(t.Label)
+		code := mapSubtitleLang(label)
+		if label == "" {
+			label = code
+		}
+		subs = append(subs, core.Subtitle{URL: u, Lang: code, Label: label})
+	}
+	return subs
+}
+
+// FindEpisodeSource resolves one episode to direct (decrypted) HLS streams
+// for lang: every server slot's embed page is fetched and decrypted to the
+// master the player would play, then probed at segment depth — dead slots
+// are dropped. Returns nil (no error) when the show, episode, language or
+// server list is absent — the fan-out treats that as "this provider has
+// nothing".
 func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
 	langKey := "sub"
 	if strings.EqualFold(lang, "dub") {
@@ -476,25 +683,65 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 
 	sources := make([]core.Source, 0, len(slots))
 	names := make([]string, 0, len(slots))
-	for _, slot := range slots {
-		u := tenshoEmbedURL(slot.ServerName, *ep, langKey)
-		p.learnURLHost(u)
+	var intro, outro *core.SkipTimestamp
+	var lastErr error
+	for i, slot := range slots {
+		embedURL := p.embedURL(slot.ServerName, *ep, langKey)
+		res, err := p.resolveEmbed(ctx, embedURL)
+		if err != nil {
+			lastErr = err
+			p.log.Warn().Str("slot", slot.ServerName).Str("embed", embedURL).Err(err).
+				Msg("tensho: embed resolve failed, skipping slot")
+			continue
+		}
+		// Segment-depth honesty: a reachable master whose segments are
+		// blocked only spins at playback. Probe with NO Referer — that is
+		// exactly the shape playback takes through the media proxy, so a
+		// passing probe cannot mask a referer-gated source.
+		if !probeSegmentsLenient(ctx, p.client, res.m3u8, "", browserUA) {
+			p.log.Info().Str("slot", slot.ServerName).Str("url", res.m3u8).
+				Msg("tensho: stream blocked from this egress, dropping slot")
+			continue
+		}
+		p.learnURLHost(res.m3u8)
+		for _, sub := range res.subs {
+			p.learnURLHost(sub.URL)
+		}
 		sources = append(sources, core.Source{
-			URL:          u,
-			Type:         "embed",
+			URL:          res.m3u8,
+			Type:         "hls",
 			Quality:      "auto",
-			Verification: "embed",
+			Subtitles:    res.subs,
+			Verification: "proxy",
 		})
-		names = append(names, tenshoServerNames[len(names)])
+		// Slot-positional labels: a dropped slot keeps its own name out of
+		// the list instead of shifting the survivors.
+		names = append(names, tenshoServerNames[i])
+		if intro == nil {
+			intro = res.intro
+		}
+		if outro == nil {
+			outro = res.outro
+		}
+	}
+	if len(sources) == 0 {
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
+			Msg("tensho: no resolvable stream")
+		return nil, nil
 	}
 
 	p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
-		Int("embeds", len(sources)).Msg("tensho: resolved")
+		Int("streams", len(sources)).Msg("tensho: resolved")
 	return &SourceResult{
 		Sources:     sources,
 		Headers:     map[string]string{},
 		ServerName:  names[0],
 		ServerNames: names,
+		Intro:       intro,
+		Outro:       outro,
 	}, nil
 }
 
