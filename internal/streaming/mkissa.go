@@ -631,7 +631,18 @@ func (b *mkissaThrottleBreaker) record(success, throttled bool) {
 }
 
 // mkissaThrottleErr reports whether an engine error is throttle-class
-// (rate message or captcha challenge — both mean "back off this IP").
+// (rate message, captcha challenge, or hang — all mean "back off this
+// egress").
+//
+// The hang case matters: when an egress's bucket goes persistently dry
+// the engine's internal pacing keeps honouring "try again in 2s" until
+// its 35s request budget is exhausted, so a pure 429 storm surfaces as
+// "engine request timed out" with no verdict at all (seen on the shared
+// proxy exit, 2026-10-07). That is a throttle verdict in disguise —
+// counting it lets two consecutive hangs rest the path instead of
+// charging every request the full 35s while that egress is unusable.
+// No rate re-attempt applies (there is no demanded N to wait out, and a
+// dry bucket would just burn the budget again).
 func mkissaThrottleErr(err error) bool {
 	if err == nil {
 		return false
@@ -640,7 +651,11 @@ func mkissaThrottleErr(err error) bool {
 	if mkissaRateRe.MatchString(msg) {
 		return true
 	}
-	return strings.Contains(msg, "NEED_CAPTCHA")
+	if strings.Contains(msg, "NEED_CAPTCHA") {
+		return true
+	}
+	return strings.Contains(msg, "engine request timed out") ||
+		strings.Contains(msg, "mkissa: engine timeout")
 }
 
 // ---------------------------------------------------------------- engine
