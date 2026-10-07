@@ -418,9 +418,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("tensho: no sources for this episode")
-	case "mkissa":
+	case "mkissa", "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
-	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto", "yuzu", "heave", "animeheaven":
+	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto", "yuzu":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
