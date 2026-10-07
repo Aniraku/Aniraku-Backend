@@ -164,8 +164,8 @@ type SourceResult struct {
 // (multi-rendition HLS masters) ride next; VidNest (MegaPlay HLS + subs)
 // rides last; Lee (ani.pm direct HLS) rides after VidNest; MegaVid
 // (verified-lang MegaPlay) rides after Lee; Heave (animeheaven.me
-// cookie-gated direct mp4) and Tensho (zangetsu.cc flixera/4animo embeds)
-// ride after MegaVid. (Zenime removed
+// cookie-gated direct mp4) and Tensho (zangetsu.cc: flixera/4animo embeds
+// decrypted to direct HLS + probed) ride after MegaVid. (Zenime removed
 // 2026-09-30: arms API unreliable. OGFLix removed: api.anizen.tr challenged
 // every request and every resolved edge was blocked — pure fan-out latency
 // for nothing.)
@@ -191,7 +191,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewLeeProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
 			NewHeaveProvider(log, "", ""),
-			NewTenshoProvider(log, "", ""),
+			NewTenshoProvider(log, "", "", "", ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},

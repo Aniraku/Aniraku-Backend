@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/http"
@@ -14,14 +15,18 @@ import (
 )
 
 // tenshoFixture serves the zangetsu.cc flow: /search poster grid, watch
-// page with a fresh AJAX_TOKEN, /ajax/episodes and /ajax/server. The stale
-// token test makes the first /ajax/server call answer 403, forcing the
-// provider to reload the watch page and retry.
+// page with a fresh AJAX_TOKEN, /ajax/episodes, /ajax/server — plus both
+// player embed flows the provider decrypts (FlixEra inline token, ReCloud
+// getSources) down to a probeable /p?t= HLS chain. The stale token test
+// makes the first /ajax/server call answer 403, forcing the provider to
+// reload the watch page and retry; deadStreams makes every /p? stream
+// 404 so the segment probe drops every slot.
 type tenshoFixture struct {
 	srv         *httptest.Server
 	watchHits   atomic.Int64
 	serverHits  atomic.Int64
 	rejectFirst atomic.Bool // first /ajax/server call answers 403 (stale token)
+	deadStreams atomic.Bool // /p? streams 404 -> probes fail -> slots dropped
 }
 
 const (
@@ -34,10 +39,6 @@ const (
 	tenshoTitleEN  = "Naruto Shippuden"
 	tenshoTitleROM = "NARUTO: Shippuuden"
 	tenshoWatchURL = "/watch/" + tenshoShowPath + "?ep=1"
-	tenshoFlixSub  = "https://flixera.co/embed/ani/" + tenshoAniID + "/sub?autoplay=0&skipintro=0&skipoutro=0"
-	tenshoHd1Sub   = "https://cdn.4animo.xyz/embed/hd-1/" + tenshoEp1ID + "/sub?k=1&autoPlay=0&skipIntro=0&skipOutro=0"
-	tenshoHd2Sub   = "https://cdn.4animo.xyz/embed/hd-2/ani/" + tenshoAniID + "/sub?k=1&autoPlay=0&skipIntro=0&skipOutro=0"
-	tenshoFlixDub  = "https://flixera.co/embed/ani/" + tenshoAniID + "/dub?autoplay=0&skipintro=0&skipoutro=0"
 	tenshoSubNames = "Tsuki,Kaze,Hoshi"
 	tenshoDubNames = "Tsuki"
 )
@@ -106,6 +107,63 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 			tenshoTitleEN, tenshoTitleROM)
 	})
 
+	// FlixEra embed: the page inlines the playback proxy path (the HLS
+	// master) and subtitle tracks — this is all the decrypt step consumes.
+	mux.HandleFunc("/embed/ani/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><head><script>window.__EMBED_PROXY__ = "/p?t=flix-master";`+
+			`window.__EMBED_TRACKS__ = [{"file":"/p?t=flix-sub-en","label":"English","kind":"captions","default":true}];`+
+			`</script></head><body></body></html>`)
+	})
+
+	// ReCloud (4animo hd-1/hd-2) embed: the page names its getSources
+	// endpoint instead of inlining a stream.
+	reCloudShell := func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<html><head><script>var sourcesUrl = '/stream/getSources?t=page-token';</script></head><body></body></html>`)
+	}
+	mux.HandleFunc("/embed/hd-1/", reCloudShell)
+	mux.HandleFunc("/embed/hd-2/", reCloudShell)
+
+	// getSources answers master + tracks + intro/outro, and rejects
+	// requests without a Referer live (404 without — measured).
+	mux.HandleFunc("/stream/getSources", func(w http.ResponseWriter, r *http.Request) {
+		if r.Referer() == "" {
+			t.Errorf("getSources: missing Referer (live endpoint 404s without it)")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"sources":[{"file":"/p?t=animo-master","type":"hls"}],
+ "tracks":[{"file":"/p?t=animo-sub-en","label":"English","kind":"captions","default":true}],
+ "intro":{"start":138,"end":215},"outro":{"start":1452,"end":1542},
+ "server":"hd-1","episodeTitle":"Episode 1"}`)
+	})
+
+	// /p?t= is the ReCloud proxy path both players end on: master ->
+	// media -> segment (the chain the probe walks) plus subtitle files.
+	mux.HandleFunc("/p", func(w http.ResponseWriter, r *http.Request) {
+		if f.deadStreams.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		switch r.URL.Query().Get("t") {
+		case "flix-master", "animo-master":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1920x1080\n%s/p?t=%s-media\n",
+				f.srv.URL, strings.TrimSuffix(r.URL.Query().Get("t"), "-master"))
+		case "flix-media", "animo-media":
+			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n%s/p?t=%s-seg\n#EXT-X-ENDLIST\n",
+				f.srv.URL, strings.TrimSuffix(r.URL.Query().Get("t"), "-media"))
+		case "flix-seg", "animo-seg":
+			// MPEG-TS sync bytes — judged playable, never HTML.
+			w.Header().Set("Content-Type", "video/mp2t")
+			w.Write(bytes.Repeat([]byte{0x47, 0x00, 0x10, 0x00}, 47))
+		case "flix-sub-en", "animo-sub-en":
+			w.Header().Set("Content-Type", "text/vtt")
+			fmt.Fprint(w, "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nHello\n")
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -131,7 +189,9 @@ func assertAjaxHeaders(t *testing.T, r *http.Request, wantToken string) {
 }
 
 func newTenshoTestProvider(f *tenshoFixture) *TenshoProvider {
-	p := NewTenshoProvider(zerolog.Nop(), f.srv.URL, f.srv.URL+"/anilist")
+	// All three hosts point at the fixture: the whole decrypt flow (embed
+	// page -> token -> stream JSON -> m3u8 probe) must run locally.
+	p := NewTenshoProvider(zerolog.Nop(), f.srv.URL, f.srv.URL+"/anilist", f.srv.URL, f.srv.URL)
 	// httptest servers are loopback: the netguard transport's SSRF guard
 	// would block them, so tests use a plain client (production always
 	// uses the guarded one built by NewTenshoProvider).
@@ -163,7 +223,8 @@ func TestTenshoSearch(t *testing.T) {
 }
 
 // Full sub resolve: title match → fresh token → episode list → server
-// slots → three positional embed URLs (flixera, hd-1, hd-2).
+// slots → each embed decrypted to its direct m3u8, probed, and labeled
+// Tsuki/Kaze/Hoshi positionally.
 func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 	f := newTenshoFixture(t)
 	p := newTenshoTestProvider(f)
@@ -173,16 +234,39 @@ func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 		t.Fatalf("FindEpisodeSource: %v", err)
 	}
 	if sr == nil || len(sr.Sources) != 3 {
-		t.Fatalf("sources = %+v, want 3 embeds", sr)
+		t.Fatalf("sources = %+v, want 3 direct streams", sr)
 	}
-	wantURLs := []string{tenshoFlixSub, tenshoHd1Sub, tenshoHd2Sub}
+	wantURLs := []string{
+		f.srv.URL + "/p?t=flix-master",
+		f.srv.URL + "/p?t=animo-master",
+		f.srv.URL + "/p?t=animo-master",
+	}
 	for i, s := range sr.Sources {
-		if s.Type != "embed" || s.Verification != "embed" {
-			t.Fatalf("source %d = %+v, want embed/embed", i, s)
+		if s.Type != "hls" || s.Verification != "proxy" {
+			t.Fatalf("source %d = %+v, want hls/proxy (decrypted, never embed)", i, s)
 		}
 		if s.URL != wantURLs[i] {
 			t.Fatalf("source %d URL = %q, want %q", i, s.URL, wantURLs[i])
 		}
+	}
+	// Both players ship subtitle tracks alongside the stream token.
+	if subs := sr.Sources[0].Subtitles; len(subs) != 1 ||
+		subs[0].URL != f.srv.URL+"/p?t=flix-sub-en" || subs[0].Lang != "en" || subs[0].Label != "English" {
+		t.Fatalf("flixera subs = %+v", subs)
+	}
+	if subs := sr.Sources[1].Subtitles; len(subs) != 1 || subs[0].URL != f.srv.URL+"/p?t=animo-sub-en" {
+		t.Fatalf("animo subs = %+v", subs)
+	}
+	// ReCloud getSources intro/outro ride the result (first non-nil slot).
+	if sr.Intro == nil || sr.Intro.Start != 138 || sr.Intro.End != 215 {
+		t.Fatalf("Intro = %+v, want 138..215", sr.Intro)
+	}
+	if sr.Outro == nil || sr.Outro.Start != 1452 || sr.Outro.End != 1542 {
+		t.Fatalf("Outro = %+v, want 1452..1542", sr.Outro)
+	}
+	// Playback needs no Referer upstream (measured) — ship no headers.
+	if len(sr.Headers) != 0 {
+		t.Fatalf("Headers = %+v, want none", sr.Headers)
 	}
 	if got := strings.Join(sr.ServerNames, ","); got != tenshoSubNames {
 		t.Fatalf("ServerNames = %q, want %q", got, tenshoSubNames)
@@ -192,7 +276,7 @@ func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 	}
 }
 
-// Dub lane: episode 1 has dub → one flixera dub embed; episode 2 is
+// Dub lane: episode 1 has dub → one decrypted flixera dub stream; episode 2 is
 // sub-only → dub request returns nil (strict per-lang, no cross fallback).
 func TestTenshoDubLane(t *testing.T) {
 	f := newTenshoFixture(t)
@@ -203,8 +287,12 @@ func TestTenshoDubLane(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dub FindEpisodeSource: %v", err)
 	}
-	if sr == nil || len(sr.Sources) != 1 || sr.Sources[0].URL != tenshoFlixDub {
-		t.Fatalf("dub sources = %+v, want single flixera dub", sr)
+	if sr == nil || len(sr.Sources) != 1 {
+		t.Fatalf("dub sources = %+v, want single decrypted flixera dub", sr)
+	}
+	if sr.Sources[0].URL != f.srv.URL+"/p?t=flix-master" ||
+		sr.Sources[0].Type != "hls" || sr.Sources[0].Verification != "proxy" {
+		t.Fatalf("dub source = %+v, want direct hls/proxy", sr.Sources[0])
 	}
 	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != tenshoDubNames {
 		t.Fatalf("dub names = %v, want [%s]", sr.ServerNames, tenshoDubNames)
@@ -267,5 +355,22 @@ func TestTenshoFindEpisodes(t *testing.T) {
 	}
 	if _, err := p.FindEpisodes(tenshoTestCtx(t), "badpath"); err == nil {
 		t.Fatal("expected error for non-path provider id")
+	}
+}
+
+// When every decrypted stream fails the segment probe (CDN blocked from
+// this egress), the provider must return nil — not embed URLs, not an
+// error — so the fan-out moves on cleanly.
+func TestTenshoDeadStreamsDrop(t *testing.T) {
+	f := newTenshoFixture(t)
+	f.deadStreams.Store(true)
+	p := newTenshoTestProvider(f)
+
+	sr, err := p.FindEpisodeSource(tenshoTestCtx(t), "21", 1, "sub")
+	if err != nil {
+		t.Fatalf("FindEpisodeSource: %v", err)
+	}
+	if sr != nil {
+		t.Fatalf("sources = %+v, want nil when every probe fails", sr)
 	}
 }
