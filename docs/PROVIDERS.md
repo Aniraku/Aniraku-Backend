@@ -39,7 +39,8 @@ then:
 1. `mergeZokoDownloads` — Anikoto download links ride onto Zoko servers.
 2. `mergeNiNSubtitles` — NiN borrows verified tracks (Niko → animex → Zoko).
 3. `verifyMegaVidLang` — Vidy language verification (below).
-4. Merge in fixed provider order; `attachKiwiDownloads`; stable-sort by
+4. Merge in fixed provider order; `attachDownloadLinks` (AnimeDL, all
+   sources but FlixCloud); stable-sort by
    playback verdict (`proxy > direct > embed > dead` — ordering hint only,
    never a filter).
 5. Every source URL is wrapped into `/api/v1/proxy?...` per request

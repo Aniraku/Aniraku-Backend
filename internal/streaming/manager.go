@@ -254,9 +254,9 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 // fallback chain, explicit provider requests) while it is unreliable.
 // Currently unpaused: streams are back, reliability re-verified.
 // Flip back to true if it degrades again; no other change needed.
-// NOTE: the Kiwi download fetcher (kiwi_downloads.go) is independent —
-// the zokoanime.video download API endpoints proved stable even while
-// streams flapped — so it keeps serving regardless of this flag.
+// NOTE: download links no longer touch zokoanime.video at all — they come
+// from AnimeDL (animedl_downloads.go, a separate domain), so this flag
+// never affects them.
 const zokoPaused = false
 
 // GetSourcesForProviderWithSlug is the frontend-aware streaming entry point.
@@ -533,7 +533,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// probed list instead; speed comes from the collectors themselves.
 
 	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers []core.Server
-	var kiwiLinks []core.DownloadLink
+	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
 	// Per-collector wall time, logged after the merge: the fan-out's
@@ -648,9 +648,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
 			start := time.Now()
-			kiwiLinks = fetchKiwiDownloads(ctx, m.httpClient, anilistID, episode, lang)
+			adlLinks = fetchAnimeDlDownloads(ctx, m.httpClient, anilistID, episode, lang)
 			dmu.Lock()
-			collectorMs["kiwiDownloads"] = time.Since(start).Milliseconds()
+			collectorMs["animedlDownloads"] = time.Since(start).Milliseconds()
 			dmu.Unlock()
 		},
 	}
@@ -685,13 +685,13 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers} {
 		allServers = append(allServers, pool...)
 	}
-	// Kiwi download links (fetched in parallel above): attach to every
-	// non-embed server (embed players take no file links). Independent of
-	// the Zoko streaming provider and its pause flag.
-	if len(kiwiLinks) > 0 {
-		allServers = attachKiwiDownloads(allServers, kiwiLinks)
+	// AnimeDL download links (fetched in parallel above): attach to every
+	// server except FlixCloud's — "all sources without the FlixCloud"; the
+	// embed player takes no file links, other providers' links stay first.
+	if len(adlLinks) > 0 {
+		allServers = attachDownloadLinks(allServers, adlLinks)
 	} else {
-		m.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("servers: no kiwi download links")
+		m.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("servers: no animedl download links")
 	}
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
