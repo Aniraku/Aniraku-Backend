@@ -123,8 +123,9 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	mux.HandleFunc("/embed/hd-1/", reCloudShell)
 	mux.HandleFunc("/embed/hd-2/", reCloudShell)
 
-	// getSources answers master + tracks + intro/outro, and rejects
-	// requests without a Referer live (404 without — measured).
+	// getSources answers master + tracks (and an intro/outro the provider
+	// ignores — skip segments come from Aniskip), and rejects requests
+	// without a Referer live (404 without — measured).
 	mux.HandleFunc("/stream/getSources", func(w http.ResponseWriter, r *http.Request) {
 		if r.Referer() == "" {
 			t.Errorf("getSources: missing Referer (live endpoint 404s without it)")
@@ -257,12 +258,10 @@ func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 	if subs := sr.Sources[1].Subtitles; len(subs) != 1 || subs[0].URL != f.srv.URL+"/p?t=animo-sub-en" {
 		t.Fatalf("animo subs = %+v", subs)
 	}
-	// ReCloud getSources intro/outro ride the result (first non-nil slot).
-	if sr.Intro == nil || sr.Intro.Start != 138 || sr.Intro.End != 215 {
-		t.Fatalf("Intro = %+v, want 138..215", sr.Intro)
-	}
-	if sr.Outro == nil || sr.Outro.Start != 1452 || sr.Outro.End != 1542 {
-		t.Fatalf("Outro = %+v, want 1452..1542", sr.Outro)
+	// The players' intro/outro ride along in the live JSON but must NOT
+	// reach the result — the frontend uses Aniskip for skip segments.
+	if sr.Intro != nil || sr.Outro != nil {
+		t.Fatalf("Intro/Outro = %+v/%+v, want nil (Aniskip is the frontend's skip source)", sr.Intro, sr.Outro)
 	}
 	// Playback needs no Referer upstream (measured) — ship no headers.
 	if len(sr.Headers) != 0 {

@@ -43,8 +43,7 @@ import (
 //	          window.__EMBED_TRACKS__ = [...] -> subtitle tracks
 //	4animo:   embed page -> var sourcesUrl = '/stream/getSources?t=...'
 //	          -> GET with the embed page as Referer (404 without — measured)
-//	          -> JSON: sources[].file = "/p?t=..." (HLS master), tracks[],
-//	          intro/outro skip segments
+//	          -> JSON: sources[].file = "/p?t=..." (HLS master) + tracks[]
 //
 // Both players' /p?t= URLs are ReCloud proxy paths answering
 // application/vnd.apple.mpegurl masters with absolute child URLs (measured
@@ -96,25 +95,12 @@ type tenshoTrack struct {
 	Label string `json:"label"`
 }
 
-// tenshoSkip is a player intro/outro segment in seconds.
-type tenshoSkip struct {
-	Start float64 `json:"start"`
-	End   float64 `json:"end"`
-}
-
-func (s tenshoSkip) toCore() *core.SkipTimestamp {
-	if s.End <= s.Start || s.Start < 0 {
-		return nil
-	}
-	return &core.SkipTimestamp{Start: s.Start, End: s.End}
-}
-
 // tenshoEmbed is one player embed decrypted to the stream it would play.
+// The players also report intro/outro skip segments — deliberately unused:
+// the frontend gets its skip data from Aniskip, not from providers.
 type tenshoEmbed struct {
-	m3u8  string
-	subs  []core.Subtitle
-	intro *core.SkipTimestamp
-	outro *core.SkipTimestamp
+	m3u8 string
+	subs []core.Subtitle
 }
 
 type tenshoShowEntry struct {
@@ -508,9 +494,9 @@ func (p *TenshoProvider) resolveEmbed(ctx context.Context, embedURL string) (*te
 }
 
 // resolveReCloud decrypts a 4animo (ReCloud) embed: the page names its
-// getSources endpoint, which answers the HLS master + subtitle tracks +
-// intro/outro. The endpoint 404s unless the embed page arrives as Referer
-// (measured: with = 200, without = 404).
+// getSources endpoint, which answers the HLS master + subtitle tracks.
+// The endpoint 404s unless the embed page arrives as Referer (measured:
+// with = 200, without = 404).
 func (p *TenshoProvider) resolveReCloud(ctx context.Context, embed *url.URL, page string) (*tenshoEmbed, error) {
 	m := tenshoSourcesURLRe.FindStringSubmatch(page)
 	if m == nil {
@@ -533,8 +519,6 @@ func (p *TenshoProvider) resolveReCloud(ctx context.Context, embed *url.URL, pag
 			Type string `json:"type"`
 		} `json:"sources"`
 		Tracks []tenshoTrack `json:"tracks"`
-		Intro  tenshoSkip    `json:"intro"`
-		Outro  tenshoSkip    `json:"outro"`
 	}
 	if err := json.Unmarshal([]byte(body), &payload); err != nil {
 		return nil, fmt.Errorf("tensho: getSources decode: %w", err)
@@ -557,10 +541,8 @@ func (p *TenshoProvider) resolveReCloud(ctx context.Context, embed *url.URL, pag
 		return nil, fmt.Errorf("tensho: getSources has no source file")
 	}
 	return &tenshoEmbed{
-		m3u8:  master,
-		subs:  tenshoSubs(payload.Tracks, embed),
-		intro: payload.Intro.toCore(),
-		outro: payload.Outro.toCore(),
+		m3u8: master,
+		subs: tenshoSubs(payload.Tracks, embed),
 	}, nil
 }
 
@@ -683,7 +665,6 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 
 	sources := make([]core.Source, 0, len(slots))
 	names := make([]string, 0, len(slots))
-	var intro, outro *core.SkipTimestamp
 	var lastErr error
 	for i, slot := range slots {
 		embedURL := p.embedURL(slot.ServerName, *ep, langKey)
@@ -717,12 +698,6 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		// Slot-positional labels: a dropped slot keeps its own name out of
 		// the list instead of shifting the survivors.
 		names = append(names, tenshoServerNames[i])
-		if intro == nil {
-			intro = res.intro
-		}
-		if outro == nil {
-			outro = res.outro
-		}
 	}
 	if len(sources) == 0 {
 		if lastErr != nil {
@@ -740,8 +715,6 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		Headers:     map[string]string{},
 		ServerName:  names[0],
 		ServerNames: names,
-		Intro:       intro,
-		Outro:       outro,
 	}, nil
 }
 
