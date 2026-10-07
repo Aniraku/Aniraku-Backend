@@ -24,10 +24,9 @@ fallback order and the `/servers` merge order.
 | `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
-| `mkissa` | Chuu (clock/wixmp), Mua, Kissy, Smooch, Peck, Xoxo (ok.ru), Umi (uns.bio) — by source kind | mkissa.to signed GraphQL → **direct m3u8/mp4 only**, probe-verified; JS engine daemon owns the crypto |
 
 Removed providers return a `removed` error naming them explicitly
-(`miruro`, `zenime`, `tryembed`, …) — never silently fall
+(`miruro`, `zenime`, `tryembed`, `mkissa`, …) — never silently fall
 through.
 
 ## Request flows
@@ -93,48 +92,14 @@ only — never wrapped URLs).
   declarations; (2) TS PMT ISO-639 segment descriptors (ground truth);
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
-- **Mkissa show matching — anti-mismatch** (`resolveShow`): an exact
-  `aniListId` match wins outright. The title-scored fallback is accepted
-  only when the edge records **no** `aniListId` *and* scores ≥ 80 (exact
-  name/English or a full-substring hit — never token overlap). An edge
-  that records a *different* `aniListId` is rejected outright: a
-  sub-only title searched in dub mode returns unrelated shows (Big X
-  dub → "Boonie Bears: The Big Top Secret", score 35, must not win).
-  A score-only match logs a Warn naming both sides; no match means no
-  mkissa server — never a wrong one. Episode existence is then checked
-  against that show's own `availableEpisodesDetail` for the requested
-  audio track (strict per-lang: missing dub list = no dub server).
-- **Mkissa engine daemon** (`third_party/mkissa-engine`, bun): the
-  signed-call crypto (lane key + AES-GCM `tobeparsed`) lives in JS and
-  cannot be re-derived in Go, so a long-lived `mkissa_daemon.mjs` keeps
-  the lane key and discovery warm across requests. It talks **POST
-  only** — GET from datacenter egress answers `NEED_CAPTCHA`, POST
-  does not (no captcha, no token, no relay). Go serializes runs with a
-  4 s gap (mkissa demands ≥ 2 s) and gives a rate verdict ("try again
-  in N seconds") exactly one polite re-attempt after N + 1 s — inside
-  an attempt the engine's own retries stay paced at the demanded N +
-  1.5 s. Throttle-class run failures trip a breaker **per egress**
-  (bridge and local each cool down 10 min after two consecutive
-  strikes) so a 429 storm on the runner rests only the bridge and a
-  dead local proxy rests only the local path — never one dry bucket
-  blinding the healthy one. The signed call itself prefers the relay
-  bridge below; the local daemon — on its proxied egress (next
-  section) — is its fallback.
-- **Mkissa is direct-only.** Only sources with a direct `extractedUrl`
-  (m3u8/mp4) are listed; pure embeds are skipped. ok.ru and the
-  allanime clock are the live extractors; mp4upload/streamsb/streamlare
-  return null and cost a fetch. Every kept URL is probe-verified
-  master → media → segment before it lists.
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
-  MegaVid/mkissa never receive hentai titles (mkissa also forces
-  `allowAdult:false` in its own search).
+  MegaVid never receive hentai titles.
 - **No server-list snapshot cache.** Tokenized URLs expire without a
   reliable invalidation signal; every request computes a fresh,
   honestly-probed list. Speed comes from provider resolve caches:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
-  (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min, mkissa
-  show 24 h + resolve 30 min (lang-keyed), VidNest/Lee/MegaVid
-  fresh per resolve (short-lived tokens).
+  (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
+  VidNest/Lee/MegaVid fresh per resolve (short-lived tokens).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
   rate limit) — never `graphql.anilist.co`.
 
@@ -158,67 +123,6 @@ routes **only those API calls** through `third_party/relay/worker.mjs`
 (key-gated, path-restricted — never an open proxy). Video bytes, probes
 and playback stay direct. Unset = direct with silent skip on 403.
 Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
-Mkissa's gated signed calls prefer the **relay bridge** (next
-section); the local daemon's fallback egress is an HTTP forwarder on
-the host (`mkissa-proxy-fwd.service`, pproxy bound to the docker
-bridge only) that carries the engine child's calls to a free
-residential-ish socks4 upstream. `MKISSA_PROXY` in the api service
-env scopes the hop to the spawned daemon alone: bun's
-`NODE_USE_ENV_PROXY` routes the engine's plain-fetch calls (bootstrap,
-discovery) through the forwarder and wreq reads `MKISSA_PROXY`
-directly for the signed gate calls — the API process itself never
-sees proxy env, so playback relays, probes and every other provider
-stay direct. The former WARP namespace + TLS splice
-(`deploy/mkissa-warp/`, compose `extra_hosts` 10.77.0.2, netguard's
-10.77.0.0/30 dial exemption) was retired on 2026-10-07: WARP exits
-drew `NEED_CAPTCHA` and the VPS's own AWS address sits in a dry 429
-bucket, while a clean residential exit answers with signed sources.
-Free proxies flap by nature, so this path is a fallback and never the
-only one: if the upstream dies the forwarder keeps restarting and its
-breaker rests *local only* while the bridge serves. `MKISSA_API` is
-retired (still honored if set). Extractor file fetches stay direct.
-
-## The mkissa relay bridge (GitHub Actions pull-worker)
-
-mkissa's signed-call gate is per egress IP: the VPS's own AWS address
-answers `Too many requests` persistently and its former WARP exits
-escalated to `NEED_CAPTCHA`, while the GitHub Actions
-runner's native US egress answered `GATE_OPEN` with signed sources on
-every probe (2026-10-06). Runners accept no inbound traffic, so the call
-is *pulled* instead:
-
-1. `runEngine` → `daemon.Call` enqueues `{id, showId, audio, ep}` on an
-   in-process queue (`internal/streaming/mkissa_bridge.go`; cap 32,
-   90 s TTL) and waits up to 15 s.
-2. The worker (`deploy/mkissa-relay-worker/worker.mjs`, kept alive by
-   `.github/workflows/mkissa-relay.yml` — 5 h 45 m windows that **arm
-   their own successor** at T−2 min via `workflow_dispatch` with the
-   job's `GITHUB_TOKEN`; GitHub's own `*/5 min` schedule is only a
-   backup because this repo's cron delivery runs hours late, and a
-   1-running/1-queued concurrency chain boots the successor within
-   seconds) polls `POST /api/v1/internal/mkissa/poll` about once a
-   second, pipes the job through the vendored `mkissa_daemon.mjs` on
-   the runner's egress, and posts the raw response line to
-   `POST /api/v1/internal/mkissa/result`.
-3. The matching pending entry wakes and the sources flow out. Typical
-   round trip: 2-8 s.
-
-Both endpoints are Bearer-gated with `ANIRAKU_BRIDGE_TOKEN` and answer
-404 while it is unset; the GitHub side stores `BRIDGE_URL` and
-`BRIDGE_TOKEN` as repo secrets (never in the tree). Every bridge failure
-— queue full, silent worker, malformed answer — falls back to the local
-daemon above (proxied egress, its own breaker + resolve cache
-absorbing), so a scheduling gap in the worker chain costs latency, not
-availability. The two paths carry **separate** throttle breakers: a 429
-storm on the runner rests the bridge only, a dead free proxy rests the
-local path only. A
-decoded engine verdict such as `NEED_CAPTCHA` is never re-tried across
-transports; only transport-level trouble triggers the fallback. Jobs are
-delivered at-least-once (a worker dying mid-job is covered by the next),
-with late/duplicate answers dropped by id. The vidnest relay
-(`ANIRAKU_RELAY_URL/KEY`, `third_party/relay/worker.mjs`) is a separate
-mechanism and untouched by all of this.
-See `deploy/mkissa-relay-worker/README.md` for the runbook.
 
 ## Adding a provider — checklist
 

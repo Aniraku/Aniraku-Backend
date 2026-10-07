@@ -45,7 +45,7 @@ func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 	}
 }
 
-// mp4 direct sources (mkissa mp4upload, animex variants) wrap through the
+// mp4 direct sources (mp4upload, animex variants) wrap through the
 // proxy like hls — never raw — but carry no al (single-audio muxed).
 func TestProxySourcesWrapsMP4WithoutAl(t *testing.T) {
 	req := httptest.NewRequest("GET", "https://api.aniraku.tech/api/v1/servers?lang=dub", nil)

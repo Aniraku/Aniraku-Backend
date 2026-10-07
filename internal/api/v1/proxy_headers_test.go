@@ -6,8 +6,8 @@ import (
 )
 
 // applyProxyQueryHeaders force-sets the hotlink referer per CDN host
-// (measured: mp4upload file servers 403 mkissa.to and empty referers,
-// 206 with the site referer; kwik CDNs behave the same for kwik.cx).
+// (measured: mp4upload file servers 403 provider/empty referers, 206
+// with the site referer; kwik CDNs behave the same for kwik.cx).
 // Client-supplied headers always win.
 func TestApplyProxyQueryHeadersReferer(t *testing.T) {
 	for url, want := range map[string]string{
@@ -31,7 +31,7 @@ func TestApplyProxyQueryHeadersReferer(t *testing.T) {
 		t.Fatalf("client referer overridden: %q", got)
 	}
 	req = httptest.NewRequest("GET", "/api/v1/proxy?url=https://a6.mp4upload.com/x.mp4", nil)
-	req.Header.Set("Referer", "https://mkissa.to/")
+	req.Header.Set("Referer", "https://custom.example/")
 	applyProxyQueryHeaders(req, "")
 	if got := req.Header.Get("Referer"); got != "https://mp4upload.com/" {
 		t.Fatalf("mp4upload provider referer not replaced: %q", got)

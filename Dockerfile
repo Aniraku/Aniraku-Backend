@@ -14,27 +14,17 @@ RUN CGO_ENABLED=0 go build \
     -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILDDATE}" \
     -o /aniraku-server ./cmd/aniraku-server
 
-# Runtime stage: debian-slim for glibc. Bun runs the vendored mkissa
-# engine as a long-lived daemon (signed-call crypto lives in JS; the
-# wreq TLS binding links glibc, so alpine/musl cannot load it).
-# Minimal, non-root; CA certs + wget (healthcheck) join the static Go
-# binary, bun and the vendored engine.
+# Runtime stage: debian-slim for glibc: minimal, non-root; CA certs +
+# wget (healthcheck) join the static Go binary.
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates wget \
     && rm -rf /var/lib/apt/lists/* && useradd -m -u 65532 appuser
-# Bun pinned to major 1 (official slim image): copied, not installed, so
-# the build needs no extra network fetch beyond base pulls.
-COPY --from=oven/bun:1-slim /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
 
 COPY --from=gobuild /aniraku-server /app/aniraku-server
-COPY --from=gobuild /src/third_party/mkissa-engine /app/third_party/mkissa-engine
 COPY start.sh /start.sh
-# Engine JS deps (wreq TLS binding) install at build time so the repo
-# stays free of vendored node_modules; bun needs HOME-writable cache
-# only during this root-owned step.
-RUN chmod +x /start.sh && /usr/local/bin/bun install --cwd /app/third_party/mkissa-engine --production --silent && chown -R appuser /app && /usr/local/bin/bun --version
+RUN chmod +x /start.sh && chown -R appuser /app
 USER appuser
 EXPOSE 43211
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \

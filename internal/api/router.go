@@ -104,12 +104,6 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		r.With(proxyRL.Middleware).Get("/api/v1/download", h.Download)
 		r.Get("/ani/v1/epsrc", h.LegacyEpsrc)
 		r.Post("/api/v1/anilist", h.AniListProxy)
-
-		// mkissa relay bridge: token-gated (404 while unset) pull-worker
-		// endpoints for the GitHub Actions worker. See
-		// internal/streaming/mkissa_bridge.go for the mechanism.
-		r.Post("/api/v1/internal/mkissa/poll", h.MkissaBridgePoll)
-		r.Post("/api/v1/internal/mkissa/result", h.MkissaBridgeResult)
 	})
 
 	// Auth-required endpoints (rate limited)

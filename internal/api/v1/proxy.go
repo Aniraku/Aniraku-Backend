@@ -843,9 +843,9 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 		}
 	}
 	// Hotlink-locked file hosts always take the site referer, even over a
-	// provider-default one: mkissa stamps Referer mkissa.to on all its
-	// results, and mp4upload answers that (or empty) with 403 while the
-	// site referer gets 206 for the same token (measured 2026-10-05).
+	// provider-default one: mp4upload answers provider referers (or
+	// empty) with 403 while the site referer gets 206 for the same
+	// token (measured 2026-10-05).
 	if strings.Contains(strings.ToLower(req.URL.String()), "mp4upload") {
 		req.Header.Set("Referer", "https://mp4upload.com/")
 	}

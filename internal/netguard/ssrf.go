@@ -12,10 +12,9 @@ import (
 // is about to dial. Validating here — rather than on the hostname — is what
 // makes it robust: DNS rebinding, HTTP redirects, and alternate IP encodings
 // all funnel through this same check, because they all must eventually connect
-// to an actual address. No private address passes: the mkissa WARP splice
-// exemption (10.77.0.0/30) retired with that namespace on 2026-10-07 — the
-// engine child now reaches its egress proxy in a separate process that never
-// uses this dial hook.
+// to an actual address. No private address passes: the retired relay
+// splice exemption (10.77.0.0/30) is gone — private space is private
+// again, and no egress trick re-grants it.
 func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {

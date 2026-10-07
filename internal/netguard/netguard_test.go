@@ -97,8 +97,8 @@ func TestControlHookBlocksPrivateDials(t *testing.T) {
 		{"[::1]:9000", true},
 		{"[fd00::5]:443", true},
 		{"not-an-ip:80", true}, // unresolved address must fail closed
-		// The former mkissa WARP splice range (10.77.0.0/30) lost its
-		// exemption with the namespace: private space is private again.
+		// The retired relay splice range (10.77.0.0/30) stays blocked:
+		// private space is private again.
 		{"10.77.0.2:443", true},
 		{"10.77.0.4:443", true},
 		{"10.77.1.2:443", true},
