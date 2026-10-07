@@ -24,6 +24,8 @@ fallback order and the `/servers` merge order.
 | `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
+| `heave` | Heave | animeheaven.me plain-PHP catalog: `fastsearch` → `anime.php` → `gate.php` (Cookie `key=`) → **direct mp4** mirrors, probe-verified; single-track site, both lanes |
+| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → **flixera/4animo embeds** (sub+dub) |
 
 Removed providers return a `removed` error naming them explicitly
 (`miruro`, `zenime`, `tryembed`, `mkissa`, …) — never silently fall
@@ -93,13 +95,16 @@ only — never wrapped URLs).
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
-  MegaVid never receive hentai titles.
+  MegaVid/Heave/Tensho never receive hentai titles.
 - **No server-list snapshot cache.** Tokenized URLs expire without a
   reliable invalidation signal; every request computes a fresh,
   honestly-probed list. Speed comes from provider resolve caches:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
-  VidNest/Lee/MegaVid fresh per resolve (short-lived tokens).
+  VidNest/Lee/MegaVid fresh per resolve (short-lived tokens),
+  Heave show/resolve 10 min (probe on resolve), Tensho show 10 min +
+  episode list/token 3 min (page token 403s when stale — refreshed
+  once and retried).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
   rate limit) — never `graphql.anilist.co`.
 

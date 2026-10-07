@@ -111,6 +111,12 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if mv, ok := p.(*MegaVidProvider); ok {
 			mv.SetHostLearner(fn)
 		}
+		if hv, ok := p.(*HeaveProvider); ok {
+			hv.SetHostLearner(fn)
+		}
+		if ts, ok := p.(*TenshoProvider); ok {
+			ts.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -157,7 +163,9 @@ type SourceResult struct {
 // playback; AnimeGG (direct mp4, highest quality per mirror) and AniWaves
 // (multi-rendition HLS masters) ride next; VidNest (MegaPlay HLS + subs)
 // rides last; Lee (ani.pm direct HLS) rides after VidNest; MegaVid
-// (verified-lang MegaPlay) rides after Lee. (Zenime removed
+// (verified-lang MegaPlay) rides after Lee; Heave (animeheaven.me
+// cookie-gated direct mp4) and Tensho (zangetsu.cc flixera/4animo embeds)
+// ride after MegaVid. (Zenime removed
 // 2026-09-30: arms API unreliable. OGFLix removed: api.anizen.tr challenged
 // every request and every resolved edge was blocked — pure fan-out latency
 // for nothing.)
@@ -182,6 +190,8 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewVidNestProvider(log, ""),
 			NewLeeProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
+			NewHeaveProvider(log, "", ""),
+			NewTenshoProvider(log, "", ""),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -267,6 +277,10 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	// "animepahe"/"pahe" alias VidNest (it scrapes animepahe pages).
 	case "vidnest", "nest", "animepahe", "pahe":
 		provider = "vidnest"
+	case "heave", "animeheaven":
+		provider = "heave"
+	case "tensho", "zangetsu":
+		provider = "tensho"
 	case "lee":
 		provider = "lee"
 	case "megavid", "vidy":
@@ -281,7 +295,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee", "megavid":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "vidnest", "lee", "megavid", "heave", "tensho":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -400,6 +414,24 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("vidnest: no sources for this episode")
+	case "heave", "animeheaven":
+		result, err := m.tryHeave(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("heave: no sources for this episode")
+	case "tensho", "zangetsu":
+		result, err := m.tryTensho(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("tensho: no sources for this episode")
 	case "mkissa":
 		return nil, fmt.Errorf("provider %q removed", provider)
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto", "yuzu":
@@ -409,7 +441,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
 	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
 	// sixth, AniWaves HLS seventh, VidNest eighth, Lee ninth, MegaVid
-	// tenth. Hentai
+	// tenth, Heave mp4 eleventh, Tensho embeds twelfth. Hentai
 	// titles
 	// only ever reach Zoko (MAL-keyed for hentai, when unpaused) and
 	// FlixCloud (Reanime embeds, covers hentai).
@@ -448,6 +480,10 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryLee(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryHeave(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryTensho(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -512,7 +548,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, hvServers, tsServers []core.Server
 	var kiwiLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -617,6 +653,20 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
+			if !hentai {
+				hvServers = run("heave", func() []core.Server {
+					return m.collectHeaveServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				tsServers = run("tensho", func() []core.Server {
+					return m.collectTenshoServers(ctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
@@ -649,12 +699,13 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// corroboration gate — Vidy lists only alongside another provider.
 	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang,
 		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
-			len(agServers)+len(awServers)+len(vnServers)+len(leeServers)+len(akServers) > 0)
+			len(agServers)+len(awServers)+len(vnServers)+len(leeServers)+len(akServers)+
+			len(hvServers)+len(tsServers) > 0)
 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, hvServers, tsServers} {
 		allServers = append(allServers, pool...)
 	}
 	// Kiwi download links (fetched in parallel above): attach to every
@@ -1635,6 +1686,117 @@ func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer str
 	VODCacheSet(masterURL, body)
 	langs := m3uAudioLangs(body)
 	return langs, len(langs) > 0
+}
+
+func (m *Manager) getHeaveProvider() *HeaveProvider {
+	for _, p := range m.providers {
+		if hv, ok := p.(*HeaveProvider); ok {
+			return hv
+		}
+	}
+	return nil
+}
+
+// tryHeave resolves an animeheaven.me cookie-gated direct mp4 (all CDN
+// mirrors of the episode).
+func (m *Manager) tryHeave(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	hv := m.getHeaveProvider()
+	if hv == nil {
+		return nil, fmt.Errorf("heave provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying heave")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := hv.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("heave failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	// Single-track site: withDubSubtitles is a no-op for heave (only Sora
+	// dub takes nico files) but keeps the call pattern uniform.
+	source = m.withDubSubtitles(ctx, "heave", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectHeaveServers maps heave mirrors to the single "Heave" server.
+func (m *Manager) collectHeaveServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		hv, ok := prov.(*HeaveProvider)
+		if !ok {
+			continue
+		}
+		sr, err := hv.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "heave").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "heave", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{heaveServerName}, "heave", lang, sr)
+	}
+	return out
+}
+
+func (m *Manager) getTenshoProvider() *TenshoProvider {
+	for _, p := range m.providers {
+		if ts, ok := p.(*TenshoProvider); ok {
+			return ts
+		}
+	}
+	return nil
+}
+
+// tryTensho resolves a zangetsu.cc embed lineup (flixera/4animo slots).
+func (m *Manager) tryTensho(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	ts := m.getTenshoProvider()
+	if ts == nil {
+		return nil, fmt.Errorf("tensho provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying tensho")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := ts.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("tensho failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+	source = m.withDubSubtitles(ctx, "tensho", lang, anilistID, episode, source)
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// collectTenshoServers maps embed slots to Tsuki/Kaze/Hoshi.
+func (m *Manager) collectTenshoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		ts, ok := prov.(*TenshoProvider)
+		if !ok {
+			continue
+		}
+		sr, err := ts.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "tensho").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		sr = m.withDubSubtitles(ctx, "tensho", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, tenshoServerNames[:], "tensho", lang, sr)
+	}
+	return out
 }
 
 // verifyMegaVidLang enforces the operator language rule: megavid sometimes
