@@ -868,7 +868,7 @@ components:
         episode: { type: integer, minimum: 1 }
         provider:
           type: string
-          description: Optional specific provider (anikoto | animex | zoko | nin | kaa | animegg | aniwaves | vidnest | lee | megavid | flixcloud | heave | tensho).
+          description: Optional specific provider (anikoto | animex | zoko | nin | kaa | animegg | aniwaves | vidnest | lee | megavid | flixcloud | tensho).
         lang: { type: string, default: sub, enum: [sub, dub] }
         quality: { type: string, default: auto }
         refresh: { type: boolean, default: false, description: Bypass provider caches }

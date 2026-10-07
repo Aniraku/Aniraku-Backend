@@ -26,8 +26,6 @@ var defaultCDNSuffixes = []string{
 	"flixera.co", "4animo.xyz",
 	// Direct mp4 mirrors
 	"animegg.org",
-	// Heave direct mp4 mirrors (ck/ct/rx.animeheaven.me)
-	"animeheaven.me",
 	// AnimeGG mp4 file host (302 target of /play/ URLs)
 	"vidcache.net",
 	// AniWaves site + echovideo extractors + savedly mp4 host

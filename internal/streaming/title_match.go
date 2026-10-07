@@ -12,7 +12,7 @@ import (
 )
 
 // Title-matching helpers for catalog sites that are searched by title
-// instead of by AniList id (heave, tensho). The rule: an exact normalized
+// instead of by AniList id (tensho). The rule: an exact normalized
 // match always wins, otherwise accept containment either way (site titles
 // drop season suffixes, punctuation and "The" prefixes; AniList titles
 // carry romaji/native variants the site never lists).
