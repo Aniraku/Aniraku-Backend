@@ -439,11 +439,16 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 	// mid-first-playback). One quiet retry after a short pause turns that
 	// blip into a success instead of a failed playback start; anything
 	// still limited after the retry fails fast through the rejection below.
+	// The same one-shot applies to a 403: Cloudflare challenges this egress
+	// intermittently (measured: the same URL, same headers, a 200 one
+	// moment and a "Just a moment" interstitial 403 the next), and without
+	// the retry a single challenged segment mid-episode killed playback.
 	pathLower := strings.ToLower(parsed.Path)
 	isPlaylistPath := strings.HasSuffix(pathLower, ".m3u8") || strings.HasSuffix(pathLower, ".m3u")
 	resp, err := h.doRequest(req, parsed.Scheme == "https")
-	if err == nil && resp.StatusCode == http.StatusTooManyRequests &&
-		r.Method == http.MethodGet && isPlaylistPath {
+	if err == nil && r.Method == http.MethodGet &&
+		(resp.StatusCode == http.StatusForbidden ||
+			(resp.StatusCode == http.StatusTooManyRequests && isPlaylistPath)) {
 		resp.Body.Close()
 		select {
 		case <-r.Context().Done():
@@ -530,25 +535,27 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 			h.respondError(w, http.StatusBadGateway, "failed to read HLS playlist")
 			return
 		}
-		if resp.StatusCode != http.StatusOK {
-			// A non-200 body is upstream error text, never a playlist —
-			// running it through the rewrite would mangle it into a fake
-			// URL and hls.js would die on a confusing parse error. Answer
-			// with a clean upstream-rejection error instead.
+		switch classifyPlaylistResponse(resp.StatusCode, resp.Header.Get("Content-Range"), body) {
+		case playlistReject:
+			// Upstream error text or a TRUNCATED playlist — running either
+			// through the rewrite would mangle it into a fake URL and hls.js
+			// would die on a confusing parse error. Answer with a clean
+			// upstream-rejection error instead.
 			h.log.Warn().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("playlist upstream rejected")
 			h.respondError(w, http.StatusBadGateway, "upstream returned "+strconv.Itoa(resp.StatusCode))
 			return
-		}
-		// The query hint can misfire (a media file whose token happens to
-		// contain "m3u8"): never run binary through the playlist mangler.
-		// Re-attach the bytes and serve them opaque below instead.
-		if !isPlaylistBody(body) {
+		case playlistMedia:
+			// The hint misfired (a media file whose token happens to contain
+			// "m3u8"), or a ranged media body behind a playlist-looking URL:
+			// never run binary through the playlist mangler. Re-attach the
+			// bytes and serve them opaque below (the normal 206 passthrough
+			// echoes Content-Range so seeking still works).
 			resp.Body = io.NopCloser(bytes.NewReader(body))
-		} else {
+		case playlistServe:
 			// Keep the RAW pre-rewrite body for the short VOD window: the next
 			// request for this URL (any lang, any proxyBase) rewrites it fresh.
 			streaming.VODCacheSet(decodedURL, body)
-			h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
+			h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, http.StatusOK)
 			return
 		}
 	}
@@ -1099,6 +1106,78 @@ func hasKnownRewriteKeys(rawURL string) bool {
 // a hint (token containing "m3u8") out of the playlist rewriter.
 func isPlaylistBody(b []byte) bool {
 	return bytes.HasPrefix(bytes.TrimSpace(b), []byte("#EXTM3U"))
+}
+
+// playlistAction is how the isHLS branch must treat one upstream response.
+type playlistAction int
+
+const (
+	// playlistServe: a whole playlist — cache the raw bytes and rewrite.
+	playlistServe playlistAction = iota
+	// playlistMedia: a media body behind a playlist-looking URL — stream it
+	// through the normal opaque media path instead.
+	playlistMedia
+	// playlistReject: error text or a truncated playlist — clean 502.
+	playlistReject
+)
+
+// classifyPlaylistResponse decides the fate of an upstream response inside
+// the HLS branch.
+//
+// The important case is 206: extension-less playlist legs (ReCloud's
+// /p?t=...) don't match the ".m3u8" Range-forwarding exclusion, so a player
+// that ranges every request gets its ranged playlist upstream-answered with
+// 206. bytes=0- carries the COMPLETE playlist and must be served — answering
+// 502 here (the old behavior) failed every ranged playlist fetch the moment
+// the 45 s VOD cache went cold and stopped playback mid-video. Anything
+// short of the full file is never rewritten: half a playlist would produce
+// fake URLs, and a media body falls through to the 206 passthrough.
+func classifyPlaylistResponse(status int, contentRange string, body []byte) playlistAction {
+	switch {
+	case status == http.StatusPartialContent:
+		if !isPlaylistBody(body) {
+			return playlistMedia
+		}
+		if partialCoversWhole(contentRange, len(body)) {
+			return playlistServe
+		}
+		return playlistReject
+	case status != http.StatusOK:
+		return playlistReject
+	case !isPlaylistBody(body):
+		return playlistMedia
+	default:
+		return playlistServe
+	}
+}
+
+// partialCoversWhole reports whether a 206 Content-Range describes the whole
+// resource: "bytes 0-1088/1089" with start 0, end n-1 and total n equal to
+// the received length. Only such a response may be cached and rewritten as a
+// full playlist.
+func partialCoversWhole(contentRange string, n int) bool {
+	spec, ok := strings.CutPrefix(contentRange, "bytes ")
+	if !ok {
+		return false
+	}
+	span, total, ok := strings.Cut(spec, "/")
+	if !ok {
+		return false
+	}
+	start, end, ok := strings.Cut(span, "-")
+	if !ok {
+		return false
+	}
+	totalN, err := strconv.Atoi(total)
+	if err != nil || totalN != n {
+		return false
+	}
+	startN, err := strconv.Atoi(start)
+	if err != nil || startN != 0 {
+		return false
+	}
+	endN, err := strconv.Atoi(end)
+	return err == nil && endN == n-1
 }
 
 func resolveURL(uri, baseURL string) string {
