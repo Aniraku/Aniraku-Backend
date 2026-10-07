@@ -60,6 +60,9 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 
 	mux.HandleFunc("/watch/"+tenshoShowPath, func(w http.ResponseWriter, r *http.Request) {
 		f.watchHits.Add(1)
+		// The real site binds the token to a session cookie — /ajax/*
+		// 403s without it.
+		w.Header().Add("Set-Cookie", "PHPSESSID=testsession00000000000000000001; Path=/; HttpOnly")
 		fmt.Fprintf(w, `<html><head><script>window.AJAX_TOKEN = %q;</script></head><body></body></html>`, tenshoToken)
 	})
 
@@ -108,7 +111,9 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	return f
 }
 
-// assertAjaxHeaders checks the token trio the site's JS always sends.
+// assertAjaxHeaders checks the session pair the site's JS always sends:
+// token + referer headers and the PHPSESSID cookie from the same watch
+// fetch (token without cookie is rejected live — measured 403).
 func assertAjaxHeaders(t *testing.T, r *http.Request, wantToken string) {
 	t.Helper()
 	if got := r.Header.Get("X-Requested-With"); got != "XMLHttpRequest" {
@@ -119,6 +124,9 @@ func assertAjaxHeaders(t *testing.T, r *http.Request, wantToken string) {
 	}
 	if !strings.HasSuffix(r.Header.Get("Referer"), tenshoWatchURL) {
 		t.Errorf("Referer = %q, want the watch page", r.Header.Get("Referer"))
+	}
+	if !strings.Contains(r.Header.Get("Cookie"), "PHPSESSID=") {
+		t.Errorf("Cookie = %q, want PHPSESSID session", r.Header.Get("Cookie"))
 	}
 }
 
