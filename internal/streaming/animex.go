@@ -836,15 +836,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 			}
 			subURL = clean
 			p.learnURLHost(subURL)
-			langCode := track.Lang
-			if langCode == "" {
-				langCode = mapSubtitleLang(track.Label)
-			}
-			subs = append(subs, core.Subtitle{
-				URL:   subURL,
-				Lang:  langCode,
-				Label: track.Label,
-			})
+			subs = append(subs, buildSubtitle(subURL, track.Lang, track.Label, ""))
 		}
 
 		// Determine source type from URL

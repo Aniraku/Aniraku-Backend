@@ -271,12 +271,7 @@ func (p *MegaVidProvider) resolveKey(ctx context.Context, key, id string, episod
 			continue
 		}
 		p.learnURLHost(t.File)
-		label := strings.TrimSpace(t.Label)
-		code := mapSubtitleLang(label)
-		if label == "" {
-			label = code
-		}
-		subs = append(subs, core.Subtitle{URL: t.File, Lang: code, Label: label})
+		subs = append(subs, buildSubtitle(t.File, "", t.Label, ""))
 	}
 	var intro, outro *core.SkipTimestamp
 	for _, c := range js.Chapters {

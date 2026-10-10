@@ -308,21 +308,22 @@ func TestKaaFractionalEpisodeNumber(t *testing.T) {
 func TestKaaSubtitleTrack(t *testing.T) {
 	for _, tc := range []struct {
 		url       string
-		fallback  string
 		wantLang  string
 		wantLabel string
 	}{
-		{"https://subbl.krussdomi.com/abc/309567_en.srt", "sub", "en", "English"},
-		{"https://subbl.krussdomi.com/abc/60596_th.srt", "sub", "th", "Thai"},
-		{"https://subbl.krussdomi.com/abc/1617262191272_vi.srt", "dub", "vi", "Vietnamese"},
-		{"https://subbl.krussdomi.com/abc/1617629104889_id.srt", "sub", "id", "Indonesian"},
-		{"https://subbl.krussdomi.com/abc/1617629724071_ms.srt", "sub", "ms", "Malay"},
-		{"https://subbl.krussdomi.com/abc/278072_zh-Hans.srt", "sub", "zh-hans", "Chinese"},
-		{"https:///subbl.krussdomi.com/abc/309567_EN.srt", "sub", "en", "English"},
-		{"https://subst.krussdomi.com/abc/64b0e386970810335d81b379.vtt", "sub", "sub", "sub"},
-		{"https://subst.krussdomi.com/abc/64b0e386970810335d81b379.vtt", "dub", "dub", "dub"},
+		{"https://subbl.krussdomi.com/abc/309567_en.srt", "en", "English"},
+		{"https://subbl.krussdomi.com/abc/60596_th.srt", "th", "Thai"},
+		{"https://subbl.krussdomi.com/abc/1617262191272_vi.srt", "vi", "Vietnamese"},
+		{"https://subbl.krussdomi.com/abc/1617629104889_id.srt", "id", "Indonesian"},
+		{"https://subbl.krussdomi.com/abc/1617629724071_ms.srt", "ms", "Malay"},
+		{"https://subbl.krussdomi.com/abc/278072_zh-Hans.srt", "zh-hans", "Chinese"},
+		{"https:///subbl.krussdomi.com/abc/309567_EN.srt", "en", "English"},
+		{"https://subbl.krussdomi.com/abc/309567_eng.srt", "en", "English"},
+		// Bare-hash files carry no code and the page exposes no label;
+		// they are the page's default English track, never "sub"/"sub".
+		{"https://subst.krussdomi.com/abc/64b0e386970810335d81b379.vtt", "en", "English"},
 	} {
-		got := kaaSubtitleTrack(tc.url, tc.fallback)
+		got := kaaSubtitleTrack(tc.url)
 		if got.URL != tc.url || got.Lang != tc.wantLang || got.Label != tc.wantLabel {
 			t.Errorf("kaaSubtitleTrack(%q) = %+v, want lang=%q label=%q", tc.url, got, tc.wantLang, tc.wantLabel)
 		}

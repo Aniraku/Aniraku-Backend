@@ -183,15 +183,7 @@ func (p *ZokoProvider) zokoBuildSourceResult(ctx context.Context, payload *zokoP
 			continue
 		}
 		p.learnURLHost(s.Src)
-		langCode := strings.TrimSpace(s.Lang)
-		if langCode == "" {
-			langCode = mapSubtitleLang(s.Label)
-		}
-		subs = append(subs, core.Subtitle{
-			URL:   s.Src,
-			Lang:  langCode,
-			Label: s.Label,
-		})
+		subs = append(subs, buildSubtitle(s.Src, s.Lang, s.Label, ""))
 	}
 
 	var downloads []core.DownloadLink

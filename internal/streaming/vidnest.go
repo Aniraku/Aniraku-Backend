@@ -295,15 +295,7 @@ func (p *VidNestProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 			continue
 		}
 		p.learnURLHost(t.File)
-		code := strings.TrimSpace(t.Lang)
-		if code == "" {
-			code = mapSubtitleLang(t.Label)
-		}
-		label := strings.TrimSpace(t.Label)
-		if label == "" {
-			label = code
-		}
-		subs = append(subs, core.Subtitle{URL: t.File, Lang: code, Label: label})
+		subs = append(subs, buildSubtitle(t.File, t.Lang, t.Label, ""))
 	}
 
 	p.log.Info().Int("animeId", id).Int("episode", episode).
