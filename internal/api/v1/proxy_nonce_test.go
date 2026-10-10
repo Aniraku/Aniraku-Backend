@@ -1,6 +1,41 @@
 package v1
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
+
+// TestRewriteEmitsStableURLs guards the egress optimisation: rewritten
+// child URLs must carry no per-session nonce, so identical upstream bytes
+// get identical proxy URLs and a shared edge cache can serve repeat views
+// instead of every playback re-burning EC2 egress. Two rewrites of the
+// same playlist must be byte-identical.
+func TestRewriteEmitsStableURLs(t *testing.T) {
+	h := &Handlers{}
+	in := "#EXTM3U\n" +
+		"#EXT-X-VERSION:3\n" +
+		"#EXT-X-TARGETDURATION:10\n" +
+		"#EXTINF:10.0,\n" +
+		"seg-1.ts\n" +
+		"#EXTINF:10.0,\n" +
+		"seg-2.ts?token=abc123\n" +
+		"#EXT-X-ENDLIST\n"
+	base := "https://cdn.example/a/b/master.m3u8"
+	first := h.rewriteHLSPlaylist(in, base, `{"Referer":"https://example.com/"}`, "https://api.test", "")
+	second := h.rewriteHLSPlaylist(in, base, `{"Referer":"https://example.com/"}`, "https://api.test", "")
+	if first != second {
+		t.Fatalf("rewrite not stable across calls:\n%s\n---\n%s", first, second)
+	}
+	if strings.Contains(first, "rn=") {
+		t.Errorf("rewritten playlist contains cache-busting rn nonce:\n%s", first)
+	}
+	if !strings.Contains(first, "/api/v1/proxy?url=") {
+		t.Errorf("segments were not proxied:\n%s", first)
+	}
+	if !strings.Contains(first, "token%3Dabc123") && !strings.Contains(first, "token=abc123") {
+		t.Errorf("upstream token lost in rewrite:\n%s", first)
+	}
+}
 
 // TestStripProxyNoncePreservesSignedQueries guards the two properties of
 // the cache-busting strip: our rn param disappears, and every other param

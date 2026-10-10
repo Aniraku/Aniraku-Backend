@@ -258,13 +258,13 @@ func isSubtitleURL(pathLower string) bool {
 	return false
 }
 
-func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media proxy must never be cached at the edge: edge caches store
-	// response variants per URL. Responses already carry Vary: Origin (set
-	// site-wide), so variants are keyed correctly. Only allowlisted origins
-	// are echoed — reflecting an arbitrary Origin would let any website
-	// read what the proxy fetches. Unknown/absent origins get '*': media
-	// here is public (allowlisted CDNs only) and no proxy request is made
-	// with credentials, so '*' never breaks playback.
+func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: nothing here is stored. Cacheable branches below (playlists,
+	// segments, subtitles, keys) overwrite this with explicit public
+	// directives; errors and rejections keep no-store. Only allowlisted
+	// origins are echoed — reflecting an arbitrary Origin would let any
+	// website read what the proxy fetches. Unknown/absent origins get '*':
+	// media here is public (allowlisted CDNs only) and no proxy request is
+	// made with credentials, so '*' never breaks playback.
 	w.Header().Set("Cache-Control", "no-store, private")
 	origin := r.Header.Get("Origin")
 	switch {
@@ -426,7 +426,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 		if cached, ok := h.keyCache.Load(cacheKeyURL); ok {
 			if entry, ok := cached.(keyCacheEntry); ok && time.Since(entry.fetchedAt) < 5*time.Minute {
 				w.Header().Set("Content-Type", "application/octet-stream")
-				w.Header().Set("Cache-Control", "public, max-age=300")
+				cacheableMediaHeaders(w, "public, max-age=300")
 				w.WriteHeader(http.StatusOK)
 				w.Write(entry.data)
 				return
@@ -513,7 +513,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 		h.keyCache.Store(cacheKeyURL, keyCacheEntry{data: body, fetchedAt: time.Now()})
 
 		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Cache-Control", "public, max-age=300")
+		cacheableMediaHeaders(w, "public, max-age=300")
 		w.WriteHeader(http.StatusOK)
 		w.Write(body)
 		return
@@ -629,16 +629,18 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 		_ = rc.SetWriteDeadline(time.Time{})
 	}
 
-	// VOD segments and subtitles are immutable bytes — let the browser keep
-	// them. The no-store set at the top of the handler exists for playlists,
-	// whose rewritten child URLs carry per-request nonces; for segments it
-	// forced every seek-back, loop restart and quality-switch return to
-	// re-hit the origin — added round-trip time that shows up as buffering
-	// exactly when the segment mirrors are slow. Only full 200s qualify: a
-	// 206 must never be stored as the whole resource, and errors (404/5xx)
-	// stay uncached. Keys keep their own max-age=300 branch above.
+	// VOD segments and subtitles are immutable bytes: an identical proxy URL
+	// always serves identical bytes (upstream tokens live inside the url=
+	// param, so a rotation is a new URL — a cached copy can never outlive
+	// its token). Mark them cacheable for a year so a shared edge absorbs
+	// repeat views instead of every playback re-burning EC2 egress. Only
+	// full 200s get immutable; 206 ranges are cached per-range without it,
+	// and errors (404/5xx) keep the no-store default. Keys keep their own
+	// max-age=300 branch above.
 	if resp.StatusCode == http.StatusOK {
-		w.Header().Set("Cache-Control", "public, max-age=3600")
+		cacheableMediaHeaders(w, "public, max-age=31536000, immutable")
+	} else if resp.StatusCode == http.StatusPartialContent {
+		cacheableMediaHeaders(w, "public, max-age=31536000")
 	}
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
@@ -650,9 +652,23 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // The media 
 	}
 }
 
+// cacheableMediaHeaders marks a public, credentialless media response so a
+// shared edge cache stores ONE variant for all origins. Media here is
+// public (allowlisted CDNs only) and players fetch it without credentials,
+// so ACAO '*' is safe — and required, because an echoed origin would pin
+// the cached variant to one site. Vary: Origin (set site-wide by the CORS
+// middleware) is dropped for the same reason: keeping it fragments the
+// edge cache per Origin header.
+func cacheableMediaHeaders(w http.ResponseWriter, cacheControl string) {
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Del("Access-Control-Allow-Credentials")
+	w.Header().Del("Vary")
+}
+
 // serveRewrittenPlaylist answers a playlist request from raw upstream bytes:
-// the rewrite (child-URI proxying, the al audio strip, the rn nonce) runs on
-// every request so nothing request-specific is ever shared between clients —
+// the rewrite (child-URI proxying, the al audio strip) runs on every
+// request so nothing request-specific is ever shared between clients —
 // both the live-fetch path and the VOD cache path answer through here.
 func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request, raw []byte, decodedURL, headersJSON, al string, status int) {
 	// Behind a reverse proxy, r.Host may be the loopback bind address;
@@ -665,6 +681,10 @@ func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request
 	} else {
 		h.log.Debug().Str("playlist_preview", rewritten[:1500]).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist (truncated)")
 	}
+	// Playlists are tiny but re-fetched constantly (hls.js polling, quality
+	// switches, prewarm HEADs). 60s of edge is far below the 3–4h upstream
+	// token lifetime, so cached copies always carry valid tokens.
+	cacheableMediaHeaders(w, "public, max-age=60")
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.WriteHeader(status)
 	w.Write([]byte(rewritten))
@@ -768,9 +788,10 @@ func proxyRedirectBlocked(status int) bool {
 	return status >= http.StatusMultipleChoices && status < http.StatusBadRequest
 }
 
-// stripProxyNonce removes the cache-busting "rn" query parameter from a
-// proxied URL. The playlist rewrite adds it so every playback session uses
-// fresh edge-cache keys; it must never reach the upstream CDN.
+// stripProxyNonce removes the legacy cache-busting "rn" query parameter from
+// a proxied URL. The playlist rewrite no longer emits it (stable URLs are
+// what make edge caching possible); this stays so old playlists still in
+// the wild keep working. It must never reach the upstream CDN.
 //
 // The query is only rebuilt when "rn" is actually present, and the rebuild
 // keeps the surviving params' original bytes and order. A ParseQuery+Encode
@@ -928,11 +949,13 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 	if headersJSON != "" {
 		headersParam = "&headers=" + url.QueryEscape(headersJSON)
 	}
-	// Per-rewrite nonce: every playlist fetch generates fresh edge-cache keys
-	// for the URLs it names, so a stale cached variant (created before the
-	// proxy always emitted CORS headers) can never be served to a browser.
-	// The Proxy handler strips "rn" before dialing upstream.
-	rnParam := fmt.Sprintf("&rn=%d", time.Now().UnixNano())
+	// Child URIs are STABLE across sessions on purpose: identical upstream
+	// bytes get identical proxy URLs, so a shared edge cache (Cloudflare)
+	// serves repeat views instead of every playback re-burning EC2 egress.
+	// (There used to be a per-rewrite &rn=<UnixNano> nonce here; it made
+	// every session's segment URLs unique and held the edge hit ratio at
+	// zero. stripProxyNonce is kept so old playlists still in the wild
+	// keep working — it is stripped before dialing upstream.)
 	// Propagate the audio language on every rewritten child URI so nested
 	// playlist fetches keep the dual-audio strip context.
 	alParam := ""
@@ -985,7 +1008,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 				}
 				learnPlaylistTarget(absoluteURL)
 				if !megaSegmentHost(absoluteURL) && (needsProxyRewrite(absoluteURL) || headersJSON != "") {
-					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam, rnParam)
+					proxied := fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
 					return fmt.Sprintf("URI=\"%s\"", proxied)
 				}
 				return fmt.Sprintf("URI=\"%s\"", absoluteURL)
@@ -1033,7 +1056,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 				if megaSegmentHost(absoluteURL) {
 					lines[i] = keyTag + "\n" + absoluteURL
 				} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
-					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam, rnParam)
+					lines[i] = keyTag + "\n" + fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
 				} else {
 					lines[i] = keyTag + "\n" + absoluteURL
 				}
@@ -1044,7 +1067,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 		if megaSegmentHost(absoluteURL) {
 			lines[i] = absoluteURL
 		} else if headersJSON != "" || needsProxyRewrite(absoluteURL) {
-			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam, rnParam)
+			lines[i] = fmt.Sprintf("%s/api/v1/proxy?url=%s%s%s", proxyBase, url.QueryEscape(absoluteURL), headersParam, alParam)
 		} else {
 			lines[i] = absoluteURL
 		}
