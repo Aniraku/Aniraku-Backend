@@ -1148,42 +1148,67 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 	type tabHit struct {
 		tab  animeggTab
 		best animeggStream
+		ok   bool
 	}
-	var hits []tabHit
-	for _, tab := range tabs {
+	// Tabs are independent mirrors on the same host; resolving them
+	// sequentially let one hung embed stall the rest. Up to 3 resolve
+	// concurrently, each under its own deadline; assembly stays in listed
+	// order so server names never shift.
+	tabHits := make([]tabHit, len(tabs))
+	var tWg sync.WaitGroup
+	tSem := make(chan struct{}, 3)
+	for i, tab := range tabs {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		embedHTML, err := p.getText(ctx, p.base+"/embed/"+tab.embedID, p.base+"/", 1<<20)
-		if err != nil {
-			continue
-		}
-		var cands []animeggStream
-		for _, s := range animeggParseVideoSources(embedHTML) {
-			abs := p.absURL(s.url)
-			if abs == "" {
-				continue
-			}
-			cands = append(cands, animeggStream{url: abs, quality: s.quality})
-		}
-		// Highest quality first; a deleted top file falls through to the
-		// next live one instead of killing the whole mirror.
-		sort.Slice(cands, func(i, j int) bool {
-			return animeggQualityRank(cands[i].quality) > animeggQualityRank(cands[j].quality)
-		})
-		placed := false
-		for _, c := range cands {
-			final, ok := p.resolveMP4Final(ctx, c.url)
-			if !ok {
-				continue
-			}
-			hits = append(hits, tabHit{tab: tab, best: animeggStream{url: final, quality: c.quality}})
-			placed = true
 			break
 		}
-		if !placed {
+		tWg.Add(1)
+		go func(i int, tab animeggTab) {
+			defer tWg.Done()
+			select {
+			case tSem <- struct{}{}:
+				defer func() { <-tSem }()
+			case <-ctx.Done():
+				return
+			}
+			tCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			embedHTML, err := p.getText(tCtx, p.base+"/embed/"+tab.embedID, p.base+"/", 1<<20)
+			if err != nil {
+				return
+			}
+			var cands []animeggStream
+			for _, s := range animeggParseVideoSources(embedHTML) {
+				abs := p.absURL(s.url)
+				if abs == "" {
+					continue
+				}
+				cands = append(cands, animeggStream{url: abs, quality: s.quality})
+			}
+			// Highest quality first; a deleted top file falls through to the
+			// next live one instead of killing the whole mirror.
+			sort.Slice(cands, func(i, j int) bool {
+				return animeggQualityRank(cands[i].quality) > animeggQualityRank(cands[j].quality)
+			})
+			for _, c := range cands {
+				final, ok := p.resolveMP4Final(tCtx, c.url)
+				if !ok {
+					continue
+				}
+				tabHits[i] = tabHit{tab: tab, best: animeggStream{url: final, quality: c.quality}, ok: true}
+				return
+			}
 			p.log.Info().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
 				Msg("animegg: mp4 probe failed, trying next mirror")
+		}(i, tab)
+	}
+	tWg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	var hits []tabHit
+	for _, h := range tabHits {
+		if h.ok {
+			hits = append(hits, h)
 		}
 	}
 	if len(hits) == 0 {
