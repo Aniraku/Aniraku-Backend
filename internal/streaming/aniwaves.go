@@ -1271,61 +1271,107 @@ func (p *AniWavesProvider) resolveEpisode(ctx context.Context, id, episode int, 
 		return nil, nil
 	}
 	sr := &SourceResult{Headers: map[string]string{"Referer": aniwavesPlaybackReferer}}
-	var intro, outro *core.SkipTimestamp
+	// Mirrors are independent upstream hosts; resolving them sequentially
+	// meant one tarpitted embed host (45s client timeout x2 attempts each
+	// for fetchSource + extractEchovideo) stalled every mirror behind it —
+	// observed 40s+ provider times on an otherwise healthy chain. Resolve
+	// up to 3 mirrors concurrently, each under its own deadline: a mirror
+	// that can't answer in 15s isn't one worth serving. Results assemble
+	// in listed order so names, intro/outro and server order never change.
+	type mirrorHit struct {
+		best     aniwavesDirect
+		quality  string
+		intro    *core.SkipTimestamp
+		outro    *core.SkipTimestamp
+		playable bool
+	}
+	hits := make([]mirrorHit, len(wanted))
+	var mWg sync.WaitGroup
+	mSem := make(chan struct{}, 3)
 	for i, srv := range wanted {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			break
 		}
-		payload, err := p.fetchSource(ctx, srv.linkID, referer)
-		if err != nil {
+		mWg.Add(1)
+		go func(i int, srv aniwavesServer) {
+			defer mWg.Done()
+			select {
+			case mSem <- struct{}{}:
+				defer func() { <-mSem }()
+			case <-ctx.Done():
+				return
+			}
+			mCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			payload, err := p.fetchSource(mCtx, srv.linkID, referer)
+			if err != nil {
+				return
+			}
+			directs := p.resolveDirect(mCtx, payload.URL)
+			if len(directs) == 0 {
+				// Embed-only mirror (BYFMS/DGHG style): never shipped.
+				return
+			}
+			// HLS-first within a mirror: a multi-rendition master beats
+			// any single mp4 file from the same extractor payload;
+			// otherwise the highest-ranked mp4 wins.
+			best := directs[0]
+			for _, d := range directs[1:] {
+				if d.typ == "hls" && best.typ != "hls" {
+					best = d
+				} else if d.typ == best.typ && best.typ == "mp4" &&
+					aniwavesSavedlyRank(d.quality) > aniwavesSavedlyRank(best.quality) {
+					best = d
+				}
+			}
+			var ok bool
+			if best.typ == "hls" {
+				ok = p.probeAniWavesMaster(mCtx, best.url, aniwavesPlaybackReferer)
+			} else {
+				ok = probeMediaFileLenient(mCtx, p.client, best.url, aniwavesPlaybackReferer, browserUA)
+			}
+			if !ok {
+				p.log.Info().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
+					Str("mirror", srv.name).Msg("aniwaves: probe failed, trying next mirror")
+				return
+			}
+			quality := "auto"
+			if best.typ == "mp4" {
+				quality = strings.TrimSpace(best.quality)
+				if quality == "" {
+					quality = "auto"
+				}
+			}
+			hits[i] = mirrorHit{
+				best:     best,
+				quality:  quality,
+				intro:    aniwavesSkipRange(payload.SkipData["intro"]),
+				outro:    aniwavesSkipRange(payload.SkipData["outro"]),
+				playable: true,
+			}
+		}(i, srv)
+	}
+	mWg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	var intro, outro *core.SkipTimestamp
+	for i, srv := range wanted {
+		h := hits[i]
+		if !h.playable {
 			continue
 		}
 		if intro == nil {
-			intro = aniwavesSkipRange(payload.SkipData["intro"])
+			intro = h.intro
 		}
 		if outro == nil {
-			outro = aniwavesSkipRange(payload.SkipData["outro"])
+			outro = h.outro
 		}
-		directs := p.resolveDirect(ctx, payload.URL)
-		if len(directs) == 0 {
-			// Embed-only mirror (BYFMS/DGHG style): never shipped.
-			continue
-		}
-		// HLS-first within a mirror: a multi-rendition master beats any
-		// single mp4 file from the same extractor payload; otherwise the
-		// highest-ranked mp4 wins.
-		best := directs[0]
-		for _, d := range directs[1:] {
-			if d.typ == "hls" && best.typ != "hls" {
-				best = d
-			} else if d.typ == best.typ && best.typ == "mp4" &&
-				aniwavesSavedlyRank(d.quality) > aniwavesSavedlyRank(best.quality) {
-				best = d
-			}
-		}
-		var ok bool
-		if best.typ == "hls" {
-			ok = p.probeAniWavesMaster(ctx, best.url, aniwavesPlaybackReferer)
-		} else {
-			ok = probeMediaFileLenient(ctx, p.client, best.url, aniwavesPlaybackReferer, browserUA)
-		}
-		if !ok {
-			p.log.Info().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
-				Str("mirror", srv.name).Msg("aniwaves: probe failed, trying next mirror")
-			continue
-		}
-		p.learnURLHost(best.url)
-		quality := "auto"
-		if best.typ == "mp4" {
-			quality = strings.TrimSpace(best.quality)
-			if quality == "" {
-				quality = "auto"
-			}
-		}
+		p.learnURLHost(h.best.url)
 		sr.Sources = append(sr.Sources, core.Source{
-			URL:          best.url,
-			Type:         best.typ,
-			Quality:      quality,
+			URL:          h.best.url,
+			Type:         h.best.typ,
+			Quality:      h.quality,
 			Verification: "proxy",
 		})
 		sr.ServerNames = append(sr.ServerNames, aniwavesCuteName(srv.name, i))
