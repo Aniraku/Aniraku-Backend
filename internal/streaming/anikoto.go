@@ -334,11 +334,7 @@ func (p *AnikotoProvider) megaplayDirectURL(ctx context.Context, embedURL, label
 			continue
 		}
 		p.learnURLHost(t.URL)
-		subs = append(subs, core.Subtitle{
-			URL:   t.URL,
-			Lang:  mapSubtitleLang(t.Label),
-			Label: t.Label,
-		})
+		subs = append(subs, buildSubtitle(t.URL, "", t.Label, ""))
 	}
 	return &SourceResult{
 		Sources: []core.Source{{
@@ -806,40 +802,6 @@ func segmentBytesPlayable(head []byte) bool {
 		}
 	}
 	return false
-}
-
-// mapSubtitleLang maps a track label to a two-letter language code.
-func mapSubtitleLang(label string) string {
-	first := strings.ToLower(strings.Split(strings.TrimSpace(label), " ")[0])
-	if len(first) == 2 {
-		ok := true
-		for _, r := range first {
-			if r < 'a' || r > 'z' {
-				ok = false
-			}
-		}
-		if ok {
-			return first
-		}
-	}
-	switch first {
-	case "english", "en":
-		return "en"
-	case "spanish":
-		return "es"
-	case "french":
-		return "fr"
-	case "german":
-		return "de"
-	case "portuguese":
-		return "pt"
-	case "arabic":
-		return "ar"
-	case "hindi":
-		return "hi"
-	default:
-		return "en"
-	}
 }
 
 // anilistMeta carries the titles Anivexa searches (english, romaji, synonyms).

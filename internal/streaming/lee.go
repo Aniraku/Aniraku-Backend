@@ -369,17 +369,11 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		if label == "" {
 			label = strings.TrimSpace(s.Name)
 		}
-		code := strings.TrimSpace(s.Lang)
-		if code == "" {
-			code = strings.TrimSpace(s.SrcLang)
+		explicit := strings.TrimSpace(s.Lang)
+		if explicit == "" {
+			explicit = strings.TrimSpace(s.SrcLang)
 		}
-		if code == "" {
-			code = mapSubtitleLang(label)
-		}
-		if label == "" {
-			label = code
-		}
-		subs = append(subs, core.Subtitle{URL: u, Lang: code, Label: label})
+		subs = append(subs, buildSubtitle(u, explicit, label, ""))
 	}
 
 	p.log.Info().Int("animeId", id).Int("episode", episode).

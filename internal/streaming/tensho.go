@@ -594,12 +594,7 @@ func tenshoSubs(tracks []tenshoTrack, base *url.URL) []core.Subtitle {
 		if u == "" {
 			continue
 		}
-		label := strings.TrimSpace(t.Label)
-		code := mapSubtitleLang(label)
-		if label == "" {
-			label = code
-		}
-		subs = append(subs, core.Subtitle{URL: u, Lang: code, Label: label})
+		subs = append(subs, buildSubtitle(u, "", t.Label, ""))
 	}
 	return subs
 }
