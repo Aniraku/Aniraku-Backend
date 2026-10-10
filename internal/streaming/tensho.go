@@ -660,25 +660,61 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 
 	sources := make([]core.Source, 0, len(slots))
 	names := make([]string, 0, len(slots))
-	var lastErr error
+	// Slots are independent upstream embeds; resolving them sequentially
+	// let one tarpitted host stall the rest (observed 20s+ tensho times).
+	// Up to 3 slots resolve concurrently, each under its own deadline;
+	// assembly stays positional so a dropped slot keeps its own name out
+	// instead of shifting the survivors.
+	type slotHit struct {
+		res *tenshoEmbed
+		ok  bool
+	}
+	slotHits := make([]slotHit, len(slots))
+	var sWg sync.WaitGroup
+	sSem := make(chan struct{}, 3)
 	for i, slot := range slots {
-		embedURL := p.embedURL(slot.ServerName, *ep, langKey)
-		res, err := p.resolveEmbed(ctx, embedURL)
-		if err != nil {
-			lastErr = err
-			p.log.Warn().Str("slot", slot.ServerName).Str("embed", embedURL).Err(err).
-				Msg("tensho: embed resolve failed, skipping slot")
+		if ctx.Err() != nil {
+			break
+		}
+		sWg.Add(1)
+		go func(i int, slot tenshoServerSlot) {
+			defer sWg.Done()
+			select {
+			case sSem <- struct{}{}:
+				defer func() { <-sSem }()
+			case <-ctx.Done():
+				return
+			}
+			sCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			embedURL := p.embedURL(slot.ServerName, *ep, langKey)
+			res, err := p.resolveEmbed(sCtx, embedURL)
+			if err != nil {
+				p.log.Warn().Str("slot", slot.ServerName).Str("embed", embedURL).Err(err).
+					Msg("tensho: embed resolve failed, skipping slot")
+				return
+			}
+			// Segment-depth honesty: a reachable master whose segments are
+			// blocked only spins at playback. Probe with NO Referer — that is
+			// exactly the shape playback takes through the media proxy, so a
+			// passing probe cannot mask a referer-gated source.
+			if !probeSegmentsLenient(sCtx, p.client, res.m3u8, "", browserUA) {
+				p.log.Info().Str("slot", slot.ServerName).Str("url", res.m3u8).
+					Msg("tensho: stream blocked from this egress, dropping slot")
+				return
+			}
+			slotHits[i] = slotHit{res: res, ok: true}
+		}(i, slot)
+	}
+	sWg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	for i := range slots {
+		if !slotHits[i].ok {
 			continue
 		}
-		// Segment-depth honesty: a reachable master whose segments are
-		// blocked only spins at playback. Probe with NO Referer — that is
-		// exactly the shape playback takes through the media proxy, so a
-		// passing probe cannot mask a referer-gated source.
-		if !probeSegmentsLenient(ctx, p.client, res.m3u8, "", browserUA) {
-			p.log.Info().Str("slot", slot.ServerName).Str("url", res.m3u8).
-				Msg("tensho: stream blocked from this egress, dropping slot")
-			continue
-		}
+		res := slotHits[i].res
 		p.learnURLHost(res.m3u8)
 		for _, sub := range res.subs {
 			p.learnURLHost(sub.URL)
@@ -695,11 +731,8 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		names = append(names, tenshoServerNames[i])
 	}
 	if len(sources) == 0 {
-		if lastErr != nil {
-			return nil, lastErr
-		}
 		p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
-			Msg("tensho: no resolvable stream")
+			Int("tried", len(slots)).Msg("tensho: no resolvable stream")
 		return nil, nil
 	}
 

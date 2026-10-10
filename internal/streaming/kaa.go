@@ -568,33 +568,60 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		return nil, fmt.Errorf("kaa: no embedded players on %s", watchURL)
 	}
 	// Every playable player becomes its own server (named by position) —
-	// first-win would hide working mirrors.
+	// first-win would hide working mirrors. Players are independent
+	// upstream embeds: resolving them sequentially let one tarpitted host
+	// stall the rest (observed 30s+ kaa times), so up to 3 resolve
+	// concurrently, each under its own deadline. Assembly stays in listed
+	// order so server names never shift.
 	type hit struct {
 		master string
 		vtts   []string
+		ok     bool
 	}
-	var hits []hit
-	var lastErr error
-	for _, pl := range players {
+	hits := make([]hit, len(players))
+	var pWg sync.WaitGroup
+	pSem := make(chan struct{}, 3)
+	for i, pl := range players {
 		// DASH-only arms carry no m3u8 — skip without an upstream call.
 		if strings.Contains(strings.ToLower(pl.src), "type=dash") {
 			continue
 		}
-		master, vtts, err := p.resolvePlayerMaster(ctx, pl, watchURL)
-		if err != nil {
-			lastErr = err
-			continue
+		if ctx.Err() != nil {
+			break
 		}
-		hits = append(hits, hit{master: master, vtts: vtts})
+		pWg.Add(1)
+		go func(i int, pl kaaPlayer) {
+			defer pWg.Done()
+			select {
+			case pSem <- struct{}{}:
+				defer func() { <-pSem }()
+			case <-ctx.Done():
+				return
+			}
+			plCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			master, vtts, err := p.resolvePlayerMaster(plCtx, pl, watchURL)
+			if err != nil {
+				return
+			}
+			hits[i] = hit{master: master, vtts: vtts, ok: true}
+		}(i, pl)
 	}
-	if len(hits) == 0 {
-		if lastErr != nil {
-			return nil, lastErr
+	pWg.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	var playable []hit
+	for _, h := range hits {
+		if h.ok {
+			playable = append(playable, h)
 		}
+	}
+	if len(playable) == 0 {
 		return nil, fmt.Errorf("kaa: no playable player for episode %d", episode)
 	}
 	p.log.Info().Int("animeId", id).Int("episode", episode).
-		Str("lang", reqLang).Int("players", len(hits)).Msg("kaa resolved")
+		Str("lang", reqLang).Int("players", len(playable)).Msg("kaa resolved")
 
 	headers := map[string]string{
 		"Referer": kaaKrussRef,
@@ -605,7 +632,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	// centrally by Manager.withDubSubtitles, which matches per upstream
 	// URL — an in-provider fetch here would only duplicate that work.
 	sr := &SourceResult{Headers: headers}
-	for i, h := range hits {
+	for i, h := range playable {
 		var subs []core.Subtitle
 		for _, s := range h.vtts {
 			p.learnURLHost(s)
