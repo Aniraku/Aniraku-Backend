@@ -119,7 +119,19 @@ func (e *animexChallengeError) Error() string {
 	return fmt.Sprintf("animex api returned HTTP %d (cloudflare challenge)", e.status)
 }
 
-// animexAPIResponse is the JSON shape returned by the AnimeX sources API.
+// animexRateLimitError marks an HTTP 429 from the AnimeX API
+// (pp.animex.one): our fingerprint is over its source budget. Retrying is
+// actively harmful — it deepens the throttle — so callers must back off
+// until retryAfter elapses and serve stale meanwhile.
+type animexRateLimitError struct {
+	status     int
+	retryAfter time.Duration
+}
+
+func (e *animexRateLimitError) Error() string {
+	return fmt.Sprintf("animex api returned HTTP %d (fingerprint source limit, retry after %s)", e.status, e.retryAfter)
+}
+
 type animexAPIResponse struct {
 	Sources []struct {
 		URL     string `json:"url"`
@@ -158,6 +170,12 @@ type AnimeXProvider struct {
 	// Last-good sub-provider results for stale serving (see animexStaleTTL).
 	staleMu sync.Mutex
 	stale   map[string]*animexStaleEntry
+
+	// Fingerprint-wide 429 cooldown: the limit is per our fingerprint, so
+	// one throttled sub-provider means all of them are. Fresh attempts
+	// hold until this time; stale results serve meanwhile.
+	limitMu    sync.Mutex
+	limitUntil time.Time
 }
 
 // animexStaleEntry is one sub-provider's last good result.
@@ -372,6 +390,12 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 			defer func() { <-sem }()
 
 			attempt := func() (*SourceResult, error) {
+				// Fingerprint throttled: skip the fresh attempt entirely
+				// and drop through to stale serving below. Hitting a
+				// throttled API anyway only extends the throttle.
+				if p.coolingDown() {
+					return nil, &animexRateLimitError{status: http.StatusTooManyRequests}
+				}
 				res, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
 				if err != nil {
 					var challenge *animexChallengeError
@@ -519,10 +543,57 @@ func cloneSourceResult(sr *SourceResult) *SourceResult {
 // worth one immediate retry: real errors that failed fast (transient edge
 // flaps — the usual reason a working server like Mochi misses one list).
 // Slow failures (hangs, long challenge storms) and legitimate empties (no
-// error, nothing listed) are never retried.
+// error, nothing listed) are never retried. Rate limits are never retried:
+// the API is explicitly asking for fewer requests, and an immediate second
+// hit only deepens the throttle (observed: 221 fingerprint_source_limit
+// hits in one afternoon, each fanning out retries).
 func shouldRetryProvider(err error, elapsed time.Duration) bool {
 	const fastFailure = 3 * time.Second
-	return err != nil && elapsed < fastFailure
+	if err == nil || elapsed >= fastFailure {
+		return false
+	}
+	var limited *animexRateLimitError
+	return !errors.As(err, &limited)
+}
+
+// parseRateLimit extracts the cooldown from a 429 body such as
+// {"error":"too_many_requests","reason":"...","retry_after":27}.
+// Unknown shapes fall back to 30s; the result is capped at 2 minutes so a
+// hostile header can never silence the provider for long.
+func parseRateLimit(body []byte) time.Duration {
+	const fallback = 30 * time.Second
+	const maxCooldown = 2 * time.Minute
+	var v struct {
+		RetryAfter float64 `json:"retry_after"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil || v.RetryAfter <= 0 {
+		return fallback
+	}
+	d := time.Duration(v.RetryAfter * float64(time.Second))
+	if d > maxCooldown {
+		return maxCooldown
+	}
+	return d
+}
+
+// coolingDown reports whether the fingerprint is still inside a 429
+// cooldown window.
+func (p *AnimeXProvider) coolingDown() bool {
+	p.limitMu.Lock()
+	defer p.limitMu.Unlock()
+	return time.Now().Before(p.limitUntil)
+}
+
+// setCooldown opens a fingerprint-wide cooldown after a 429 so concurrent
+// sub-providers stop piling fresh requests onto a throttled API. Later
+// (longer) windows win; windows never shrink.
+func (p *AnimeXProvider) setCooldown(d time.Duration) {
+	until := time.Now().Add(d)
+	p.limitMu.Lock()
+	defer p.limitMu.Unlock()
+	if until.After(p.limitUntil) {
+		p.limitUntil = until
+	}
 }
 
 // fetchPlyrData fetches the AnimeX plyr page once and extracts BOTH the show
@@ -705,6 +776,12 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		}
 		if resp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+			if resp.StatusCode == http.StatusTooManyRequests {
+				cooldown := parseRateLimit(body)
+				p.setCooldown(cooldown)
+				out.err = &animexRateLimitError{status: resp.StatusCode, retryAfter: cooldown}
+				return out
+			}
 			out.err = fmt.Errorf("animex api returned HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
 			return out
 		}
