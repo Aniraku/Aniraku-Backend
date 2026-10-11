@@ -1,8 +1,10 @@
 package v1
 
 import (
+	"encoding/json"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -213,6 +215,7 @@ func resetDynamicCDNEntries() {
 // Hostnames match on exact host or any subdomain of a listed suffix; IP
 // literals match exactly. Hostnames fail closed when the allowlist is empty.
 func isAllowedProxyHost(host string) bool {
+	ensureDynamicCDNLoaded()
 	host = strings.ToLower(strings.TrimSpace(host))
 	host = strings.Trim(host, "[]")
 	if host == "" {
@@ -252,6 +255,73 @@ func dynamicEntryLive(host string) bool {
 	return ok && time.Since(addedAt) <= dynamicEntryTTL
 }
 
+// dynamicCDNFilePath is where learned hosts persist so container restarts
+// and redeploys don't wipe the dynamic allowlist (a wipe turns every
+// in-flight edge-cached playlist into 403s until each upstream is
+// re-fetched). Overridable for tests via ANIRAKU_DYNAMIC_CDN_FILE.
+func dynamicCDNFilePath() string {
+	if p := strings.TrimSpace(os.Getenv("ANIRAKU_DYNAMIC_CDN_FILE")); p != "" {
+		return p
+	}
+	return "/app/data/dynamic_cdn.json"
+}
+
+var dynamicCDNLoadOnce sync.Once
+
+// ensureDynamicCDNLoaded restores previously learned hosts (dropping
+// expired ones) exactly once per process. A missing or corrupt file is
+// not an error — the learner simply starts cold, as before.
+func ensureDynamicCDNLoaded() {
+	dynamicCDNLoadOnce.Do(func() {
+		raw, err := os.ReadFile(dynamicCDNFilePath())
+		if err != nil {
+			return
+		}
+		var saved map[string]time.Time
+		if err := json.Unmarshal(raw, &saved); err != nil {
+			return
+		}
+		now := time.Now()
+		dynamicCDNMu.Lock()
+		defer dynamicCDNMu.Unlock()
+		for h, at := range saved {
+			if len(dynamicCDNSuffixes) >= maxDynamicEntries {
+				break
+			}
+			if h != "" && now.Sub(at) <= dynamicEntryTTL {
+				if _, ok := dynamicCDNSuffixes[h]; !ok {
+					dynamicCDNSuffixes[h] = at
+				}
+			}
+		}
+	})
+}
+
+// persistDynamicCDNEntries snapshots the learned hosts to disk. Called
+// after each successful learn (learns are rare — one per new host) so a
+// restart never loses more than nothing.
+func persistDynamicCDNEntries() {
+	dynamicCDNMu.RLock()
+	snap := make(map[string]time.Time, len(dynamicCDNSuffixes))
+	for h, at := range dynamicCDNSuffixes {
+		snap[h] = at
+	}
+	dynamicCDNMu.RUnlock()
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	path := dynamicCDNFilePath()
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return
+		}
+	}
+	// Best effort: an unwritable path (no volume mounted) keeps the
+	// previous in-memory-only behavior instead of failing learns.
+	_ = os.WriteFile(path, raw, 0o600)
+}
+
 // LearnHostFromPlaylist adds host to the dynamic allowlist because it was
 // referenced by a playlist we fetched from an already-trusted host.
 func LearnHostFromPlaylist(host string) {
@@ -273,7 +343,6 @@ func LearnHostFromPlaylist(host string) {
 		return
 	}
 	dynamicCDNMu.Lock()
-	defer dynamicCDNMu.Unlock()
 	// Enforce max entries with LRU-style eviction
 	if len(dynamicCDNSuffixes) >= maxDynamicEntries {
 		// Remove oldest entry
@@ -292,6 +361,10 @@ func LearnHostFromPlaylist(host string) {
 		}
 	}
 	dynamicCDNSuffixes[host] = time.Now()
+	dynamicCDNMu.Unlock()
+	// Persist outside the write lock: the snapshot takes its own read
+	// lock, and holding both would deadlock.
+	persistDynamicCDNEntries()
 }
 
 // CleanupDynamicCDNEntries removes expired entries from the dynamic allowlist.
