@@ -284,6 +284,30 @@ var (
 	animeggSlugMv  = regexp.MustCompile(`movie|film`)
 )
 
+// animeggSeasonWordRe matches bare season/part/cour/arc continuations
+// ("season 2", "part 2", "cour", "arc") that legitimately distinguish a
+// query from a merged base listing (episode offsets handle those) as
+// opposed to a genuinely different entry ("Beerus", "Shippuden").
+var animeggSeasonWordRe = regexp.MustCompile(`(?i)\b(season|part|cour|arc|saga|act|ova|ona|movie|film|special|sp|ova|oad)\b`)
+
+// animeggExtraSpecificity returns how many characters of the query name
+// something MORE SPECIFIC than the candidate: when the candidate is a
+// proper part of the query (parent franchise entry), the remainder names
+// the actual entry ("beerus" in "dragonballsuperbeerus" vs
+// "dragonballsuper"). Season words and digits are stripped first because
+// merged base listings legitimately cover "Season 2" queries via episode
+// offsets. A remainder of 4+ chars is a different show, not a variant.
+func animeggExtraSpecificity(query, candidate string) int {
+	qn, cn := animeggNorm(query), animeggNorm(candidate)
+	if qn == "" || cn == "" || qn == cn || !strings.Contains(qn, cn) {
+		return 0
+	}
+	rest := strings.Replace(qn, cn, "", 1)
+	rest = animeggNumRe.ReplaceAllString(rest, "")
+	rest = animeggSeasonWordRe.ReplaceAllString(rest, "")
+	return len(rest)
+}
+
 func animeggTitleScore(query, candidate, slug string) float64 {
 	slugged := strings.ReplaceAll(slug, "-", " ")
 	base := animeggDice(query, candidate)
@@ -311,6 +335,14 @@ func animeggTitleScore(query, candidate, slug string) float64 {
 	isMovieQuery := animeggMovieRe.MatchString(query)
 	isMovieMatch := animeggMovieRe.MatchString(candidate) || animeggSlugMv.MatchString(slug)
 	if isMovieQuery && !isMovieMatch {
+		return base * 0.4
+	}
+	// The site may lack the specific entry (unreleased sequel/spinoff):
+	// without this, the parent franchise entry scores ~0.8 on overlap
+	// alone and its episode 1 ships as the wrong show (observed: a 2026
+	// "Beerus" query matching the 2015 "Dragon Ball Super" listing).
+	// Season continuations are exempt — merged listings cover those.
+	if animeggExtraSpecificity(query, candidate) >= 4 {
 		return base * 0.4
 	}
 	if ql, sl := len(animeggNorm(query)), len(animeggNorm(slugged)); sl > ql*16/10+4 {
