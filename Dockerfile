@@ -1,7 +1,8 @@
-# Build stage: pinned Go builder. go.mod's toolchain directive (go1.25.3)
-# upgrades the 1.25-alpine base automatically — pinned for CVE fixes
-# (GO-2025-39xx/40xx series, all stdlib, fixed in 1.25.2/1.25.3).
-FROM golang:1.25-alpine AS gobuild
+# Build stage: pinned Go builder matching go.mod's toolchain (go1.26.x).
+# The toolchain directive can auto-upgrade a base image, but the official
+# alpine images ship GOTOOLCHAIN=local, which refuses — so the base must
+# satisfy go.mod on its own. Pinned for CVE fixes (GO-2026-66xx series).
+FROM golang:1.26-alpine AS gobuild
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
