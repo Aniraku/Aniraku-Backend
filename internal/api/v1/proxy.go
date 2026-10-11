@@ -682,9 +682,9 @@ func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request
 		h.log.Debug().Str("playlist_preview", rewritten[:1500]).Str("proxy_url", decodedURL).Msg("rewritten HLS playlist (truncated)")
 	}
 	// Playlists are tiny but re-fetched constantly (hls.js polling, quality
-	// switches, prewarm HEADs). 60s of edge is far below the 3–4h upstream
-	// token lifetime, so cached copies always carry valid tokens.
-	cacheableMediaHeaders(w, "public, max-age=60")
+	// switches, prewarm HEADs). 300s of edge is still far below the 3–4h
+	// upstream token lifetime, so cached copies always carry valid tokens.
+	cacheableMediaHeaders(w, "public, max-age=300")
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.WriteHeader(status)
 	w.Write([]byte(rewritten))
