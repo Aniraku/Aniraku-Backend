@@ -1600,7 +1600,9 @@ func fribbMalID(ctx context.Context, client *http.Client, anilistID int) int {
 }
 
 // resolveTmdbIDViaMal maps a MAL anime id to its TMDB show id via Jikan's
-// external links (the only free MAL→TMDB bridge). Cached for the mapping TTL.
+// external links (the only free MAL→TMDB bridge). Jikan blocks datacenter
+// egress, so the call goes through the relay worker when configured
+// (ANIRAKU_RELAY_URL); otherwise it fails fast and the caller falls through.
 func resolveTmdbIDViaMal(ctx context.Context, client *http.Client, malID int) int {
 	if malID <= 0 {
 		return 0
@@ -1613,6 +1615,11 @@ func resolveTmdbIDViaMal(ctx context.Context, client *http.Client, malID int) in
 			return nil, err
 		}
 		req.Header.Set("Accept", "application/json")
+		// Tight timeout: Jikan is unreachable from datacenter egress;
+		// fail fast so the caller falls through to generic episodes.
+		ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		req = req.WithContext(ctx2)
 		resp, err := client.Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("jikan request failed: %w", err)
