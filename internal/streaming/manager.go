@@ -490,11 +490,16 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		lang = "sub"
 	}
 
-	// Hard cap for the whole fan-out: one slow provider (dead embed, blocked
-	// CDN, hanging search) must not stretch the server list past this.
-	fanCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	// No hard cap on the whole fan-out. The response waits for the
+	// slowest collector to finish on its own — operators need EVERY
+	// provider in the list, and slow resolvers (Hana/animex regularly
+	// needs 30-35s) legitimately take that long. The total lifetime is
+	// still bounded upstream by the request context (90s in the handler,
+	// which also lifts the server-wide WriteTimeout), so a genuinely
+	// dead embed cannot hang forever — it just never gets cut for being
+	// merely slow.
+	ctx, cancel := context.WithTimeout(ctx, 85*time.Second)
 	defer cancel()
-	ctx = fanCtx
 
 	// All providers run AT ONCE (fan-out), then merge in fixed provider
 	// order and rank by playback verdict.
@@ -525,29 +530,20 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	var dmu sync.Mutex
 	collectorMs := map[string]int64{}
 
-	// Per-collector budget: the response waits for the slowest
-	// collector, so this is the completeness ceiling — operators
-	// require EVERY provider in the list, even when that means a
-	// 20-26s response (measured tails 2026-10-12: animex max 22s,
-	// lee 24s, megavid 24s, animegg 42s — all of them must be able
-	// to finish, not be killed and drop out of the list). 26s covers
-	// every observed working tail and still sits under the 45s fan
-	// cap; a collector that burns the whole budget logs its name so
-	// the slowest one is measured, not guessed.
-	const collectorBudget = 26 * time.Second
+	// No per-collector time limit. Every provider must appear in the
+	// list, and slow resolvers (Hana/animex regularly needs 30-35s)
+	// legitimately take that long — cutting them just made them vanish.
+	// The response waits for the slowest collector to finish on its own;
+	// each collector only bounds its OWN individual network calls, never
+	// the whole collector. Timing is still recorded per collector so the
+	// slowest one is measured, not guessed.
 	run := func(name string, fn func(context.Context) []core.Server) []core.Server {
 		start := time.Now()
-		cctx, cancel := context.WithTimeout(ctx, collectorBudget)
-		out := fn(cctx)
-		cancel()
+		out := fn(ctx)
 		ms := time.Since(start).Milliseconds()
 		dmu.Lock()
 		collectorMs[name] = ms
 		dmu.Unlock()
-		if ms >= collectorBudget.Milliseconds() {
-			m.log.Warn().Str("collector", name).Int64("ms", ms).
-				Msg("servers: collector exhausted its budget")
-		}
 		return out
 	}
 
@@ -639,9 +635,10 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
-			// budget — observed 46s responses when the 45s fan-out cap trips.
+			// budget. Its own generous timeout bounds a true hang without
+			// cutting a slow-but-working download host.
 			start := time.Now()
-			actx, cancel := context.WithTimeout(ctx, collectorBudget)
+			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
 			cancel()
 			dmu.Lock()

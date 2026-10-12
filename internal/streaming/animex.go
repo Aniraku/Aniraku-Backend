@@ -40,17 +40,18 @@ const (
 )
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
-// 20s: slow-but-working providers (yuki API runs observed past 10s) must
-// still return their server instead of being cut from the list — the
-// operator requirement is that every provider appears, so this stays
-// generous and only true hangs get cut. A var so tests can shrink it.
-var animexProviderTimeout = 20 * time.Second
+// Generous on purpose: Hana/animex regularly needs 30-35s to resolve, and
+// operators require every provider to appear in the list — a slow-but-
+// working sub-provider must return its server, never be cut for being
+// slow. 35s only bounds a true hang (dead embed / blocked CDN). A var so
+// tests can shrink it.
+var animexProviderTimeout = 35 * time.Second
 
 // animexAPIHedgeDelay is when a slow sources-API attempt gets a parallel
 // twin (first to finish wins). Normally the API answers in 0.3-1.8s and
 // the hedge never fires; a hung request used to eat the whole provider
-// budget (observed: yuki held all 20s and cost the Mochi slot on a cold
-// cache). Hedging recovers a flap in ~8s while a merely slow attempt
+// budget (observed: yuki held the full timeout and cost the Mochi slot
+// on a cold cache). Hedging recovers a flap while a merely slow attempt
 // still returns by itself — nothing that works today can regress.
 const animexAPIHedgeDelay = 8 * time.Second
 
