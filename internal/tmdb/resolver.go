@@ -1193,6 +1193,26 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 		mappings = append([]tmdbMapping{}, showMappings...)
 		mappings = append(mappings, movieMappings...)
 	}
+	// MAL-keyed fallback: AniBridge sometimes carries only mal:{malId}
+	// (unreleased shows, hentai). Resolve the MAL id from Fribb, then the
+	// TMDB show id via Jikan external links, and reuse the mal: ranges.
+	if len(mappings) == 0 {
+		if malID := fribbMalID(ctx, client, anilistID); malID > 0 {
+			if tmdbID := resolveTmdbIDViaMal(ctx, client, malID); tmdbID > 0 {
+				if malPayload, mErr := getMapping(ctx, client, anilistID); mErr == nil {
+					if src, sErr := extractMappingSource(malPayload, anilistID); sErr == nil {
+						if rangesVal, ok := src[fmt.Sprintf("mal:%d", malID)]; ok {
+							if ranges := toStringMap(rangesVal); len(ranges) > 0 {
+								mappings = append(mappings, tmdbMapping{
+									Type: "tv", ShowID: tmdbID, SeasonNumber: 1, Ranges: ranges,
+								})
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 	if len(mappings) == 0 {
 		// AniBridge missing or unverified -> try Fribb fallback (exhaustive but less verified)
 		if fribb, ferr := getFribbMappings(ctx, client, anilistID); ferr == nil && len(fribb) > 0 {
@@ -1492,6 +1512,7 @@ var fribbCache struct {
 
 type fribbEntry struct {
 	AnilistID    int    `json:"anilist_id"`
+	MalID        int    `json:"mal_id"`
 	Type         string `json:"type"`
 	ThemoviedbID struct {
 		TV    any   `json:"tv"` // int or null
@@ -1550,6 +1571,82 @@ func getFribbMappings(ctx context.Context, client *http.Client, anilistID int) (
 		return nil, fmt.Errorf("fribb: no entry for %d", anilistID)
 	}
 	return fribbToMappings(entry), nil
+}
+
+// fribbMalID returns the MAL id for an AniList id from the Fribb list
+// (no network: the shared cache is already loaded by getFribbMappings).
+func fribbMalID(ctx context.Context, client *http.Client, anilistID int) int {
+	if anilistID <= 0 {
+		return 0
+	}
+	fribbCache.RLock()
+	entries := fribbCache.entries
+	fetched := fribbCache.fetched
+	fribbCache.RUnlock()
+	if entries == nil || time.Since(fetched) >= 24*time.Hour {
+		// Cold: load once (getFribbMappings caches), then re-read.
+		if _, err := getFribbMappings(ctx, client, anilistID); err != nil {
+			return 0
+		}
+		fribbCache.RLock()
+		entries = fribbCache.entries
+		fribbCache.RUnlock()
+	}
+	if e, ok := entries[anilistID]; ok {
+		return e.MalID
+	}
+	return 0
+}
+
+// resolveTmdbIDViaMal maps a MAL anime id to its TMDB show id via Jikan's
+// external links (the only free MAL→TMDB bridge). Cached for the mapping TTL.
+func resolveTmdbIDViaMal(ctx context.Context, client *http.Client, malID int) int {
+	if malID <= 0 {
+		return 0
+	}
+	key := cacheKey("mal2tmdb", malID)
+	val, err := cached(key, MappingTTL, func() (any, error) {
+		u := fmt.Sprintf("https://api.jikan.moe/v4/anime/%d", malID)
+		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("jikan request failed: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("jikan returned %d", resp.StatusCode)
+		}
+		var raw struct {
+			Data struct {
+				ExternalLinks []struct {
+					Name string `json:"name"`
+					URL  string `json:"url"`
+				} `json:"external_links"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); err != nil {
+			return nil, fmt.Errorf("jikan decode: %w", err)
+		}
+		for _, l := range raw.Data.ExternalLinks {
+			if !strings.Contains(strings.ToLower(l.URL), "themoviedb.org/tv/") {
+				continue
+			}
+			parts := strings.Split(strings.TrimRight(l.URL, "/"), "/")
+			if n, err := strconv.Atoi(parts[len(parts)-1]); err == nil && n > 0 {
+				return n, nil
+			}
+		}
+		return nil, fmt.Errorf("no TMDB link for mal %d", malID)
+	})
+	if err != nil || val == nil {
+		return 0
+	}
+	id, _ := val.(int)
+	return id
 }
 
 func fribbToMappings(e fribbEntry) []tmdbMapping {
