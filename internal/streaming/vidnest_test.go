@@ -87,6 +87,19 @@ func newVidNestFixture(t *testing.T) *vidnestFixture {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"data":%q,"encrypted":true}`, vidnestEncode(payload))
 	})
+	// Relay route: the provider is relay-exclusive (direct branch
+	// removed), so tests exercise the worker path.
+	mux.HandleFunc("/vidnest", func(w http.ResponseWriter, r *http.Request) {
+		payload, _ := json.Marshal(map[string]any{
+			"sources": []any{map[string]any{"file": base + "/m/master.m3u8", "type": "hls"}},
+			"tracks":  []any{map[string]any{"file": base + "/subs/en.vtt", "label": "English", "lang": "en"}},
+			"intro":   map[string]any{"start": 31, "end": 111},
+			"outro":   map[string]any{"start": 1376, "end": 1447},
+			"status":  200, "success": true,
+		})
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"data":%q,"encrypted":true}`, vidnestEncode(payload))
+	})
 	mux.HandleFunc("/m/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n/media.m3u8\n")
 	})
@@ -106,6 +119,7 @@ func TestVidNestSubResolve(t *testing.T) {
 	f := newVidNestFixture(t)
 	p := NewVidNestProvider(zerolog.Nop(), f.base)
 	p.client = f.server.Client()
+	p.relay = newRelayTestClient(f.server)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -139,14 +153,15 @@ func TestVidNestSubResolve(t *testing.T) {
 
 func TestVidNestGatedSkipsSilently(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Datacenter-egress shape: Cloudflare 403 on the API.
-		http.Error(w, "Attention Required", http.StatusForbidden)
+	mux.HandleFunc("/vidnest", func(w http.ResponseWriter, r *http.Request) {
+		// Relay-side gate (worker denied / upstream 403 through it).
+		http.Error(w, "forbidden", http.StatusForbidden)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	p := NewVidNestProvider(zerolog.Nop(), srv.URL)
 	p.client = srv.Client()
+	p.relay = newRelayTestClient(srv)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
