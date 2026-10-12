@@ -524,12 +524,28 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	fanStart := time.Now()
 	var dmu sync.Mutex
 	collectorMs := map[string]int64{}
-	run := func(name string, fn func() []core.Server) []core.Server {
+
+	// Per-collector budget: the response latency IS the slowest
+	// collector, and the shared 45s fan cap let stragglers wait out
+	// 13-42s tails (measured 2026-10-12: totalMs p50 9.8s / p90 24s;
+	// animex + animegg + megavid set the total in 73% of requests).
+	// Every healthy collector answers within 6.7s at p90 — 12s bounds
+	// the tails while keeping that headroom. A collector that burns the
+	// whole budget logs its name so the next offender is measured.
+	const collectorBudget = 12 * time.Second
+	run := func(name string, fn func(context.Context) []core.Server) []core.Server {
 		start := time.Now()
-		out := fn()
+		cctx, cancel := context.WithTimeout(ctx, collectorBudget)
+		out := fn(cctx)
+		cancel()
+		ms := time.Since(start).Milliseconds()
 		dmu.Lock()
-		collectorMs[name] = time.Since(start).Milliseconds()
+		collectorMs[name] = ms
 		dmu.Unlock()
+		if ms >= collectorBudget.Milliseconds() {
+			m.log.Warn().Str("collector", name).Int64("ms", ms).
+				Msg("servers: collector exhausted its budget")
+		}
 		return out
 	}
 
@@ -545,76 +561,76 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	collectors := []func(){
 		func() {
 			if !hentai {
-				akServers = run("anikoto", func() []core.Server {
-					return m.collectAnikotoServers(ctx, anilistID, episode, lang)
+				akServers = run("anikoto", func(cctx context.Context) []core.Server {
+					return m.collectAnikotoServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				axServers = run("animex", func() []core.Server {
-					return m.collectAnimeXServers(ctx, anilistID, episode, lang)
+				axServers = run("animex", func(cctx context.Context) []core.Server {
+					return m.collectAnimeXServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !zokoPaused {
-				zkServers = run("zoko", func() []core.Server {
-					return m.collectZokoServers(ctx, anilistID, episode, lang)
+				zkServers = run("zoko", func(cctx context.Context) []core.Server {
+					return m.collectZokoServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
-			fcServers = run("flixcloud", func() []core.Server {
-				return m.collectFlixServers(ctx, anilistID, episode, lang)
+			fcServers = run("flixcloud", func(cctx context.Context) []core.Server {
+				return m.collectFlixServers(cctx, anilistID, episode, lang)
 			})
 		},
 		func() {
 			if !hentai {
-				nnServers = run("nin", func() []core.Server {
-					return m.collectNiNServers(ctx, anilistID, episode, lang)
+				nnServers = run("nin", func(cctx context.Context) []core.Server {
+					return m.collectNiNServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				kaServers = run("kaa", func() []core.Server {
-					return m.collectKaaServers(ctx, anilistID, episode, lang)
+				kaServers = run("kaa", func(cctx context.Context) []core.Server {
+					return m.collectKaaServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				agServers = run("animegg", func() []core.Server {
-					return m.collectAnimeGGServers(ctx, anilistID, episode, lang)
+				agServers = run("animegg", func(cctx context.Context) []core.Server {
+					return m.collectAnimeGGServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				awServers = run("aniwaves", func() []core.Server {
-					return m.collectAniWavesServers(ctx, anilistID, episode, lang)
+				awServers = run("aniwaves", func(cctx context.Context) []core.Server {
+					return m.collectAniWavesServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				leeServers = run("lee", func() []core.Server {
-					return m.collectLeeServers(ctx, anilistID, episode, lang)
+				leeServers = run("lee", func(cctx context.Context) []core.Server {
+					return m.collectLeeServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				mvServers = run("megavid", func() []core.Server {
-					return m.collectMegaVidServers(ctx, anilistID, episode, lang)
+				mvServers = run("megavid", func(cctx context.Context) []core.Server {
+					return m.collectMegaVidServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
 		func() {
 			if !hentai {
-				tsServers = run("tensho", func() []core.Server {
-					return m.collectTenshoServers(ctx, anilistID, episode, lang)
+				tsServers = run("tensho", func(cctx context.Context) []core.Server {
+					return m.collectTenshoServers(cctx, anilistID, episode, lang)
 				})
 			}
 		},
@@ -623,7 +639,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			// provider must never starve the download fetch of context
 			// budget — observed 46s responses when the 45s fan-out cap trips.
 			start := time.Now()
-			adlLinks = fetchAnimeDlDownloads(ctx, m.httpClient, anilistID, episode, lang)
+			actx, cancel := context.WithTimeout(ctx, collectorBudget)
+			adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
+			cancel()
 			dmu.Lock()
 			collectorMs["animedlDownloads"] = time.Since(start).Milliseconds()
 			dmu.Unlock()
