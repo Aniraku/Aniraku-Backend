@@ -15,19 +15,22 @@
 // stream>&headers=...). Every decision keys off the UPSTREAM url inside
 // the param; prefetches rebuild the edge URL with the incremented upstream.
 //
-// ORIGIN: plain HTTP to the VM (env ORIGIN_HOST, e.g. the EC2 public DNS
-// name). TLS still terminates at Cloudflare toward viewers. Host and
-// X-Forwarded-Host are set to the public API host so the backend mints
-// stable proxy URLs (identical bytes = identical URLs = shared edge cache).
+// ORIGIN: the public edge URL itself (https:// + env API_HOST).
+// Same-zone subrequests never re-enter workers — they flow through the
+// normal edge pipeline (Cache Rule, then origin over the existing
+// mutual-TLS path). TLS stays valid, the backend mints https proxy URLs,
+// and there is no VM IP/DNS to maintain across moves. (Fetching the VM
+// directly failed two ways: Workers refuse direct-IP origins (error
+// 1003), and plain-HTTP origin fetches made the backend mint http://
+// children.)
 //
 // COST: each prefetch is one cache fill that linear playback would have
 // caused seconds later anyway. Abandoned views waste at most one segment.
 // Free tier: ~2x request volume still fits 100k req/day at current scale.
 //
 // DEPLOY: dashboard Workers & Pages -> Create -> paste this file ->
-// Settings -> Variables: ORIGIN_HOST=<vm public dns>, API_HOST=
-// api.aniraku.tech -> Deploy. Attach to a TEST route first
-// (test.aniraku.tech/*), verify, then attach
+// Settings -> Variables: API_HOST=api.aniraku.tech -> Deploy. Attach to
+// a TEST route first (test.aniraku.tech/*), verify, then attach
 // api.aniraku.tech/api/v1/proxy*.
 
 const SEGMENT_TTL = 31536000; // immutable bytes, same as origin header
@@ -96,11 +99,10 @@ function withUpstream(reqUrl, upstream) {
 
 function originRequest(edgeUrl, req, env) {
   const incoming = new URL(edgeUrl);
-  const origin = new URL(incoming.pathname + incoming.search, `http://${env.ORIGIN_HOST}`);
+  // Same-zone edge URL: flows through cache + origin like any viewer
+  // request, without re-entering this worker.
+  const origin = new URL(incoming.pathname + incoming.search, `https://${env.API_HOST}`);
   const headers = new Headers(req.headers);
-  headers.set("Host", env.API_HOST);
-  headers.set("X-Forwarded-Host", env.API_HOST);
-  headers.set("X-Forwarded-Proto", "https");
   return new Request(origin.toString(), {
     method: req.method,
     headers,
