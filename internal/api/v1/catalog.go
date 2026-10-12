@@ -270,15 +270,38 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	<-anizipDone
 	mark("list")
 
+	// Human title for the TMDB title-search fallback (unreleased/new shows
+	// where AniBridge has no tmdb_show descriptor yet).
+	titleHint := ""
+	if t, ok := media["title"].(map[string]any); ok {
+		for _, k := range []string{"english", "romaji", "userPreferred"} {
+			if s, _ := t[k].(string); strings.TrimSpace(s) != "" {
+				titleHint = strings.TrimSpace(s)
+				break
+			}
+		}
+	}
+
 	episodeCount := 0
 	if eps, ok := media["episodes"].(float64); ok && eps > 0 {
 		episodeCount = int(eps)
-	} else if nae, ok := media["nextAiringEpisode"].(map[string]any); ok {
-		if ep, ok := nae["episode"].(float64); ok && ep > 1 {
-			episodeCount = int(ep) - 1
+	} else {
+		// Airing shows often have episodes:null and nextAiringEpisode only
+		// counts what has AIRED (1 of 12) — the verified AniBridge mapping
+		// ranges carry the full cour length, so consult them first.
+		if abMax := tmdb.AnibridgeMaxEpisode(ctx, h.httpClient, anilistID); abMax > episodeCount {
+			episodeCount = abMax
 		}
-	} else if status, ok := media["status"].(string); ok && (status == "RELEASING" || status == "NOT_YET_RELEASED") {
-		episodeCount = 12
+		if nae, ok := media["nextAiringEpisode"].(map[string]any); ok {
+			if ep, ok := nae["episode"].(float64); ok && int(ep)-1 > episodeCount {
+				episodeCount = int(ep) - 1
+			}
+		}
+		if episodeCount == 0 {
+			if status, ok := media["status"].(string); ok && (status == "RELEASING" || status == "NOT_YET_RELEASED") {
+				episodeCount = 12
+			}
+		}
 	}
 
 	// AniList outages (or titles with unknown counts) leave episodeCount at
@@ -363,7 +386,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		if len(episodeNumbers) > 0 {
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 50*time.Second)
 			defer fetchCancel()
-			result, _ := tmdb.ResolveEpisodes(fetchCtx, h.httpClient, token, anilistID, episodeNumbers)
+			result, _ := tmdb.ResolveEpisodesWithTitle(fetchCtx, h.httpClient, token, anilistID, episodeNumbers, titleHint)
 			if result != nil {
 				for _, ep := range result.Episodes {
 					tmdbByNumber[ep.Number] = ep
