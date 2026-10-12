@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -155,71 +154,20 @@ type vidnestPayload struct {
 }
 
 func (p *VidNestProvider) fetchAPI(ctx context.Context, id, episode int, lang, referer string) (*vidnestPayload, error) {
-	// Relay first when configured: the direct API 403s datacenter egress.
-	if p.relay != nil {
-		body, err := p.relay.VidNestFetch(ctx, id, episode, lang)
-		if err != nil {
-			return nil, err
-		}
-		return decodeVidNestEnvelope(body)
+	// Relay-exclusive: the direct API 403s datacenter egress, so the dead
+	// direct branch was removed — the relay worker (ANIRAKU_RELAY_URL) is
+	// the only path. Unset relay means misconfiguration, said loudly.
+	if p.relay == nil {
+		return nil, fmt.Errorf("vidnest: relay not configured (set ANIRAKU_RELAY_URL/ANIRAKU_RELAY_KEY)")
 	}
-	rawURL := fmt.Sprintf("%s/hianime/anime/%d/%d/%s/hd-2", p.api, id, episode, lang)
-	var lastErr error
-	for attempt := 1; attempt <= 2; attempt++ {
-		// Per-attempt cap far below the client timeout: a tarpitted
-		// block page must never eat the fan-out budget.
-		actx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		if attempt > 1 {
-			select {
-			case <-ctx.Done():
-				cancel()
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
-			}
-		}
-		req, err := http.NewRequestWithContext(actx, http.MethodGet, rawURL, nil)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		req.Header.Set("User-Agent", browserUA)
-		req.Header.Set("Accept", "application/json")
-		req.Header.Set("Referer", referer)
-		resp, err := p.client.Do(req)
-		if err != nil {
-			cancel()
-			lastErr = err
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		status := resp.StatusCode
-		resp.Body.Close()
-		cancel()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if status == http.StatusTooManyRequests || status >= 500 {
-			lastErr = fmt.Errorf("vidnest: GET %s -> HTTP %d", rawURL, status)
-			continue
-		}
-		if status != http.StatusOK {
-			return nil, fmt.Errorf("vidnest: GET %s -> HTTP %d", rawURL, status)
-		}
-		var env vidnestAPIEnvelope
-		if err := json.Unmarshal(body, &env); err != nil {
-			return nil, fmt.Errorf("vidnest: envelope json: %w", err)
-		}
-		return decodeVidNestEnvelopeBody(env)
+	body, err := p.relay.VidNestFetch(ctx, id, episode, lang)
+	if err != nil {
+		return nil, err
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("vidnest: request failed")
-	}
-	return nil, lastErr
+	return decodeVidNestEnvelope(body)
 }
 
-// decodeVidNestEnvelope parses + decodes one API envelope body (shared by
-// the direct and relayed fetch paths).
+// decodeVidNestEnvelope parses + decodes one API envelope body.
 func decodeVidNestEnvelope(body []byte) (*vidnestPayload, error) {
 	var env vidnestAPIEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
