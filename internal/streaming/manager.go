@@ -444,7 +444,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryAnimeGG(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAniWaves(ctx, animeID, episode, lang, quality)
-
+		}, func() (*core.StreamResult, error) {
 			return m.tryLee(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)

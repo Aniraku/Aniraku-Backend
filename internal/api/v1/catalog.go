@@ -396,8 +396,14 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// have nothing for this anime. Thumbnails intentionally stay the anime
 	// poster (coverFallback) per product decision — Anisearch ships a generic
 	// placeholder cover for adult titles. Reuses the fetch from the count
-	// stage above when available.
-	if episodeCount > 0 && anisearchEps == nil && len(anizipData) == 0 && len(tmdbByNumber) == 0 {
+	// stage above when available. Skipped for unreleased shows: Anisearch
+	// indexes released episodes only, so the 15s fetch would always return
+	// empty for a title whose episodes haven't aired.
+	unreleased := false
+	if s, ok := media["status"].(string); ok {
+		unreleased = strings.EqualFold(s, "RELEASING") || strings.EqualFold(s, "NOT_YET_RELEASED")
+	}
+	if episodeCount > 0 && !unreleased && anisearchEps == nil && len(anizipData) == 0 && len(tmdbByNumber) == 0 {
 		asiCtx, asiCancel := context.WithTimeout(ctx, 15*time.Second)
 		anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)
 		asiCancel()
