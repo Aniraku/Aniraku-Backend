@@ -127,12 +127,11 @@ type megavidSourceJSON struct {
 func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episode int, lang string) (*megavidSourceJSON, error) {
 	rawURL := fmt.Sprintf("%s/%s/%s/%d/%s/source", p.api, key, url.PathEscape(id), episode, lang)
 	var lastErr error
-	// Both attempts share this budget so a hung first attempt can never
-	// leave the second no runway — but the budget is generous (20s) so a
-	// slow-but-working megavid edge still returns its server instead of
-	// being cut from the list. Healthy answers are sub-second; this only
-	// bounds true hangs.
-	actx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	// Shared budget across both attempts so a hung first attempt can
+	// never leave the retry no runway. Generous: a slow-but-working
+	// megavid edge must still return its server (operators require every
+	// provider in the list) — this only bounds a true hang.
+	actx, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
 	for attempt := 1; attempt <= 2; attempt++ {
 		if attempt > 1 {
