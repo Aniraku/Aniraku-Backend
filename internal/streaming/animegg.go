@@ -108,8 +108,13 @@ func NewAnimeGGProvider(log zerolog.Logger, base, anilistURL string) *AnimeGGPro
 		anilistURL = "https://graphql.aniraku.tech"
 	}
 	return &AnimeGGProvider{
-		log:        log,
-		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
+		log: log,
+		// 8s per request: every page here is ≤1MB and healthy fetches
+		// answer in well under 2s — the old 45s let one hung page hold
+		// the collector to its fan-out budget kill (observed animegg
+		// max 42s against a 12s budget). The mp4 probe's inner 10s
+		// deadline still applies, bounded by this.
+		client:     &http.Client{Timeout: 8 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
 		anilistURL: anilistURL,
 		shows:      make(map[int]*animeggShowEntry),

@@ -40,17 +40,21 @@ const (
 )
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
-// Slow-but-working providers (yuki API runs observed past 10s) must still
-// return; only true hangs get cut. A var so tests can shrink it.
-var animexProviderTimeout = 20 * time.Second
+// It was 20s until the 2026-10-12 measurements: the collector's p90 WAS
+// this timeout (dead edges waiting out the full budget while the stale
+// cache already had the answer). Healthy resolves answer in 0.3-1.8s —
+// 11s keeps slow-but-working runs and hands the tail to stale-serving.
+// A var so tests can shrink it.
+var animexProviderTimeout = 11 * time.Second
 
 // animexAPIHedgeDelay is when a slow sources-API attempt gets a parallel
 // twin (first to finish wins). Normally the API answers in 0.3-1.8s and
 // the hedge never fires; a hung request used to eat the whole provider
-// budget (observed: yuki held all 20s and cost the Mochi slot on a cold
-// cache). Hedging recovers a flap in ~8s while a merely slow attempt
-// still returns by itself — nothing that works today can regress.
-const animexAPIHedgeDelay = 8 * time.Second
+// budget (observed: yuki held the full timeout and cost the Mochi slot
+// on a cold cache). With animexProviderTimeout at 11s the twin needs
+// runway: firing at 5s leaves 6s — enough for a healthy twin (0.3-1.8s)
+// to land while a merely slow attempt still returns by itself.
+const animexAPIHedgeDelay = 5 * time.Second
 
 // animexPlyrTimeout bounds waiting on the plyr page (slug + provider
 // list). It has its own internal retry, and the fallback path (anilistID

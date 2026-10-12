@@ -127,19 +127,22 @@ type megavidSourceJSON struct {
 func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episode int, lang string) (*megavidSourceJSON, error) {
 	rawURL := fmt.Sprintf("%s/%s/%s/%d/%s/source", p.api, key, url.PathEscape(id), episode, lang)
 	var lastErr error
+	// One budget for both attempts (was 12s each — a hung first attempt
+	// alone could eat the collector's whole fan-out budget before the
+	// retry even started). Healthy answers are sub-second; 8s covers a
+	// slow run and still leaves room for the retry.
+	actx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
 	for attempt := 1; attempt <= 2; attempt++ {
-		actx, cancel := context.WithTimeout(ctx, 12*time.Second)
 		if attempt > 1 {
 			select {
-			case <-ctx.Done():
-				cancel()
-				return nil, ctx.Err()
-			case <-time.After(time.Duration(attempt) * time.Second):
+			case <-actx.Done():
+				return nil, actx.Err()
+			case <-time.After(time.Second):
 			}
 		}
 		req, err := http.NewRequestWithContext(actx, http.MethodGet, rawURL, nil)
 		if err != nil {
-			cancel()
 			return nil, err
 		}
 		req.Header.Set("User-Agent", browserUA)
@@ -147,14 +150,12 @@ func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episo
 		req.Header.Set("Referer", megavidReferer)
 		resp, err := p.client.Do(req)
 		if err != nil {
-			cancel()
 			lastErr = err
 			continue
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		status := resp.StatusCode
 		resp.Body.Close()
-		cancel()
 		if err != nil {
 			lastErr = err
 			continue
