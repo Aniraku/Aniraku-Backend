@@ -1195,13 +1195,14 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 	}
 	// MAL-keyed fallback: AniBridge sometimes carries only mal:{malId}
 	// (unreleased shows, hentai). Resolve the MAL id from Fribb, then the
-	// TMDB show id via Jikan external links, and reuse the mal: ranges.
+	// TMDB show id via Jikan external links, and read the mal: ranges
+	// directly from the payload (extractMappingSource only handles anilist:).
 	if len(mappings) == 0 {
 		if malID := fribbMalID(ctx, client, anilistID); malID > 0 {
 			if tmdbID := resolveTmdbIDViaMal(ctx, client, malID); tmdbID > 0 {
 				if malPayload, mErr := getMapping(ctx, client, anilistID); mErr == nil {
-					if src, sErr := extractMappingSource(malPayload, anilistID); sErr == nil {
-						if rangesVal, ok := src[fmt.Sprintf("mal:%d", malID)]; ok {
+					if data, ok := malPayload["data"].(map[string]any); ok {
+						if rangesVal, ok := data[fmt.Sprintf("mal:%d", malID)]; ok {
 							if ranges := toStringMap(rangesVal); len(ranges) > 0 {
 								mappings = append(mappings, tmdbMapping{
 									Type: "tv", ShowID: tmdbID, SeasonNumber: 1, Ranges: ranges,
