@@ -1617,7 +1617,7 @@ func resolveTmdbIDViaMal(ctx context.Context, client *http.Client, malID int) in
 		req.Header.Set("Accept", "application/json")
 		// Tight timeout: Jikan is unreachable from datacenter egress;
 		// fail fast so the caller falls through to generic episodes.
-		ctx2, cancel := context.WithTimeout(ctx, 10*time.Second)
+		ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 		req = req.WithContext(ctx2)
 		resp, err := client.Do(req)
