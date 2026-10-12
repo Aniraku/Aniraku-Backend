@@ -1163,7 +1163,16 @@ type ResolveResult struct {
 
 // ResolveEpisodes is the Go port of api/tmdb-episodes.js:267 resolveEpisodes
 // It first tries AniBridge verified mappings, then falls back to Fribb/anime-lists exhaustive mapping for 100% coverage.
+// ResolveEpisodes resolves episode metadata without a title hint (kept for
+// background enrichment paths).
 func ResolveEpisodes(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int) (*ResolveResult, error) {
+	return ResolveEpisodesWithTitle(ctx, client, token, anilistID, episodeNumbers, "")
+}
+
+// ResolveEpisodesWithTitle resolves episode metadata. The title enables the
+// TMDB title-search fallback when AniBridge has no direct tmdb_show
+// descriptor (newly-verified shows only carry nested ranges).
+func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int, title string) (*ResolveResult, error) {
 	if client == nil {
 		client = &http.Client{Timeout: RequestTimeout}
 	}
@@ -1193,37 +1202,47 @@ func ResolveEpisodes(ctx context.Context, client *http.Client, token string, ani
 		mappings = append([]tmdbMapping{}, showMappings...)
 		mappings = append(mappings, movieMappings...)
 	}
-	// MAL-keyed fallback: AniBridge sometimes carries only mal:{malId}
-	// (unreleased shows, hentai). Resolve the MAL id from Fribb, then the
-	// TMDB show id via Jikan external links, and read the mal: ranges
-	// directly from the payload (extractMappingSource only handles anilist:).
-	if len(mappings) == 0 {
-		if malID := fribbMalID(ctx, client, anilistID); malID > 0 {
-			if tmdbID := resolveTmdbIDViaMal(ctx, client, malID); tmdbID > 0 {
-				if malPayload, mErr := getMapping(ctx, client, anilistID); mErr == nil {
-					if data, ok := malPayload["data"].(map[string]any); ok {
-						if rangesVal, ok := data[fmt.Sprintf("mal:%d", malID)]; ok {
-							if ranges := toStringMap(rangesVal); len(ranges) > 0 {
-								mappings = append(mappings, tmdbMapping{
-									Type: "tv", ShowID: tmdbID, SeasonNumber: 1, Ranges: ranges,
-								})
-							}
-						}
-					}
-				}
+	// No direct tmdb_show/tmdb_movie descriptor: AniBridge often still
+	// carries nested identity ranges (anilist:{id} -> mal:{id} -> ranges)
+	// for newly-verified shows, but no TMDB id. Verified Fribb is tried
+	// first below; if that yields nothing, chain the nested ranges with a
+	// TMDB title search for the show id — no MAL/Jikan lookup involved.
+	titleFallback := func() {
+		if len(mappings) > 0 || title == "" {
+			return
+		}
+		tmdbID := resolveTmdbIDByTitle(ctx, client, token, title)
+		if tmdbID <= 0 {
+			return
+		}
+		ranges := extractNestedRanges(payload, anilistID)
+		if len(ranges) == 0 {
+			ranges = make(map[string]string, len(nums))
+			for _, n := range nums {
+				s := strconv.Itoa(n)
+				ranges[s] = s
 			}
 		}
+		mappings = append(mappings, tmdbMapping{
+			Type: "tv", ShowID: tmdbID, SeasonNumber: 1, Ranges: ranges,
+		})
 	}
 	if len(mappings) == 0 {
 		// AniBridge missing or unverified -> try Fribb fallback (exhaustive but less verified)
 		if fribb, ferr := getFribbMappings(ctx, client, anilistID); ferr == nil && len(fribb) > 0 {
 			mappings = fribb
-		} else {
-			if err != nil {
-				return nil, err
-			}
-			return nil, newResolverError("TMDB_MEDIA_MAPPING_NOT_FOUND", "No verified TMDB television or movie mapping exists for this anime.", 404)
 		}
+	}
+	if len(mappings) == 0 {
+		// Last resort: TMDB title search chained with AniBridge's nested
+		// identity ranges (covers newly-verified shows with no tmdb id yet).
+		titleFallback()
+	}
+	if len(mappings) == 0 {
+		if err != nil {
+			return nil, err
+		}
+		return nil, newResolverError("TMDB_MEDIA_MAPPING_NOT_FOUND", "No verified TMDB television or movie mapping exists for this anime.", 404)
 	}
 	requested := map[int]*tmdbMapping{}
 	for _, n := range nums {
@@ -1574,87 +1593,132 @@ func getFribbMappings(ctx context.Context, client *http.Client, anilistID int) (
 	return fribbToMappings(entry), nil
 }
 
-// fribbMalID returns the MAL id for an AniList id from the Fribb list
-// (no network: the shared cache is already loaded by getFribbMappings).
-func fribbMalID(ctx context.Context, client *http.Client, anilistID int) int {
-	if anilistID <= 0 {
+// AnibridgeMaxEpisode returns the highest episode number in the verified
+// AniBridge mapping for an AniList id (0 when unavailable). It reads both
+// flat tmdb_show descriptors and nested shapes (anilist->mal->ranges), so
+// airing shows with episodes:null can derive their full cour length
+// instead of the aired-only nextAiringEpisode count. Cached with the
+// mapping itself (MappingTTL), so the later resolve reuses the same fetch.
+func AnibridgeMaxEpisode(ctx context.Context, client *http.Client, anilistID int) int {
+	payload, err := getMapping(ctx, client, anilistID)
+	if err != nil || payload == nil {
 		return 0
 	}
-	fribbCache.RLock()
-	entries := fribbCache.entries
-	fetched := fribbCache.fetched
-	fribbCache.RUnlock()
-	if entries == nil || time.Since(fetched) >= 24*time.Hour {
-		// Cold: load once (getFribbMappings caches), then re-read.
-		if _, err := getFribbMappings(ctx, client, anilistID); err != nil {
-			return 0
+	maxEp := 0
+	scan := func(ranges map[string]string) {
+		for k, v := range ranges {
+			for _, s := range []string{k, v} {
+				if r := parseRange(s); r != nil && r.end != nil && *r.end > maxEp {
+					maxEp = *r.end
+				}
+			}
 		}
-		fribbCache.RLock()
-		entries = fribbCache.entries
-		fribbCache.RUnlock()
 	}
-	if e, ok := entries[anilistID]; ok {
-		return e.MalID
+	data, _ := payload["data"].(map[string]any)
+	src, _ := data[fmt.Sprintf("anilist:%d", anilistID)].(map[string]any)
+	for _, v := range src {
+		if r := toStringMap(v); looksLikeRanges(r) {
+			scan(r)
+			continue
+		}
+		if nested, ok := v.(map[string]any); ok {
+			for _, nv := range nested {
+				if r := toStringMap(nv); looksLikeRanges(r) {
+					scan(r)
+				}
+			}
+		}
 	}
-	return 0
+	return maxEp
 }
 
-// resolveTmdbIDViaMal maps a MAL anime id to its TMDB show id via Jikan's
-// external links (the only free MAL→TMDB bridge). Jikan blocks datacenter
-// egress, so the call goes through the relay worker when configured
-// (ANIRAKU_RELAY_URL); otherwise it fails fast and the caller falls through.
-func resolveTmdbIDViaMal(ctx context.Context, client *http.Client, malID int) int {
-	if malID <= 0 {
+// extractNestedRanges digs out the first range map under the anilist key,
+// handling AniBridge's nested shape (anilist:{id} -> mal:{id} -> ranges).
+func extractNestedRanges(payload map[string]any, anilistID int) map[string]string {
+	data, _ := payload["data"].(map[string]any)
+	src, _ := data[fmt.Sprintf("anilist:%d", anilistID)].(map[string]any)
+	for _, v := range src {
+		if r := toStringMap(v); looksLikeRanges(r) {
+			return r
+		}
+		// one level deeper: {"mal:63367": {"1-12": "1-12"}}
+		if nested, ok := v.(map[string]any); ok {
+			for _, nv := range nested {
+				if r := toStringMap(nv); looksLikeRanges(r) {
+					return r
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func looksLikeRanges(m map[string]string) bool {
+	if len(m) == 0 {
+		return false
+	}
+	for k := range m {
+		if parseRange(k) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveTmdbIDByTitle finds a TMDB TV show id from a human title using
+// TMDB's own search API (always reachable; replaces the MAL/Jikan bridge).
+// Exact name match wins; a lone result is accepted; otherwise the first
+// result is taken only when its name contains the query.
+func resolveTmdbIDByTitle(ctx context.Context, client *http.Client, token, title string) int {
+	title = strings.TrimSpace(title)
+	if title == "" || strings.TrimSpace(token) == "" {
 		return 0
 	}
-	key := cacheKey("mal2tmdb", malID)
+	key := cacheKey("tmdb-title-search", strings.ToLower(title))
 	val, err := cached(key, MappingTTL, func() (any, error) {
-		u := fmt.Sprintf("https://api.jikan.moe/v4/anime/%d", malID)
-		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		// Tight timeout: Jikan is unreachable from datacenter egress;
-		// fail fast so the caller falls through to generic episodes.
-		ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-		req = req.WithContext(ctx2)
-		resp, err := client.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("jikan request failed: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("jikan returned %d", resp.StatusCode)
-		}
-		var raw struct {
-			Data struct {
-				ExternalLinks []struct {
-					Name string `json:"name"`
-					URL  string `json:"url"`
-				} `json:"external_links"`
-			} `json:"data"`
-		}
-		if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&raw); err != nil {
-			return nil, fmt.Errorf("jikan decode: %w", err)
-		}
-		for _, l := range raw.Data.ExternalLinks {
-			if !strings.Contains(strings.ToLower(l.URL), "themoviedb.org/tv/") {
-				continue
-			}
-			parts := strings.Split(strings.TrimRight(l.URL, "/"), "/")
-			if n, err := strconv.Atoi(parts[len(parts)-1]); err == nil && n > 0 {
-				return n, nil
-			}
-		}
-		return nil, fmt.Errorf("no TMDB link for mal %d", malID)
+		u := fmt.Sprintf("%s/search/tv?query=%s&language=en-US&page=1&include_adult=true",
+			TMDBAPIBase, url.QueryEscape(title))
+		return requestJson(ctx, client, u,
+			map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token},
+			"TMDB_SEARCH_UNAVAILABLE", "TMDB search is unavailable.")
 	})
 	if err != nil || val == nil {
 		return 0
 	}
-	id, _ := val.(int)
-	return id
+	payload, _ := val.(map[string]any)
+	results, _ := payload["results"].([]any)
+	if len(results) == 0 {
+		return 0
+	}
+	want := strings.ToLower(title)
+	exact, contains, first := 0, 0, 0
+	for i, raw := range results {
+		m, _ := raw.(map[string]any)
+		name := strings.ToLower(text(m["name"]))
+		idPtr := positiveInteger(m["id"])
+		if idPtr == nil || *idPtr <= 0 {
+			continue
+		}
+		id := *idPtr
+		if first == 0 {
+			first = id
+		}
+		if name == want {
+			exact = id
+			break
+		}
+		if contains == 0 && (strings.Contains(name, want) || strings.Contains(want, name)) {
+			contains = id
+		}
+		_ = i
+	}
+	if exact > 0 {
+		return exact
+	}
+	if len(results) == 1 {
+		return first
+	}
+	return contains
 }
 
 func fribbToMappings(e fribbEntry) []tmdbMapping {
