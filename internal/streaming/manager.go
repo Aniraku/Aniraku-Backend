@@ -525,14 +525,16 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	var dmu sync.Mutex
 	collectorMs := map[string]int64{}
 
-	// Per-collector budget: the response latency IS the slowest
-	// collector, and the shared 45s fan cap let stragglers wait out
-	// 13-42s tails (measured 2026-10-12: totalMs p50 9.8s / p90 24s;
-	// animex + animegg + megavid set the total in 73% of requests).
-	// Every healthy collector answers within 6.7s at p90 — 12s bounds
-	// the tails while keeping that headroom. A collector that burns the
-	// whole budget logs its name so the next offender is measured.
-	const collectorBudget = 12 * time.Second
+	// Per-collector budget: the response waits for the slowest
+	// collector, so this is the completeness ceiling — operators
+	// require EVERY provider in the list, even when that means a
+	// 20-26s response (measured tails 2026-10-12: animex max 22s,
+	// lee 24s, megavid 24s, animegg 42s — all of them must be able
+	// to finish, not be killed and drop out of the list). 26s covers
+	// every observed working tail and still sits under the 45s fan
+	// cap; a collector that burns the whole budget logs its name so
+	// the slowest one is measured, not guessed.
+	const collectorBudget = 26 * time.Second
 	run := func(name string, fn func(context.Context) []core.Server) []core.Server {
 		start := time.Now()
 		cctx, cancel := context.WithTimeout(ctx, collectorBudget)

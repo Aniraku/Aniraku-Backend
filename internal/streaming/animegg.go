@@ -109,12 +109,11 @@ func NewAnimeGGProvider(log zerolog.Logger, base, anilistURL string) *AnimeGGPro
 	}
 	return &AnimeGGProvider{
 		log: log,
-		// 8s per request: every page here is ≤1MB and healthy fetches
-		// answer in well under 2s — the old 45s let one hung page hold
-		// the collector to its fan-out budget kill (observed animegg
-		// max 42s against a 12s budget). The mp4 probe's inner 10s
-		// deadline still applies, bounded by this.
-		client:     &http.Client{Timeout: 8 * time.Second, Transport: netguard.NewTransport()},
+		// HTTP timeout stays generous (was 45s): a slow-but-working
+		// AnimeGG edge must still return its server rather than being
+		// cut from the list. 20s bounds true hangs only — every real
+		// page here answers in well under 3s.
+		client:     &http.Client{Timeout: 20 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
 		anilistURL: anilistURL,
 		shows:      make(map[int]*animeggShowEntry),
