@@ -1088,8 +1088,11 @@ func toTmdbEpisodeMetadata(entry map[string]any, anilistNumber, tmdbNumber int) 
 		return nil
 	}
 	name, _ := entry["name"].(string)
+	// Placeholder names ("Episode 3") must never reach clients as titles,
+	// but the entry itself still carries real air date / overview / still —
+	// keep those and blank the title so the handler's generic title shows.
 	if !isPublishedTitle(name) {
-		return nil
+		name = ""
 	}
 	thumb := safeStillUrl(text(entry["still_path"]))
 	var thumbPtr *string
