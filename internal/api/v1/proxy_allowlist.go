@@ -34,8 +34,8 @@ var defaultCDNSuffixes = []string{
 	"aniwaves.ru", "echovideo.to", "echovideo.ru", "savedly.net",
 	// MegaVid file host (same AnimeX codec family, direct API)
 	"megavid.buzz",
-	// VidNest API + MegaPlay file host + subtitle host
-	"vidnest.fun", "new.vidnest.fun", "megap.shiora.top", "stellarfrontier.world",
+	// MegaPlay file host + subtitle host
+	"vidnest.fun", "new.vidnest.fun", "megaplay.shiora.top", "stellarfrontier.world",
 	// ani.pm (Lee provider) + settlar file hosts
 	"ani.pm", "embed.settlar.io", "media.settlar.io",
 	// Zoko dramahot CDN (kept: still served by zoko)
