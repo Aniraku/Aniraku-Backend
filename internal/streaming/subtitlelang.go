@@ -17,7 +17,7 @@ import (
 // Two defects motivated this file. mapSubtitleLang used to return "en" for
 // any label outside an eight-entry switch, so a Thai track fetched with the
 // label "Thai (- ภาษาไทย)" was advertised as lang:"en" — every provider that
-// shared it (anikoto, vidnest, megavid, tensho, zoko, lee) reported English
+// shared it (anikoto, megavid, tensho, zoko, lee) reported English
 // for Indonesian, Malay, Thai and Vietnamese alike. And kaa carried the
 // request language (a track *kind*, "sub") into Subtitle.Lang for unnamed
 // files, producing lang:"sub" label:"sub", which is neither a language nor
