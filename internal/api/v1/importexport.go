@@ -43,11 +43,28 @@ import (
 // stays well inside provider rate limits and the platform's timeout.
 
 const (
-	importExportCap    = 150  // max titles per request
-	importBatchSize    = 200  // supabase rows per POST
-	importWatchBatch   = 200  // watch_history rows per POST
-	importMaxWatchRows = 2000 // max synthesized watch rows per import
-	exportWriteCap     = 60   // max provider writes per export (bounds request time)
+	importExportCap = 150 // max titles per request
+	importBatchSize = 200 // supabase rows per POST
+	// importWatchBatch / importMaxWatchRows size the watch-history
+	// synthesis: one POST carries up to 500 rows and a single import may
+	// create up to 8000. The old 2000-row budget was smaller than one
+	// large title plus a modest list (One Piece alone is ~1100 rows), so
+	// the whole-loop break starved the remaining titles — in random map
+	// order — of episode progress AND scores. Budget exhaustion now only
+	// stops row synthesis; every title still gets its score processed,
+	// and a re-run continues from each title's real local max.
+	importWatchBatch   = 500
+	importMaxWatchRows = 8000
+	// watchPageSize / watchIDChunk bound each watch-history GET: rows for
+	// at most watchIDChunk titles (an anime_id=in.(...) filter keeps the
+	// URL far under header limits) per page, watchPageSize rows a page,
+	// paged with a cursor until a page comes back empty. Supabase clamps
+	// any single response, and the old shared timestamp-descending window
+	// silently dropped every title outside it — those titles then exported
+	// progress 0 and never advanced the provider.
+	watchPageSize  = 1000
+	watchIDChunk   = 400
+	exportWriteCap = 60 // max provider writes per export (bounds request time)
 	// exportTimeBudget hard-stops an export's write loop so the JSON
 	// response is always on its way well before nginx's 180s
 	// proxy_read_timeout — the write deadline is lifted for these routes
@@ -249,10 +266,12 @@ func anilistScoreToTen(score float64, format string) int {
 	return s
 }
 
+// animeWatchProgress is the per-title fold of a user's watch_history rows.
 type animeWatchProgress struct {
-	Episode   int
-	Progress  int
-	Completed bool
+	Episode   int  // highest FINISHED episode — the count MAL/AniList store as watched
+	Progress  int  // seconds watched on the newest row (display/debug)
+	Completed bool // the newest row itself was fully watched
+	MaxRow    int  // highest episode row present, finished or not (import merge guard)
 }
 
 // fetchMediaMeta resolves AniList IDs to title + cover image + episode
@@ -491,74 +510,110 @@ func wantExportStatus(stored string, done bool) string {
 	return listCurrent
 }
 
-// loadUserWatchProgress returns the latest/highest Aniraku episode state for
-// each title. Watch history stores one row per episode, so exports must fold
-// those rows into the provider's anime-level progress field instead of
-// treating every favorite as completed.
-func (h *Handlers) loadUserWatchProgress(ctx context.Context, userID string) (map[int]animeWatchProgress, error) {
-	resp, err := h.supabaseRequest(ctx, "GET",
-		"/rest/v1/watch_history?select=anime_id,episode_number,progress,duration,timestamp&user_id=eq."+encodePath(userID)+"&order=timestamp.desc&limit=5000",
-		nil, nil)
-	if err != nil {
-		return nil, err
+// watchHistoryRow is one watch_history record as read by fetchWatchProgress.
+type watchHistoryRow struct {
+	AnimeID  int     `json:"anime_id"`
+	Episode  int     `json:"episode_number"`
+	Progress float64 `json:"progress"`
+	Duration float64 `json:"duration"`
+}
+
+// watchHistoryPath builds one page of a user's watch rows for a slice of
+// titles. The ordering is part of the contract: anime_id ASC,
+// episode_number DESC makes (anime_id, episode_number) a unique, fully
+// deterministic sort key, so offset paging can never skip or repeat rows —
+// even while the user keeps watching.
+func watchHistoryPath(userID string, ids []int, offset int) string {
+	strs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			strs = append(strs, strconv.Itoa(id))
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("watch history fetch returned %s", resp.Status)
-	}
-	var rows []struct {
-		AnimeID   int     `json:"anime_id"`
-		Episode   int     `json:"episode_number"`
-		Progress  float64 `json:"progress"`
-		Duration  float64 `json:"duration"`
-		Timestamp int64   `json:"timestamp"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return nil, err
-	}
-	result := make(map[int]animeWatchProgress)
+	return "/rest/v1/watch_history?select=anime_id,episode_number,progress,duration&user_id=eq." +
+		encodePath(userID) + "&anime_id=in.(" + strings.Join(strs, ",") +
+		")&order=anime_id.asc,episode_number.desc&limit=" + strconv.Itoa(watchPageSize) +
+		"&offset=" + strconv.Itoa(offset)
+}
+
+// foldWatchRows folds rows into acc. Row order does not matter: MaxRow is
+// a max, Progress/Completed always describe the row at MaxRow, and Episode
+// is the highest row that finished (>=95% of duration). Episode is what
+// providers count as "episodes watched" — a title the user merely opened
+// (say, jumped into episode 50 for ten seconds) must not export progress
+// 50 when only episodes 1-11 are actually finished.
+func foldWatchRows(acc map[int]animeWatchProgress, rows []watchHistoryRow) {
 	for _, row := range rows {
 		if row.AnimeID <= 0 || row.Episode <= 0 {
 			continue
 		}
-		progress := row.Episode
-		completed := row.Duration > 0 && row.Progress >= row.Duration*0.95
-		current, ok := result[row.AnimeID]
-		if !ok || row.Episode > current.Episode ||
-			(row.Episode == current.Episode && (completed || int(row.Progress) > current.Progress)) {
-			result[row.AnimeID] = animeWatchProgress{Episode: row.Episode, Progress: progress, Completed: completed}
+		finished := row.Duration > 0 && row.Progress >= row.Duration*0.95
+		st := acc[row.AnimeID] // zero value = unseen; seen titles always have MaxRow >= 1
+		if row.Episode > st.MaxRow {
+			st.MaxRow = row.Episode
+			st.Progress = int(row.Progress)
+			st.Completed = finished
 		}
+		if finished && row.Episode > st.Episode {
+			st.Episode = row.Episode
+		}
+		acc[row.AnimeID] = st
 	}
-	return result, nil
 }
 
-// loadUserWatchMax returns the highest watched episode_number per anime.
-// Imports use it to only ever advance Aniraku progress, never regress it.
-func (h *Handlers) loadUserWatchMax(ctx context.Context, userID string) (map[int]int, error) {
-	resp, err := h.supabaseRequest(ctx, "GET",
-		"/rest/v1/watch_history?select=anime_id,episode_number&user_id=eq."+encodePath(userID)+"&limit=5000",
-		nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("watch history fetch returned %s", resp.Status)
-	}
-	var rows []struct {
-		AnimeID int `json:"anime_id"`
-		Episode int `json:"episode_number"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return nil, err
-	}
-	max := make(map[int]int)
-	for _, r := range rows {
-		if r.AnimeID > 0 && r.Episode > max[r.AnimeID] {
-			max[r.AnimeID] = r.Episode
+// fetchWatchProgress reads the watch rows of exactly the given titles and
+// folds them per title (see foldWatchRows). The old loaders read one shared
+// timestamp-descending window across ALL titles — Supabase clamps a single
+// response, so every title outside the newest window silently exported
+// progress 0 and imports re-synthesized rows over real history.
+// Import uses MaxRow to only ever advance local history; export uses
+// Episode/Completed as the provider-facing progress. Any fetch failure
+// returns an error — import then skips progress entirely (a blind upsert
+// would overwrite real rows) and export reports it and continues without.
+func (h *Handlers) fetchWatchProgress(ctx context.Context, userID string, ids []int) (map[int]animeWatchProgress, error) {
+	out := make(map[int]animeWatchProgress, len(ids))
+	seen := make(map[int]bool, len(ids))
+	uniq := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			uniq = append(uniq, id)
 		}
 	}
-	return max, nil
+	if len(uniq) == 0 {
+		return out, nil
+	}
+	for start := 0; start < len(uniq); start += watchIDChunk {
+		end := start + watchIDChunk
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		// Cursor paging: advance by the rows actually returned, so a
+		// server-side clamp smaller than watchPageSize cannot skip rows.
+		offset := 0
+		for {
+			resp, err := h.supabaseRequest(ctx, "GET", watchHistoryPath(userID, uniq[start:end], offset), nil, nil)
+			if err != nil {
+				return nil, err
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return nil, fmt.Errorf("watch history fetch returned %s", resp.Status)
+			}
+			var rows []watchHistoryRow
+			err = json.NewDecoder(resp.Body).Decode(&rows)
+			resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			foldWatchRows(out, rows)
+			if len(rows) == 0 {
+				break
+			}
+			offset += len(rows)
+		}
+	}
+	return out, nil
 }
 
 // insertWatchHistoryRows upserts synthetic fully-watched episode rows
@@ -650,32 +705,67 @@ func (h *Handlers) insertEpisodeRatings(ctx context.Context, userID string, rows
 }
 
 // loadUserAnimeScores averages per-episode ratings into a 1-10 anime
-// score per title so exports can write scores alongside progress.
-func (h *Handlers) loadUserAnimeScores(ctx context.Context, userID string) (map[int]int, error) {
+// score per title so exports can write scores alongside progress. Scoped
+// to the requested titles and paged (same windowing problem as watch
+// history: one shared limit= window dropped scores of older titles, so
+// their ratings never reached the provider).
+func (h *Handlers) loadUserAnimeScores(ctx context.Context, userID string, ids []int) (map[int]int, error) {
 	scores := map[int]int{}
-	resp, err := h.supabaseRequest(ctx, "GET",
-		"/rest/v1/episode_ratings?select=anime_id,score&user_id=eq."+encodePath(userID)+"&limit=5000",
-		nil, nil)
-	if err != nil {
-		return scores, err
+	seen := make(map[int]bool, len(ids))
+	uniq := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			uniq = append(uniq, id)
+		}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return scores, fmt.Errorf("episode ratings fetch returned %s", resp.Status)
-	}
-	var rows []struct {
-		AnimeID int `json:"anime_id"`
-		Score   int `json:"score"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return scores, err
+	if len(uniq) == 0 {
+		return scores, nil
 	}
 	sum := map[int]int{}
 	count := map[int]int{}
-	for _, r := range rows {
-		if r.AnimeID > 0 && r.Score >= 1 && r.Score <= 10 {
-			sum[r.AnimeID] += r.Score
-			count[r.AnimeID]++
+	for start := 0; start < len(uniq); start += 100 {
+		end := start + 100
+		if end > len(uniq) {
+			end = len(uniq)
+		}
+		strIDs := make([]string, 0, end-start)
+		for _, id := range uniq[start:end] {
+			strIDs = append(strIDs, strconv.Itoa(id))
+		}
+		offset := 0
+		for {
+			resp, err := h.supabaseRequest(ctx, "GET",
+				"/rest/v1/episode_ratings?select=anime_id,score&user_id=eq."+encodePath(userID)+
+					"&anime_id=in.("+strings.Join(strIDs, ",")+")&limit="+strconv.Itoa(watchPageSize)+
+					"&offset="+strconv.Itoa(offset),
+				nil, nil)
+			if err != nil {
+				return scores, err
+			}
+			if resp.StatusCode != http.StatusOK {
+				resp.Body.Close()
+				return scores, fmt.Errorf("ratings fetch returned %s", resp.Status)
+			}
+			var rows []struct {
+				AnimeID int `json:"anime_id"`
+				Score   int `json:"score"`
+			}
+			err = json.NewDecoder(resp.Body).Decode(&rows)
+			resp.Body.Close()
+			if err != nil {
+				return scores, err
+			}
+			for _, r := range rows {
+				if r.AnimeID > 0 && r.Score >= 1 && r.Score <= 10 {
+					sum[r.AnimeID] += r.Score
+					count[r.AnimeID]++
+				}
+			}
+			if len(rows) == 0 {
+				break
+			}
+			offset += len(rows)
 		}
 	}
 	for id, n := range count {
@@ -752,13 +842,15 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		}
 	}
 
-	watchMax, err := h.loadUserWatchMax(ctx, userID)
+	// Scoped, paged fetch of this import's titles only — every title's
+	// real local max, regardless of how old it is.
+	watch, err := h.fetchWatchProgress(ctx, userID, ids)
 	historyOK := err == nil
 	if err != nil {
 		// Fail safe: without the existing history we cannot merge, and a
 		// blind upsert would overwrite real per-episode progress rows.
 		h.log.Warn().Err(err).Msg("import: watch history fetch failed, skipping progress import")
-		watchMax = map[int]int{}
+		watch = map[int]animeWatchProgress{}
 	}
 	rated, err := h.loadRatedAnime(ctx, userID, ids)
 	scoresOK := err == nil
@@ -788,7 +880,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 			if ok && cur == e.Status {
 				continue
 			}
-			if ok && (!historyOK || watchMax[id] > 0) {
+			if ok && (!historyOK || watch[id].MaxRow > 0) {
 				continue // real local state — provider must not clobber it
 			}
 			row := map[string]any{
@@ -843,13 +935,18 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		// Merge-only: rows are only ever appended after the real history.
 		// If the existing history could not be read we skip progress
 		// entirely instead of blind-upserting over real rows.
-		if historyOK {
-			from := watchMax[e.AnimeID] + 1
+		if historyOK && !limited {
+			from := watch[e.AnimeID].MaxRow + 1
 			if from < 1 {
 				from = 1
 			}
 			for ep := from; ep <= want; ep++ {
 				if len(watchRows) >= importMaxWatchRows {
+					// Budget exhausted: stop synthesizing rows, but keep
+					// looping so the remaining titles still get their
+					// scores — map order must not decide which titles
+					// starve. A re-run continues from each title's real
+					// local max (merge-only upsert).
 					limited = true
 					break
 				}
@@ -868,9 +965,6 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 					"timestamp":      ts,
 				})
 				episodesAdded++
-			}
-			if limited {
-				break
 			}
 		}
 		if !scoresOK {
@@ -916,6 +1010,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 // for every title, watch_history advanced to the provider's episode
 // count, and scores filled in where Aniraku has none.
 func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
+	liftExportWriteDeadline(w)
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
@@ -939,12 +1034,18 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		Status   string
 		Score    int
 		Progress int
+		Total    int
 	}
 	byMAL := map[int]*malEntry{}
 	malIDs := []int{}
 	offset := 0
+	// num_episodes carries each title's total so completed-with-no-count
+	// entries synthesize the right rows even if the follow-up meta fetch
+	// fails. If a particular API build rejects the field (400), degrade to
+	// list_status only — losing totals must never break the whole import.
+	fields := "num_episodes,list_status"
 	for offset < 1000 {
-		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&fields=list_status", offset)
+		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&fields=%s", offset, fields)
 		req, err := http.NewRequestWithContext(r.Context(), "GET", u, nil)
 		if err != nil {
 			break
@@ -957,6 +1058,10 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		resp.Body.Close()
+		if resp.StatusCode == http.StatusBadRequest && fields != "list_status" {
+			fields = "list_status"
+			continue // same offset, degraded field list
+		}
 		if resp.StatusCode != http.StatusOK {
 			h.log.Warn().Msg("mal import: list fetch failed " + resp.Status)
 			h.respondError(w, http.StatusBadGateway, "MyAnimeList rejected the request — reconnect the account in Settings")
@@ -965,7 +1070,8 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		var page struct {
 			Data []struct {
 				Node struct {
-					ID int `json:"id"`
+					ID          int `json:"id"`
+					NumEpisodes int `json:"num_episodes"`
 				} `json:"node"`
 				ListStatus struct {
 					Status             string `json:"status"`
@@ -990,6 +1096,9 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 				byMAL[e.Node.ID] = &malEntry{MALID: e.Node.ID}
 			}
 			en := byMAL[e.Node.ID]
+			if e.Node.NumEpisodes > en.Total {
+				en.Total = e.Node.NumEpisodes
+			}
 			// Keep the best row on duplicates: most progress wins.
 			if e.ListStatus.NumEpisodesWatched > en.Progress {
 				en.Progress = e.ListStatus.NumEpisodesWatched
@@ -1031,6 +1140,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 			Progress: progress,
 			Score:    score,
 			Status:   normalizeMALStatus(en.Status),
+			Total:    en.Total,
 		})
 	}
 
@@ -1055,6 +1165,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 // for every title, watch_history advanced to the provider's progress,
 // and scores filled in where Aniraku has none.
 func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
+	liftExportWriteDeadline(w)
 	userID := auth.GetUserID(r.Context())
 	if userID == "" {
 		h.respondError(w, http.StatusUnauthorized, "unauthorized")
@@ -1218,17 +1329,17 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 // Export: Aniraku favorites → provider library
 // ────────────────────────────────────────────────────────────────
 
-// exportCompleted reports whether Aniraku considers a title completed:
-// the highest episode was fully watched AND reached the known total
-// (or the total is unknown, preserving the legacy behavior).
+// exportCompleted reports whether Aniraku considers a title completed.
+// Episode counts FINISHED episodes (foldWatchRows), so a known total is
+// fully covered when Episode reaches it — a half-opened episode above the
+// total cannot un-complete the series. With an unknown total the legacy
+// rule stands: the newest row itself fully watched (nothing left
+// half-watched at the top).
 func exportCompleted(state animeWatchProgress, total int) bool {
-	if !state.Completed {
-		return false
-	}
 	if total > 0 {
 		return state.Episode >= total
 	}
-	return true
+	return state.Completed && state.Episode > 0
 }
 
 // liftExportWriteDeadline clears the server-wide 60s WriteTimeout for this
@@ -1413,18 +1524,16 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Skip titles already marked completed on MAL — no pointless writes.
-	// (Full exact-match diffing needs per-title remote state; MAL's list
-	// reads are paged and rate-limited, so the completed-set shortcut
-	// stays for COMPLETED targets and every other target is written —
-	// PUT is idempotent and carries the exact status + progress.)
+	// Remote state (fetchMALListState below) reads status + progress +
+	// score per title: exact-match skips and the never-regress progress
+	// guard keep MAL writes both minimal and safe.
 	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
-	watchProgress, progressErr := h.loadUserWatchProgress(r.Context(), userID)
+	watchProgress, progressErr := h.fetchWatchProgress(r.Context(), userID, anilistIDs)
 	if progressErr != nil {
 		h.log.Warn().Err(progressErr).Msg("mal export: watch history fetch failed, exporting without progress")
 		watchProgress = map[int]animeWatchProgress{}
 	}
-	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID)
+	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID, anilistIDs)
 	if scoresErr != nil {
 		h.log.Warn().Err(scoresErr).Msg("mal export: ratings fetch failed, exporting without scores")
 		scores = map[int]int{}
@@ -1437,9 +1546,12 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.log.Warn().Err(merr).Msg("mal export: episode totals unavailable, using watch flags")
 	}
-	completed, err := h.fetchMALCompletedSet(r.Context(), token.AccessToken)
+	// One paged read of the whole list: status + progress + score per
+	// title, so MAL gets the same exact-match diff and never-regress
+	// progress guard the AniList export already has.
+	remote, err := h.fetchMALListState(r.Context(), token.AccessToken)
 	if err != nil {
-		h.log.Warn().Err(err).Msg("mal export: completed set fetch failed, exporting all")
+		h.log.Warn().Err(err).Msg("mal export: remote list fetch failed, exporting all")
 	}
 
 	exported, skipped, failed, scoresSent := 0, 0, 0, 0
@@ -1470,17 +1582,50 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		state := watchProgress[anilistID]
 		done := exportCompleted(state, totals[anilistID].episodes)
 		wantStatus := wantExportStatus(bookmarkStatus[anilistID], done)
-		if wantStatus == listCompleted && completed[malID] && (done || state.Episode == 0) {
+		wantScore := scores[anilistID]
+		if wantScore < 1 || wantScore > 10 {
+			wantScore = 0
+		}
+		rem, hasRemote := remote[malID]
+		remoteStatus := ""
+		if hasRemote {
+			remoteStatus = normalizeMALStatus(rem.Status)
+		}
+		if remoteStatus == listCompleted && wantStatus != listCompleted && state.MaxRow == 0 {
+			// MAL says COMPLETED and Aniraku has no watch row for the
+			// title: a bare favorite carries no evidence, so it must not
+			// downgrade MAL's completed state to watching.
 			skipped++
 			continue
 		}
+		if hasRemote {
+			// Exact-match skip: same status AND remote progress already at
+			// least ours AND same score. REPEATING counts as MAL's own
+			// "watching" (MAL has no rewatch flag — a write would send
+			// exactly what is already stored).
+			statusOK := remoteStatus == wantStatus ||
+				(wantStatus == listRepeating && remoteStatus == listCurrent)
+			progressOK := rem.Progress >= state.Episode
+			scoreOK := wantScore == 0 || rem.Score == wantScore
+			if statusOK && progressOK && scoreOK {
+				skipped++
+				continue
+			}
+		}
 		form := url.Values{}
-		if state.Episode > 0 {
-			form.Set("num_watched_episodes", fmt.Sprintf("%d", state.Episode))
+		// Never regress a provider lead: episodes watched on MAL directly
+		// past the Aniraku max stay put (the old export clobbered them
+		// with the lower local count).
+		num := state.Episode
+		if hasRemote && rem.Progress > num {
+			num = rem.Progress
+		}
+		if num > 0 {
+			form.Set("num_watched_episodes", fmt.Sprintf("%d", num))
 		}
 		form.Set("status", statusForMAL(wantStatus))
-		if s := scores[anilistID]; s >= 1 && s <= 10 {
-			form.Set("score", fmt.Sprintf("%d", s))
+		if wantScore >= 1 && wantScore <= 10 {
+			form.Set("score", fmt.Sprintf("%d", wantScore))
 		}
 		req, err := http.NewRequestWithContext(r.Context(), "PUT",
 			fmt.Sprintf("https://api.myanimelist.net/v2/anime/%d/my_list_status", malID),
@@ -1552,7 +1697,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		ids = ids[:importExportCap]
 	}
 
-	watchProgress, progressErr := h.loadUserWatchProgress(r.Context(), userID)
+	watchProgress, progressErr := h.fetchWatchProgress(r.Context(), userID, ids)
 	if progressErr != nil {
 		h.log.Warn().Err(progressErr).Msg("anilist export: watch history fetch failed, exporting without progress")
 		watchProgress = map[int]animeWatchProgress{}
@@ -1560,7 +1705,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	// Stored list statuses drive per-title targeting (import-saved or
 	// watch-advanced); absent rows fall back to watch-derived targeting.
 	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
-	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID)
+	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID, ids)
 	if scoresErr != nil {
 		h.log.Warn().Err(scoresErr).Msg("anilist export: ratings fetch failed, exporting without scores")
 		scores = map[int]int{}
@@ -1621,6 +1766,13 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 			wantScore = 0
 		}
 		if cur, ok := remote[id]; ok {
+			if cur.Status == listCompleted && wantStatus != listCompleted && wp.MaxRow == 0 {
+				// AniList says COMPLETED and Aniraku has no watch row for
+				// the title: a bare favorite carries no evidence, so it
+				// must not downgrade AniList's completed state.
+				skipped++
+				continue
+			}
 			progressOK := cur.Progress >= wp.Episode
 			// Exact-match skip: same status AND at least our progress
 			// AND same score. A remote COMPLETED with a different local
@@ -1904,13 +2056,24 @@ func (h *Handlers) resolveAniListIDsToMAL(ctx context.Context, anilistIDs []int)
 	return mapped, nil
 }
 
-// fetchMALCompletedSet returns the set of MAL anime ids the user has
-// already marked completed, paginated by offset (status filter + fields).
-func (h *Handlers) fetchMALCompletedSet(ctx context.Context, accessToken string) (map[int]bool, error) {
-	completed := map[int]bool{}
+// malListState is one title's remote MAL list row (my_list_status).
+type malListState struct {
+	Status   string
+	Score    int // 0 = unset
+	Progress int // num_episodes_watched
+}
+
+// fetchMALListState pages the user's MAL list and returns status, score
+// and watched-episode count per title. It is the MAL counterpart of the
+// AniList export's remote-state fetch: it powers the exact-match skip and
+// the never-regress progress guard. Partial results are returned with the
+// error so a mid-list failure still covers the pages read so far — callers
+// fall back to writing any title the diff could not confirm.
+func (h *Handlers) fetchMALListState(ctx context.Context, accessToken string) (map[int]malListState, error) {
+	remote := map[int]malListState{}
 	offset := 0
 	for offset < 1000 {
-		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&status=completed&fields=list_status", offset)
+		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&fields=list_status", offset)
 		req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
 		if err != nil {
 			break
@@ -1918,34 +2081,43 @@ func (h *Handlers) fetchMALCompletedSet(ctx context.Context, accessToken string)
 		req.Header.Set("Authorization", "Bearer "+accessToken)
 		resp, err := h.h2Client.Do(req)
 		if err != nil {
-			return completed, err
+			return remote, err
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return completed, fmt.Errorf("mal list fetch returned %s", resp.Status)
+			return remote, fmt.Errorf("mal list fetch returned %s", resp.Status)
 		}
 		var page struct {
 			Data []struct {
 				Node struct {
 					ID int `json:"id"`
 				} `json:"node"`
+				ListStatus struct {
+					Status             string `json:"status"`
+					Score              int    `json:"score"`
+					NumEpisodesWatched int    `json:"num_episodes_watched"`
+				} `json:"list_status"`
 			} `json:"data"`
 		}
 		if err := json.Unmarshal(raw, &page); err != nil {
-			return completed, err
+			return remote, err
 		}
 		if len(page.Data) == 0 {
 			break
 		}
 		for _, e := range page.Data {
 			if e.Node.ID > 0 {
-				completed[e.Node.ID] = true
+				remote[e.Node.ID] = malListState{
+					Status:   e.ListStatus.Status,
+					Score:    e.ListStatus.Score,
+					Progress: e.ListStatus.NumEpisodesWatched,
+				}
 			}
 		}
 		offset += len(page.Data)
 	}
-	return completed, nil
+	return remote, nil
 }
 
 // anilistHTTPError is a non-200 GraphQL response. It carries the status code
