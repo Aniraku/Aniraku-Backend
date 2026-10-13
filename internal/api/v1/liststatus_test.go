@@ -56,39 +56,60 @@ func TestStatusForMAL(t *testing.T) {
 func TestWantExportStatus(t *testing.T) {
 	// Stored status always wins (import-saved or watch-advanced).
 	stored := []string{listCurrent, listPlanning, listCompleted, listPaused, listDropped, listRepeating}
+	watched := animeWatchProgress{MaxRow: 3, Episode: 3, Completed: true}
 	for _, s := range stored {
-		if got := wantExportStatus(s, true); got != s {
-			t.Errorf("wantExportStatus(%q, done) = %q, want %q", s, got, s)
+		if got := wantExportStatus(s, watched, true); got != s {
+			t.Errorf("wantExportStatus(%q, watched, done) = %q, want %q", s, got, s)
 		}
-		if got := wantExportStatus(s, false); got != s {
-			t.Errorf("wantExportStatus(%q, !done) = %q, want %q", s, got, s)
+		if got := wantExportStatus(s, watched, false); got != s {
+			t.Errorf("wantExportStatus(%q, watched, !done) = %q, want %q", s, got, s)
+		}
+		if got := wantExportStatus(s, animeWatchProgress{}, false); got != s {
+			t.Errorf("wantExportStatus(%q, unwatched, !done) = %q, want %q", s, got, s)
 		}
 	}
-	// Legacy fallback: watch-derived targeting.
-	if got := wantExportStatus("", true); got != listCompleted {
-		t.Errorf("wantExportStatus(unknown, done) = %q, want COMPLETED", got)
+	// Watch-derived: finished → COMPLETED, mid-series → CURRENT,
+	// favorited but never watched → PLANNING (never CURRENT — that
+	// rewrote MAL plan_to_watch entries to watching).
+	if got := wantExportStatus("", watched, true); got != listCompleted {
+		t.Errorf("wantExportStatus(unknown, watched, done) = %q, want COMPLETED", got)
 	}
-	if got := wantExportStatus("", false); got != listCurrent {
-		t.Errorf("wantExportStatus(unknown, !done) = %q, want CURRENT", got)
+	if got := wantExportStatus("", watched, false); got != listCurrent {
+		t.Errorf("wantExportStatus(unknown, watched, !done) = %q, want CURRENT", got)
 	}
-	if got := wantExportStatus("bogus", false); got != listCurrent {
-		t.Errorf("wantExportStatus(bogus, !done) = %q, want CURRENT", got)
+	if got := wantExportStatus("", animeWatchProgress{}, false); got != listPlanning {
+		t.Errorf("wantExportStatus(unknown, unwatched, !done) = %q, want PLANNING", got)
+	}
+	if got := wantExportStatus("bogus", watched, false); got != listCurrent {
+		t.Errorf("wantExportStatus(bogus, watched, !done) = %q, want CURRENT", got)
+	}
+	if got := wantExportStatus("bogus", animeWatchProgress{}, false); got != listPlanning {
+		t.Errorf("wantExportStatus(bogus, unwatched, !done) = %q, want PLANNING", got)
 	}
 }
 
 func TestExportCompletedUnchanged(t *testing.T) {
-	// Highest episode fully watched AND at/above the known total.
-	if !exportCompleted(animeWatchProgress{Episode: 12, Progress: 12, Completed: true}, 12) {
+	// Known total is authoritative: every episode finished.
+	if !exportCompleted(animeWatchProgress{Episode: 12, Progress: 12, Completed: true}, 12, false) {
 		t.Error("full series should be completed")
 	}
-	// Unknown total preserves the legacy behavior.
-	if !exportCompleted(animeWatchProgress{Episode: 3, Progress: 3, Completed: true}, 0) {
-		t.Error("unknown total should preserve legacy completed")
-	}
-	if exportCompleted(animeWatchProgress{Episode: 3, Progress: 3, Completed: true}, 12) {
+	if exportCompleted(animeWatchProgress{Episode: 3, Progress: 3, Completed: true}, 12, true) {
 		t.Error("partial series must not be completed")
 	}
-	if exportCompleted(animeWatchProgress{Episode: 0, Progress: 0, Completed: false}, 0) {
+	if exportCompleted(animeWatchProgress{Episode: 0, Progress: 0, Completed: false}, 0, false) {
 		t.Error("unwatched must not be completed")
+	}
+	// Unknown total: only a series AniList says has ENDED may complete,
+	// and only with the newest row fully watched. Airing shows carry
+	// episodes: null — the old rule ("newest row full → completed") was
+	// mass-marking the seasonal watch list COMPLETED on export.
+	if !exportCompleted(animeWatchProgress{Episode: 6, MaxRow: 6, Progress: 1440, Completed: true}, 0, true) {
+		t.Error("ended series, all rows full, unknown total should be completed")
+	}
+	if exportCompleted(animeWatchProgress{Episode: 6, MaxRow: 6, Progress: 1440, Completed: true}, 0, false) {
+		t.Error("airing show (no total, not finished) must never be completed")
+	}
+	if exportCompleted(animeWatchProgress{Episode: 6, MaxRow: 7, Completed: false}, 0, true) {
+		t.Error("unknown total with a half-watched row on top must not be completed")
 	}
 }

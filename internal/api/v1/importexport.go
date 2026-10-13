@@ -156,7 +156,8 @@ func (h *Handlers) importFavoriteDiff(ctx context.Context, userID string, ids []
 type mediaMeta struct {
 	title    string
 	image    string
-	episodes int // known total episode count, 0 = unknown
+	episodes int  // known total episode count, 0 = unknown
+	finished bool // AniList says the series ended (status FINISHED)
 }
 
 // providerEntry is a normalized provider list entry, keyed by AniList ID.
@@ -289,6 +290,7 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 				media(id_in: $ids, type: ANIME) {
 					id
 					episodes
+					status
 					title { romaji english }
 					coverImage { medium }
 				}
@@ -302,8 +304,9 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 			Data struct {
 				Page struct {
 					Media []struct {
-						ID       int  `json:"id"`
-						Episodes *int `json:"episodes"`
+						ID       int    `json:"id"`
+						Episodes *int   `json:"episodes"`
+						Status   string `json:"status"`
 						Title    struct {
 							Romaji  string `json:"romaji"`
 							English string `json:"english"`
@@ -333,7 +336,12 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 			if m.Episodes != nil && *m.Episodes > 0 {
 				total = *m.Episodes
 			}
-			meta[m.ID] = mediaMeta{title: title, image: m.CoverImage.Medium, episodes: total}
+			meta[m.ID] = mediaMeta{
+				title:    title,
+				image:    m.CoverImage.Medium,
+				episodes: total,
+				finished: strings.EqualFold(m.Status, "FINISHED"),
+			}
 		}
 	}
 	return meta, nil
@@ -462,52 +470,63 @@ func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int,
 	return ids, nil
 }
 
-// loadUserBookmarkStatus returns the stored canonical list status per
-// anime for export targeting. Unknown rows (and projects predating the
-// `status` column) are absent — callers fall back to the legacy watch-
-// derived targeting. Never fails the export: schema errors yield an
-// empty map.
-func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) map[int]string {
+// loadUserBookmarkStatus returns the stored canonical list status and the
+// stored episode total per anime. The totals give exports a fallback when
+// the live AniList meta has none (episodes: null on airing shows).
+// Unknown rows (and projects predating the `status` / `total_episodes`
+// columns) are absent — callers fall back to watch-derived targeting.
+// Never fails the export: schema errors yield empty maps.
+func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) (map[int]string, map[int]int) {
 	resp, err := h.supabaseRequest(ctx, "GET",
-		"/rest/v1/bookmarks?select=anime_id,status&user_id=eq."+encodePath(userID)+"&limit=2000",
+		"/rest/v1/bookmarks?select=anime_id,status,total_episodes&user_id=eq."+encodePath(userID)+"&limit=2000",
 		nil, nil)
 	if err != nil {
-		return map[int]string{}
+		return map[int]string{}, map[int]int{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return map[int]string{}
+		return map[int]string{}, map[int]int{}
 	}
 	var rows []struct {
-		AnimeID int     `json:"anime_id"`
-		Status  *string `json:"status"`
+		AnimeID       int     `json:"anime_id"`
+		Status        *string `json:"status"`
+		TotalEpisodes *int    `json:"total_episodes"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
-		return map[int]string{}
+		return map[int]string{}, map[int]int{}
 	}
-	out := make(map[int]string, len(rows))
+	statuses := make(map[int]string, len(rows))
+	totals := make(map[int]int, len(rows))
 	for _, r := range rows {
-		if r.AnimeID <= 0 || r.Status == nil {
+		if r.AnimeID <= 0 {
 			continue
 		}
-		if isCanonicalStatus(*r.Status) {
-			out[r.AnimeID] = *r.Status
+		if r.Status != nil && isCanonicalStatus(*r.Status) {
+			statuses[r.AnimeID] = *r.Status
+		}
+		if r.TotalEpisodes != nil && *r.TotalEpisodes > 0 {
+			totals[r.AnimeID] = *r.TotalEpisodes
 		}
 	}
-	return out
+	return statuses, totals
 }
 
 // wantExportStatus resolves the export target: the stored bookmark status
-// when present, else the legacy watch-derived targeting (completed from
-// watch history, otherwise CURRENT).
-func wantExportStatus(stored string, done bool) string {
+// when present, else watch-derived targeting — finished the whole series
+// → COMPLETED, watched anything but not finished → CURRENT, favorited but
+// never watched → PLANNING. The old fallback marked every unwatched
+// favorite CURRENT, which rewrote MAL plan_to_watch entries to watching.
+func wantExportStatus(stored string, state animeWatchProgress, done bool) string {
 	if isCanonicalStatus(stored) {
 		return stored
 	}
 	if done {
 		return listCompleted
 	}
-	return listCurrent
+	if state.MaxRow > 0 {
+		return listCurrent
+	}
+	return listPlanning
 }
 
 // watchHistoryRow is one watch_history record as read by fetchWatchProgress.
@@ -870,7 +889,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	// always wins over the provider snapshot.
 	statusesUpdated := 0
 	{
-		stored := h.loadUserBookmarkStatus(ctx, userID)
+		stored, _ := h.loadUserBookmarkStatus(ctx, userID)
 		updates := []map[string]any{}
 		for id, e := range best {
 			if freshSet[id] {
@@ -1329,17 +1348,19 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 // Export: Aniraku favorites → provider library
 // ────────────────────────────────────────────────────────────────
 
-// exportCompleted reports whether Aniraku considers a title completed.
-// Episode counts FINISHED episodes (foldWatchRows), so a known total is
-// fully covered when Episode reaches it — a half-opened episode above the
-// total cannot un-complete the series. With an unknown total the legacy
-// rule stands: the newest row itself fully watched (nothing left
-// half-watched at the top).
-func exportCompleted(state animeWatchProgress, total int) bool {
+// exportCompleted reports whether Aniraku considers a title finished.
+// A known episode total is authoritative: Episode counts FINISHED
+// episodes, so Episode >= total. With no total the series must show it
+// ended (AniList status FINISHED) AND the newest row must be fully
+// watched. The old unknown-total rule ("newest row full → completed")
+// mass-completed seasonal watch lists: airing shows carry episodes: null
+// on AniList, so watching every aired episode to the end marked the whole
+// show completed the moment it exported.
+func exportCompleted(state animeWatchProgress, total int, seriesFinished bool) bool {
 	if total > 0 {
 		return state.Episode >= total
 	}
-	return state.Completed && state.Episode > 0
+	return seriesFinished && state.Completed && state.Episode > 0
 }
 
 // liftExportWriteDeadline clears the server-wide 60s WriteTimeout for this
@@ -1527,7 +1548,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 	// Remote state (fetchMALListState below) reads status + progress +
 	// score per title: exact-match skips and the never-regress progress
 	// guard keep MAL writes both minimal and safe.
-	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
+	bookmarkStatus, bookmarkTotals := h.loadUserBookmarkStatus(r.Context(), userID)
 	watchProgress, progressErr := h.fetchWatchProgress(r.Context(), userID, anilistIDs)
 	if progressErr != nil {
 		h.log.Warn().Err(progressErr).Msg("mal export: watch history fetch failed, exporting without progress")
@@ -1580,8 +1601,16 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		state := watchProgress[anilistID]
-		done := exportCompleted(state, totals[anilistID].episodes)
-		wantStatus := wantExportStatus(bookmarkStatus[anilistID], done)
+		m := totals[anilistID]
+		total := m.episodes
+		if total == 0 {
+			// Live meta unknown (airing shows carry episodes: null) —
+			// fall back to the total stored on the bookmark at import.
+			total = bookmarkTotals[anilistID]
+		}
+		done := exportCompleted(state, total, m.finished)
+		stored, hasStored := bookmarkStatus[anilistID]
+		wantStatus := wantExportStatus(stored, state, done)
 		wantScore := scores[anilistID]
 		if wantScore < 1 || wantScore > 10 {
 			wantScore = 0
@@ -1595,6 +1624,15 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 			// MAL says COMPLETED and Aniraku has no watch row for the
 			// title: a bare favorite carries no evidence, so it must not
 			// downgrade MAL's completed state to watching.
+			skipped++
+			continue
+		}
+		if !hasStored && state.MaxRow == 0 && hasRemote {
+			// No local evidence at all (never watched, no stored status):
+			// a bare favorite must not rewrite what MAL already says —
+			// plan_to_watch stays plan_to_watch, watching stays watching.
+			// Titles MAL doesn't have yet are still added below as
+			// PLANNING.
 			skipped++
 			continue
 		}
@@ -1704,7 +1742,8 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	}
 	// Stored list statuses drive per-title targeting (import-saved or
 	// watch-advanced); absent rows fall back to watch-derived targeting.
-	bookmarkStatus := h.loadUserBookmarkStatus(r.Context(), userID)
+	// Stored totals back completion when AniList has no episode count yet.
+	bookmarkStatus, bookmarkTotals := h.loadUserBookmarkStatus(r.Context(), userID)
 	scores, scoresErr := h.loadUserAnimeScores(r.Context(), userID, ids)
 	if scoresErr != nil {
 		h.log.Warn().Err(scoresErr).Msg("anilist export: ratings fetch failed, exporting without scores")
@@ -1759,8 +1798,16 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		wp := watchProgress[id]
-		done := exportCompleted(wp, totals[id].episodes)
-		wantStatus := wantExportStatus(bookmarkStatus[id], done)
+		m := totals[id]
+		total := m.episodes
+		if total == 0 {
+			// Live meta unknown (airing shows carry episodes: null) —
+			// fall back to the total stored on the bookmark at import.
+			total = bookmarkTotals[id]
+		}
+		done := exportCompleted(wp, total, m.finished)
+		stored, hasStored := bookmarkStatus[id]
+		wantStatus := wantExportStatus(stored, wp, done)
 		wantScore := scores[id]
 		if wantScore < 1 || wantScore > 10 {
 			wantScore = 0
@@ -1770,6 +1817,14 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				// AniList says COMPLETED and Aniraku has no watch row for
 				// the title: a bare favorite carries no evidence, so it
 				// must not downgrade AniList's completed state.
+				skipped++
+				continue
+			}
+			if !hasStored && wp.MaxRow == 0 {
+				// No local evidence at all (never watched, no stored
+				// status): a bare favorite must not rewrite what AniList
+				// already says. Titles AniList doesn't have yet are still
+				// added below as PLANNING.
 				skipped++
 				continue
 			}

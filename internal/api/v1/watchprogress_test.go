@@ -127,20 +127,24 @@ func TestWatchHistoryPath(t *testing.T) {
 func TestExportCompletedFinishedCount(t *testing.T) {
 	// total known: every episode finished, even with a half-opened row
 	// above the total — still completed.
-	if !exportCompleted(animeWatchProgress{Episode: 12, MaxRow: 13, Completed: false}, 12) {
+	if !exportCompleted(animeWatchProgress{Episode: 12, MaxRow: 13, Completed: false}, 12, false) {
 		t.Error("12 finished of 12 with a partial row above = want completed")
 	}
-	if exportCompleted(animeWatchProgress{Episode: 11, MaxRow: 12, Completed: false}, 12) {
+	if exportCompleted(animeWatchProgress{Episode: 11, MaxRow: 12, Completed: false}, 12, false) {
 		t.Error("11 finished of 12 = want not completed")
 	}
-	// total unknown: legacy rule — nothing left half-watched at the top.
-	if !exportCompleted(animeWatchProgress{Episode: 3, MaxRow: 3, Completed: true}, 0) {
-		t.Error("unknown total, newest row full = want completed")
+	// total unknown: only a series AniList says has ended, and only when
+	// nothing is left half-watched at the top.
+	if !exportCompleted(animeWatchProgress{Episode: 3, MaxRow: 3, Completed: true}, 0, true) {
+		t.Error("unknown total, ended series, newest row full = want completed")
 	}
-	if exportCompleted(animeWatchProgress{Episode: 3, MaxRow: 4, Completed: false}, 0) {
+	if exportCompleted(animeWatchProgress{Episode: 3, MaxRow: 4, Completed: false}, 0, true) {
 		t.Error("unknown total, newest row partial = want not completed")
 	}
-	if exportCompleted(animeWatchProgress{Episode: 0, MaxRow: 0, Completed: false}, 0) {
+	if exportCompleted(animeWatchProgress{Episode: 3, MaxRow: 3, Completed: true}, 0, false) {
+		t.Error("airing show (no total, not finished) = want not completed")
+	}
+	if exportCompleted(animeWatchProgress{Episode: 0, MaxRow: 0, Completed: false}, 0, false) {
 		t.Error("no rows = want not completed")
 	}
 }
