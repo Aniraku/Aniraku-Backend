@@ -511,6 +511,15 @@ func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) (m
 	return statuses, totals
 }
 
+// noEvidencePlanningFix reports whether a provider row with no local
+// evidence (never watched, no stored status) should be re-planned instead
+// of skipped: "watching with zero episodes" is the exact artifact old
+// Aniraku exports left on every favorited title (status watching, episode
+// count omitted) — watching-through always carries at least episode 1.
+func noEvidencePlanningFix(remoteStatus string, remoteProgress int, wantStatus string) bool {
+	return remoteStatus == listCurrent && remoteProgress == 0 && wantStatus == listPlanning
+}
+
 // wantExportStatus resolves the export target: the stored bookmark status
 // when present, else watch-derived targeting — finished the whole series
 // → COMPLETED, watched anything but not finished → CURRENT, favorited but
@@ -1627,12 +1636,15 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 			skipped++
 			continue
 		}
-		if !hasStored && state.MaxRow == 0 && hasRemote {
+		if !hasStored && state.MaxRow == 0 && hasRemote &&
+			!noEvidencePlanningFix(remoteStatus, rem.Progress, wantStatus) {
 			// No local evidence at all (never watched, no stored status):
 			// a bare favorite must not rewrite what MAL already says —
-			// plan_to_watch stays plan_to_watch, watching stays watching.
-			// Titles MAL doesn't have yet are still added below as
-			// PLANNING.
+			// plan_to_watch stays plan_to_watch, watching with real
+			// episodes stays watching. The only shape rewritten is
+			// "watching with zero episodes": the artifact old Aniraku
+			// exports left on every favorite (see noEvidencePlanningFix).
+			// Titles MAL doesn't have yet are still added as PLANNING.
 			skipped++
 			continue
 		}
@@ -1820,11 +1832,12 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				skipped++
 				continue
 			}
-			if !hasStored && wp.MaxRow == 0 {
+			if !hasStored && wp.MaxRow == 0 &&
+				!noEvidencePlanningFix(cur.Status, cur.Progress, wantStatus) {
 				// No local evidence at all (never watched, no stored
 				// status): a bare favorite must not rewrite what AniList
-				// already says. Titles AniList doesn't have yet are still
-				// added below as PLANNING.
+				// already says, except the "watching with zero episodes"
+				// artifact old Aniraku exports left behind.
 				skipped++
 				continue
 			}
