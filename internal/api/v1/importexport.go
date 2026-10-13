@@ -23,7 +23,9 @@ import (
 //
 //	import = pull provider list → Aniraku bookmarks + watch_history +
 //	         episode_ratings (progress, status and scores are merged in:
-//	         provider episodes only ever advance Aniraku's max episode,
+//	         provider episodes advance Aniraku's max episode and RECONCILE
+//	         import-synthesized rows down to the provider's count — a
+//	         re-import makes local progress exactly match the source —
 //	         provider scores only fill titles with no local ratings)
 //	export = push Aniraku favorites → provider library, writing progress
 //	         (num_watched_episodes), list status (all six AniList states:
@@ -269,10 +271,11 @@ func anilistScoreToTen(score float64, format string) int {
 
 // animeWatchProgress is the per-title fold of a user's watch_history rows.
 type animeWatchProgress struct {
-	Episode   int  // highest FINISHED episode — the count MAL/AniList store as watched
-	Progress  int  // seconds watched on the newest row (display/debug)
-	Completed bool // the newest row itself was fully watched
-	MaxRow    int  // highest episode row present, finished or not (import merge guard)
+	Episode     int  // highest FINISHED episode — the count MAL/AniList store as watched
+	Progress    int  // seconds watched on the newest row (display/debug)
+	Completed   bool // the newest row itself was fully watched
+	MaxRow      int  // highest episode row present, finished or not (import merge guard)
+	RealEpisode int  // highest FINISHED episode with real player evidence (import rows are exactly 1440/1440)
 }
 
 // fetchMediaMeta resolves AniList IDs to title + cover image + episode
@@ -520,6 +523,37 @@ func noEvidencePlanningFix(remoteStatus string, remoteProgress int, wantStatus s
 	return remoteStatus == listCurrent && remoteProgress == 0 && wantStatus == listPlanning
 }
 
+// exportProgress resolves the episode count an export may write for a
+// title, and whether it needs writing at all.
+//
+//   - PLANNING always exports 0: planning means nothing has been watched,
+//     so a provider carrying a count on a planning entry is stale export
+//     damage (the plan_to_watch-with-full-progress artifact).
+//   - No local rows, or rows but nothing finished: Aniraku has no finished
+//     evidence — keep the provider's own progress untouched (write=false).
+//   - Local count above the provider's: only REAL player evidence may RAISE
+//     a provider. Import-synthesized rows are mirrors of whatever the
+//     provider said once — pushing them back up would re-inflate a
+//     provider that is now correct (the 12/12-over-your-correct-6 bug).
+//   - Otherwise the local count stands: a reconciled import makes local
+//     history the curated truth, which is how a corrupted provider count
+//     (MAL inflated by old exports) is healed back down.
+func exportProgress(state animeWatchProgress, stored string, remote int) (num int, write bool) {
+	if stored == listPlanning {
+		return 0, true
+	}
+	if state.MaxRow == 0 || state.Episode == 0 {
+		return remote, false
+	}
+	if state.Episode > remote {
+		if state.RealEpisode > remote {
+			return state.RealEpisode, true
+		}
+		return remote, false
+	}
+	return state.Episode, true
+}
+
 // wantExportStatus resolves the export target: the stored bookmark status
 // when present, else watch-derived targeting — finished the whole series
 // → COMPLETED, watched anything but not finished → CURRENT, favorited but
@@ -576,6 +610,10 @@ func foldWatchRows(acc map[int]animeWatchProgress, rows []watchHistoryRow) {
 			continue
 		}
 		finished := row.Duration > 0 && row.Progress >= row.Duration*0.95
+		// Import-synthesized rows are written as exactly
+		// fullEpisodeSeconds/fullEpisodeSeconds; real player rows carry
+		// media-derived float durations and a real watched position.
+		synthetic := row.Progress == fullEpisodeSeconds && row.Duration == fullEpisodeSeconds
 		st := acc[row.AnimeID] // zero value = unseen; seen titles always have MaxRow >= 1
 		if row.Episode > st.MaxRow {
 			st.MaxRow = row.Episode
@@ -584,6 +622,9 @@ func foldWatchRows(acc map[int]animeWatchProgress, rows []watchHistoryRow) {
 		}
 		if finished && row.Episode > st.Episode {
 			st.Episode = row.Episode
+		}
+		if finished && !synthetic && row.Episode > st.RealEpisode {
+			st.RealEpisode = row.Episode
 		}
 		acc[row.AnimeID] = st
 	}
@@ -642,6 +683,59 @@ func (h *Handlers) fetchWatchProgress(ctx context.Context, userID string, ids []
 		}
 	}
 	return out, nil
+}
+
+// trimSyntheticWatchRows deletes import-synthesized watch rows (exactly
+// fullEpisodeSeconds progress AND duration) above the provider's current
+// episode count. Real player rows carry media-derived values and are
+// never touched. Returns how many rows were removed.
+func (h *Handlers) trimSyntheticWatchRows(ctx context.Context, userID string, animeID, keep int) (int, error) {
+	resp, err := h.supabaseRequest(ctx, "DELETE",
+		"/rest/v1/watch_history?user_id=eq."+encodePath(userID)+
+			"&anime_id=eq."+strconv.Itoa(animeID)+
+			"&episode_number=gt."+strconv.Itoa(keep)+
+			"&progress=eq."+strconv.Itoa(fullEpisodeSeconds)+
+			"&duration=eq."+strconv.Itoa(fullEpisodeSeconds),
+		nil, map[string]string{"Prefer": "return=representation"})
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return 0, fmt.Errorf("watch history trim returned %s", resp.Status)
+	}
+	var rows []struct {
+		Episode int `json:"episode_number"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&rows) // 204 = nothing deleted
+	return len(rows), nil
+}
+
+// maxWatchEpisode returns the highest episode number still present for a
+// title after a trim, so the merge continues from the real remaining
+// history. ok=false means the refresh failed (caller keeps the old max).
+func (h *Handlers) maxWatchEpisode(ctx context.Context, userID string, animeID int) (int, bool) {
+	resp, err := h.supabaseRequest(ctx, "GET",
+		"/rest/v1/watch_history?select=episode_number&user_id=eq."+encodePath(userID)+
+			"&anime_id=eq."+strconv.Itoa(animeID)+
+			"&order=episode_number.desc&limit=1", nil, nil)
+	if err != nil {
+		return 0, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
+	}
+	var rows []struct {
+		Episode int `json:"episode_number"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+		return 0, false
+	}
+	if len(rows) == 0 {
+		return 0, true // every row for this title is gone
+	}
+	return rows[0].Episode, true
 }
 
 // insertWatchHistoryRows upserts synthetic fully-watched episode rows
@@ -810,10 +904,12 @@ func (h *Handlers) loadUserAnimeScores(ctx context.Context, userID string, ids [
 }
 
 // runProviderImport merges normalized provider entries into Aniraku:
-// bookmarks for every title, watch_history rows that only advance the
-// local max episode, and scores only for titles with no local ratings.
-// Returns (imported, already, episodesAdded, scoresAdded, limited).
-func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, map[string]int, int, bool) {
+// bookmarks for every title, watch_history rows that advance the local
+// max episode and reconcile import-synthesized rows down to the
+// provider's count, and scores only for titles with no local ratings.
+// Returns (imported, already, episodesAdded, scoresAdded, statuses,
+// statusesUpdated, syntheticRowsTrimmed, limited).
+func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries []providerEntry, meta map[int]mediaMeta) (int, int, int, int, map[string]int, int, int, bool) {
 	// De-duplicate: keep the best entry per title (most progress wins,
 	// completed beats other statuses on ties, then highest score).
 	best := make(map[int]providerEntry, len(entries))
@@ -937,7 +1033,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	now := time.Now().UnixMilli()
 	watchRows := []map[string]any{}
 	ratingRows := []map[string]any{}
-	episodesAdded, scoresAdded := 0, 0
+	episodesAdded, scoresAdded, trimmedRows := 0, 0, 0
 	limited := false
 	for _, e := range best {
 		m := meta[e.AnimeID]
@@ -964,6 +1060,32 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		// If the existing history could not be read we skip progress
 		// entirely instead of blind-upserting over real rows.
 		if historyOK && !limited {
+			// Reconcile down: rows synthesized by an earlier import mirror
+			// an older provider snapshot — once written they used to be
+			// permanent, so a wrong count imported once (old export damage,
+			// a provider glitch) survived every later import and was
+			// re-exported forever. Trim synthetic rows (exactly
+			// fullEpisodeSeconds progress AND duration — real player rows
+			// carry media-derived values) down to the provider's current
+			// count so a re-import makes local progress EXACTLY match the
+			// source being imported.
+			if watch[e.AnimeID].MaxRow > want {
+				trimmed, terr := h.trimSyntheticWatchRows(ctx, userID, e.AnimeID, want)
+				if terr != nil {
+					h.log.Warn().Err(terr).Int("anime_id", e.AnimeID).
+						Msg("import: synthetic-row reconcile failed")
+				} else if trimmed > 0 {
+					trimmedRows += trimmed
+					if maxEp, ok := h.maxWatchEpisode(ctx, userID, e.AnimeID); ok {
+						w := watch[e.AnimeID]
+						w.MaxRow = maxEp
+						watch[e.AnimeID] = w
+					}
+					// Refresh failed: keep the old higher MaxRow — `from`
+					// lands past `want` and this run appends nothing. Safe;
+					// the next import finishes the reconcile.
+				}
+			}
 			from := watch[e.AnimeID].MaxRow + 1
 			if from < 1 {
 				from = 1
@@ -1026,7 +1148,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 			scoresAdded = 0
 		}
 	}
-	return imported, already, episodesAdded, scoresAdded, statuses, statusesUpdated, limited
+	return imported, already, episodesAdded, scoresAdded, statuses, statusesUpdated, trimmedRows, limited
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -1172,7 +1294,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	imported, already, episodes, scores, statuses, statusesUpdated, limited := h.runProviderImport(r.Context(), userID, entries, nil)
+	imported, already, episodes, scores, statuses, statusesUpdated, trimmed, limited := h.runProviderImport(r.Context(), userID, entries, nil)
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
 		"provider":         "mal",
@@ -1185,6 +1307,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		"limited":          limited,
 		"statuses":         statuses,
 		"statuses_updated": statusesUpdated,
+		"trimmed":          trimmed,
 	})
 }
 
@@ -1338,7 +1461,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
 		return
 	}
-	imported, already, episodes, scores, statuses, statusesUpdated, limited := h.runProviderImport(r.Context(), userID, entries, meta)
+	imported, already, episodes, scores, statuses, statusesUpdated, trimmed, limited := h.runProviderImport(r.Context(), userID, entries, meta)
 	h.respondJSON(w, http.StatusOK, map[string]any{
 		"status":           "ok",
 		"provider":         "anilist",
@@ -1350,6 +1473,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		"limited":          limited,
 		"statuses":         statuses,
 		"statuses_updated": statusesUpdated,
+		"trimmed":          trimmed,
 	})
 }
 
@@ -1648,14 +1772,19 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 			skipped++
 			continue
 		}
+		remoteProgress := 0
 		if hasRemote {
-			// Exact-match skip: same status AND remote progress already at
-			// least ours AND same score. REPEATING counts as MAL's own
-			// "watching" (MAL has no rewatch flag — a write would send
-			// exactly what is already stored).
+			remoteProgress = rem.Progress
+		}
+		num, numWrite := exportProgress(state, stored, remoteProgress)
+		if hasRemote {
+			// Exact-match skip: same status AND same target progress AND
+			// same score. REPEATING counts as MAL's own "watching" (MAL
+			// has no rewatch flag — a write would send exactly what is
+			// already stored).
 			statusOK := remoteStatus == wantStatus ||
 				(wantStatus == listRepeating && remoteStatus == listCurrent)
-			progressOK := rem.Progress >= state.Episode
+			progressOK := !numWrite || rem.Progress == num
 			scoreOK := wantScore == 0 || rem.Score == wantScore
 			if statusOK && progressOK && scoreOK {
 				skipped++
@@ -1663,14 +1792,11 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		form := url.Values{}
-		// Never regress a provider lead: episodes watched on MAL directly
-		// past the Aniraku max stay put (the old export clobbered them
-		// with the lower local count).
-		num := state.Episode
-		if hasRemote && rem.Progress > num {
-			num = rem.Progress
-		}
-		if num > 0 {
+		// Progress rules live in exportProgress: PLANNING pushes 0, no
+		// finished local evidence leaves MAL's own count alone, and only
+		// real player watches may raise a count (synthetic import rows
+		// can never inflate a provider again).
+		if numWrite {
 			form.Set("num_watched_episodes", fmt.Sprintf("%d", num))
 		}
 		form.Set("status", statusForMAL(wantStatus))
@@ -1824,6 +1950,16 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		if wantScore < 1 || wantScore > 10 {
 			wantScore = 0
 		}
+		remoteProgress := 0
+		if cur, ok := remote[id]; ok {
+			remoteProgress = cur.Progress
+		}
+		// Progress rules live in exportProgress: PLANNING pushes 0, no
+		// finished local evidence keeps AniList's own count, and only real
+		// player watches may raise a count — import-synthesized rows can
+		// never inflate AniList (protecting the correct side of a
+		// provider-disagreement until a reconciling import lands).
+		num, numWrite := exportProgress(wp, stored, remoteProgress)
 		if cur, ok := remote[id]; ok {
 			if cur.Status == listCompleted && wantStatus != listCompleted && wp.MaxRow == 0 {
 				// AniList says COMPLETED and Aniraku has no watch row for
@@ -1841,8 +1977,8 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				skipped++
 				continue
 			}
-			progressOK := cur.Progress >= wp.Episode
-			// Exact-match skip: same status AND at least our progress
+			progressOK := !numWrite || cur.Progress == num
+			// Exact-match skip: same status AND same target progress
 			// AND same score. A remote COMPLETED with a different local
 			// target (e.g. REPEATING after a rewatch) is rewritten, not
 			// skipped — statuses round-trip exactly.
@@ -1853,13 +1989,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		// Never regress a provider lead (e.g. episodes watched on AniList
-		// directly past the Aniraku max).
-		progress := wp.Episode
-		if cur, ok := remote[id]; ok && cur.Progress > progress {
-			progress = cur.Progress
-		}
-		w := anilistExportWrite{MediaID: id, Progress: progress, Status: wantStatus, WantScore: wantScore}
+		w := anilistExportWrite{MediaID: id, Progress: num, Status: wantStatus, WantScore: wantScore}
 		if wantScore != 0 {
 			w.Score = float64(wantScore) * 10
 		}

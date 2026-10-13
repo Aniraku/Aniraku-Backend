@@ -148,3 +148,61 @@ func TestExportCompletedFinishedCount(t *testing.T) {
 		t.Error("no rows = want not completed")
 	}
 }
+
+func TestFoldWatchRowsRealEpisode(t *testing.T) {
+	rows := []watchHistoryRow{
+		fullWatchRow(7, 1), // import-synthesized
+		fullWatchRow(7, 2), // import-synthesized
+		{AnimeID: 7, Episode: 3, Progress: 1422.06, Duration: 1467.1}, // real finish
+		{AnimeID: 7, Episode: 4, Progress: 100, Duration: 1448.51},    // real, partial
+		fullWatchRow(9, 5), // synthetic-only title
+	}
+	acc := map[int]animeWatchProgress{}
+	foldWatchRows(acc, rows)
+
+	if acc[7].Episode != 3 {
+		t.Errorf("anime 7 Episode = %d, want 3", acc[7].Episode)
+	}
+	// Only the real player row counts as evidence — synthetic rows are
+	// provider mirrors and may never raise a provider's count.
+	if acc[7].RealEpisode != 3 {
+		t.Errorf("anime 7 RealEpisode = %d, want 3 (synthetic 1-2 excluded)", acc[7].RealEpisode)
+	}
+	if acc[9].Episode != 5 || acc[9].RealEpisode != 0 {
+		t.Errorf("anime 9 = Episode %d / RealEpisode %d, want 5 / 0 (all synthetic)", acc[9].Episode, acc[9].RealEpisode)
+	}
+}
+
+func TestExportProgress(t *testing.T) {
+	// PLANNING always pushes 0 — the plan_to_watch-with-full-progress fix.
+	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12}, listPlanning, 12); num != 0 || !write {
+		t.Errorf("PLANNING with claimed rows = (%d, %v), want (0, true)", num, write)
+	}
+	// No local rows: provider progress untouched.
+	if num, write := exportProgress(animeWatchProgress{}, "", 8); num != 8 || write {
+		t.Errorf("no rows = (%d, %v), want (8, false)", num, write)
+	}
+	// Rows exist but nothing finished: also untouched (no evidence either way).
+	if num, write := exportProgress(animeWatchProgress{MaxRow: 3}, "", 5); num != 5 || write {
+		t.Errorf("opened-only rows = (%d, %v), want (5, false)", num, write)
+	}
+	// THE bug: synthetic import rows claim 12, provider says 6, no real
+	// watches → a raise must be blocked so a correct provider stays correct.
+	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12, RealEpisode: 0}, "", 6); num != 6 || write {
+		t.Errorf("synthetic-only claim over provider = (%d, %v), want (6, false)", num, write)
+	}
+	// Real player evidence above the provider raises — capped at the real
+	// evidence, never at the synthetic claim.
+	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12, RealEpisode: 8}, "", 6); num != 8 || !write {
+		t.Errorf("real evidence raise = (%d, %v), want (8, true)", num, write)
+	}
+	// Reconciled local below an inflated provider: local is curated truth,
+	// the export heals the provider back down.
+	if num, write := exportProgress(animeWatchProgress{Episode: 6, MaxRow: 6}, "", 12); num != 6 || !write {
+		t.Errorf("reconciled local below provider = (%d, %v), want (6, true)", num, write)
+	}
+	// Equal: write the same value (exact-match skip handles the no-op).
+	if num, write := exportProgress(animeWatchProgress{Episode: 6, MaxRow: 6}, "", 6); num != 6 || !write {
+		t.Errorf("equal progress = (%d, %v), want (6, true)", num, write)
+	}
+}
