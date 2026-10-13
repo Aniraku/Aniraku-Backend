@@ -88,6 +88,29 @@ func TestWantExportStatus(t *testing.T) {
 	}
 }
 
+func TestNoEvidencePlanningFix(t *testing.T) {
+	// "watching with zero episodes" = old Aniraku export artifact → re-plan.
+	if !noEvidencePlanningFix(listCurrent, 0, listPlanning) {
+		t.Error("watching with 0 episodes should re-plan")
+	}
+	// Everything else with no local evidence stays untouched.
+	if noEvidencePlanningFix(listCurrent, 3, listPlanning) {
+		t.Error("watching with real episodes must stay")
+	}
+	if noEvidencePlanningFix(listPlanning, 0, listPlanning) {
+		t.Error("already planning is an exact match, not a fix")
+	}
+	if noEvidencePlanningFix(listCompleted, 0, listPlanning) {
+		t.Error("completed must stay")
+	}
+	if noEvidencePlanningFix(listDropped, 0, listPlanning) {
+		t.Error("explicit statuses must stay")
+	}
+	if noEvidencePlanningFix(listCurrent, 0, listCurrent) {
+		t.Error("only PLANNING targets re-plan (watched titles are skipped earlier)")
+	}
+}
+
 func TestExportCompletedUnchanged(t *testing.T) {
 	// Known total is authoritative: every episode finished.
 	if !exportCompleted(animeWatchProgress{Episode: 12, Progress: 12, Completed: true}, 12, false) {
