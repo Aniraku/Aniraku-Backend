@@ -650,7 +650,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	}
 	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(resp.StatusCode)
-	if n, err := io.Copy(w, resp.Body); err != nil {
+	if n, err := io.Copy(shapeWriter(w), resp.Body); err != nil {
 		// The status line is already sent; the client will see a truncated
 		// chunked response. Log it so upstream drops are distinguishable
 		// from nginx/app-level truncation.
@@ -775,7 +775,7 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", "attachment")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	io.Copy(shapeWriter(w), resp.Body)
 }
 
 func requestPublicBaseURL(r *http.Request) string {
