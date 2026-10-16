@@ -63,3 +63,39 @@ jobs:
 
       - name: Vulnerability scan
         run: govulncheck ./...
+
+  # Builds the production linux/amd64 binary on GitHub's machines instead
+  # of the 836MB origin box: on-box `docker compose build` was the memory
+  # spike behind the OOM wedges (kernel killed aniraku-server 3x on
+  # Oct 15-16). The box now downloads this release asset and runs it under
+  # a bare systemd unit — no Docker, no build step on the box, ever.
+  # Rolling release: bin-latest is deleted and re-published every green
+  # push so origin always fetches the newest artifact by stable URL.
+  deploy-binary:
+    needs: build-test-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build static linux/amd64 binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o aniraku-server ./cmd/aniraku-server
+
+      - name: Publish bin-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete bin-latest -y --cleanup-tag || true
+          gh release create bin-latest aniraku-server \
+            --target ${{ github.sha }} \
+            --title "deploy binary (auto)" \
+            --notes "linux/amd64 built from ${{ github.sha }}; consumed by the origin box systemd deploy"
