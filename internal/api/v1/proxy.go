@@ -441,6 +441,22 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 	}
 
+	// Emergency fill limiter (2026-10-16, after the OOM wedges): every
+	// cache miss downstream of here holds an upstream connection for the
+	// whole paced copy, so fills must be capped or an evening spike pushes
+	// the 836 MB box into swap thrash. Taken AFTER all local gates (SSRF,
+	// allowlist, VOD/key cache hits) so garbage URLs and cache hits never
+	// consume slots, and held across the single retry below so a retry
+	// cannot double-dial past the cap.
+	released, limiterOK := proxyFills.acquire(r.Context())
+	if !limiterOK {
+		w.Header().Set("Retry-After", "3")
+		h.log.Warn().Str("proxy_host", parsed.Hostname()).Msg("proxy fill limiter shed upstream fetch")
+		h.respondError(w, http.StatusServiceUnavailable, "proxy busy, retry shortly")
+		return
+	}
+	defer released()
+
 	// Relay CDNs rate-limit bursts with 429 (krussdomi answers "slow down"
 	// mid-first-playback). One quiet retry after a short pause turns that
 	// blip into a success instead of a failed playback start; anything
@@ -513,16 +529,23 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// gate above has already passed.
 
 	if isKey && resp.StatusCode == http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		h.keyCache.Store(cacheKeyURL, keyCacheEntry{data: body, fetchedAt: time.Now()})
+		// Emergency memory guard (2026-10-16): the key read is capped so a
+		// misrouted or hostile .key URL cannot be slurped into RAM in
+		// full. Real keys are 16 bytes; anything at or beyond the cap
+		// falls through to the generic streaming path WITHOUT caching.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, keyCacheMaxRead))
+		if len(body) < keyCacheMaxRead {
+			resp.Body.Close()
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			h.keyCache.Store(cacheKeyURL, keyCacheEntry{data: body, fetchedAt: time.Now()})
 
-		w.Header().Set("Content-Type", "application/octet-stream")
-		cacheableMediaHeaders(w, "public, max-age=300")
-		w.WriteHeader(http.StatusOK)
-		w.Write(body)
-		return
+			w.Header().Set("Content-Type", "application/octet-stream")
+			cacheableMediaHeaders(w, "public, max-age=300")
+			w.WriteHeader(http.StatusOK)
+			w.Write(body)
+			return
+		}
+		resp.Body = streamKeepCloser(bytes.NewReader(body), resp.Body)
 	}
 
 	// Check if this is an HLS playlist — use parsed path, not raw URL (query
@@ -536,7 +559,14 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		strings.Contains(strings.ToLower(parsed.RawQuery), "m3u8")
 
 	if isHLS {
-		body, err := io.ReadAll(resp.Body)
+		// Emergency memory guard (2026-10-16): this read used to consume
+		// the ENTIRE upstream body. A huge mislabeled body behind a
+		// playlist-looking URL hit RAM in full — on the 836 MB box, three
+		// of those are an OOM. Playlists are tens of KiB (the VOD cache
+		// itself refuses bodies over vodCacheMaxBody = 256 KiB), so read
+		// at most hlsMaxRead and route any remainder through a joined
+		// reader when classification says media instead of playlist.
+		body, err := io.ReadAll(io.LimitReader(resp.Body, hlsMaxRead))
 		if err != nil {
 			h.respondError(w, http.StatusBadGateway, "failed to read HLS playlist")
 			return
@@ -553,11 +583,23 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		case playlistMedia:
 			// The hint misfired (a media file whose token happens to contain
 			// "m3u8"), or a ranged media body behind a playlist-looking URL:
-			// never run binary through the playlist mangler. Re-attach the
-			// bytes and serve them opaque below (the normal 206 passthrough
-			// echoes Content-Range so seeking still works).
-			resp.Body = io.NopCloser(bytes.NewReader(body))
+			// never run binary through the playlist mangler. Re-attach BOTH
+			// the capped head and the uncapped remainder and stream them
+			// opaque below (the normal 206 passthrough echoes Content-Range
+			// so seeking still works).
+			resp.Body = streamKeepCloser(bytes.NewReader(body), resp.Body)
 		case playlistServe:
+			// The capped read cannot distinguish "exactly hlsMaxRead bytes"
+			// from a playlist that continues past the cap. Serving the
+			// former is fine; rewriting from a TRUNCATED playlist would
+			// emit fake child URLs, so refuse it with a clean 502 instead.
+			// Playlists are tens of KiB; this fires only on pathological
+			// upstreams and costs nothing in the normal path.
+			if len(body) >= hlsMaxRead {
+				h.log.Warn().Str("proxy_url", decodedURL).Int("playlist_bytes", len(body)).Msg("playlist exceeds proxy read cap")
+				h.respondError(w, http.StatusBadGateway, "upstream playlist too large")
+				return
+			}
 			// Keep the RAW pre-rewrite body for the short VOD window: the next
 			// request for this URL (any lang, any proxyBase) rewrites it fresh.
 			streaming.VODCacheSet(decodedURL, body)
@@ -742,6 +784,18 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 
 	headersJSON := r.URL.Query().Get("headers")
 	applyProxyQueryHeaders(req, headersJSON)
+
+	// Same shed contract as the media proxy above: downloads are full-file
+	// upstream fills that outrun every other content class in both bytes
+	// and held-connection wall time, so they count against the same cap.
+	released, limiterOK := proxyFills.acquire(r.Context())
+	if !limiterOK {
+		w.Header().Set("Retry-After", "3")
+		h.log.Warn().Str("download_host", parsed.Hostname()).Msg("download fill limiter shed upstream fetch")
+		h.respondError(w, http.StatusServiceUnavailable, "proxy busy, retry shortly")
+		return
+	}
+	defer released()
 
 	resp, err := h.downloadClient.Do(req)
 	if err != nil {
