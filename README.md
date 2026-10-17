@@ -24,20 +24,19 @@ Aniraku is open source. Voluntary support helps fund **hosting, releases, and op
 > - **Ok the rest-api Web-GUI is being disabled to make the server lightweight for Streaming and Episode focused Scraping**.Enjoy
 > - **Anilist Mirror Graphql With Same Anilist Endpoint:** [Mirror](https://graphql.aniraku.tech)
 > - **GitHub Repository:** [Shoislam0311/anilist-offline-db](https://github.com/Shoislam0311/anilist-offline-db)
-## Sponsor☕💘
 
-<a href="https://patreon.com/ShoIslam"><img src="https://user-images.githubusercontent.com/61944859/180249027-678b01b8-c336-451e-b147-6d84a5b9d0e7.png" width="250"/></a>
-## Binance Pay
+> [!CAUTION]
+> **Keep Aniraku online.** Our backend credit runs out around **October 19–20** — when it's gone, streaming stops (the app still opens, but playback goes dark until the servers are topped up). Aniraku is free, open-source, and has **no ads and no paid tier**. It's built and run by one person from a middle-class family — no company, no investors, and no personal money left to keep the servers on. **Donations are the only thing keeping Aniraku alive.** If it has saved you time, a small donation keeps it online past October 20. And the library keeps growing — **missing an anime?** Email [`sho.islam0311@proton.me`](mailto:sho.islam0311@proton.me) and it'll get added.
 
-Send directly via Binance Pay to UID:
+<p align="center">
+  <a href="https://patreon.com/ShoIslam"><img src="https://img.shields.io/badge/Support_on_Patreon-FF4D4D?style=for-the-badge&logo=patreon&logoColor=white" alt="Support on Patreon" /></a>
+</p>
+<p align="center">
+  <img src="./assets/images/binance-pay-qr.png" width="190" alt="Binance Pay QR code for UID 1098400042" /><br>
+  <sub>Binance Pay UID <code>1098400042</code> · full details in <a href="./SUPPORT.md">SUPPORT.md</a></sub>
+</p>
 
-```
-1098400042
-```
-
-Open Binance > Pay > Enter UID > Send. No network fees.
-
-Read the full [Support Guide](./SUPPORT.md).
+---
 
 ## What this service does
 
