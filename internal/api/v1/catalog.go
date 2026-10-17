@@ -395,7 +395,21 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			// Only cache non-empty results; caching an empty map poisons
 			// hentai titles for 30min when TMDB is briefly unreachable.
 			if len(tmdbByNumber) > 0 {
-				tmdb.CacheEpisodes(anilistID, tmdbByNumber)
+				// 2026-10-17 crash fix: handing the handler's map to the
+				// cache aliased it as entry.episodes (setCachedEpisodes
+				// stores data by reference on first write), so a later
+				// merge — background EnrichInBackground's
+				// entry.episodes[k]=v — mutated it WHILE this handler
+				// kept reading it unlocked in the merge loop below:
+				// "fatal error: concurrent map read and map write",
+				// GetEpisodes catalog.go:472 (03:48 UTC). Cache a copy;
+				// the *EpisodeMetadata values are immutable after
+				// resolve, so sharing pointers is safe.
+				cached := make(map[int]*tmdb.EpisodeMetadata, len(tmdbByNumber))
+				for k, v := range tmdbByNumber {
+					cached[k] = v
+				}
+				tmdb.CacheEpisodes(anilistID, cached)
 			}
 		}
 	}
