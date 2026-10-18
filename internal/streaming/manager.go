@@ -185,6 +185,8 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewLeeProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
 			NewTenshoProvider(log, "", "", "", ""),
+			NewAnvProvider(log),
+			NewAnixoProvider(log),
 		},
 		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache: map[int]hentaiEntry{},
@@ -265,6 +267,10 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	switch strings.ToLower(provider) {
 	case "animegg", "sunny", "yolky", "eggy":
 		provider = "animegg"
+	case "anv", "mikan", "nashi", "bana":
+		provider = "anv"
+	case "anixo", "kohaku":
+		provider = "anixo"
 	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
 		provider = "aniwaves"
 	case "tensho", "zangetsu":
@@ -283,7 +289,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "lee", "megavid", "tensho":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "lee", "megavid", "tensho", "anv", "mikan", "nashi", "bana", "anixo", "kohaku":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -402,6 +408,24 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("tensho: no sources for this episode")
+	case "anv", "mikan", "nashi", "bana":
+		result, err := m.tryAnv(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("anv: no sources for this episode")
+	case "anixo", "kohaku":
+		result, err := m.tryAnixo(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("anixo: no sources for this episode")
 	case "mkissa", "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto", "yuzu":
@@ -450,6 +474,10 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryTensho(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryAnv(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryAnixo(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -519,7 +547,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
 	// probed list instead; speed comes from the collectors themselves.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers, avServers, axoServers []core.Server
 	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -551,9 +579,9 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// slice, never a hand-maintained number — adding or removing a
 	// provider cannot wedge wg.Wait() again (observed 2026-10-02: a stale
 	// Add(11) deadlocked every /servers call after a provider removal).
-	// Anikoto, AnimeX, NiN, AnimeGG, AniWaves and VidNest are never queried
-	// for hentai titles (hentai gate — Supaplay's API 502s them). Zoko and
-	// FlixCloud serve them:
+	// Anikoto, AnimeX, NiN, AnimeGG, AniWaves, VidNest, Tensho, AnV and
+	// Anixo are never queried for hentai titles (hentai gate — Supaplay's
+	// API 502s them). Zoko and FlixCloud serve them:
 	// Zoko only via its MAL-keyed path (its AniList index carries no
 	// hentai), FlixCloud via Reanime.
 	collectors := []func(){
@@ -633,6 +661,20 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			}
 		},
 		func() {
+			if !hentai {
+				avServers = run("anv", func(cctx context.Context) []core.Server {
+					return m.collectAnvServers(cctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
+			if !hentai {
+				axoServers = run("anixo", func(cctx context.Context) []core.Server {
+					return m.collectAnixoServers(cctx, anilistID, episode, lang)
+				})
+			}
+		},
+		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
 			// budget. Its own generous timeout bounds a true hang without
@@ -674,7 +716,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers, avServers, axoServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL download links (fetched in parallel above): attach to every
@@ -1637,6 +1679,66 @@ func (m *Manager) tryTensho(ctx context.Context, animeID int, episode int, lang,
 	return m.applyQualityFilter(source, quality), nil
 }
 
+// tryAnv resolves anv.to (first-party edge HLS, session-cookie gated).
+func (m *Manager) tryAnv(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	av := m.getAnvProvider()
+	if av == nil {
+		return nil, fmt.Errorf("anv provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying anv")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := av.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("anv failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+// tryAnixo resolves Anixo's anixo.buzz player relay (AniList-keyed).
+func (m *Manager) tryAnixo(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	axo := m.getAnixoProvider()
+	if axo == nil {
+		return nil, fmt.Errorf("anixo provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying anixo")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := axo.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("anixo failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
+func (m *Manager) getAnvProvider() *AnvProvider {
+	for _, p := range m.providers {
+		if av, ok := p.(*AnvProvider); ok {
+			return av
+		}
+	}
+	return nil
+}
+
+func (m *Manager) getAnixoProvider() *AnixoProvider {
+	for _, p := range m.providers {
+		if axo, ok := p.(*AnixoProvider); ok {
+			return axo
+		}
+	}
+	return nil
+}
+
 // collectTenshoServers maps embed slots to Tsuki/Kaze/Hoshi.
 func (m *Manager) collectTenshoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
@@ -1656,6 +1758,52 @@ func (m *Manager) collectTenshoServers(ctx context.Context, anilistID string, ep
 		}
 		sr = m.withDubSubtitles(ctx, "tensho", lang, anilistID, episode, sr)
 		out = appendNamedServers(out, tenshoServerNames[:], "tensho", lang, sr)
+	}
+	return out
+}
+
+// collectAnvServers maps AnV (anv.to) sources onto Aniraku-style fruit
+// names (Mikan/Nashi/Bana = the site's Orange/Pear/Banana slots; ServerNames
+// carries them positionally).
+func (m *Manager) collectAnvServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		av, ok := prov.(*AnvProvider)
+		if !ok {
+			continue
+		}
+		sr, err := av.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "anv").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		out = appendNamedServers(out, anvServerNames[:], "anv", lang, sr)
+	}
+	return out
+}
+
+// collectAnixoServers maps Anixo's single Sora-Edge slot to its own server.
+func (m *Manager) collectAnixoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		axo, ok := prov.(*AnixoProvider)
+		if !ok {
+			continue
+		}
+		sr, err := axo.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "anixo").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		out = appendNamedServers(out, []string{anixoServerName}, "anixo", lang, sr)
 	}
 	return out
 }
