@@ -81,7 +81,33 @@ type AnimeGGProvider struct {
 	mu       sync.Mutex
 	shows    map[int]*animeggShowEntry
 	resolved map[animeggResolveKey]*animeggResolvedEntry
+
+	// Outage breaker. While animegg.org is unreachable or sick, the full
+	// resolve ladder (20s timeouts x retries x multi-page scrapes) used to
+	// burn 40-80s of every /servers call and still end in zero servers —
+	// dead weight for the whole fan-out (the response waits for the
+	// slowest collector by design). After a network-health strike the
+	// network path pauses: calls fail fast with zero results, which is
+	// exactly what a failing run delivered, minus the wait. Each pause
+	// doubles up to the cap; when one expires a single full probe run
+	// happens — success lifts the pause instantly, failure re-opens (and
+	// extends) it. Healthy animegg resolves in seconds, so caches and
+	// probe runs keep the provider zero-latency to return when the site
+	// recovers.
+	outageMu      sync.Mutex
+	outageUntil   time.Time
+	outageStrikes int
 }
+
+// Outage-pause ladder: one strike = 10 min, doubling per consecutive
+// strike, capped at 1h. A resolve slower than outageProbeMin is counted as
+// a strike too: the provider's healthy ladder is seconds short (verified
+// 3.3-5.2s on One Piece), and 20s+ runs only happen on edge pain.
+const (
+	outagePauseProbeMin = 20 * time.Second
+	outageBasePause     = 10 * time.Minute
+	outageMaxPause      = 60 * time.Minute
+)
 
 type animeggShowEntry struct {
 	slug    string
@@ -122,6 +148,75 @@ func NewAnimeGGProvider(log zerolog.Logger, base, anilistURL string) *AnimeGGPro
 }
 
 func (p *AnimeGGProvider) Name() string { return "animegg" }
+
+// pausedOutage reports whether the network path is inside a pause window.
+func (p *AnimeGGProvider) pausedOutage() bool {
+	p.outageMu.Lock()
+	defer p.outageMu.Unlock()
+	return time.Now().Before(p.outageUntil)
+}
+
+// noteOutageHealth records one resolve outcome. healthy = sources were
+// resolved through the network path; sick = hard network failure or a
+// pathological runtime. Sickness opens/extends the pause (doubling
+// ladder); health clears it instantly.
+func (p *AnimeGGProvider) noteOutageHealth(healthy bool) {
+	p.outageMu.Lock()
+	defer p.outageMu.Unlock()
+	if healthy {
+		if p.outageStrikes > 0 {
+			p.log.Info().Msg("animegg: outage pause lifted (cycle healthy again)")
+		}
+		p.outageStrikes = 0
+		p.outageUntil = time.Time{}
+		return
+	}
+	p.outageStrikes++
+	d := outageBasePause
+	for i := 1; i < p.outageStrikes; i++ {
+		d *= 2
+		if d >= outageMaxPause {
+			break
+		}
+	}
+	if d > outageMaxPause {
+		d = outageMaxPause
+	}
+	until := time.Now().Add(d)
+	if until.After(p.outageUntil) {
+		p.outageUntil = until
+	}
+	p.log.Info().Time("until", until).Dur("pause", d).Msg("animegg: outage pause opened — network path skipped until, probe run re-checks on expiry")
+}
+
+// networkOutageErr classifies a resolve error as network-health pain
+// (timeouts, dial failures, hard 429/5xx edges) versus logical business
+// ("episode not listed on animegg" stays a normal, never-pausing outcome).
+func networkOutageErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, sig := range []string{
+		"context deadline exceeded",
+		"Client.Timeout",
+		"connection refused",
+		"connection reset",
+		"no such host",
+		"TLS handshake",
+		"connect:",
+	} {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	for _, sig := range []string{"-> HTTP 429", "-> HTTP 50", "HTTP 52", "HTTP 51"} {
+		if strings.Contains(msg, sig) {
+			return true
+		}
+	}
+	return false
+}
 
 func (p *AnimeGGProvider) SetHostLearner(fn func(host string)) { p.learnHost = fn }
 
@@ -1091,7 +1186,26 @@ func (p *AnimeGGProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 	if got := p.loadResolved(key); got != nil {
 		return got, nil
 	}
+	if p.pausedOutage() {
+		// Inside a pause window the network path is skipped (zero results,
+		// identical to a failed run, minus the 40-80s wait). Cached entries
+		// above still serve, and the pause expires on its own for a probe.
+		p.log.Debug().Str("anilistId", anilistID).Int("episode", episode).
+			Msg("animegg: outage pause active, skipping network resolve")
+		return nil, nil
+	}
+	start := time.Now()
 	sr, err := p.resolveEpisode(ctx, id, episode, langKey)
+	elapsed := time.Since(start)
+	if err == nil {
+		p.noteOutageHealth(sr != nil && len(sr.Sources) > 0 && elapsed < outagePauseProbeMin)
+	} else if networkOutageErr(err) || elapsed >= outagePauseProbeMin {
+		// Network pain or a pathological runtime opens the pause; a clean
+		// logical miss ("not listed") on a healthy site does not — the
+		// breaker is global and must never hide healthy providers over
+		// one show's absence.
+		p.noteOutageHealth(false)
+	}
 	if err != nil {
 		return nil, err
 	}
