@@ -42,6 +42,11 @@ var defaultCDNSuffixes = []string{
 	"hls.dramahot.top",
 	// Wix-hosted video (repackager.wixmp.com)
 	"wixmp.com", "wixstatic.com",
+	// AnV (anv.to) first-party edge — /stream/ HLS + media playlists all
+	// live on the site's own domain, session-cookie gated
+	"anv.to",
+	// Anixo player edge (anixo.buzz/api/stream/m3u8 + /vtt, self-hosted)
+	"anixo.buzz",
 	// Miruro's own domains
 	"miruro.tv", "miruro.cc", "miruro.be",
 	// Common video CDN platforms
