@@ -834,67 +834,38 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	// effectiveUA is the User-Agent used for probes AND shipped in the
 	// result headers: a CDN that gates by UA class (see iosSafariUA) must
 	// be played with the exact UA the probe cleared, or the media proxy
-	// would 403 on the very segments we just verified. It starts as the
-	// provider's configured UA and may swap to iOS Safari once.
-	effectiveUA := userAgent
-	adoptedIOS := false
-	for _, src := range apiResp.Sources {
-		directURL := src.URL
-
-		// Decode CDN proxy URLs (/uwu/) to get the actual origin m3u8 URL.
-		// The CDN proxy is only needed for browser playback (CORS). Our server
-		// can fetch the origin directly, bypassing CDN IP/Referer checks.
-		if decoded, _, _ := DecodeAnimeXProxyURL(src.URL); decoded != src.URL {
-			directURL = decoded
-			p.log.Debug().Str("origin", directURL).Msg("animex: decoded CDN proxy to origin URL")
+	// would 403 on the very segments we just verified. Probes use the
+	// provider's configured UA and may clear through iOS Safari (below).
+	//
+	// Probes run in parallel. One Piece–scale sub-providers ship many
+	// qualities, and the serial probe loop (HEAD + first segment +
+	// possible iOS retry, per source) was the fan-out's wall clock: 25 s+
+	// cold on big shows while the API hop itself takes 1-2 s. The
+	// per-source rules are unchanged — desktop pair first, one atomic
+	// retry of the whole pair with the iOS UA on definitive failure, drop
+	// only definitive blocks — only their order. Probes hit CDN origins,
+	// never the animex API, so the fingerprint source budget is untouched.
+	//
+	// Adoption (iOS header flip) is decided across ALL kept sources: any
+	// source that cleared only via iOS ships headers with the iOS UA,
+	// same as the serial loop's late adoption. The one deliberate
+	// simplification: a serial quirk that silently KEPT sources failing
+	// both UAs after an earlier source had adopted is gone — definitive
+	// failures are dropped in every regime (those sources were unplayable
+	// everywhere, the honest verdict the probe ladder exists for).
+	type probeVerdict struct {
+		keep      bool
+		neededIOS bool
+		src       core.Source
+	}
+	buildSource := func(directURL, quality string) core.Source {
+		// Determine source type from URL
+		srcType := "hls"
+		if strings.Contains(directURL, ".mp4") || strings.Contains(directURL, ".m4v") {
+			srcType = "mp4"
+		} else if strings.Contains(directURL, ".mpd") {
+			srcType = "dash"
 		}
-
-		// Apply domain rewrites (vivibebe→hawk, etc.)
-		// Only apply global rewrites — never re-encode into CDN proxy.
-		for _, rw := range animexGlobalRewrites {
-			directURL = rw(directURL)
-		}
-
-		// Learn the host for CDN allowlist
-		p.learnURLHost(directURL) // The media proxy shares this server's egress: a manifest the probe
-		// cannot reach would 403 through the proxy too, so it is dropped
-		// instead of surfacing a server that can only produce 502s. The
-		// same honesty rule extends one level deeper: a reachable manifest
-		// whose segments are egress-blocked only produces a spinning
-		// player. NOTE: a 403 is not automatically an egress block —
-		// Sora's bl1.* segment layer 403s every desktop/Android UA while
-		// serving iPhone Safari, so a failed pair is retried with the iOS
-		// UA before condemning the source.
-		//
-		// The segment verdict is deliberately lenient — definitive blocks
-		// only (unreachable, non-2xx, HTML error pages). Ambiguous payloads
-		// (image cloaks some CDNs serve probes while playing video fine)
-		// keep the server listed: worst case is today's behavior, never a
-		// regression on a working stream.
-		headOK, _ := p.probeHLSHead(ctx, directURL, referer, effectiveUA)
-		segOK := headOK && p.probeFirstSegment(ctx, directURL, referer, effectiveUA)
-		if !headOK || !segOK {
-			// One atomic retry of the WHOLE pair with iOS Safari (only
-			// once per result): if it clears, that UA becomes the
-			// playback UA too.
-			if effectiveUA != iosSafariUA {
-				if hOK, _ := p.probeHLSHead(ctx, directURL, referer, iosSafariUA); hOK &&
-					p.probeFirstSegment(ctx, directURL, referer, iosSafariUA) {
-					effectiveUA = iosSafariUA
-					adoptedIOS = true
-					p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: CDN gates by UA class, adopting iOS Safari UA")
-				}
-			}
-			if effectiveUA != iosSafariUA {
-				if !headOK {
-					p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: manifest blocked from this egress, dropping source")
-				} else {
-					p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: segments blocked from this egress, dropping source")
-				}
-				continue
-			}
-		}
-
 		// Build subtitle tracks from the API response
 		var subs []core.Subtitle
 		for _, track := range apiResp.Tracks {
@@ -918,22 +889,102 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 			p.learnURLHost(subURL)
 			subs = append(subs, buildSubtitle(subURL, track.Lang, track.Label, ""))
 		}
-
-		// Determine source type from URL
-		srcType := "hls"
-		if strings.Contains(directURL, ".mp4") || strings.Contains(directURL, ".m4v") {
-			srcType = "mp4"
-		} else if strings.Contains(directURL, ".mpd") {
-			srcType = "dash"
-		}
-
-		sources = append(sources, core.Source{
+		return core.Source{
 			URL:          directURL,
 			Type:         srcType,
-			Quality:      src.Quality,
+			Quality:      quality,
 			Subtitles:    subs,
 			Verification: "proxy",
-		})
+		}
+	}
+	// probeSource returns the per-source verdict: HEAD + first segment with
+	// ua, then — only on definitive failure and when allowed — the whole
+	// pair retried once with the iOS UA. Verdict grounds stay identical to
+	// the serial loop (nothing here reads or writes shared state).
+	probeSource := func(directURL, quality, ua string, allowIOSRetry bool) probeVerdict {
+		headOK, _ := p.probeHLSHead(ctx, directURL, referer, ua)
+		segOK := headOK && p.probeFirstSegment(ctx, directURL, referer, ua)
+		if headOK && segOK {
+			return probeVerdict{keep: true, src: buildSource(directURL, quality)}
+		}
+		if allowIOSRetry && ua != iosSafariUA {
+			// One atomic retry of the WHOLE pair with iOS Safari (only
+			// once per result): if it clears, that UA becomes the
+			// playback UA too.
+			if hOK, _ := p.probeHLSHead(ctx, directURL, referer, iosSafariUA); hOK &&
+				p.probeFirstSegment(ctx, directURL, referer, iosSafariUA) {
+				p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: CDN gates by UA class, adopting iOS Safari UA")
+				return probeVerdict{keep: true, neededIOS: true, src: buildSource(directURL, quality)}
+			}
+		}
+		if !headOK {
+			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: manifest blocked from this egress, dropping source")
+		} else {
+			p.log.Info().Str("provider", providerID).Str("url", directURL).Msg("animex: segments blocked from this egress, dropping source")
+		}
+		return probeVerdict{}
+	}
+
+	verdicts := make([]probeVerdict, len(apiResp.Sources))
+	probeSem := make(chan struct{}, 6) // politeness cap per sub-provider: CDN origins see less than one real viewer's load
+	var pwg sync.WaitGroup
+	for i, src := range apiResp.Sources {
+		srcCopy := src
+		idx := i
+		pwg.Add(1)
+		go func() {
+			defer pwg.Done()
+
+			probeSem <- struct{}{}
+			defer func() { <-probeSem }()
+
+			// Decode CDN proxy URLs (/uwu/) to get the actual origin m3u8 URL.
+			// The CDN proxy is only needed for browser playback (CORS). Our server
+			// can fetch the origin directly, bypassing CDN IP/Referer checks.
+			directURL := srcCopy.URL
+			if decoded, _, _ := DecodeAnimeXProxyURL(srcCopy.URL); decoded != srcCopy.URL {
+				directURL = decoded
+				p.log.Debug().Str("origin", directURL).Msg("animex: decoded CDN proxy to origin URL")
+			}
+
+			// Apply domain rewrites (vivibebe→hawk, etc.)
+			// Only apply global rewrites — never re-encode into CDN proxy.
+			for _, rw := range animexGlobalRewrites {
+				directURL = rw(directURL)
+			}
+
+			// Learn the host for CDN allowlist
+			p.learnURLHost(directURL) // The media proxy shares this server's egress: a manifest the probe
+			// cannot reach would 403 through the proxy too, so it is dropped
+			// instead of surfacing a server that can only produce 502s. The
+			// same honesty rule extends one level deeper: a reachable manifest
+			// whose segments are egress-blocked only produces a spinning
+			// player. NOTE: a 403 is not automatically an egress block —
+			// Sora's bl1.* segment layer 403s every desktop/Android UA while
+			// serving iPhone Safari, so a failed pair is retried with the iOS
+			// UA before condemning the source.
+			//
+			// The segment verdict is deliberately lenient — definitive blocks
+			// only (unreachable, non-2xx, HTML error pages). Ambiguous payloads
+			// (image cloaks some CDNs serve probes while playing video fine)
+			// keep the server listed: worst case is today's behavior, never a
+			// regression on a working stream.
+
+			verdicts[idx] = probeSource(directURL, srcCopy.Quality, userAgent, true)
+		}()
+	}
+	pwg.Wait()
+	for _, v := range verdicts {
+		if v.keep {
+			sources = append(sources, v.src)
+		}
+	}
+	adoptedIOS := false
+	for _, v := range verdicts {
+		if v.keep && v.neededIOS {
+			adoptedIOS = true
+			break
+		}
 	}
 
 	// 3. Extract chapters (intro/outro)
