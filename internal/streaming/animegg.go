@@ -131,7 +131,7 @@ func NewAnimeGGProvider(log zerolog.Logger, base, anilistURL string) *AnimeGGPro
 		base = animeggDefaultBase
 	}
 	if strings.TrimSpace(anilistURL) == "" {
-		anilistURL = "https://graphql.aniraku.tech"
+		anilistURL = core.AnilistGraphQLEndpoint()
 	}
 	return &AnimeGGProvider{
 		log: log,

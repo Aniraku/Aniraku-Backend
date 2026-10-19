@@ -169,7 +169,7 @@ func NewTenshoProvider(log zerolog.Logger, base, anilistURL, flixeraBase, animoB
 		base = tenshoDefaultBase
 	}
 	if strings.TrimSpace(anilistURL) == "" {
-		anilistURL = tenshoAnilistURL
+		anilistURL = core.AnilistGraphQLEndpoint()
 	}
 	if strings.TrimSpace(flixeraBase) == "" {
 		flixeraBase = tenshoFlixera

@@ -4,6 +4,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
+	"os"
+	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -15,6 +19,13 @@ import (
 // to an actual address. No private address passes: the retired relay
 // splice exemption (10.77.0.0/30) is gone — private space is private
 // again, and no egress trick re-grants it.
+//
+// The one exception is deliberate, operator-granted and exact: hosts listed
+// in ANIRAKU_PRIVATE_BRIDGE_HOSTS (comma-separated ip:port — currently the
+// self-hosted AniList mirror collocated with the backend on the same VPS).
+// The match happens on the concrete post-DNS ip:port, so redirects or a
+// DNS trick to any OTHER private address still fail; the media proxy's
+// allowlist path never consults this — proxy targets stay public-only.
 func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -24,10 +35,52 @@ func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	if ip == nil {
 		return fmt.Errorf("ssrf guard: unresolved address %q", host)
 	}
+	if allowedBridge(address) {
+		return nil
+	}
 	if !IsPublicIP(ip) {
 		return fmt.Errorf("ssrf guard: blocked non-public address %s", ip)
 	}
 	return nil
+}
+
+// allowedBridge reports whether address (ip:port as the dialer presented
+// it) is on the operator bridge exception list. The list is re-derived
+// whenever ANIRAKU_PRIVATE_BRIDGE_HOSTS changes value, so operators can
+// adjust it across service restarts and tests can exercise both sides.
+func allowedBridge(address string) bool {
+	raw := os.Getenv("ANIRAKU_PRIVATE_BRIDGE_HOSTS")
+	bridgeMu.Lock()
+	defer bridgeMu.Unlock()
+	if bridgeRaw != raw {
+		bridgeSet = parseBridges(raw)
+		bridgeRaw = raw
+	}
+	_, ok := bridgeSet[address]
+	return ok
+}
+
+var (
+	bridgeMu  sync.Mutex
+	bridgeRaw string
+	bridgeSet map[string]bool
+)
+
+func parseBridges(raw string) map[string]bool {
+	out := make(map[string]bool)
+	for _, h := range strings.Split(raw, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		// Canonical form keeps "[::1]:4401"-style IPv6 entries sane; a
+		// dashboard typo like 127.0.0.1:44o1 simply never parses and is
+		// dropped instead of widening the exception.
+		if ap, err := netip.ParseAddrPort(h); err == nil {
+			out[ap.String()] = true
+		}
+	}
+	return out
 }
 
 // IsPublicIP reports whether ip is a globally routable unicast address.

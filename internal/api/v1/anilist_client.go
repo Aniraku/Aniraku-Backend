@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
 // tokenBucket is a simple client-side rate limiter. We hold ourselves to
@@ -76,7 +78,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 	return &anilistClient{
 		h:          h,
 		client:     h.h2Client,
-		endpoint:   "https://graphql.aniraku.tech",
+		endpoint:   core.AnilistGraphQLEndpoint(),
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,

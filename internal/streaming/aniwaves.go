@@ -116,7 +116,7 @@ func NewAniWavesProvider(log zerolog.Logger, base, anilistURL string) *AniWavesP
 		base = aniwavesDefaultBase
 	}
 	if strings.TrimSpace(anilistURL) == "" {
-		anilistURL = "https://graphql.aniraku.tech"
+		anilistURL = core.AnilistGraphQLEndpoint()
 	}
 	return &AniWavesProvider{
 		log:        log,
