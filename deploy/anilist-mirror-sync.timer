@@ -1,0 +1,11 @@
+[Unit]
+Description=Hourly release check for anilist-offline-db
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=180
+Persistent=true
+Unit=anilist-mirror-sync.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Sync local AniList shard base to the latest GitHub release (sha-verified, atomic symlink swap)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/shoislam/bin/mirror-sync.py
