@@ -34,23 +34,27 @@ const iosSafariUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) Appl
 // non-2xx, HTML error pages) — so ambiguous payloads (image cloaks some
 // CDNs serve probes while playing video fine) keep a server listed instead
 // of regressing a working stream.
+//
+// Playlist hops for every probe go through fetchPlaylistCapped: within the
+// VOD cache's 45s TTL a freshly fetched identical master/media body is
+// served from the cache instead of paying the same upstream hop again —
+// repeat /servers rounds (the app re-asks when the user switches servers)
+// and multi-variant probes stop re-dialing identical tokenized playlists.
+// The cache stores exact-URL, raw upstream bytes only (no origin to
+// poison), so a rotated token is a new key and refetches by design.
 func probeSegmentsLenient(ctx context.Context, client *http.Client, masterURL, referer, ua string) bool {
-	mhead, ok := fetchURLCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
+	mhead, ok := fetchPlaylistCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
 	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
 		return false
 	}
-	// Warm the playback cache: the browser will fetch this exact master
-	// seconds later through the media proxy (see vod_cache.go).
-	VODCacheSet(masterURL, mhead)
 	media := firstPlaylistURL(string(mhead), masterURL)
 	if media == "" {
 		return false
 	}
-	mbody, ok := fetchURLCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
+	mbody, ok := fetchPlaylistCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
 	if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
 		return false
 	}
-	VODCacheSet(media, mbody)
 	seg := firstPlaylistURL(string(mbody), media)
 	if seg == "" {
 		return false
@@ -70,22 +74,18 @@ func probeSegmentsLenient(ctx context.Context, client *http.Client, masterURL, r
 // while costing 0.3-1.8s on the fan-out's pacing collector. Verdict stays
 // lenient: definitive blocks only (unreachable, non-2xx, non-#EXTM3U).
 func probePlaylistsLenient(ctx context.Context, client *http.Client, masterURL, referer, ua string) bool {
-	mhead, ok := fetchURLCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
+	mhead, ok := fetchPlaylistCapped(ctx, client, masterURL, referer, ua, 65536, 6*time.Second)
 	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
 		return false
 	}
-	// Warm the playback cache: the browser will fetch this exact master
-	// seconds later through the media proxy (see vod_cache.go).
-	VODCacheSet(masterURL, mhead)
 	media := firstPlaylistURL(string(mhead), masterURL)
 	if media == "" {
 		return false
 	}
-	mbody, ok := fetchURLCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
+	mbody, ok := fetchPlaylistCapped(ctx, client, media, referer, ua, 262144, 6*time.Second)
 	if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
 		return false
 	}
-	VODCacheSet(media, mbody)
 	return true
 }
 
@@ -119,22 +119,18 @@ func probeMediaFileLenient(ctx context.Context, client *http.Client, fileURL, re
 // where edge alternatives exist (MegaPlay ?s= variants): a stricter
 // verdict is safe because another variant can still win.
 func probeSegmentsStrict(ctx context.Context, client *http.Client, fileURL, origin, ua string) bool {
-	master, ok := fetchURLCapped(ctx, client, fileURL, origin, ua, 64*1024, 6*time.Second)
+	master, ok := fetchPlaylistCapped(ctx, client, fileURL, origin, ua, 64*1024, 6*time.Second)
 	if !ok || !strings.Contains(string(master), "#EXTM3U") {
 		return false
 	}
-	// Warm the playback cache: the browser will fetch this exact master
-	// seconds later through the media proxy (see vod_cache.go).
-	VODCacheSet(fileURL, master)
 	media := firstPlaylistURL(string(master), fileURL)
 	if media == "" {
 		return false
 	}
-	medBody, ok := fetchURLCapped(ctx, client, media, origin, ua, 256*1024, 6*time.Second)
+	medBody, ok := fetchPlaylistCapped(ctx, client, media, origin, ua, 256*1024, 6*time.Second)
 	if !ok || !strings.Contains(string(medBody), "#EXTM3U") {
 		return false
 	}
-	VODCacheSet(media, medBody)
 	seg := firstPlaylistURL(string(medBody), media)
 	if seg == "" {
 		return false
@@ -167,6 +163,25 @@ func normalizeOriginReferer(referer string) string {
 
 // fetchURLCapped GETs url with referer/UA, bounding both time and bytes
 // (full GET capped, never Range — identical request shape to players).
+//
+// fetchPlaylistCapped is the playlist variant of the same shape: it serves
+// the hop first from the VOD body cache (45s TTL, exact-URL key, static-
+// playlist gated) and otherwise fetches upstream through fetchURLCapped
+// and stores the result. Probe rounds that re-run within the TTL — repeat
+// /servers rounds and multi-variant sweeps — stop paying the identical
+// upstream hop; playback-startup warm-up is unchanged because the fetch
+// path still stores into the same cache.
+func fetchPlaylistCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
+	if body, ok := VODCacheGet(rawURL); ok && int64(len(body)) <= limit {
+		return body, true
+	}
+	body, ok := fetchURLCapped(ctx, client, rawURL, referer, ua, limit, timeout)
+	if ok {
+		VODCacheSet(rawURL, body)
+	}
+	return body, ok
+}
+
 func fetchURLCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
