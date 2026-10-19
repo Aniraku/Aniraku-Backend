@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
+	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // tokenBucket is a simple client-side rate limiter. We hold ourselves to
@@ -75,10 +76,25 @@ type anilistCacheEntry struct {
 }
 
 func newAnilistClient(h *Handlers) *anilistClient {
+	endpoint := core.AnilistGraphQLEndpoint()
+	client := h.h2Client
+	if strings.HasPrefix(endpoint, "http:") {
+		// The collocated mirror override (ANIRAKU_GRAPHQL_URL) is plain
+		// HTTP/1.1 — node serves no cleartext h2, so the h2-only client
+		// would refuse it ("unencrypted HTTP/2 not enabled") and open
+		// the circuit for everything after. Plaintext endpoints ride
+		// the regular guarded transport instead; the loopback hop
+		// itself stays netguard-gated via the exact-address exception.
+		client = &http.Client{
+			Timeout:       h.h2Client.Timeout,
+			Transport:     netguard.NewTransport(),
+			CheckRedirect: netguard.NoRedirects,
+		}
+	}
 	return &anilistClient{
 		h:          h,
-		client:     h.h2Client,
-		endpoint:   core.AnilistGraphQLEndpoint(),
+		client:     client,
+		endpoint:   endpoint,
 		cacheTTL:   5 * time.Minute,
 		maxRetries: 3,
 		baseDelay:  1 * time.Second,
