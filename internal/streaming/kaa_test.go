@@ -36,11 +36,21 @@ type kaaFixture struct {
 	// fractionalEpisode emulates result entries with fractional episode
 	// numbers (observed 1004.5 on long runners).
 	fractionalEpisode bool
+	// dualPlayers makes the sub watch page carry two players — the second
+	// holds its response until the requester's context dies (partial
+	// fan-out pin). episodePageHits counts listing-page fetches (the
+	// anchored-page fast path must need exactly one for an on-page ep).
+	dualPlayers bool
+	// hangFirstListing makes the FIRST listing fetch hold until the
+	// requester's context dies; later fetches get a good page. This is
+	// the kaa.lt flaky-draw simulation the bg-retry pin uses.
+	hangFirstListing atomic.Bool
+	episodePageHits  *int64
 }
 
 func newKaaFixture(t *testing.T) *kaaFixture {
 	t.Helper()
-	f := &kaaFixture{t: t, masterHits: new(int64), segmentOrigin: new(string)}
+	f := &kaaFixture{t: t, masterHits: new(int64), segmentOrigin: new(string), episodePageHits: new(int64)}
 	var kaaURL string
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/search", func(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +58,13 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 		fmt.Fprint(w, `[{"slug":"naruto-f3cf","title":"Naruto","year":2002,"type":"tv","start_date":"2002-10-03"}]`)
 	})
 	mux.HandleFunc("/api/show/naruto-f3cf/episodes", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(f.episodePageHits, 1)
+		if f.hangFirstListing.CompareAndSwap(true, false) {
+			// First draw: never answer — the requester's deadline cut
+			// releases both sides (round fails; the bg retry draws fresh).
+			<-r.Context().Done()
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		// Lang-aware watch slugs (like production): each lang page has
 		// its own player page and subtitle set.
@@ -75,6 +92,13 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 		fmt.Fprintf(w, `{"result":%s,"pages":%s}`, result, pages)
 	})
 	mux.HandleFunc("/naruto-f3cf/ep-1-subslug", func(w http.ResponseWriter, r *http.Request) {
+		if f.dualPlayers {
+			// Second player stems its response until the client gives
+			// up — the fast one must survive the cut intact.
+			fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s/fplayer?id=1"}`+
+				`{name:"MegaCloud",shortName:"Mega",src:"%s/hangplayer?id=2"}</html>`, kaaURL, kaaURL)
+			return
+		}
 		player := kaaURL + "/subplayer?id=1"
 		fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s"}</html>`, player)
 	})
@@ -92,6 +116,16 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	mux.HandleFunc("/dubplayer", func(w http.ResponseWriter, r *http.Request) {
 		master := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/master.m3u8`
 		fmt.Fprintf(w, `<html>"%s" "%s/vtt-dub.vtt"</html>`, master, strings.ReplaceAll(kaaURL, "/", `\/`))
+	})
+	mux.HandleFunc("/fplayer", func(w http.ResponseWriter, r *http.Request) {
+		master := strings.ReplaceAll(kaaURL, "/", `\/`) + `\/master.m3u8`
+		fmt.Fprintf(w, `<html>"%s" "%s/vtt-dub.vtt"</html>`, master, strings.ReplaceAll(kaaURL, "/", `\/`))
+	})
+	mux.HandleFunc("/hangplayer", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(60 * time.Second):
+		case <-r.Context().Done():
+		}
 	})
 	mux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(f.masterHits, 1)

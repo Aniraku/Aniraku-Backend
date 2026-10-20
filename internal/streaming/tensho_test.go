@@ -27,6 +27,10 @@ type tenshoFixture struct {
 	serverHits  atomic.Int64
 	rejectFirst atomic.Bool // first /ajax/server call answers 403 (stale token)
 	deadStreams atomic.Bool // /p? streams 404 -> probes fail -> slots dropped
+	// hangEmbed holds the hd-1 embed page open until the requester's
+	// context dies (partial-fan-out pin: the cut must not erase the
+	// slots that already resolved).
+	hangEmbed atomic.Bool
 }
 
 const (
@@ -120,7 +124,18 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	reCloudShell := func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<html><head><script>var sourcesUrl = '/stream/getSources?t=page-token';</script></head><body></body></html>`)
 	}
-	mux.HandleFunc("/embed/hd-1/", reCloudShell)
+	mux.HandleFunc("/embed/hd-1/", func(w http.ResponseWriter, r *http.Request) {
+		if f.hangEmbed.Load() {
+			// Hold the response until the client gives up — one hung
+			// slot must never erase the survivors' results.
+			select {
+			case <-time.After(60 * time.Second):
+			case <-r.Context().Done():
+			}
+			return
+		}
+		reCloudShell(w, r)
+	})
 	mux.HandleFunc("/embed/hd-2/", reCloudShell)
 
 	// getSources answers master + tracks (and an intro/outro the provider

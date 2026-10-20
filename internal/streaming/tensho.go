@@ -57,12 +57,22 @@ const (
 	tenshoDefaultBase = "https://zangetsu.cc"
 	tenshoServerName  = "Tensho"
 	tenshoAnilistURL  = "https://graphql.aniraku.tech"
-	tenshoShowTTL     = 10 * time.Minute
+
+	tenshoShowTTL = 10 * time.Minute
 	// The page token is short-lived (403 after minutes): keep the cached
 	// window below that and refresh once on 403 anyway.
 	tenshoEpisodesTTL = 3 * time.Minute
-	tenshoFlixera     = "https://flixera.co"
-	tenshoCDN         = "https://cdn.4animo.xyz"
+
+	// Resolved-episode cache: one episode's identity + slot lists are
+	// stable for minutes, so repeat rounds skip the whole sequential
+	// prefix (watch session → episodes ajax → server ajax) — measured
+	// 3-6s on One Piece-listing size, exactly what pushed still-cold
+	// rounds past the 10s collector budget (2026-10-20).
+	tenshoResolvedTTL        = 10 * time.Minute
+	maxTenshoResolvedEntries = 500
+
+	tenshoFlixera = "https://flixera.co"
+	tenshoCDN     = "https://cdn.4animo.xyz"
 )
 
 // tenshoServerNames labels Zangetsu's server slots positionally (s-1
@@ -146,6 +156,22 @@ type tenshoServerResp struct {
 	Dub []tenshoServerSlot `json:"dub"`
 }
 
+// tenshoResolvedEntry caches one episode's identity + slot lists — the
+// prefix's strictly sequential outcome (findShow → session+episodes →
+// server ajax). The embed resolution itself is never cached: streams must
+// stay probe-verified each round.
+type tenshoResolvedKey struct {
+	path    string
+	episode int
+}
+
+type tenshoResolvedEntry struct {
+	ep      tenshoEpisode
+	sub     []tenshoServerSlot
+	dub     []tenshoServerSlot
+	fetched time.Time
+}
+
 type TenshoProvider struct {
 	log        zerolog.Logger
 	client     *http.Client
@@ -162,6 +188,7 @@ type TenshoProvider struct {
 	mu       sync.Mutex
 	shows    map[string]*tenshoShowEntry     // anilistID -> watch path + id
 	episodes map[string]*tenshoEpisodesEntry // show path -> episode list + token
+	resolved map[tenshoResolvedKey]*tenshoResolvedEntry
 }
 
 func NewTenshoProvider(log zerolog.Logger, base, anilistURL, flixeraBase, animoBase string) *TenshoProvider {
@@ -186,6 +213,7 @@ func NewTenshoProvider(log zerolog.Logger, base, anilistURL, flixeraBase, animoB
 		animo:      strings.TrimRight(animoBase, "/"),
 		shows:      make(map[string]*tenshoShowEntry),
 		episodes:   make(map[string]*tenshoEpisodesEntry),
+		resolved:   make(map[tenshoResolvedKey]*tenshoResolvedEntry),
 	}
 }
 
@@ -217,7 +245,12 @@ func (p *TenshoProvider) learnURLHost(raw string) {
 // precedent caps this same class at ~10s; anything slower on a page or
 // ajax endpoint is unusable for playback that round anyway. Var so tests
 // can shrink it.
-var tenshoUpstreamTimeout = 10 * time.Second
+//
+// 6s (2026-10-20 evening): healthy hops measured 0.1-2s; the observed
+// failure mode is a poisoned keep-alive path that never answers and
+// burned the whole 10s collector wall every round. Failing dead hops at
+// 6s frees the remaining budget for the slots that do answer.
+var tenshoUpstreamTimeout = 6 * time.Second
 
 func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, string, []*http.Cookie, error) {
 	getCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
@@ -456,6 +489,45 @@ func (p *TenshoProvider) serverSlots(ctx context.Context, show *tenshoShowEntry,
 	return nil, nil, fmt.Errorf("tensho: server ajax rejected token twice")
 }
 
+// loadResolvedEpisode returns the cached ep + slots for a show/episode, or
+// nil when absent/expired. The pointer is only used under its TTL window
+// and never mutated: FindEpisodeSource treats slot slices as read-only.
+func (p *TenshoProvider) loadResolvedEpisode(path string, episode int) *tenshoResolvedEntry {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.resolved[tenshoResolvedKey{path: path, episode: episode}]
+	if e == nil || time.Now().After(e.fetched.Add(tenshoResolvedTTL)) {
+		return nil
+	}
+	return e
+}
+
+// storeResolvedEpisode caches the prefix result (ep + both slot lists).
+// Entries with zero slots on BOTH langs are skipped: caching an empty
+// response would brick the episode for a full TTL on a transient empty
+// server list.
+func (p *TenshoProvider) storeResolvedEpisode(path string, ep tenshoEpisode, sub, dub []tenshoServerSlot) {
+	if len(sub) == 0 && len(dub) == 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for k, e := range p.resolved {
+		if now.After(e.fetched.Add(tenshoResolvedTTL)) {
+			delete(p.resolved, k)
+		}
+	}
+	if len(p.resolved) >= maxTenshoResolvedEntries {
+		for k := range p.resolved {
+			delete(p.resolved, k)
+			break
+		}
+	}
+	p.resolved[tenshoResolvedKey{path: path, episode: int(ep.Number)}] =
+		&tenshoResolvedEntry{ep: ep, sub: sub, dub: dub, fetched: now}
+}
+
 // embedURL mirrors the site's loadPlayer switch: s-1 (and any unknown
 // slot) is the flixera player keyed by the episode's ani/mal ids, s-2 is
 // the 4animo hd-1 player keyed by episode id, s-3 is the 4animo hd-2
@@ -631,6 +703,31 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 	if err != nil {
 		return nil, err
 	}
+
+	// Resolved-episode cache: repeat rounds within the TTL skip the whole
+	// sequential prefix (episodeList session fetch + episodes ajax +
+	// server ajax ≈ 3-6s on deep listings) and go straight to the embed
+	// fan-out — the part that consumes the 10s collector budget on
+	// long-runner rounds. Slot lists may be stale for a refresh that
+	// happened inside the window; the embed resolution itself never is.
+	if rv := p.loadResolvedEpisode(show.path, episode); rv != nil {
+		if (langKey == "sub" && !rv.ep.Sub) || (langKey == "dub" && !rv.ep.Dub) {
+			p.log.Info().Str("showId", show.id).Int("episode", episode).
+				Str("lang", langKey).Msg("tensho: no lang lane for episode (cached)")
+			return nil, nil
+		}
+		slots := rv.sub
+		if langKey == "dub" {
+			slots = rv.dub
+		}
+		if len(slots) == 0 {
+			p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
+				Msg("tensho: no server slots for lang (cached)")
+			return nil, nil
+		}
+		return p.resolveSlots(ctx, show.id, slots, rv.ep, langKey, episode)
+	}
+
 	entry, err := p.episodeList(ctx, show, false)
 	if err != nil {
 		return nil, err
@@ -670,6 +767,16 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 			Msg("tensho: no server slots for lang")
 		return nil, nil
 	}
+	p.storeResolvedEpisode(show.path, *ep, sub, dub)
+	return p.resolveSlots(ctx, show.id, slots, *ep, langKey, episode)
+}
+
+// resolveSlots resolves the listed server slots (≤3 concurrent, each under
+// its own deadline) to decrypted masters and assembles positionally so a
+// dropped slot keeps its own name out instead of shifting the survivors.
+// Split from FindEpisodeSource so the resolved-episode cache re-enters the
+// same fan-out without re-walking the session/ajax chain.
+func (p *TenshoProvider) resolveSlots(ctx context.Context, showID string, slots []tenshoServerSlot, ep tenshoEpisode, langKey string, episode int) (*SourceResult, error) {
 	if len(slots) > len(tenshoServerNames) {
 		slots = slots[:len(tenshoServerNames)]
 	}
@@ -703,7 +810,7 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 			}
 			sCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 			defer cancel()
-			embedURL := p.embedURL(slot.ServerName, *ep, langKey)
+			embedURL := p.embedURL(slot.ServerName, ep, langKey)
 			res, err := p.resolveEmbed(sCtx, embedURL)
 			if err != nil {
 				p.log.Warn().Str("slot", slot.ServerName).Str("embed", embedURL).Err(err).
@@ -723,9 +830,12 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		}(i, slot)
 	}
 	sWg.Wait()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
+	// A collector-budget cut mid-fan-out does NOT discard what resolved:
+	// slots are independent upstreams, and completed ones hold complete
+	// streams (master + subtitles). The 2026-10-20 bug shape — one hung
+	// slot burning the wall cut the whole collector at context deadline,
+	// erasing the other slots that had already resolved — is why Hoshi
+	// vanished from every One Piece round. Survivors ship as a partial.
 	for i := range slots {
 		if !slotHits[i].ok {
 			continue
@@ -747,12 +857,12 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 		names = append(names, tenshoServerNames[i])
 	}
 	if len(sources) == 0 {
-		p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
+		p.log.Info().Str("showId", showID).Int("episode", episode).Str("lang", langKey).
 			Int("tried", len(slots)).Msg("tensho: no resolvable stream")
 		return nil, nil
 	}
 
-	p.log.Info().Str("showId", show.id).Int("episode", episode).Str("lang", langKey).
+	p.log.Info().Str("showId", showID).Int("episode", episode).Str("lang", langKey).
 		Int("streams", len(sources)).Msg("tensho: resolved")
 	return &SourceResult{
 		Sources:     sources,
