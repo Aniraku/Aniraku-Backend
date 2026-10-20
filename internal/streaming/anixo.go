@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,7 +24,8 @@ import (
 //	       request 403s as "Unauthorized Embed Domain", the parentHost
 //	       query is exactly what anixo.online's own SDK sends)
 //	    -> inline jwplayer config naming streamUrl = anixo.buzz/api/stream/
-//	       m3u8?t=<opaque token> plus a vtt subtitle token
+//	       m3u8?t=<opaque token> plus a subtitles[] track array (per entry:
+//	       url, label, default, kind — tokens are base64URL)
 //	GET /api/stream/m3u8?t=... -> master: one 1440x1080 variant whose child
 //	    URLs are absolute anixo.buzz/api/stream/m3u8?t=... (self-hosted edge)
 //	inner playlist -> absolute /api/stream/... segments, plain 200s
@@ -54,8 +56,43 @@ var (
 	// {"success":true,"server":"Server 1 (Sora Edge)","serverId":1,
 	//  "streamUrl":"https://anixo.buzz/api/stream/m3u8?t=<token>","..."}
 	anixoStreamURLRe = regexp.MustCompile(`"streamUrl"\s*:\s*"([^"]+)"`)
-	anixoVTTURLRe    = regexp.MustCompile(`"(https://anixo\.buzz/api/stream/vtt\?t=[A-Za-z0-9+/=]{16,})"`)
+	// Track tokens are base64URL (alphabet includes '-' and '_' — observed
+	// live: "...EVoUFks-Y2loaDtQ...bT8-UlBXUFdSV19dX1k..."). Keeping the raw
+	// single-URL match as the fallback for older page shapes; the primary
+	// path parses the subtitles[] array (anixoSubsArrRe).
+	anixoVTTURLRe   = regexp.MustCompile(`"(https://anixo\.buzz/api/stream/vtt\?t=[A-Za-z0-9+/=_-]{16,})"`)
+	anixoSubsArrRe  = regexp.MustCompile(`"subtitles"\s*:\s*(\[[^\]]*\])`)
 )
+
+// anixoSubtitleTrack mirrors one entry of the player page's subtitles[]
+// array: {"url":"https://anixo.buzz/api/stream/vtt?t=<base64url token>",
+// "label":"English","default":true,"kind":"captions"}. Live pages ship the
+// full multi-language list (English/German/Spanish/French/Italian/
+// Portuguese observed on 185874 ep9); the old single-URLregex path matched
+// at most one and its base64-only alphabet could never terminate on
+// base64URL tokens, silently yielding zero subtitles for those episodes.
+type anixoSubtitleTrack struct {
+	URL   string `json:"url"`
+	Label string `json:"label"`
+	Kind  string `json:"kind"`
+}
+
+// parseAnixoSubtitles extracts the player page's subtitle tracks. Primary
+// shape: the subtitles[] JSON array (bound by regex, parsed as JSON — track
+// URLs carry only base64URL characters, so no unescaped quotes inside).
+// Fallback for older page shapes: a bare vtt URL match (now base64URL-aware).
+func parseAnixoSubtitles(html string) []anixoSubtitleTrack {
+	if m := anixoSubsArrRe.FindStringSubmatch(html); len(m) > 1 {
+		var tracks []anixoSubtitleTrack
+		if err := json.Unmarshal([]byte(m[1]), &tracks); err == nil && len(tracks) > 0 {
+			return tracks
+		}
+	}
+	if m := anixoVTTURLRe.FindStringSubmatch(html); len(m) > 1 {
+		return []anixoSubtitleTrack{{URL: m[1], Label: "English"}}
+	}
+	return nil
+}
 
 type AnixoProvider struct {
 	log    zerolog.Logger
@@ -122,10 +159,15 @@ func (p *AnixoProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		return nil, fmt.Errorf("anixo: no streamUrl in player page")
 	}
 
-	// Subtitle track token, when the platform ships one for the episode.
+	// Subtitle tracks, when the platform ships them for the episode. The
+	// "default":true entry is English; hint=en covers any label the lang
+	// table does not normalize.
 	var subs []core.Subtitle
-	if m := anixoVTTURLRe.FindStringSubmatch(html); len(m) > 1 {
-		subs = append(subs, core.Subtitle{URL: m[1], Lang: "en", Label: "English"})
+	for _, t := range parseAnixoSubtitles(html) {
+		if strings.TrimSpace(t.URL) == "" {
+			continue
+		}
+		subs = append(subs, buildSubtitle(t.URL, "", t.Label, "en"))
 	}
 
 	// Segment-depth honesty, playback shape: no Referer was needed for the

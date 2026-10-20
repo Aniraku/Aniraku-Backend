@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -25,6 +26,21 @@ const (
 	zokoPlayerUA   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 	zokoServerName = "Zoko"
 )
+
+// zokoProbeBudget: how long a live-manifest probe may run before it is
+// judged unusable for playback and dropped. The CDN's blocked shape from
+// this egress is a silent blackhole, not a fast 403; on the provider's
+// full 45s client timeout the probe alone burned the /servers fan-out's
+// whole budget (measured 2026-10-20: zoko logged at the 85000ms ctx cap).
+// Var (not const) so tests can shrink it.
+var zokoProbeBudget = 6 * time.Second
+
+// zokoManifestGateBackoff: after a confirmed manifest block, skip every
+// zoko upstream call for this long. The embed pages stay reachable while
+// the manifests are not, so only opening the gate again after real time
+// has passed is what lets zoko recover automatically once the CDN
+// unblocks the IP. Var (not const) so tests can shrink the window.
+var zokoManifestGateBackoff = 10 * time.Minute
 
 // zokoBase is a var (not const) so tests can point the provider at a fake
 // server.
@@ -61,6 +77,13 @@ type ZokoProvider struct {
 	client    *http.Client
 	log       zerolog.Logger
 	learnHost func(host string)
+
+	// manifestBlocked: unix-nano until which every zoko resolve returns
+	// immediately. Armed when a decoded payload's manifest is unreachable
+	// from this egress, cleared by any successful probe. The gate is what
+	// makes the (recurring, real) CDN block cost one probe per 10 minutes
+	// instead of per request.
+	manifestBlocked atomic.Int64
 }
 
 func (p *ZokoProvider) SetHostLearner(fn func(host string)) {
@@ -118,7 +141,9 @@ func deobfuscateZokoPayload(blob string) (*zokoPayload, error) {
 // ZokoAnime referer (the CDN 403s without it). A CDN-blocked manifest must
 // not surface as a playable server.
 func (p *ZokoProvider) probeManifest(ctx context.Context, manifestURL string) bool {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	probeCtx, cancel := context.WithTimeout(ctx, zokoProbeBudget)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return false
 	}
@@ -172,9 +197,14 @@ func (p *ZokoProvider) zokoBuildSourceResult(ctx context.Context, payload *zokoP
 	// cannot reach would 403 through the proxy too, so it is dropped instead
 	// of surfacing a server that can only produce 502s.
 	if !p.probeManifest(ctx, payload.Src) {
-		p.log.Info().Str("source", source).Msg("zoko: manifest blocked from this egress, dropping source")
+		p.log.Info().Str("source", source).
+			Dur("backoff", zokoManifestGateBackoff).
+			Msg("zoko: manifest blocked from this egress, dropping source")
+		p.manifestBlocked.Store(time.Now().Add(zokoManifestGateBackoff).UnixNano())
 		return nil, nil
 	}
+	// Reachable: clear any stale gate from an earlier block window.
+	p.manifestBlocked.Store(0)
 	p.learnURLHost(payload.Src)
 
 	var subs []core.Subtitle
@@ -225,15 +255,39 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 		lang = "sub"
 	}
 
+	// Manifest-block gate: while armed, Zoko cannot yield a playable
+	// (embed pages stay reachable, manifests do not), so return before
+	// any upstream call. One round per 10-minute window pays the probe;
+	// the rest cost nothing.
+	if until := p.manifestBlocked.Load(); until != 0 && time.Now().UnixNano() < until {
+		return nil, nil
+	}
+
 	// --- attempt 1: AniList-keyed URL ---
 	anilistURL := fmt.Sprintf("%s/stream/ani/%s/%d/%s", zokoBase, url.PathEscape(anilistID), episode, lang)
+	manifestUnreachable := false
 	payload, err := p.zokoFetchEmbed(ctx, anilistURL)
 	if err == nil {
 		result, err2 := p.zokoBuildSourceResult(ctx, payload, "anilist")
 		if err2 != nil || result != nil {
 			return result, err2
 		}
-		// manifest probe failed — fall through to MAL
+		// zokoBuildSourceResult only returns (nil, nil) when the manifest
+		// probe judged it unreachable from this egress. The MAL-keyed
+		// variant resolves to the same CDN edge over the same egress IP,
+		// so retrying it (MAL-ID lookups + second embed fetch + second
+		// probe) can only reproduce the block — measured 2026-10-20: this
+		// double burn is exactly how zoko pinned /servers at 85s. Drop
+		// now; the gate below keeps the skip cheap for later rounds.
+		manifestUnreachable = true
+	}
+	if manifestUnreachable {
+		return nil, nil
+	}
+
+	// --- attempt 2: MAL-keyed URL (gate first) ---
+	if until := p.manifestBlocked.Load(); until != 0 && time.Now().UnixNano() < until {
+		return nil, nil
 	}
 
 	// --- attempt 2: MAL-keyed URL ---

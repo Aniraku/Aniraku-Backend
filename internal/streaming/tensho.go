@@ -207,8 +207,22 @@ func (p *TenshoProvider) learnURLHost(raw string) {
 // get fetches a page (browser headers) and returns its Set-Cookie pairs —
 // the watch page's PHPSESSID is required by the ajax endpoints. status
 // 403 is returned, not an error, so the caller can refresh and retry.
+// tenshoUpstreamTimeout: per-call ceiling for every upstream read through
+// p.get / p.ajaxGet. The fan-out waits for the slowest collector, and one
+// blackholed hop up tensho's strictly sequential prefix (AniList titles →
+// search → watch page → episodes ajax → server ajax) used to eat the
+// shared client's full 45s — that pinning produced the 20-35s tensho rows
+// measured in collectorMs on 2026-10-20 (with 1.8-3s rounds when upstream
+// was healthy, so time comes from hangs, not honest work). The animex
+// precedent caps this same class at ~10s; anything slower on a page or
+// ajax endpoint is unusable for playback that round anyway. Var so tests
+// can shrink it.
+var tenshoUpstreamTimeout = 10 * time.Second
+
 func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, string, []*http.Cookie, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	getCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(getCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, "", nil, err
 	}
@@ -234,7 +248,9 @@ func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, 
 // sends: X-Page-Token + the PHPSESSID cookie from the same watch fetch
 // (token without cookie = 403 — measured).
 func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL string, sess tenshoSession) (int, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	ajaxCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ajaxCtx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return 0, "", err
 	}
@@ -756,7 +772,9 @@ func (p *TenshoProvider) findShow(ctx context.Context, anilistID string) (*tensh
 	}
 	p.mu.Unlock()
 
-	titles, err := fetchAnilistTitles(ctx, p.client, p.anilistURL, anilistID)
+	titlesCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
+	defer cancel()
+	titles, err := fetchAnilistTitles(titlesCtx, p.client, p.anilistURL, anilistID)
 	if err != nil {
 		return nil, fmt.Errorf("tensho: %w", err)
 	}
