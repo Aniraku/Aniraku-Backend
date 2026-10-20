@@ -514,16 +514,18 @@ func containsHentai(genres []string) bool {
 // genres is used to skip providers that should not serve certain content
 // collectorBudget: hard wall-clock ceiling for EVERY fan-out collector
 // (each provider + the downloads fetch). Cold /servers latency IS its
-// slowest collector, and "a cold fetch must land within seconds" is the
-// operator contract (2026-10-20: theuser-facing symptom that drove the
-// zoko gate and the tensho per-hop caps — a single tarpitted upstream
-// pinned the response at 20-85s). The budget does not discard partial
-// progress blindly: inner ops inherit this deadline, so a cut collector
-// returns whatever it managed to gather and logs its time for the next
-// culprit hunt. Slow-but-honest upstreams (animegg 3s, kaa multi-page)
-// comfortably finish inside it; a provider occasionally dropped for
-// exceeding it reappears the next round. Var so tests can shrink it.
-var collectorBudget = 10 * time.Second
+// slowest collector, and the outer contract is 15s max end-to-end —
+// edge + transfer measured ~1-2.5s on top of the server bound, so the
+// budget is 12s: honest-but-slow providers keep their room inside the
+// contract instead of being trimmed at 10s (2026-10-20: the user-facing
+// symptom that drove the zoko gate and the tensho per-hop caps — a
+// single tarpitted upstream pinned the response at 20-85s). The budget
+// does not discard partial progress blindly: inner ops inherit this
+// deadline, so a cut collector returns whatever it managed to gather
+// (kaa/tensho ship surviving slots; measured in fanout tests), and the
+// slowest one is logged for the next culprit hunt. Var so tests can
+// shrink it.
+var collectorBudget = 12 * time.Second
 
 // (e.g. Anikoto is skipped for Hentai titles).
 func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) []core.Server {
