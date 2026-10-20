@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -67,6 +68,16 @@ const (
 	kaaResolveTTL        = 10 * time.Minute
 	maxKaaSlugEntries    = 500
 	maxKaaResolveEntries = 500
+
+	// kaaListingBudget: per-call ceiling for the episode-listing fetch.
+	// Measured 2026-10-20 from the production egress on the SAME page:
+	// 0.9s, 6.2s, then 11.2s — kaa.lt's loading is wildly variable, and a
+	// listing draw slower than 6s can never complete the resolve under
+	// the 10s collector budget (watch page + players still need ~4s).
+	// Capping the draw there converts a guaranteed wall-burn into a fast
+	// fail; any round that could have succeeded inside the budget is
+	// unaffected (listing+watch+players must fit in 10s regardless).
+	kaaListingBudget = 6 * time.Second
 )
 
 var (
@@ -89,8 +100,9 @@ type KaaProvider struct {
 	anilistURL string
 	learnHost  func(host string)
 
-	mu       sync.Mutex
-	slugs    map[int]*kaaSlugEntry
+	mu     sync.Mutex
+	slugs  map[int]*kaaSlugEntry
+	bgWarm map[string]bool
 	resolved map[kaaResolveKey]*kaaResolvedEntry
 }
 
@@ -162,12 +174,67 @@ func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider
 	}
 	return &KaaProvider{
 		log:        log,
-		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
+		// DisableKeepAlives: from this egress the poison pattern is a
+		// reused connection that never answers (python fresh-conn probes
+		// to the same hosts answered 200 in <1s while the Go client sat
+		// out its full budget on keep-alive reuse — krussdomi 2026-10-20
+		// 12:33). kaa fetches are few per round, so per-request dials
+		// cost ~30ms and buy reliable reads.
+		client: kaaFreshConnClient(),
 		kaaBase:    strings.TrimRight(kaaBase, "/"),
 		anilistURL: anilistURL,
 		slugs:      make(map[int]*kaaSlugEntry),
+		bgWarm:     make(map[string]bool),
 		resolved:   make(map[kaaResolveKey]*kaaResolvedEntry),
 	}
+}
+
+// bgRetryResolve launches at most one background resolve per (slug, ep,
+// lang) after a failed round. This is the no-compromise clause: the 10s
+// collector budget bounds what a round may try, not what the provider may
+// TRY TOTAL — suppose kaa.lt's draws land 0.9s or 11s and krussdomi
+// blackholes keep-alives (both measured 2026-10-20 12:33); a round that
+// drew badly has NO second chance inside its budget, so the resolve
+// retries detached with a fresh 20s budget and fills the 10-minute
+// resolve cache the moment the upstream cooperates. Every later round
+// then serves the resolve from the cache at full strength — kaa does not
+// keep vanishing because one draw was slow. Inflight deduped by key;
+// the goroutine leaks bounded (≤1 per failing key, 20s cap, pure work).
+func (p *KaaProvider) bgRetryResolve(anilistID int, slug string, episode int, langKey, reqLang string) {
+	key := fmt.Sprintf("%s|%d|%s", slug, episode, langKey)
+	p.mu.Lock()
+	if p.bgWarm[key] {
+		p.mu.Unlock()
+		return
+	}
+	p.bgWarm[key] = true
+	p.mu.Unlock()
+
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			delete(p.bgWarm, key)
+			p.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		sr, err := p.resolveEpisode(ctx, anilistID, slug, episode, kaaLangParam(reqLang), reqLang)
+		if err != nil || sr == nil || len(sr.Sources) == 0 {
+			p.log.Info().Str("slug", slug).Int("episode", episode).Str("lang", langKey).
+				Err(err).Msg("kaa: background retry failed")
+			return
+		}
+		p.storeResolved(slug, episode, langKey, sr)
+		p.log.Info().Str("slug", slug).Int("episode", episode).Str("lang", langKey).
+			Int("players", len(sr.Sources)).Msg("kaa: background retry cached")
+	}()
+}
+
+// kaaFreshConnClient builds the guarded client with connection reuse off.
+func kaaFreshConnClient() *http.Client {
+	tr := netguard.NewTransport().Clone()
+	tr.DisableKeepAlives = true
+	return &http.Client{Timeout: 45 * time.Second, Transport: tr}
 }
 
 func (p *KaaProvider) Name() string { return "kaa" }
@@ -288,26 +355,41 @@ func (p *KaaProvider) FindEpisodes(ctx context.Context, providerID string) ([]Ep
 	return out, nil
 }
 
-func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, firstEp int) ([]kaaEpisode, error) {
-	var first struct {
-		Result []kaaEpisode `json:"result"`
-		Pages  []struct {
-			// Page markers are usually ints but kaa.lt sometimes emits
-			// fractional episode numbers (observed 14.5 for specials) —
-			// json.Number keeps the unmarshal from killing the resolve.
-			Eps []json.Number `json:"eps"`
-		} `json:"pages"`
+// kaaPageMark is one pagination marker from an anchored listing page:
+// kaa.lt flags every OTHER page by its leading episode number.
+type kaaPageMark struct {
+	// Page markers are usually ints but kaa.lt sometimes emits
+	// fractional episode numbers (observed 14.5 for specials) —
+	// json.Number keeps the unmarshal from killing the resolve.
+	Eps []json.Number `json:"eps"`
+}
+
+// fetchEpisodePage fetches ONE anchored page of a show's episode listing.
+func (p *KaaProvider) fetchEpisodePage(ctx context.Context, slug, lang, anchor string) ([]kaaEpisode, []kaaPageMark, error) {
+	var page struct {
+		Result []kaaEpisode  `json:"result"`
+		Pages  []kaaPageMark `json:"pages"`
 	}
-	u := fmt.Sprintf("%s/api/show/%s/episodes?ep=%d&lang=%s", p.kaaBase, slug, firstEp, lang)
-	if err := p.doJSON(ctx, http.MethodGet, u, nil, p.kaaHeaders(p.kaaBase+"/"), &first); err != nil {
+	u := fmt.Sprintf("%s/api/show/%s/episodes?ep=%s&lang=%s", p.kaaBase, slug, anchor, lang)
+	lsCtx, cancel := context.WithTimeout(ctx, kaaListingBudget)
+	defer cancel()
+	if err := p.doJSON(lsCtx, http.MethodGet, u, nil, p.kaaHeaders(p.kaaBase+"/"), &page); err != nil {
+		return nil, nil, err
+	}
+	return page.Result, page.Pages, nil
+}
+
+func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, firstEp int) ([]kaaEpisode, error) {
+	firstResult, pages, err := p.fetchEpisodePage(ctx, slug, lang, strconv.Itoa(firstEp))
+	if err != nil {
 		return nil, err
 	}
-	eps := append([]kaaEpisode(nil), first.Result...)
+	eps := append([]kaaEpisode(nil), firstResult...)
 	seen := map[string]bool{}
 	for _, e := range eps {
 		seen[e.Number.key()] = true
 	}
-	for _, page := range first.Pages {
+	for _, page := range pages {
 		if len(page.Eps) == 0 {
 			continue
 		}
@@ -363,13 +445,27 @@ func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	}
 	sr, err := p.resolveEpisode(ctx, id, slug, episode, kaaLangParam(lang), lang)
 	if err != nil {
+		// The miss schedules one background resolve: any moment the
+		// upstreams cooperate fills the resolve cache, and rounds after
+		// that serve kaa fully — a slow draw never benches it for a TTL.
+		p.bgRetryResolve(id, slug, episode, langKey, lang)
 		return nil, err
 	}
 	if sr == nil || len(sr.Sources) == 0 {
+		p.bgRetryResolve(id, slug, episode, langKey, lang)
 		return nil, fmt.Errorf("kaa: no sources for episode %d (%s)", episode, langKey)
 	}
 	p.storeResolved(slug, episode, langKey, sr)
 	return sr, nil
+}
+
+// kaaLangParam returns kaa.lt's listing-language code for a request lang.
+// deadlineShapedErr reports whether an upstream failure was a
+// budget/deadline cut rather than a plain network error — deadline-shaped
+// failures must not be retried on the same context (the retry cannot find
+// the missing time).
+func deadlineShapedErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func kaaLangParam(lang string) string {
@@ -543,15 +639,35 @@ var kaaServerNames = []string{
 }
 
 func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, episode int, kaaLang, reqLang string) (*SourceResult, error) {
-	eps, err := p.listEpisodes(ctx, slug, kaaLang, episode)
-	if err != nil {
-		return nil, err
-	}
 	var match *kaaEpisode
-	for i := range eps {
-		if eps[i].Number.equals(episode) {
-			match = &eps[i]
-			break
+	// Fast path: the anchored page usually carries the requested episode
+	// itself. Long runners paginate deep (One Piece = 1180 listed eps) and
+	// listEpisodes' full sequential walk takes 10-19s — over the 10s
+	// collector budget, which cut every One Piece round even with episode 1
+	// one hop away (2026-10-20: Kaa vanished from all OP lists). Only the
+	// rare not-on-page case falls back to the full walk.
+	//
+	// A deadline-shaped failure is NOT retried: the listing budget (6s)
+	// already consumed most of the collector budget, and kaa.lt's flaky
+	// draws resolve by round, not by instant retry — retrying here just
+	// burned the wall (measured: 6s fail + fresh 6s walk = the 10s cut).
+	if firstPage, _, fpErr := p.fetchEpisodePage(ctx, slug, kaaLang, strconv.Itoa(episode)); fpErr == nil {
+		for i := range firstPage {
+			if firstPage[i].Number.equals(episode) && firstPage[i].Slug != "" {
+				match = &firstPage[i]
+				break
+			}
+		}
+	} else if !deadlineShapedErr(fpErr) {
+		eps, err := p.listEpisodes(ctx, slug, kaaLang, episode)
+		if err != nil {
+			return nil, err
+		}
+		for i := range eps {
+			if eps[i].Number.equals(episode) {
+				match = &eps[i]
+				break
+			}
 		}
 	}
 	if match == nil || match.Slug == "" {
@@ -602,15 +718,20 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 			defer cancel()
 			master, vtts, err := p.resolvePlayerMaster(plCtx, pl, watchURL)
 			if err != nil {
+				p.log.Warn().Str("player", pl.name).Str("src", pl.src).Err(err).
+					Msg("kaa: player resolve failed, skipping")
 				return
 			}
 			hits[i] = hit{master: master, vtts: vtts, ok: true}
 		}(i, pl)
 	}
 	pWg.Wait()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
+	// Collector-budget cut mid-fan-out does NOT discard what resolved:
+	// players are independent, and completed ones hold complete streams
+	// (master + subtitles + headers). The budget expired 2026-10-20
+	// scenario — one player slower than the wall dropped the other two
+	// playable ones — must never erase usable sources. Dead-ctx failed
+	// players are simply absent from hits.
 	var playable []hit
 	for _, h := range hits {
 		if h.ok {
@@ -766,6 +887,12 @@ type kaaVariant struct {
 // probeKaaMaster verifies master -> first media -> first segment with the
 // Origin header krussdomi segments require, warming the VOD playback cache
 // like every other provider probe. Returns the master's quality variants.
+// kaaProbeFetchTimeout caps each hop at 6s: healthy krussdomi reads are
+// well under 1s, and a hung hop must not consume the whole collector
+// budget — the budget cuts everything anyway, but per-hop caps let the
+// NEXT player's surviving probe use the freed time.
+const kaaProbeFetchTimeout = 6 * time.Second
+
 func (p *KaaProvider) probeKaaMaster(ctx context.Context, master string) ([]kaaVariant, bool) {
 	fetch := func(rawURL string, limit int64, timeout time.Duration) ([]byte, bool) {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
@@ -791,7 +918,7 @@ func (p *KaaProvider) probeKaaMaster(ctx context.Context, master string) ([]kaaV
 		}
 		return b, true
 	}
-	mhead, ok := fetch(master, 65536, 10*time.Second)
+	mhead, ok := fetch(master, 65536, kaaProbeFetchTimeout)
 	if !ok || !strings.Contains(string(mhead), "#EXTM3U") {
 		return nil, false
 	}
@@ -801,7 +928,7 @@ func (p *KaaProvider) probeKaaMaster(ctx context.Context, master string) ([]kaaV
 		return nil, false
 	}
 	media := variants[0].url
-	mbody, ok := fetch(media, 262144, 10*time.Second)
+	mbody, ok := fetch(media, 262144, kaaProbeFetchTimeout)
 	if !ok || !strings.Contains(string(mbody), "#EXTM3U") {
 		return nil, false
 	}
@@ -810,7 +937,7 @@ func (p *KaaProvider) probeKaaMaster(ctx context.Context, master string) ([]kaaV
 	if seg == "" {
 		return nil, false
 	}
-	shead, ok := fetch(seg, 8192, 12*time.Second)
+	shead, ok := fetch(seg, 8192, kaaProbeFetchTimeout)
 	if !ok || !segmentBytesPlayable(shead) {
 		return nil, false
 	}
