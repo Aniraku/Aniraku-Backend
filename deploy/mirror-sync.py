@@ -180,11 +180,31 @@ def adopt(tag, assets):
     return True
 
 
+def spawn_warm(full):
+    """Run the warmer as its own transient user unit. A plain Popen child
+    lives inside THIS service's cgroup and is killed by systemd the moment
+    the sync service exits (that silently killed every spawn since the hook
+    shipped). systemd-run escapes the cgroup and keeps it alive+logged."""
+    warm = os.path.expanduser("~/bin/mirror-warm.py")
+    if not os.path.exists(warm):
+        return
+    unit = f"mirror-warm-{int(time.time())}"
+    mode = ["--full"] if full else []
+    try:
+        subprocess.run(
+            ["systemd-run", "--user", f"--unit={unit}", "--collect",
+             sys.executable, warm, *mode],
+            check=True, timeout=30, capture_output=True,
+        )
+        print(f"warm sweep spawned as {unit} ({'full' if full else 'top'})")
+    except Exception as ex:
+        print(f"warm spawn failed: {ex}")
+
+
 def restart_and_warm():
     """Long cache TTLs (self-host tuning) mean stale pages would outlive the
     data swap; restart the engine right after promotion (only on release-swap
-    days), then re-fill the hot surface in the background so first users hit
-    warm caches. Runs inside the hourly sync service, no sudo needed."""
+    days), then re-fill the hot surface so first users hit warm caches."""
     try:
         subprocess.run(["systemctl", "--user", "restart", "anilist-mirror.service"], check=True, timeout=90)
     except Exception as ex:
@@ -202,15 +222,7 @@ def restart_and_warm():
             break
         except Exception:
             time.sleep(1)
-    warm = os.path.expanduser("~/bin/mirror-warm.py")
-    if os.path.exists(warm):
-        log_path = os.path.expanduser("~/logs/mirror-warm.log")
-        with open(log_path, "a") as lf:
-            subprocess.Popen(
-                [sys.executable, warm, "--full"],
-                stdout=lf, stderr=lf,
-            )
-        print(f"full warm sweep started in background (log: {log_path})")
+    spawn_warm(full=True)
 
 
 def main():
@@ -225,11 +237,7 @@ def main():
     if tag == synced_tag() and manifest_tag(LIVE) == tag:
         print(f"up-to-date: {tag}")
         # keep the hourly-refreshed hot surface warm (3-10h TTLs would decay)
-        warm = os.path.expanduser("~/bin/mirror-warm.py")
-        if os.path.exists(warm):
-            log_path = os.path.expanduser("~/logs/mirror-warm.log")
-            with open(log_path, "a") as lf:
-                subprocess.Popen([sys.executable, warm], stdout=lf, stderr=lf)
+        spawn_warm(full=False)
         return
     if os.path.islink(LIVE):
         done = sync_new(tag, assets)
