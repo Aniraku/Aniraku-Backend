@@ -22,6 +22,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 import urllib.request
 
@@ -178,6 +180,39 @@ def adopt(tag, assets):
     return True
 
 
+def restart_and_warm():
+    """Long cache TTLs (self-host tuning) mean stale pages would outlive the
+    data swap; restart the engine right after promotion (only on release-swap
+    days), then re-fill the hot surface in the background so first users hit
+    warm caches. Runs inside the hourly sync service, no sudo needed."""
+    try:
+        subprocess.run(["systemctl", "--user", "restart", "anilist-mirror.service"], check=True, timeout=90)
+    except Exception as ex:
+        print(f"engine restart failed: {ex}")
+        return
+    print("engine restarted after release swap")
+    for _ in range(30):
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:4401/",
+                data=b'{"query":"{ Page(perPage:1) { media(id:21) { id } } }"}',
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(req, timeout=5).read()
+            break
+        except Exception:
+            time.sleep(1)
+    warm = os.path.expanduser("~/bin/mirror-warm.py")
+    if os.path.exists(warm):
+        log_path = os.path.expanduser("~/logs/mirror-warm.log")
+        with open(log_path, "a") as lf:
+            subprocess.Popen(
+                [sys.executable, warm, "--full"],
+                stdout=lf, stderr=lf,
+            )
+        print(f"full warm sweep started in background (log: {log_path})")
+
+
 def main():
     os.makedirs(BASE, exist_ok=True)
     lock = open(os.path.join(BASE, ".lock"), "a+")
@@ -189,6 +224,12 @@ def main():
     tag, assets = latest_release()
     if tag == synced_tag() and manifest_tag(LIVE) == tag:
         print(f"up-to-date: {tag}")
+        # keep the hourly-refreshed hot surface warm (3-10h TTLs would decay)
+        warm = os.path.expanduser("~/bin/mirror-warm.py")
+        if os.path.exists(warm):
+            log_path = os.path.expanduser("~/logs/mirror-warm.log")
+            with open(log_path, "a") as lf:
+                subprocess.Popen([sys.executable, warm], stdout=lf, stderr=lf)
         return
     if os.path.islink(LIVE):
         done = sync_new(tag, assets)
@@ -199,6 +240,7 @@ def main():
     prune()
     json.dump({"tag": tag, "at": time.time()}, open(os.path.join(BASE, ".synced"), "w"))
     print(f"synced -> {tag}")
+    restart_and_warm()
 
 
 if __name__ == "__main__":
