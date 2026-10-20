@@ -512,20 +512,30 @@ func containsHentai(genres []string) bool {
 // direct > embed > dead), then provider order. No server is hidden — dead
 // providers simply contribute nothing.
 // genres is used to skip providers that should not serve certain content
+// collectorBudget: hard wall-clock ceiling for EVERY fan-out collector
+// (each provider + the downloads fetch). Cold /servers latency IS its
+// slowest collector, and "a cold fetch must land within seconds" is the
+// operator contract (2026-10-20: theuser-facing symptom that drove the
+// zoko gate and the tensho per-hop caps — a single tarpitted upstream
+// pinned the response at 20-85s). The budget does not discard partial
+// progress blindly: inner ops inherit this deadline, so a cut collector
+// returns whatever it managed to gather and logs its time for the next
+// culprit hunt. Slow-but-honest upstreams (animegg 3s, kaa multi-page)
+// comfortably finish inside it; a provider occasionally dropped for
+// exceeding it reappears the next round. Var so tests can shrink it.
+var collectorBudget = 10 * time.Second
+
 // (e.g. Anikoto is skipped for Hentai titles).
 func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) []core.Server {
 	if lang == "" {
 		lang = "sub"
 	}
 
-	// No hard cap on the whole fan-out. The response waits for the
-	// slowest collector to finish on its own — operators need EVERY
-	// provider in the list, and slow resolvers (Hana/animex regularly
-	// needs 30-35s) legitimately take that long. The total lifetime is
-	// still bounded upstream by the request context (90s in the handler,
-	// which also lifts the server-wide WriteTimeout), so a genuinely
-	// dead embed cannot hang forever — it just never gets cut for being
-	// merely slow.
+	// No hard cap on the whole fan-out beyond the handler's own request
+	// lifetime (90s in the handler, which also lifts the server-wide
+	// WriteTimeout): each collector below runs under collectorBudget, so
+	// the response bound is that ceiling rather than a dead upstream's
+	// client timeout.
 	ctx, cancel := context.WithTimeout(ctx, 85*time.Second)
 	defer cancel()
 
@@ -558,16 +568,14 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	var dmu sync.Mutex
 	collectorMs := map[string]int64{}
 
-	// No per-collector time limit. Every provider must appear in the
-	// list, and slow resolvers (Hana/animex regularly needs 30-35s)
-	// legitimately take that long — cutting them just made them vanish.
-	// The response waits for the slowest collector to finish on its own;
-	// each collector only bounds its OWN individual network calls, never
-	// the whole collector. Timing is still recorded per collector so the
-	// slowest one is measured, not guessed.
+	// Per-collector budget + timing, logged after the merge: the fan-out's
+	// response latency IS its slowest collector, so every round needs the
+	// culprit visible instead of guessed.
 	run := func(name string, fn func(context.Context) []core.Server) []core.Server {
 		start := time.Now()
-		out := fn(ctx)
+		bctx, cancel := context.WithTimeout(ctx, collectorBudget)
+		out := fn(bctx)
+		cancel()
 		ms := time.Since(start).Milliseconds()
 		dmu.Lock()
 		collectorMs[name] = ms
@@ -677,10 +685,10 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		func() {
 			// Runs alongside the provider fan-out (not after it): a slow
 			// provider must never starve the download fetch of context
-			// budget. Its own generous timeout bounds a true hang without
-			// cutting a slow-but-working download host.
+			// budget. Same collectorBudget as the providers — a download
+			// resolution above it cannot serve the app's UI in time.
 			start := time.Now()
-			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			actx, cancel := context.WithTimeout(ctx, collectorBudget)
 			adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
 			cancel()
 			dmu.Lock()
