@@ -60,8 +60,8 @@ var (
 	// live: "...EVoUFks-Y2loaDtQ...bT8-UlBXUFdSV19dX1k..."). Keeping the raw
 	// single-URL match as the fallback for older page shapes; the primary
 	// path parses the subtitles[] array (anixoSubsArrRe).
-	anixoVTTURLRe   = regexp.MustCompile(`"(https://anixo\.buzz/api/stream/vtt\?t=[A-Za-z0-9+/=_-]{16,})"`)
-	anixoSubsArrRe  = regexp.MustCompile(`"subtitles"\s*:\s*(\[[^\]]*\])`)
+	anixoVTTURLRe  = regexp.MustCompile(`"(https://anixo\.buzz/api/stream/vtt\?t=[A-Za-z0-9+/=_-]{16,})"`)
+	anixoSubsArrRe = regexp.MustCompile(`"subtitles"\s*:\s*(\[[^\]]*\])`)
 )
 
 // anixoSubtitleTrack mirrors one entry of the player page's subtitles[]

@@ -100,9 +100,9 @@ type KaaProvider struct {
 	anilistURL string
 	learnHost  func(host string)
 
-	mu     sync.Mutex
-	slugs  map[int]*kaaSlugEntry
-	bgWarm map[string]bool
+	mu       sync.Mutex
+	slugs    map[int]*kaaSlugEntry
+	bgWarm   map[string]bool
 	resolved map[kaaResolveKey]*kaaResolvedEntry
 }
 
@@ -173,14 +173,14 @@ func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider
 		anilistURL = core.AnilistGraphQLEndpoint()
 	}
 	return &KaaProvider{
-		log:        log,
+		log: log,
 		// DisableKeepAlives: from this egress the poison pattern is a
 		// reused connection that never answers (python fresh-conn probes
 		// to the same hosts answered 200 in <1s while the Go client sat
 		// out its full budget on keep-alive reuse — krussdomi 2026-10-20
 		// 12:33). kaa fetches are few per round, so per-request dials
 		// cost ~30ms and buy reliable reads.
-		client: kaaFreshConnClient(),
+		client:     kaaFreshConnClient(),
 		kaaBase:    strings.TrimRight(kaaBase, "/"),
 		anilistURL: anilistURL,
 		slugs:      make(map[int]*kaaSlugEntry),
