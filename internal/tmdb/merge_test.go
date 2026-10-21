@@ -59,7 +59,7 @@ func TestIsValidAniZipThumbnail(t *testing.T) {
 	}{
 		{"", false},
 		{"   ", false},
-		{"http://example.com/img.jpg", false}, // http rejected — https only
+		{"http://example.com/img.jpg", false}, // http rejected, https only
 		{"https://episodes.anizip.dev/abc.jpg", true},
 		{"https://image.tmdb.org/t/p/w780/x.jpg", true},
 		{"https://has space .com/x.jpg", false}, // whitespace rejected

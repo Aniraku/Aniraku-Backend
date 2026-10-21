@@ -6,7 +6,7 @@ import (
 
 // Request counters for the /api/v1/metrics snapshot. They live in the
 // middleware package (not api/v1) because the Logging middleware is the
-// instrumentation point and api/v1 imports middleware — keeping them here
+// instrumentation point and api/v1 imports middleware, keeping them here
 // avoids an import cycle. Counters are atomic: no lock on the hot path.
 var (
 	metricRequests2xx   atomic.Uint64

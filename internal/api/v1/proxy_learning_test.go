@@ -55,7 +55,7 @@ func TestUntrustedPlaylistCannotVouch(t *testing.T) {
 }
 
 // The segment CDN from the production logs (extension-less URLs on a
-// Bytedance host) must be learnable — those are real video segments, not
+// Bytedance host) must be learnable, those are real video segments, not
 // ads, despite the "ad-site-i18n" path segment.
 func TestExtensionLessSegmentHostLearnedFromTrustedPlaylist(t *testing.T) {
 	t.Cleanup(resetDynamicCDNEntries)

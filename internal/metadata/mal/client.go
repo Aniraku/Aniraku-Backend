@@ -1,4 +1,4 @@
-// ponytail: Jikan V4 client — MAL metadata, no auth, no rate limit hits (24h cache)
+// ponytail: Jikan V4 client, MAL metadata, no auth, no rate limit hits (24h cache)
 package mal
 
 import (
@@ -23,7 +23,7 @@ type Client struct {
 	log   zerolog.Logger
 	cache map[string]cacheEntry
 	mu    sync.RWMutex
-	// ponytail: global rate limiter — 3 req/sec burst, 60/min sustained
+	// ponytail: global rate limiter, 3 req/sec burst, 60/min sustained
 	// Jikan says cached responses don't count, so 24h cache means near-zero API calls
 	lastReq time.Time
 	reqMu   sync.Mutex
@@ -58,7 +58,7 @@ func (c *Client) set(key string, data any, ttl time.Duration) {
 	c.cache[key] = cacheEntry{data: data, expiresAt: time.Now().Add(ttl)}
 }
 
-// ponytail: rate limiter — wait 350ms between requests to stay under 3/sec
+// ponytail: rate limiter, wait 350ms between requests to stay under 3/sec
 func (c *Client) throttle() {
 	c.reqMu.Lock()
 	defer c.reqMu.Unlock()
@@ -93,7 +93,7 @@ func (c *Client) do(ctx context.Context, path string, out any) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusTooManyRequests {
-		// ponytail: Jikan rate limited — wait and retry once
+		// ponytail: Jikan rate limited, wait and retry once
 		time.Sleep(2 * time.Second)
 		resp.Body.Close()
 		req2, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -268,7 +268,7 @@ func mapAnime(j jikanAnime) anilist.Anime {
 		nat = &j.TitleJapanese
 	}
 
-	// cover image — prefer webp, fallback to jpg
+	// cover image, prefer webp, fallback to jpg
 	img := anilist.Image{}
 	if j.Images.Webp.LargeImageURL != "" {
 		img.ExtraLarge = j.Images.Webp.LargeImageURL
@@ -434,7 +434,7 @@ func (c *Client) Browse(ctx context.Context, filters anilist.BrowseFilters, page
 		return cached.(*anilist.BrowseResponse), nil
 	}
 
-	// ponytail: Jikan doesn't have a single browse endpoint — use search with filters
+	// ponytail: Jikan doesn't have a single browse endpoint, use search with filters
 	// Build query params
 	params := []string{fmt.Sprintf("page=%d", page), fmt.Sprintf("limit=%d", perPage)}
 
@@ -459,7 +459,7 @@ func (c *Client) Browse(ctx context.Context, filters anilist.BrowseFilters, page
 		params = append(params, fmt.Sprintf("start_date=%d-01-01", filters.Year))
 	}
 	if len(filters.Genre) > 0 {
-		// Jikan uses genre IDs, not names — use q for genre name search
+		// Jikan uses genre IDs, not names, use q for genre name search
 		params = append(params, fmt.Sprintf("q=%s", strings.Join(filters.Genre, " ")))
 	}
 
@@ -502,7 +502,7 @@ func (c *Client) GetRelations(ctx context.Context, id int) (*anilist.RelationsRe
 		return cached.(*anilist.RelationsResponse), nil
 	}
 
-	// ponytail: /anime/{id}/full already includes relations — fetch full and extract
+	// ponytail: /anime/{id}/full already includes relations, fetch full and extract
 	var resp jikanFullResponse
 	if err := c.do(ctx, fmt.Sprintf("/anime/%d/full", id), &resp); err != nil {
 		return nil, err
@@ -531,7 +531,7 @@ func (c *Client) GetRelations(ctx context.Context, id int) (*anilist.RelationsRe
 }
 
 func (c *Client) GetSimilar(ctx context.Context, id int, page, perPage int) (*anilist.BrowseResponse, error) {
-	// ponytail: Jikan has /anime/{id}/recommendations — use it
+	// ponytail: Jikan has /anime/{id}/recommendations, use it
 	cachev := fmt.Sprintf("similar:%d:%d:%d", id, page, perPage)
 	if cached, ok := c.get(cachev); ok {
 		return cached.(*anilist.BrowseResponse), nil
@@ -605,7 +605,7 @@ func (c *Client) GetGenres(ctx context.Context) ([]string, error) {
 }
 
 func (c *Client) BrowseAdult(ctx context.Context, page, perPage int) (*anilist.BrowseResponse, error) {
-	// ponytail: Jikan doesn't have NSFW filter — return empty
+	// ponytail: Jikan doesn't have NSFW filter, return empty
 	return &anilist.BrowseResponse{
 		Data: struct {
 			Page struct {
@@ -625,7 +625,7 @@ func (c *Client) BrowseAdult(ctx context.Context, page, perPage int) (*anilist.B
 }
 
 func (c *Client) GetSchedule(ctx context.Context, page, perPage int) (*anilist.BrowseResponse, error) {
-	// ponytail: Jikan has /schedules — use it
+	// ponytail: Jikan has /schedules, use it
 	cachev := fmt.Sprintf("schedule:%d:%d", page, perPage)
 	if cached, ok := c.get(cachev); ok {
 		return cached.(*anilist.BrowseResponse), nil

@@ -220,18 +220,18 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// Hard total budget for every upstream stage below. The stages run
 	// serially (AniZip + AniList + count fallbacks + TMDB resolve + cover),
-	// each with its own 15–50s timeout — summed they can exceed the server's
+	// each with its own 15–50s timeout, summed they can exceed the server's
 	// 60s WriteTimeout, at which point the connection is killed before a
 	// single byte is written and the browser sees ERR_TIMED_OUT with zero
 	// log lines (production incident: /anime/21/episodes hung >180s while
 	// /health answered in 5ms on the same port). 45s bounds the whole chain
-	// under 60s so the handler ALWAYS answers — partial data beats a dead
+	// under 60s so the handler ALWAYS answers, partial data beats a dead
 	// connection.
 	ctx, cancel := context.WithTimeout(r.Context(), 45*time.Second)
 	defer cancel()
 
 	// Cumulative stage marks, logged once (Warn) only when the total passes
-	// slowThreshold — so the next slow incident names the guilty stage
+	// slowThreshold, so the next slow incident names the guilty stage
 	// instead of leaving no trace at all.
 	const slowThreshold = 5 * time.Second
 	started := time.Now()
@@ -240,7 +240,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&stages, "%s=%dms ", name, time.Since(started).Milliseconds())
 	}
 
-	// AniList metadata and the AniZip episode map are independent sources —
+	// AniList metadata and the AniZip episode map are independent sources,
 	// fetch AniZip concurrently so the AniList round trip never serializes
 	// in front of it. The channel close gives the happens-before edge: the
 	// write to anizipData is visible after <-anizipDone below.
@@ -287,7 +287,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		episodeCount = int(eps)
 	} else {
 		// Airing shows often have episodes:null and nextAiringEpisode only
-		// counts what has AIRED (1 of 12) — the verified AniBridge mapping
+		// counts what has AIRED (1 of 12), the verified AniBridge mapping
 		// ranges carry the full cour length, so consult them first.
 		if abMax := tmdb.AnibridgeMaxEpisode(ctx, h.httpClient, anilistID); abMax > episodeCount {
 			episodeCount = abMax
@@ -306,7 +306,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// AniList outages (or titles with unknown counts) leave episodeCount at
 	// 0, which collapses this response to an empty list even though AniZip
-	// carries the full episode map — derive the count from AniZip instead of
+	// carries the full episode map, derive the count from AniZip instead of
 	// returning nothing. Hentai often returns episodes:{} from AniZip, so fall
 	// back to AniBridge verified mapping ranges (e.g. anilist:368 "1-6" -> 6).
 	// Anisearch titles are fetched once here and reused below for titles.
@@ -359,7 +359,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TMDB resolve and the AniZip cover lookup are independent once the
-	// episode count is known — run them concurrently so a slow TMDB resolve
+	// episode count is known, run them concurrently so a slow TMDB resolve
 	// no longer serializes the cover fallback behind it. The channel close
 	// gives the happens-before edge for the coverFallback write.
 	episodeNumbers := make([]int, episodeCount)
@@ -379,7 +379,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	tmdbByNumber := tmdb.GetCachedEpisodes(anilistID, episodeNumbers)
 	if tmdbByNumber == nil {
-		// Cache miss — fetch TMDB with a generous timeout (blocks until
+		// Cache miss, fetch TMDB with a generous timeout (blocks until
 		// done), but still derived from the handler's total 45s budget so
 		// the chain can never outlive the server's 60s WriteTimeout.
 		tmdbByNumber = map[int]*tmdb.EpisodeMetadata{}
@@ -395,11 +395,11 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			// Only cache non-empty results; caching an empty map poisons
 			// hentai titles for 30min when TMDB is briefly unreachable.
 			if len(tmdbByNumber) > 0 {
-				// 2026-10-17 crash fix: handing the handler's map to the
+				// Crash fix: handing the handler's map to the
 				// cache aliased it as entry.episodes (setCachedEpisodes
 				// stores data by reference on first write), so a later
-				// merge — background EnrichInBackground's
-				// entry.episodes[k]=v — mutated it WHILE this handler
+				// merge, background EnrichInBackground's
+				// entry.episodes[k]=v, mutated it WHILE this handler
 				// kept reading it unlocked in the merge loop below:
 				// "fatal error: concurrent map read and map write",
 				// GetEpisodes catalog.go:472 (03:48 UTC). Cache a copy;
@@ -431,7 +431,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// Anisearch episode titles (last resort): only when AniZip + TMDB both
 	// have nothing for this anime. Thumbnails intentionally stay the anime
-	// poster (coverFallback) per product decision — Anisearch ships a generic
+	// poster (coverFallback) per product decision, Anisearch ships a generic
 	// placeholder cover for adult titles. Reuses the fetch from the count
 	// stage above when available. Skipped for unreleased shows: Anisearch
 	// indexes released episodes only, so the 15s fetch would always return
@@ -463,7 +463,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		// Thumbnails are validated before use: junk URLs previously flowed
 		// straight to clients as broken images. TMDB stills win (verified
 		// image.tmdb.org stills), else AniZip art, else the anime poster
-		// (coverFallback) applied below — never an Anisearch placeholder.
+		// (coverFallback) applied below, never an Anisearch placeholder.
 		if asiEp, ok := anisearchEps[epNum]; ok && asiEp != nil {
 			if cur, _ := ep["title"].(string); !tmdb.IsPublishedTitle(cur) && tmdb.IsPublishedTitle(asiEp.Title) {
 				ep["title"] = asiEp.Title
@@ -861,7 +861,7 @@ func (h *Handlers) browseAniList(ctx context.Context, filters anilist.BrowseFilt
 	variables["sort"] = sort
 
 	// Build cache key from all filter parameters. The filter slices are
-	// optional (a bare /browse call has none) — never index them without a
+	// optional (a bare /browse call has none), never index them without a
 	// length check, or the request panics into a 500 on every filter-less
 	// page load.
 	first := func(s []string) string {

@@ -52,7 +52,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		return chimw.Compress(5, "application/json", "text/plain")(next)
 	}
 
-	// ponytail: 30 req/s per IP with burst of 60 — enough for normal browsing,
+	// ponytail: 30 req/s per IP with burst of 60, enough for normal browsing,
 	// prevents abuse that causes AniList 502s. Overridable via env for
 	// deployments with different traffic profiles.
 	rl := middleware.NewRateLimiter(
@@ -144,7 +144,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 	})
 
 	// Admin-only endpoints. RequireAdmin re-verifies the user's role against
-	// Supabase server-side — the client can never gate itself into /admin.
+	// Supabase server-side, the client can never gate itself into /admin.
 	r.Group(func(r chi.Router) {
 		r.Use(rl.Middleware)
 		r.Use(jsonCompress)
@@ -162,7 +162,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		}
 	})
 
-	// Pure API backend — no embedded UI. Unknown paths answer JSON 404 so
+	// Pure API backend, no embedded UI. Unknown paths answer JSON 404 so
 	// clients never receive an HTML page (the old web-tagged build served
 	// the API-docs GUI from a /* catch-all, which masked missing routes as
 	// 200 HTML and bloated the binary with the static assets).

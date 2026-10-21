@@ -69,7 +69,7 @@ func TestWantExportStatus(t *testing.T) {
 		}
 	}
 	// Watch-derived: finished → COMPLETED, mid-series → CURRENT,
-	// favorited but never watched → PLANNING (never CURRENT — that
+	// favorited but never watched → PLANNING (never CURRENT, that
 	// rewrote MAL plan_to_watch entries to watching).
 	if got := wantExportStatus("", watched, true); got != listCompleted {
 		t.Errorf("wantExportStatus(unknown, watched, done) = %q, want COMPLETED", got)
@@ -124,7 +124,7 @@ func TestExportCompletedUnchanged(t *testing.T) {
 	}
 	// Unknown total: only a series AniList says has ENDED may complete,
 	// and only with the newest row fully watched. Airing shows carry
-	// episodes: null — the old rule ("newest row full → completed") was
+	// episodes: null, the old rule ("newest row full → completed") was
 	// mass-marking the seasonal watch list COMPLETED on export.
 	if !exportCompleted(animeWatchProgress{Episode: 6, MaxRow: 6, Progress: 1440, Completed: true}, 0, true) {
 		t.Error("ended series, all rows full, unknown total should be completed")

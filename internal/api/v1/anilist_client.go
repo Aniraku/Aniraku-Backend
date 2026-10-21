@@ -80,7 +80,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 	client := h.h2Client
 	if strings.HasPrefix(endpoint, "http:") {
 		// The collocated mirror override (ANIRAKU_GRAPHQL_URL) is plain
-		// HTTP/1.1 — node serves no cleartext h2, so the h2-only client
+		// HTTP/1.1, node serves no cleartext h2, so the h2-only client
 		// would refuse it ("unencrypted HTTP/2 not enabled") and open
 		// the circuit for everything after. Plaintext endpoints ride
 		// the regular guarded transport instead; the loopback hop
@@ -102,7 +102,7 @@ func newAnilistClient(h *Handlers) *anilistClient {
 		// 30 req/min per IP (down from 90). The old 0.9/s refill
 		// (~54/min) tripped 429s on every fast scroll; each 429 then
 		// burned blind 1/2/3s retries inside AniList's 60s ban window
-		// while queued requests piled up behind them — minutes of felt
+		// while queued requests piled up behind them, minutes of felt
 		// slowness from a fast page load. A page load fires ~10-15
 		// parallel queries; the burst absorbs that, the refill keeps us
 		// under the ceiling.

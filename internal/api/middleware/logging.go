@@ -40,7 +40,7 @@ func Logging(log zerolog.Logger) func(http.Handler) http.Handler {
 
 			RecordRequestStatus(wrapped.status)
 
-			// The media proxy answers every HLS segment fetch — during
+			// The media proxy answers every HLS segment fetch, during
 			// playback it is the overwhelming majority of requests, and
 			// every line carries the same path ("/api/v1/proxy"), so
 			// production logged ~65MB/h of near-identical entries in the

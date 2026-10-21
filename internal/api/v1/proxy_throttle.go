@@ -7,16 +7,16 @@ import (
 	"time"
 )
 
-// Emergency origin-egress shaping (ordered 2026-10-14, expires ~2026-10-17).
+// Emergency origin-egress shaping (temporary; review schedule in docs/ops-notes.md).
 //
 // Azure bills every byte the origin serves, and Cloudflare only absorbs
-// repeat pulls — first views always come from this box. While the throttle
+// repeat pulls, first views always come from this box. While the throttle
 // env is set, large proxy bodies pace to that rate after a small burst:
 // players' ABR measures the slower fill and settles ~one rung lower on its
 // own. No URL, header, or status semantics change; small bodies (errors,
 // playlists, subtitles, keys) fit inside the burst and pass at full speed,
 // so provider-fallback chains and channel switching stay fast. Edge HITs
-// are unaffected (full Cloudflare speed) — only origin fills are slowed.
+// are unaffected (full Cloudflare speed), only origin fills are slowed.
 //
 // Revert: unset ANIRAKU_PROXY_SHAPE_BPS and restart (or delete this file
 // and the two shaping call sites).

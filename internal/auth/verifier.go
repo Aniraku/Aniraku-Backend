@@ -61,7 +61,7 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string) (string, error) 
 		return "", fmt.Errorf("invalid token claims")
 	}
 
-	// Verify audience — exact match only, not substring.
+	// Audience: exact match only, not substring.
 	// A missing aud claim is rejected: treating it as "no audience to check"
 	// let any validly-signed token from the issuer through.
 	if v.aud != "" {
@@ -85,7 +85,7 @@ func (v *Verifier) Verify(ctx context.Context, rawToken string) (string, error) 
 		return "", fmt.Errorf("invalid issuer: expected %s, got %s", v.issuer, claims.Issuer)
 	}
 
-	// Verify expiry — reject tokens without expiry
+	// Expiry: reject tokens without expiry
 	if claims.ExpiresAt == nil {
 		return "", fmt.Errorf("token has no expiry claim")
 	}

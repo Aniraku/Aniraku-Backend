@@ -25,7 +25,7 @@ func TestFoldWatchRowsFinishedCount(t *testing.T) {
 
 	got := acc[7]
 	// Episode must be the highest FINISHED episode (3), not the highest
-	// opened one (4) — this is the number MAL/AniList store as watched.
+	// opened one (4), this is the number MAL/AniList store as watched.
 	if got.Episode != 3 {
 		t.Errorf("anime 7 Episode = %d, want 3 (finished count, not opened count)", got.Episode)
 	}
@@ -74,7 +74,7 @@ func TestFoldWatchRowsOrderIndependent(t *testing.T) {
 
 func TestFoldWatchRowsAcrossPages(t *testing.T) {
 	// The paged fetch folds page after page into one map; a title's rows
-	// can span a page boundary. 95% of 1440 = 1368 exactly — that row
+	// can span a page boundary. 95% of 1440 = 1368 exactly, that row
 	// counts as finished (>=, not >), one second less does not, and the
 	// unfinished rows at the top must not become the watched count.
 	page1 := []watchHistoryRow{
@@ -126,7 +126,7 @@ func TestWatchHistoryPath(t *testing.T) {
 
 func TestExportCompletedFinishedCount(t *testing.T) {
 	// total known: every episode finished, even with a half-opened row
-	// above the total — still completed.
+	// above the total, still completed.
 	if !exportCompleted(animeWatchProgress{Episode: 12, MaxRow: 13, Completed: false}, 12, false) {
 		t.Error("12 finished of 12 with a partial row above = want completed")
 	}
@@ -163,7 +163,7 @@ func TestFoldWatchRowsRealEpisode(t *testing.T) {
 	if acc[7].Episode != 3 {
 		t.Errorf("anime 7 Episode = %d, want 3", acc[7].Episode)
 	}
-	// Only the real player row counts as evidence — synthetic rows are
+	// Only the real player row counts as evidence, synthetic rows are
 	// provider mirrors and may never raise a provider's count.
 	if acc[7].RealEpisode != 3 {
 		t.Errorf("anime 7 RealEpisode = %d, want 3 (synthetic 1-2 excluded)", acc[7].RealEpisode)
@@ -174,7 +174,7 @@ func TestFoldWatchRowsRealEpisode(t *testing.T) {
 }
 
 func TestExportProgress(t *testing.T) {
-	// PLANNING always pushes 0 — the plan_to_watch-with-full-progress fix.
+	// PLANNING always pushes 0, the plan_to_watch-with-full-progress fix.
 	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12}, listPlanning, 12); num != 0 || !write {
 		t.Errorf("PLANNING with claimed rows = (%d, %v), want (0, true)", num, write)
 	}
@@ -191,7 +191,7 @@ func TestExportProgress(t *testing.T) {
 	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12, RealEpisode: 0}, "", 6); num != 6 || write {
 		t.Errorf("synthetic-only claim over provider = (%d, %v), want (6, false)", num, write)
 	}
-	// Real player evidence above the provider raises — capped at the real
+	// Real player evidence above the provider raises, capped at the real
 	// evidence, never at the synthetic claim.
 	if num, write := exportProgress(animeWatchProgress{Episode: 12, MaxRow: 12, RealEpisode: 8}, "", 6); num != 8 || !write {
 		t.Errorf("real evidence raise = (%d, %v), want (8, true)", num, write)

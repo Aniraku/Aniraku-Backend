@@ -8,7 +8,7 @@ import (
 // TestControlPrivateBridgeAllowlist walks the exact-address exception that
 // lets the backend reach deliberately collocated services (the self-hosted
 // AniList mirror) through the dialer guard: the listed ip:port passes, every
-// other private address — even the same host on a neighboring port — stays
+// other private address, even the same host on a neighboring port, stays
 // blocked, which is what keeps redirects and rebinding attempts inert.
 // Membership in the exception list and the Control verdict are separate
 // axes: a public address dials because IsPublicIP says so, not because any

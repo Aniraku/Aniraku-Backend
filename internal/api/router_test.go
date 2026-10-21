@@ -135,7 +135,7 @@ func TestRouterAuthRequiredWithValidToken(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/favorites", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	// Supabase request would fail (fake has no /rest/v1/favorites with data),
-	// but the auth chain itself must pass — a 404/502 from the fake backend
+	// but the auth chain itself must pass, a 404/502 from the fake backend
 	// proves authentication succeeded.
 	resp, err := srv.Client().Do(req)
 	if err != nil {

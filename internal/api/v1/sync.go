@@ -28,7 +28,7 @@ import (
 //   1. Frontend (logged-in) asks GET /api/v1/sync/{provider}/authorize.
 //      The backend builds the provider OAuth URL (PKCE, signed state) and
 //      remembers the pending handshake in memory.
-//   2. Provider redirects the browser to the registered redirect URI —
+//   2. Provider redirects the browser to the registered redirect URI,
 //      the frontend's /sync/callback route (never the backend).
 //   3. The frontend POSTs {code, state} to /api/v1/sync/{provider}/callback
 //      with the user's Supabase JWT. The backend exchanges the code for
@@ -249,8 +249,8 @@ func (h *Handlers) SyncCallback(w http.ResponseWriter, r *http.Request) {
 
 // SyncCallbackGeneric is like SyncCallback but resolves the provider from
 // the pending OAuth state instead of the URL path. MAL / AniList redirect
-// back to the registered URI with only ?code= and ?state= — there is no
-// provider in the URL — so the callback page cannot know which provider
+// back to the registered URI with only ?code= and ?state=, there is no
+// provider in the URL, so the callback page cannot know which provider
 // it came from. The pending-state map (keyed by state, bound to a user)
 // already stores the provider, making the path parameter redundant.
 func (h *Handlers) SyncCallbackGeneric(w http.ResponseWriter, r *http.Request) {
@@ -273,7 +273,7 @@ func (h *Handlers) SyncCallbackGeneric(w http.ResponseWriter, r *http.Request) {
 
 	pendingRaw, ok := h.syncPending.Load(input.State)
 	if !ok {
-		h.respondError(w, http.StatusBadRequest, "invalid or expired OAuth state — start over")
+		h.respondError(w, http.StatusBadRequest, "invalid or expired OAuth state, start over")
 		return
 	}
 	pending, ok := pendingRaw.(*pendingOAuth)
@@ -309,7 +309,7 @@ func (h *Handlers) completeOAuthExchange(w http.ResponseWriter, r *http.Request,
 	// Validate the state: must exist, match this user/provider, and be fresh.
 	pendingRaw, ok := h.syncPending.Load(input.State)
 	if !ok {
-		h.respondError(w, http.StatusBadRequest, "invalid or expired OAuth state — start over")
+		h.respondError(w, http.StatusBadRequest, "invalid or expired OAuth state, start over")
 		return
 	}
 	pending, ok := pendingRaw.(*pendingOAuth)
@@ -319,7 +319,7 @@ func (h *Handlers) completeOAuthExchange(w http.ResponseWriter, r *http.Request,
 	}
 	if time.Now().After(pending.expiresAt) {
 		h.syncPending.Delete(input.State)
-		h.respondError(w, http.StatusBadRequest, "OAuth state expired — try again")
+		h.respondError(w, http.StatusBadRequest, "OAuth state expired, try again")
 		return
 	}
 	defer h.syncPending.Delete(input.State)
@@ -335,7 +335,7 @@ func (h *Handlers) completeOAuthExchange(w http.ResponseWriter, r *http.Request,
 	}
 	if err != nil {
 		h.log.Warn().Err(err).Str("provider", provider).Msg("sync token exchange failed")
-		h.respondError(w, http.StatusBadGateway, fmt.Sprintf("%s rejected the authorization code — %s", strings.ToUpper(provider), scrubSensitive(err.Error(), h.cfg)))
+		h.respondError(w, http.StatusBadGateway, fmt.Sprintf("%s rejected the authorization code, %s", strings.ToUpper(provider), scrubSensitive(err.Error(), h.cfg)))
 		return
 	}
 
@@ -390,7 +390,7 @@ func (h *Handlers) SyncDisconnect(w http.ResponseWriter, r *http.Request) {
 }
 
 // SyncUpdate pushes watch progress to a connected provider. If the access
-// token is stale it is refreshed first. Failures never break playback —
+// token is stale it is refreshed first. Failures never break playback,
 // the frontend treats any non-2xx as "skip".
 func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 	userID := auth.GetUserID(r.Context())
@@ -433,7 +433,7 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	token, ok := tokens[input.Provider]
 	if !ok || token.AccessToken == "" {
-		h.respondError(w, http.StatusNotFound, "provider not connected — reconnect from Settings")
+		h.respondError(w, http.StatusNotFound, "provider not connected, reconnect from Settings")
 		return
 	}
 
@@ -448,7 +448,7 @@ func (h *Handlers) SyncUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync token refresh failed")
-			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
+			h.respondError(w, http.StatusUnauthorized, "sync session expired, reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
 			return
 		}
 		token = refreshed
@@ -744,7 +744,7 @@ func (h *Handlers) anilistTokenRequest(ctx context.Context, form url.Values) (*o
 	return &tok, nil
 }
 
-// Viewer read with the user's token — official API only (the offline
+// Viewer read with the user's token, official API only (the offline
 // mirror carries no user data).
 func (h *Handlers) fetchAniListUsername(ctx context.Context, accessToken string) (string, error) {
 	query := `query { Viewer { name } }`
@@ -864,7 +864,7 @@ func (h *Handlers) SyncScore(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			h.log.Warn().Err(err).Str("provider", input.Provider).Msg("sync score token refresh failed")
-			h.respondError(w, http.StatusUnauthorized, "sync session expired — reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
+			h.respondError(w, http.StatusUnauthorized, "sync session expired, reconnect from Settings ("+truncate([]byte(err.Error()), 200)+")")
 			return
 		}
 		token = refreshed

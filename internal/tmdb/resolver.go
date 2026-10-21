@@ -53,22 +53,22 @@ const episodeCacheTTL = 30 * time.Minute
 
 // maxEpisodeCacheEntries bounds the per-anime episode cache: without a cap
 // every anime ever browsed keeps its episode map for the process lifetime.
-// Eviction only drops expired entries (identical to a TTL miss — the caller
+// Eviction only drops expired entries (identical to a TTL miss, the caller
 // just refetches) or, over the cap, the stalest entry first.
 const maxEpisodeCacheEntries = 2000
 
 // entryLockWaitMax bounds every wait on an episode-cache entry lock.
 // Normal critical sections (map read/merge) last microseconds; if a lock
 // cannot be acquired within this budget, something is wrong and the caller
-// must degrade (cache miss / dropped write) instead of blocking — a request
+// must degrade (cache miss / dropped write) instead of blocking, a request
 // path that waits on a mutex with no deadline can hang forever, ignoring
 // every context timeout above it. This is the hard guarantee behind the
-// 2026-09-27 deadlock fix: the episodes endpoint stays alive even if an
+// Deadlock fix: the episodes endpoint stays alive even if an
 // entry lock ever wedges again.
 const entryLockWaitMax = 50 * time.Millisecond
 
 // lockEntryW acquires the entry write lock with a deadline. False means
-// "skip the write" — dropping a cache write is always safe (the data is
+// "skip the write", dropping a cache write is always safe (the data is
 // derived and refetchable), hanging a request is never acceptable.
 func lockEntryW(entry *episodeCacheEntry) bool {
 	waitUntil := time.Now().Add(entryLockWaitMax)
@@ -84,7 +84,7 @@ func lockEntryW(entry *episodeCacheEntry) bool {
 }
 
 // lockEntryR acquires the entry read lock with a deadline. False means
-// "treat as cache miss" — the handler refetches upstream (slow for one
+// "treat as cache miss", the handler refetches upstream (slow for one
 // anime, but alive), instead of blocking on a wedged lock.
 func lockEntryR(entry *episodeCacheEntry) bool {
 	waitUntil := time.Now().Add(entryLockWaitMax)
@@ -154,7 +154,7 @@ func setCachedEpisodes(anilistID int, data map[int]*EpisodeMetadata) {
 	entry.fetchedAt = time.Now()
 	entry.mu.Unlock()
 	// Eviction runs AFTER the entry lock is released. Calling it under the
-	// lock was the 2026-09-27 production deadlock: the Range callback takes
+	// lock was the production deadlock: the Range callback takes
 	// each entry's RLock, including the one this goroutine already
 	// write-locks (Go's RWMutex is not reentrant), permanently poisoning
 	// the entry and cascading through every later cache write.
@@ -181,7 +181,7 @@ func evictEpisodeCacheIfNeeded() {
 		// Never block the eviction scan on an entry lock: a locked entry
 		// is in active use (hence fresh), so count it as fresh and move
 		// on. Blocking here is what turned one wedged entry into a
-		// cache-wide cascade on 2026-09-27.
+		// cache-wide cascade.
 		if !entry.mu.TryRLock() {
 			count++
 			return true
@@ -321,7 +321,7 @@ func cached(key string, ttl time.Duration, loader func() (any, error)) (any, err
 
 // maxResponseCacheEntries bounds the generic loader cache: expired keys are
 // only deleted when re-read, so entries nobody asks for again would
-// otherwise live for the process lifetime. Eviction is behavior-preserving —
+// otherwise live for the process lifetime. Eviction is behavior-preserving,
 // a dropped entry is just a cache miss and the loader re-runs.
 const maxResponseCacheEntries = 5000
 
@@ -1089,7 +1089,7 @@ func toTmdbEpisodeMetadata(entry map[string]any, anilistNumber, tmdbNumber int) 
 	}
 	name, _ := entry["name"].(string)
 	// Placeholder names ("Episode 3") must never reach clients as titles,
-	// but the entry itself still carries real air date / overview / still —
+	// but the entry itself still carries real air date / overview / still,
 	// keep those and blank the title so the handler's generic title shows.
 	if !isPublishedTitle(name) {
 		name = ""
@@ -1209,7 +1209,7 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 	// carries nested identity ranges (anilist:{id} -> mal:{id} -> ranges)
 	// for newly-verified shows, but no TMDB id. Verified Fribb is tried
 	// first below; if that yields nothing, chain the nested ranges with a
-	// TMDB title search for the show id — no MAL/Jikan lookup involved.
+	// TMDB title search for the show id, no MAL/Jikan lookup involved.
 	titleFallback := func() {
 		if len(mappings) > 0 || title == "" {
 			return
@@ -1294,7 +1294,7 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 	// map to many TMDB seasons (One Piece: ~20). Sequential fetching made
 	// cold episode lists take 10s+ (20+ HTTP round trips in a row), so fetch
 	// them through a bounded worker pool, then verify/merge deterministically
-	// below — same output, same error semantics, a fraction of the latency.
+	// below, same output, same error semantics, a fraction of the latency.
 	type seasonResult struct {
 		mapping tmdbMapping
 		season  map[string]any // tv
@@ -1384,7 +1384,7 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 		}
 		g.targetNumbers[*m.TmdbNumber] = true
 	}
-	// Continuation groups are independent of each other — fetched through
+	// Continuation groups are independent of each other, fetched through
 	// the shared worker pool; within a group, seasons are also fetched
 	// concurrently (see below).
 	if len(contGroups) > 0 {
@@ -1409,12 +1409,12 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 					pending[k] = true
 				}
 				seasonNums := continuationSeasonNumbers(show, g.afterSeasonNumber)
-				// Seasons within a continuation group are independent —
+				// Seasons within a continuation group are independent,
 				// fetch them through the shared worker pool instead of one
 				// after another. The sequential early-exit saved a few
 				// requests but cost seconds on long-running shows; the 24h
 				// season cache absorbs the extra fetches. No semaphore is
-				// taken at group level — only the inner fetches acquire
+				// taken at group level, only the inner fetches acquire
 				// slots, so nesting can never deadlock the pool.
 				seasonResults := make([]map[string]any, len(seasonNums))
 				var innerWg sync.WaitGroup

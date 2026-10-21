@@ -1738,7 +1738,7 @@ func (m *Manager) collectAnixoServers(ctx context.Context, anilistID string, epi
 	return out
 }
 
-// verifyMegaVidLang enforces the operator language rule: megavid sometimes
+// verifyMegaVidLang enforces a language audit: megavid sometimes
 // serves the opposite audio for the requested lang. Three layers, first
 // decisive signal wins per source:
 //

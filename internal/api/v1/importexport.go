@@ -24,18 +24,18 @@ import (
 //	import = pull provider list → Aniraku bookmarks + watch_history +
 //	         episode_ratings (progress, status and scores are merged in:
 //	         provider episodes advance Aniraku's max episode and RECONCILE
-//	         import-synthesized rows down to the provider's count — a
-//	         re-import makes local progress exactly match the source —
+//	         import-synthesized rows down to the provider's count, a
+//	         re-import makes local progress exactly match the source,
 //	         provider scores only fill titles with no local ratings)
 //	export = push Aniraku favorites → provider library, writing progress
 //	         (num_watched_episodes), list status (all six AniList states:
-//	         CURRENT/PLANNING/COMPLETED/PAUSED/DROPPED/REPEATING — MAL's
+//	         CURRENT/PLANNING/COMPLETED/PAUSED/DROPPED/REPEATING, MAL's
 //	         closest mapping) and score in a single per-title write.
 //
 // Statuses live on the bookmark row (`status` column, canonical
 // uppercase): import persists the provider's status per title, local
 // watch events advance it (PLANNING → CURRENT → COMPLETED, post-
-// completion watches → REPEATING), and export writes it back — so a
+// completion watches → REPEATING), and export writes it back, so a
 // round trip preserves the user's list phases exactly. Rows predating
 // the column fall back to the legacy derivation (completed from watch
 // history, else watching/CURRENT).
@@ -51,8 +51,8 @@ const (
 	// synthesis: one POST carries up to 500 rows and a single import may
 	// create up to 8000. The old 2000-row budget was smaller than one
 	// large title plus a modest list (One Piece alone is ~1100 rows), so
-	// the whole-loop break starved the remaining titles — in random map
-	// order — of episode progress AND scores. Budget exhaustion now only
+	// the whole-loop break starved the remaining titles, in random map
+	// order, of episode progress AND scores. Budget exhaustion now only
 	// stops row synthesis; every title still gets its score processed,
 	// and a re-run continues from each title's real local max.
 	importWatchBatch   = 500
@@ -62,14 +62,14 @@ const (
 	// URL far under header limits) per page, watchPageSize rows a page,
 	// paged with a cursor until a page comes back empty. Supabase clamps
 	// any single response, and the old shared timestamp-descending window
-	// silently dropped every title outside it — those titles then exported
+	// silently dropped every title outside it, those titles then exported
 	// progress 0 and never advanced the provider.
 	watchPageSize  = 1000
 	watchIDChunk   = 400
 	exportWriteCap = 60 // max provider writes per export (bounds request time)
 	// exportTimeBudget hard-stops an export's write loop so the JSON
 	// response is always on its way well before nginx's 180s
-	// proxy_read_timeout — the write deadline is lifted for these routes
+	// proxy_read_timeout, the write deadline is lifted for these routes
 	// (see liftExportWriteDeadline), so the loop is the only thing still
 	// bounding the request. Past the budget the handler responds with
 	// limited=true and the client re-runs to continue where it left off.
@@ -78,7 +78,7 @@ const (
 	// AniList now enforces 30 req/min per token/IP. Exports stay at 10
 	// requests/min (one request every 6s, 3x headroom under the ceiling)
 	// with up to exportAniListBatchSize title mutations packed into each
-	// write request via GraphQL aliases — up to ~100 titles/min of
+	// write request via GraphQL aliases, up to ~100 titles/min of
 	// throughput while spending only 10 req/min of the budget.
 	exportAniListRequestInterval = 6 * time.Second
 	exportAniListBatchSize       = 10
@@ -94,7 +94,7 @@ func (h *Handlers) requireProviderToken(ctx context.Context, userID, provider st
 	}
 	token, ok := tokens[provider]
 	if !ok || token.AccessToken == "" {
-		return syncProviderToken{}, fmt.Errorf("%s is not connected — connect it in Settings first", provider)
+		return syncProviderToken{}, fmt.Errorf("%s is not connected, connect it in Settings first", provider)
 	}
 
 	// Refresh when the token is within 5 minutes of expiring or already stale.
@@ -224,7 +224,7 @@ func normalizeAniListStatus(s string) string {
 }
 
 // statusForMAL maps a canonical status to the MAL my_list_status value
-// (MAL has no rewatching flag — REPEATING rides as `watching` with the
+// (MAL has no rewatching flag, REPEATING rides as `watching` with the
 // episode progress intact).
 func statusForMAL(status string) string {
 	switch status {
@@ -271,7 +271,7 @@ func anilistScoreToTen(score float64, format string) int {
 
 // animeWatchProgress is the per-title fold of a user's watch_history rows.
 type animeWatchProgress struct {
-	Episode     int  // highest FINISHED episode — the count MAL/AniList store as watched
+	Episode     int  // highest FINISHED episode, the count MAL/AniList store as watched
 	Progress    int  // seconds watched on the newest row (display/debug)
 	Completed   bool // the newest row itself was fully watched
 	MaxRow      int  // highest episode row present, finished or not (import merge guard)
@@ -352,7 +352,7 @@ func (h *Handlers) fetchMediaMeta(ctx context.Context, anilistIDs []int) (map[in
 
 // insertBookmarks upserts bookmark rows with their canonical list status
 // and known episode total. Projects predating the `status` /
-// `total_episodes` columns answer the first write with a column error —
+// `total_episodes` columns answer the first write with a column error,
 // fall back to the legacy shape so import still lands (statuses apply on
 // the next import after the column migration).
 func (h *Handlers) insertBookmarks(ctx context.Context, userID string, ids []int, meta map[int]mediaMeta, statuses map[int]string) (int, error) {
@@ -477,7 +477,7 @@ func (h *Handlers) loadUserFavorites(ctx context.Context, userID string) ([]int,
 // stored episode total per anime. The totals give exports a fallback when
 // the live AniList meta has none (episodes: null on airing shows).
 // Unknown rows (and projects predating the `status` / `total_episodes`
-// columns) are absent — callers fall back to watch-derived targeting.
+// columns) are absent, callers fall back to watch-derived targeting.
 // Never fails the export: schema errors yield empty maps.
 func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) (map[int]string, map[int]int) {
 	resp, err := h.supabaseRequest(ctx, "GET",
@@ -518,7 +518,7 @@ func (h *Handlers) loadUserBookmarkStatus(ctx context.Context, userID string) (m
 // evidence (never watched, no stored status) should be re-planned instead
 // of skipped: "watching with zero episodes" is the exact artifact old
 // Aniraku exports left on every favorited title (status watching, episode
-// count omitted) — watching-through always carries at least episode 1.
+// count omitted), watching-through always carries at least episode 1.
 func noEvidencePlanningFix(remoteStatus string, remoteProgress int, wantStatus string) bool {
 	return remoteStatus == listCurrent && remoteProgress == 0 && wantStatus == listPlanning
 }
@@ -530,10 +530,10 @@ func noEvidencePlanningFix(remoteStatus string, remoteProgress int, wantStatus s
 //     so a provider carrying a count on a planning entry is stale export
 //     damage (the plan_to_watch-with-full-progress artifact).
 //   - No local rows, or rows but nothing finished: Aniraku has no finished
-//     evidence — keep the provider's own progress untouched (write=false).
+//     evidence, keep the provider's own progress untouched (write=false).
 //   - Local count above the provider's: only REAL player evidence may RAISE
 //     a provider. Import-synthesized rows are mirrors of whatever the
-//     provider said once — pushing them back up would re-inflate a
+//     provider said once, pushing them back up would re-inflate a
 //     provider that is now correct (the 12/12-over-your-correct-6 bug).
 //   - Otherwise the local count stands: a reconciled import makes local
 //     history the curated truth, which is how a corrupted provider count
@@ -555,7 +555,7 @@ func exportProgress(state animeWatchProgress, stored string, remote int) (num in
 }
 
 // wantExportStatus resolves the export target: the stored bookmark status
-// when present, else watch-derived targeting — finished the whole series
+// when present, else watch-derived targeting, finished the whole series
 // → COMPLETED, watched anything but not finished → CURRENT, favorited but
 // never watched → PLANNING. The old fallback marked every unwatched
 // favorite CURRENT, which rewrote MAL plan_to_watch entries to watching.
@@ -583,7 +583,7 @@ type watchHistoryRow struct {
 // watchHistoryPath builds one page of a user's watch rows for a slice of
 // titles. The ordering is part of the contract: anime_id ASC,
 // episode_number DESC makes (anime_id, episode_number) a unique, fully
-// deterministic sort key, so offset paging can never skip or repeat rows —
+// deterministic sort key, so offset paging can never skip or repeat rows,
 // even while the user keeps watching.
 func watchHistoryPath(userID string, ids []int, offset int) string {
 	strs := make([]string, 0, len(ids))
@@ -601,7 +601,7 @@ func watchHistoryPath(userID string, ids []int, offset int) string {
 // foldWatchRows folds rows into acc. Row order does not matter: MaxRow is
 // a max, Progress/Completed always describe the row at MaxRow, and Episode
 // is the highest row that finished (>=95% of duration). Episode is what
-// providers count as "episodes watched" — a title the user merely opened
+// providers count as "episodes watched", a title the user merely opened
 // (say, jumped into episode 50 for ten seconds) must not export progress
 // 50 when only episodes 1-11 are actually finished.
 func foldWatchRows(acc map[int]animeWatchProgress, rows []watchHistoryRow) {
@@ -632,12 +632,12 @@ func foldWatchRows(acc map[int]animeWatchProgress, rows []watchHistoryRow) {
 
 // fetchWatchProgress reads the watch rows of exactly the given titles and
 // folds them per title (see foldWatchRows). The old loaders read one shared
-// timestamp-descending window across ALL titles — Supabase clamps a single
+// timestamp-descending window across ALL titles, Supabase clamps a single
 // response, so every title outside the newest window silently exported
 // progress 0 and imports re-synthesized rows over real history.
 // Import uses MaxRow to only ever advance local history; export uses
 // Episode/Completed as the provider-facing progress. Any fetch failure
-// returns an error — import then skips progress entirely (a blind upsert
+// returns an error, import then skips progress entirely (a blind upsert
 // would overwrite real rows) and export reports it and continues without.
 func (h *Handlers) fetchWatchProgress(ctx context.Context, userID string, ids []int) (map[int]animeWatchProgress, error) {
 	out := make(map[int]animeWatchProgress, len(ids))
@@ -966,7 +966,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		}
 	}
 
-	// Scoped, paged fetch of this import's titles only — every title's
+	// Scoped, paged fetch of this import's titles only, every title's
 	// real local max, regardless of how old it is.
 	watch, err := h.fetchWatchProgress(ctx, userID, ids)
 	historyOK := err == nil
@@ -989,7 +989,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 	// carried their provider status, but pre-existing rows (including
 	// everything bookmarked before the `status` column migration) keep
 	// whatever they have. Update a stored status only when it is missing
-	// (never set) or when there is no local watch progress at all — local
+	// (never set) or when there is no local watch progress at all, local
 	// watch-advanced state (CURRENT/COMPLETED/REPEATING earned in-app)
 	// always wins over the provider snapshot.
 	statusesUpdated := 0
@@ -1005,7 +1005,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 				continue
 			}
 			if ok && (!historyOK || watch[id].MaxRow > 0) {
-				continue // real local state — provider must not clobber it
+				continue // real local state, provider must not clobber it
 			}
 			row := map[string]any{
 				"user_id":  userID,
@@ -1061,11 +1061,11 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 		// entirely instead of blind-upserting over real rows.
 		if historyOK && !limited {
 			// Reconcile down: rows synthesized by an earlier import mirror
-			// an older provider snapshot — once written they used to be
+			// an older provider snapshot, once written they used to be
 			// permanent, so a wrong count imported once (old export damage,
 			// a provider glitch) survived every later import and was
 			// re-exported forever. Trim synthetic rows (exactly
-			// fullEpisodeSeconds progress AND duration — real player rows
+			// fullEpisodeSeconds progress AND duration, real player rows
 			// carry media-derived values) down to the provider's current
 			// count so a re-import makes local progress EXACTLY match the
 			// source being imported.
@@ -1081,7 +1081,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 						w.MaxRow = maxEp
 						watch[e.AnimeID] = w
 					}
-					// Refresh failed: keep the old higher MaxRow — `from`
+					// Refresh failed: keep the old higher MaxRow, `from`
 					// lands past `want` and this run appends nothing. Safe;
 					// the next import finishes the reconcile.
 				}
@@ -1094,7 +1094,7 @@ func (h *Handlers) runProviderImport(ctx context.Context, userID string, entries
 				if len(watchRows) >= importMaxWatchRows {
 					// Budget exhausted: stop synthesizing rows, but keep
 					// looping so the remaining titles still get their
-					// scores — map order must not decide which titles
+					// scores, map order must not decide which titles
 					// starve. A re-run continues from each title's real
 					// local max (merge-only upsert).
 					limited = true
@@ -1192,7 +1192,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 	// num_episodes carries each title's total so completed-with-no-count
 	// entries synthesize the right rows even if the follow-up meta fetch
 	// fails. If a particular API build rejects the field (400), degrade to
-	// list_status only — losing totals must never break the whole import.
+	// list_status only, losing totals must never break the whole import.
 	fields := "num_episodes,list_status"
 	for offset < 1000 {
 		u := fmt.Sprintf("https://api.myanimelist.net/v2/users/@me/animelist?limit=100&offset=%d&fields=%s", offset, fields)
@@ -1203,7 +1203,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+token.AccessToken)
 		resp, err := h.h2Client.Do(req)
 		if err != nil {
-			h.respondError(w, http.StatusBadGateway, "could not reach MyAnimeList — try again")
+			h.respondError(w, http.StatusBadGateway, "could not reach MyAnimeList, try again")
 			return
 		}
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
@@ -1214,7 +1214,7 @@ func (h *Handlers) ImportMAL(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode != http.StatusOK {
 			h.log.Warn().Msg("mal import: list fetch failed " + resp.Status)
-			h.respondError(w, http.StatusBadGateway, "MyAnimeList rejected the request — reconnect the account in Settings")
+			h.respondError(w, http.StatusBadGateway, "MyAnimeList rejected the request, reconnect the account in Settings")
 			return
 		}
 		var page struct {
@@ -1334,7 +1334,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 
 	// score comes back in the viewer's own scoreFormat, so fetch the
 	// format alongside the entries to normalize everything to 1-10.
-	// Media carries title/cover/total inline — no follow-up meta fetch.
+	// Media carries title/cover/total inline, no follow-up meta fetch.
 	// The viewer ID is resolved first and passed explicitly: a null
 	// userId does not reliably default to the viewer (400).
 	// Imports keep the direct (unpaged) call: two requests total.
@@ -1345,12 +1345,12 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case isAniListAuthError(err):
-			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid, reconnect the account in Settings")
 		case isRetryableAniListError(err):
-			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests — wait a minute and try again")
+			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests, wait a minute and try again")
 		default:
 			h.log.Warn().Err(err).Msg("anilist import: viewer lookup failed")
-			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+") — try again")
+			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+"), try again")
 		}
 		return
 	}
@@ -1379,13 +1379,13 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		switch {
 		case isAniListAuthError(err):
-			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid, reconnect the account in Settings")
 		case isRetryableAniListError(err):
 			h.log.Warn().Err(err).Msg("anilist import: rate-limited or unavailable")
-			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests — wait a minute and try again")
+			h.respondError(w, http.StatusBadGateway, "AniList is rate-limiting requests, wait a minute and try again")
 		default:
 			h.log.Warn().Err(err).Msg("anilist import: query failed")
-			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+") — try again")
+			h.respondError(w, http.StatusBadGateway, "AniList request failed ("+err.Error()+"), try again")
 		}
 		return
 	}
@@ -1458,7 +1458,7 @@ func (h *Handlers) ImportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(entries) == 0 && out.Data.Viewer.ID == 0 {
-		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+		h.respondError(w, http.StatusUnauthorized, "AniList token is invalid, reconnect the account in Settings")
 		return
 	}
 	imported, already, episodes, scores, statuses, statusesUpdated, trimmed, limited := h.runProviderImport(r.Context(), userID, entries, meta)
@@ -1501,7 +1501,7 @@ func exportCompleted(state animeWatchProgress, total int, seriesFinished bool) b
 // meta + up to exportWriteCap provider writes at rate-limit pace) routinely
 // runs past 60s; without the lift the response write fails after the
 // deadline, the connection is closed before a single header is sent, nginx
-// answers 502 — and because nginx's own error page carries no
+// answers 502, and because nginx's own error page carries no
 // Access-Control-Allow-Origin, browsers surface it as a CORS error even
 // though CORS is configured correctly. The exportTimeBudget loop cap keeps
 // the total under nginx's 180s proxy_read_timeout.
@@ -1514,7 +1514,7 @@ func liftExportWriteDeadline(w http.ResponseWriter) {
 // anilistExportPacer spaces one export's AniList requests to at most one
 // per interval (10/min against AniList's 30 req/min ceiling). A pacer is
 // created per export request and shared by every AniList call that export
-// makes — pre-fetch reads and batched writes alike — so the whole export
+// makes, pre-fetch reads and batched writes alike, so the whole export
 // stays inside the budget with headroom to spare.
 type anilistExportPacer struct {
 	mu       sync.Mutex
@@ -1578,7 +1578,7 @@ type anilistExportWrite struct {
 
 // buildAniListBulkMutation packs a batch of title updates into a single
 // GraphQL request using field aliases (m0, m1, ...). All values are ints
-// from our own DB or fixed enum strings, so inlining them is safe — and one
+// from our own DB or fixed enum strings, so inlining them is safe, and one
 // request carrying exportAniListBatchSize mutations spends 1 req/min of the
 // AniList budget instead of 10.
 func buildAniListBulkMutation(writes []anilistExportWrite) string {
@@ -1597,7 +1597,7 @@ func buildAniListBulkMutation(writes []anilistExportWrite) string {
 
 // parseAniListBulkResult maps a bulk-mutation response back onto its
 // aliases: an alias with a non-null entry id succeeded; aliases named in a
-// GraphQL error path — or missing/null in data — failed. ok has one entry
+// GraphQL error path, or missing/null in data, failed. ok has one entry
 // per requested alias, in order.
 func parseAniListBulkResult(raw []byte, aliases int) (ok []bool, firstErr string) {
 	ok = make([]bool, aliases)
@@ -1737,7 +1737,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		m := totals[anilistID]
 		total := m.episodes
 		if total == 0 {
-			// Live meta unknown (airing shows carry episodes: null) —
+			// Live meta unknown (airing shows carry episodes: null),
 			// fall back to the total stored on the bookmark at import.
 			total = bookmarkTotals[anilistID]
 		}
@@ -1763,7 +1763,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		if !hasStored && state.MaxRow == 0 && hasRemote &&
 			!noEvidencePlanningFix(remoteStatus, rem.Progress, wantStatus) {
 			// No local evidence at all (never watched, no stored status):
-			// a bare favorite must not rewrite what MAL already says —
+			// a bare favorite must not rewrite what MAL already says,
 			// plan_to_watch stays plan_to_watch, watching with real
 			// episodes stays watching. The only shape rewritten is
 			// "watching with zero episodes": the artifact old Aniraku
@@ -1780,7 +1780,7 @@ func (h *Handlers) ExportMAL(w http.ResponseWriter, r *http.Request) {
 		if hasRemote {
 			// Exact-match skip: same status AND same target progress AND
 			// same score. REPEATING counts as MAL's own "watching" (MAL
-			// has no rewatch flag — a write would send exactly what is
+			// has no rewatch flag, a write would send exactly what is
 			// already stored).
 			statusOK := remoteStatus == wantStatus ||
 				(wantStatus == listRepeating && remoteStatus == listCurrent)
@@ -1927,7 +1927,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 	rateLimitedStop := false
 	var firstExportErr error
 
-	// Phase 1 — diff: collect the titles that actually need writing.
+	// Phase 1, diff: collect the titles that actually need writing.
 	// Skipped titles cost nothing; only pending titles consume the cap.
 	var pending []anilistExportWrite
 	for _, id := range ids {
@@ -1939,7 +1939,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		m := totals[id]
 		total := m.episodes
 		if total == 0 {
-			// Live meta unknown (airing shows carry episodes: null) —
+			// Live meta unknown (airing shows carry episodes: null),
 			// fall back to the total stored on the bookmark at import.
 			total = bookmarkTotals[id]
 		}
@@ -1956,7 +1956,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 		// Progress rules live in exportProgress: PLANNING pushes 0, no
 		// finished local evidence keeps AniList's own count, and only real
-		// player watches may raise a count — import-synthesized rows can
+		// player watches may raise a count, import-synthesized rows can
 		// never inflate AniList (protecting the correct side of a
 		// provider-disagreement until a reconciling import lands).
 		num, numWrite := exportProgress(wp, stored, remoteProgress)
@@ -1981,7 +1981,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 			// Exact-match skip: same status AND same target progress
 			// AND same score. A remote COMPLETED with a different local
 			// target (e.g. REPEATING after a rewatch) is rewritten, not
-			// skipped — statuses round-trip exactly.
+			// skipped, statuses round-trip exactly.
 			statusOK := cur.Status == wantStatus
 			scoreOK := wantScore == 0 || cur.Score == wantScore
 			if progressOK && statusOK && scoreOK {
@@ -1996,7 +1996,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		pending = append(pending, w)
 	}
 
-	// Phase 2 — write in batches of exportAniListBatchSize mutations per
+	// Phase 2, write in batches of exportAniListBatchSize mutations per
 	// request, one request per 6s (10 batched req/min). The budget check
 	// before each batch guarantees the JSON response still goes out.
 	for off := 0; off < len(pending); off += exportAniListBatchSize {
@@ -2018,7 +2018,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 			if isAniListRateLimitError(err) {
 				// The retry helper already waited out full Retry-After
 				// windows and the limit still holds: pause here and let
-				// the client re-run — diff-then-write skips what's done.
+				// the client re-run, diff-then-write skips what's done.
 				h.log.Warn().Err(err).Int("remaining", len(pending)-off).
 					Msg("anilist export: rate limit persists, pausing for re-run")
 				limited, rateLimitedStop = true, true
@@ -2047,14 +2047,14 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// Every write rejected on credentials is an auth problem, not 36
-	// individual failures — say so instead of reporting "N failed".
+	// individual failures, say so instead of reporting "N failed".
 	// Otherwise report the first error verbatim so the cause is visible.
 	// A rate-limit pause is not a failure: it answers 200 with
-	// limited=true (+rate_limited) so the client re-runs and resumes —
+	// limited=true (+rate_limited) so the client re-runs and resumes,
 	// diff-then-write skips everything already exported.
 	if exported == 0 && failed > 0 && !rateLimitedStop {
 		if isAniListAuthError(firstExportErr) {
-			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid — reconnect the account in Settings")
+			h.respondError(w, http.StatusUnauthorized, "AniList token is invalid, reconnect the account in Settings")
 			return
 		}
 		if firstExportErr != nil {
@@ -2079,7 +2079,7 @@ func (h *Handlers) ExportAniList(w http.ResponseWriter, r *http.Request) {
 // fetchAniListViewerID resolves the token owner's user ID. Collection
 // queries take it explicitly: a null userId does not reliably default
 // to the viewer and AniList answers such calls with a 400. call is how the
-// request is sent — the plain retry helper for imports, the paced export
+// request is sent, the plain retry helper for imports, the paced export
 // call for exports.
 func (h *Handlers) fetchAniListViewerID(ctx context.Context, accessToken string, call anilistCall) (int, error) {
 	raw, err := call(ctx, `query { Viewer { id } }`, map[string]any{})
@@ -2265,7 +2265,7 @@ type malListState struct {
 // and watched-episode count per title. It is the MAL counterpart of the
 // AniList export's remote-state fetch: it powers the exact-match skip and
 // the never-regress progress guard. Partial results are returned with the
-// error so a mid-list failure still covers the pages read so far — callers
+// error so a mid-list failure still covers the pages read so far, callers
 // fall back to writing any title the diff could not confirm.
 func (h *Handlers) fetchMALListState(ctx context.Context, accessToken string) (map[int]malListState, error) {
 	remote := map[int]malListState{}
@@ -2374,7 +2374,7 @@ func isAniListRateLimitError(err error) bool {
 // anilistAuthed POSTs a GraphQL request to AniList with a user token.
 // ALWAYS the official API: the offline mirror is read-only (it rejects
 // mutations like SaveMediaListEntry) and carries no user data, so every
-// authenticated call — imports, exports, list-state reads — belongs here.
+// authenticated call, imports, exports, list-state reads, belongs here.
 func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	payload, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
 	req, err := http.NewRequestWithContext(ctx, "POST", "https://graphql.anilist.co", bytes.NewReader(payload))
@@ -2403,7 +2403,7 @@ func (h *Handlers) anilistAuthed(ctx context.Context, accessToken, query string,
 // failures. AniList can return HTTP 200 with a GraphQL errors array, so those
 // responses are inspected as well instead of being reported as success.
 // Rate limits (HTTP 429) are honored, not hammered: the wait follows the
-// server's Retry-After header (default one full minute — AniList's window
+// server's Retry-After header (default one full minute, AniList's window
 // resets per minute), so a retry lands after the window instead of inside it.
 func (h *Handlers) anilistAuthedWithRetry(ctx context.Context, accessToken, query string, variables map[string]any) ([]byte, error) {
 	const maxAttempts = 4

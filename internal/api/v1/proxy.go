@@ -95,8 +95,8 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	proxyBase := requestPublicBaseURL(r)
 	// Audio language for dual-audio masters: the proxy strips the wrong
 	// AUDIO rendition at rewrite time (see stripAudioRenditions in
-	// proxy_audio.go). Attached ONLY to krussdomi/kaa HLS sources
-	// (operator rule) — they are the only dual-audio masters in the
+	// proxy_audio.go). Attached only to krussdomi/kaa HLS sources:
+	// they are the only dual-audio masters in the
 	// catalog; every other provider serves single-audio muxed streams
 	// where the strip is a guaranteed no-op.
 	wantAl := lang == "sub" || lang == "dub"
@@ -267,7 +267,7 @@ func isSubtitleURL(pathLower string) bool {
 func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: nothing here is stored. Cacheable branches below (playlists,
 	// segments, subtitles, keys) overwrite this with explicit public
 	// directives; errors and rejections keep no-store. Only allowlisted
-	// origins are echoed — reflecting an arbitrary Origin would let any
+	// origins are echoed, reflecting an arbitrary Origin would let any
 	// website read what the proxy fetches. Unknown/absent origins get '*':
 	// media here is public (allowlisted CDNs only) and no proxy request is
 	// made with credentials, so '*' never breaks playback.
@@ -346,9 +346,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	}
 
 	// Short-lived VOD playlist cache (see streaming.vod_cache.go). The
-	// collector's honesty probe fetched this exact upstream body seconds
+	// collector's segment probe fetched this exact upstream body seconds
 	// before the player asked for it, and the browser's prewarm fires HEADs
-	// that would each cost another full upstream round-trip — burst traffic
+	// that would each cost another full upstream round-trip, burst traffic
 	// that trips relay rate limits (krussdomi 429s the first playback
 	// attempt otherwise, which the frontend reports as "blocked"). Stored
 	// bytes are always RAW upstream content; the rewrite runs per request so
@@ -358,7 +358,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	if cachedBody, ok := streaming.VODCacheGet(decodedURL); ok {
 		if r.Method == http.MethodHead {
 			// No Content-Length: the GET representation is the REWRITTEN
-			// playlist whose length differs from these raw bytes —
+			// playlist whose length differs from these raw bytes,
 			// reporting the raw length lies to download managers.
 			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 			w.WriteHeader(http.StatusOK)
@@ -402,7 +402,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Forward the client's Range header for media/segment requests so the
 	// video element can seek through the proxy. Without it every seek turns
 	// into a fresh full-body download and playback restarts from the start.
-	// Playlists and keys are excluded — their paths need full bodies (HLS
+	// Playlists and keys are excluded, their paths need full bodies (HLS
 	// rewrite / key cache), and neither hls.js nor native HLS ranges them.
 	if rng := r.Header.Get("Range"); rng != "" {
 		p := strings.ToLower(parsed.Path)
@@ -411,7 +411,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 	}
 
-	// Cache key responses — hls.js makes one request per unique KEY URI
+	// Cache key responses, hls.js makes one request per unique KEY URI
 	// (we append &sn=N to each per-segment KEY tag). The backend strips sn
 	// from the upstream URL, so every request fetches the same CDN key URL.
 	cacheKeyURL := decodedURL
@@ -441,7 +441,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 	}
 
-	// Emergency fill limiter (2026-10-16, after the OOM wedges): every
+	// Emergency fill limiter (added after the OOM wedges): every
 	// cache miss downstream of here holds an upstream connection for the
 	// whole paced copy, so fills must be capped or an evening spike pushes
 	// the 836 MB box into swap thrash. Taken AFTER all local gates (SSRF,
@@ -493,7 +493,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	}
 	defer resp.Body.Close()
 
-	// ponytail: debug — log upstream status for proxy issues
+	// ponytail: debug, log upstream status for proxy issues
 	h.log.Debug().Str("proxy_url", decodedURL).Int("upstream_status", resp.StatusCode).Msg("proxy upstream response")
 
 	// The media proxy is not a navigation relay. A 3xx response can direct a
@@ -529,7 +529,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// gate above has already passed.
 
 	if isKey && resp.StatusCode == http.StatusOK {
-		// Emergency memory guard (2026-10-16): the key read is capped so a
+		// Emergency memory guard: the key read is capped so a
 		// misrouted or hostile .key URL cannot be slurped into RAM in
 		// full. Real keys are 16 bytes; anything at or beyond the cap
 		// falls through to the generic streaming path WITHOUT caching.
@@ -548,7 +548,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		resp.Body = streamKeepCloser(bytes.NewReader(body), resp.Body)
 	}
 
-	// Check if this is an HLS playlist — use parsed path, not raw URL (query
+	// Check if this is an HLS playlist, use parsed path, not raw URL (query
 	// params break HasSuffix). pathLower is computed once before the dial.
 	// The RawQuery check covers query-suffixed masters (/cdn/<hash>?t.m3u8);
 	// the body sniff below covers extension-less legs served with a cloaked
@@ -559,9 +559,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		strings.Contains(strings.ToLower(parsed.RawQuery), "m3u8")
 
 	if isHLS {
-		// Emergency memory guard (2026-10-16): this read used to consume
+		// Emergency memory guard: this read used to consume
 		// the ENTIRE upstream body. A huge mislabeled body behind a
-		// playlist-looking URL hit RAM in full — on the 836 MB box, three
+		// playlist-looking URL hit RAM in full, on the 836 MB box, three
 		// of those are an OOM. Playlists are tens of KiB (the VOD cache
 		// itself refuses bodies over vodCacheMaxBody = 256 KiB), so read
 		// at most hlsMaxRead and route any remainder through a joined
@@ -573,7 +573,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 		switch classifyPlaylistResponse(resp.StatusCode, resp.Header.Get("Content-Range"), body) {
 		case playlistReject:
-			// Upstream error text or a TRUNCATED playlist — running either
+			// Upstream error text or a TRUNCATED playlist, running either
 			// through the rewrite would mangle it into a fake URL and hls.js
 			// would die on a confusing parse error. Answer with a clean
 			// upstream-rejection error instead.
@@ -610,7 +610,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Extension-less playlist legs (echovideo variant/media URLs are bare
 	// /cdn/<hash>, cloaked as image/jpeg): no hint fires, so sniff the
 	// first bytes. Serving a playlist raw leaves its relative child URIs
-	// pointing at our own domain and playback blacks out — exactly the
+	// pointing at our own domain and playback blacks out, exactly the
 	// failure this guards.
 	if !isHLS && resp.StatusCode == http.StatusOK {
 		if peek, perr := io.ReadAll(io.LimitReader(resp.Body, 1024)); perr == nil {
@@ -626,7 +626,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 	}
 	// Stream non-HLS content directly through the proxy.
-	// Force correct Content-Type for TS segments — CDN lies with "image/jpeg"
+	// Force correct Content-Type for TS segments, CDN lies with "image/jpeg"
 	// to bypass Cloudflare media blocking.
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
@@ -643,7 +643,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Subtitle tracks served as downloadable blobs (moe /captions answers
 	// application/octet-stream): players need text/vtt to parse cues and
 	// otherwise download the file. Override only generic binary types,
-	// never a specific upstream type — working .vtt subtitles pass through
+	// never a specific upstream type, working .vtt subtitles pass through
 	// untouched.
 	if isSubtitleURL(pathLower) && (ct == "" || ct == "application/octet-stream" || ct == "application/binary") {
 		ct = "text/vtt; charset=utf-8"
@@ -653,7 +653,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Content-Range and advertise Accept-Ranges so the video element knows it
 	// can seek. Content-Length is echoed only for 206 to keep the response
 	// non-chunked; for full-body (200) streaming we omit it so Go uses
-	// chunked transfer encoding — this prevents ERR_CONTENT_LENGTH_MISMATCH
+	// chunked transfer encoding, this prevents ERR_CONTENT_LENGTH_MISMATCH
 	// when the upstream CDN drops the connection or returns fewer bytes than
 	// its Content-Length promised.
 	if cr := resp.Header.Get("Content-Range"); cr != "" {
@@ -672,14 +672,14 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 
 	// Media segments are small, but a slow client reading a large one can
 	// still outrun the server-wide 60s WriteTimeout; lift it for this
-	// response — the request context cancels on client disconnect anyway.
+	// response, the request context cancels on client disconnect anyway.
 	if rc := http.NewResponseController(w); rc != nil {
 		_ = rc.SetWriteDeadline(time.Time{})
 	}
 
 	// VOD segments and subtitles are immutable bytes: an identical proxy URL
 	// always serves identical bytes (upstream tokens live inside the url=
-	// param, so a rotation is a new URL — a cached copy can never outlive
+	// param, so a rotation is a new URL, a cached copy can never outlive
 	// its token). Mark them cacheable for a year so a shared edge absorbs
 	// repeat views instead of every playback re-burning EC2 egress. Only
 	// full 200s get immutable; 206 ranges are cached per-range without it,
@@ -703,7 +703,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 // cacheableMediaHeaders marks a public, credentialless media response so a
 // shared edge cache stores ONE variant for all origins. Media here is
 // public (allowlisted CDNs only) and players fetch it without credentials,
-// so ACAO '*' is safe — and required, because an echoed origin would pin
+// so ACAO '*' is safe, and required, because an echoed origin would pin
 // the cached variant to one site. Vary: Origin (set site-wide by the CORS
 // middleware) is dropped for the same reason: keeping it fragments the
 // edge cache per Origin header.
@@ -716,7 +716,7 @@ func cacheableMediaHeaders(w http.ResponseWriter, cacheControl string) {
 
 // serveRewrittenPlaylist answers a playlist request from raw upstream bytes:
 // the rewrite (child-URI proxying, the al audio strip) runs on every
-// request so nothing request-specific is ever shared between clients —
+// request so nothing request-specific is ever shared between clients,
 // both the live-fetch path and the VOD cache path answer through here.
 func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request, raw []byte, decodedURL, headersJSON, al string, status int) {
 	// Behind a reverse proxy, r.Host may be the loopback bind address;
@@ -856,7 +856,7 @@ func proxyRedirectBlocked(status int) bool {
 // The query is only rebuilt when "rn" is actually present, and the rebuild
 // keeps the surviving params' original bytes and order. A ParseQuery+Encode
 // round-trip would sort the params and append "=" to nameless ones, which
-// breaks CDNs that sign the raw query verbatim — animeheaven signs
+// breaks CDNs that sign the raw query verbatim, animeheaven signs
 // ?<md5>&<md5> order-sensitively and answers 404 to the re-encoded form.
 func stripProxyNonce(u string) string {
 	idx := strings.IndexByte(u, '?')
@@ -918,7 +918,7 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 	if err == nil {
 		return resp, nil
 	}
-	// ponytail: standard Go TLS fallback — utls Chrome fingerprint triggers
+	// ponytail: standard Go TLS fallback, utls Chrome fingerprint triggers
 	// bot detection on some CDNs (nekostream, watching.onl). Native Go TLS works fine.
 	return h.proxyGoTLSClient.Do(req)
 }
@@ -929,7 +929,7 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 // (the uTLS transports don't auto-decompress; gzipped upstream bytes would
 // corrupt AES-128 keys and segment data).
 func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
-	// Disable compression — the uTLS/http2 transport doesn't auto-decompress
+	// Disable compression, the uTLS/http2 transport doesn't auto-decompress
 	// like a default http.Transport does. Upstream gzipped bytes would arrive
 	// garbled, corrupting AES-128 keys and segment data.
 	req.Header.Set("Accept-Encoding", "identity")
@@ -950,7 +950,7 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 		}
 	}
 
-	// Set referer for CDNs that require it — client headers take priority where provided
+	// Set referer for CDNs that require it, client headers take priority where provided
 	if req.Header.Get("Referer") == "" {
 		u := strings.ToLower(req.URL.String())
 		if strings.Contains(u, "uwucdn") || strings.Contains(u, "owocdn") || strings.Contains(u, "185.237.106.79") {
@@ -965,7 +965,7 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 	// Hotlink-locked file hosts always take the site referer, even over a
 	// provider-default one: mp4upload answers provider referers (or
 	// empty) with 403 while the site referer gets 206 for the same
-	// token (measured 2026-10-05).
+	// token (measured live).
 	if strings.Contains(strings.ToLower(req.URL.String()), "mp4upload") {
 		req.Header.Set("Referer", "https://mp4upload.com/")
 	}
@@ -998,7 +998,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 		if err != nil {
 			return
 		}
-		// A trusted playlist may name any media host — including extension-less
+		// A trusted playlist may name any media host, including extension-less
 		// segment URLs (observed: p1.ipstatp.com/obj/ad-site-i18n/...). The
 		// dialer SSRF guard plus static allowlist gate remain the boundary;
 		// the media-path filter was dropping real segment hosts.
@@ -1015,7 +1015,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 	// (There used to be a per-rewrite &rn=<UnixNano> nonce here; it made
 	// every session's segment URLs unique and held the edge hit ratio at
 	// zero. stripProxyNonce is kept so old playlists still in the wild
-	// keep working — it is stripped before dialing upstream.)
+	// keep working, it is stripped before dialing upstream.)
 	// Propagate the audio language on every rewritten child URI so nested
 	// playlist fetches keep the dual-audio strip context.
 	alParam := ""
@@ -1031,14 +1031,14 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 	// URLs. This happens when an upstream edge serves a stale cached copy of
 	// a previously rewritten playlist. Re-wrapping would double-encode the
 	// target and 403 at the proxy gate, so such URIs are passed through
-	// untouched — they already carry their own headers param.
+	// untouched, they already carry their own headers param.
 	alreadyProxied := func(u string) bool {
 		return strings.Contains(u, "/api/v1/proxy?")
 	}
 	// megaSegmentHost matches the TikTok-CDN family megaplay hosts its video
 	// segments on. Those CDNs refuse datacenter IPs (the proxy dial gets
 	// rejected with CDN_BLOCKED) and prefix every response with a 252-byte
-	// canary the client must strip — so they only work fetched directly from
+	// canary the client must strip, so they only work fetched directly from
 	// the viewer's browser, exactly like megaplay's own player. Such URIs are
 	// left absolute and unproxied.
 	megaSegmentHost := func(u string) bool {
@@ -1083,7 +1083,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 			continue
 		}
 
-		// #EXTINF and other non-URI HLS tags — left unchanged
+		// #EXTINF and other non-URI HLS tags, left unchanged
 		if strings.HasPrefix(original, "#") {
 			continue
 		}
@@ -1110,7 +1110,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 			if matches := segmentNumRe.FindStringSubmatch(original); len(matches) >= 2 {
 				num, _ := strconv.ParseInt(matches[1], 10, 64)
 				iv := fmt.Sprintf("0x%032x", num)
-				// hls.js indexes LevelKey by URI — same URI skips IV update.
+				// hls.js indexes LevelKey by URI, same URI skips IV update.
 				// Append segment number to force a separate LevelKey per segment.
 				keyTag := fmt.Sprintf(`#EXT-X-KEY:METHOD=AES-128,URI="%s&sn=%d",IV=%s`, encKeyURI, num, iv)
 				if megaSegmentHost(absoluteURL) {
@@ -1136,7 +1136,7 @@ func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, 
 	result := strings.Join(lines, "\n")
 
 	// VOD playlists without #EXT-X-ENDLIST cause hls.js to loop re-fetching.
-	// Append it if missing — the CDN already returned the full segment list.
+	// Append it if missing, the CDN already returned the full segment list.
 	if strings.Contains(result, "#EXT-X-PLAYLIST-TYPE:VOD") && !strings.Contains(result, "#EXT-X-ENDLIST") {
 		result += "\n#EXT-X-ENDLIST"
 	}
@@ -1153,7 +1153,7 @@ func needsProxyRewrite(rawURL string) bool {
 }
 
 // hasKnownRewriteKeys returns true for CDN hostnames that must be proxied even
-// if they're on the allowlist — these are hosts where the player's direct
+// if they're on the allowlist, these are hosts where the player's direct
 // request would be rejected at the CDN without custom headers or transport
 // (e.g. uTLS-required hosts).
 func hasKnownRewriteKeys(rawURL string) bool {
@@ -1185,7 +1185,7 @@ func hasKnownRewriteKeys(rawURL string) bool {
 // isPlaylistBody reports whether raw bytes open with an HLS playlist
 // signature. The proxy uses it to catch playlist legs that no URL or
 // content-type hint identifies (query-suffixed masters, extension-less
-// variant URLs, cloaked image/jpeg types) — and to keep binary that trips
+// variant URLs, cloaked image/jpeg types), and to keep binary that trips
 // a hint (token containing "m3u8") out of the playlist rewriter.
 func isPlaylistBody(b []byte) bool {
 	return bytes.HasPrefix(bytes.TrimSpace(b), []byte("#EXTM3U"))
@@ -1195,12 +1195,12 @@ func isPlaylistBody(b []byte) bool {
 type playlistAction int
 
 const (
-	// playlistServe: a whole playlist — cache the raw bytes and rewrite.
+	// playlistServe: a whole playlist, cache the raw bytes and rewrite.
 	playlistServe playlistAction = iota
-	// playlistMedia: a media body behind a playlist-looking URL — stream it
+	// playlistMedia: a media body behind a playlist-looking URL, stream it
 	// through the normal opaque media path instead.
 	playlistMedia
-	// playlistReject: error text or a truncated playlist — clean 502.
+	// playlistReject: error text or a truncated playlist, clean 502.
 	playlistReject
 )
 
@@ -1210,7 +1210,7 @@ const (
 // The important case is 206: extension-less playlist legs (ReCloud's
 // /p?t=...) don't match the ".m3u8" Range-forwarding exclusion, so a player
 // that ranges every request gets its ranged playlist upstream-answered with
-// 206. bytes=0- carries the COMPLETE playlist and must be served — answering
+// 206. bytes=0- carries the COMPLETE playlist and must be served, answering
 // 502 here (the old behavior) failed every ranged playlist fetch the moment
 // the 45 s VOD cache went cold and stopped playback mid-video. Anything
 // short of the full file is never rewritten: half a playlist would produce

@@ -42,7 +42,7 @@ var defaultCDNSuffixes = []string{
 	"hls.dramahot.top",
 	// Wix-hosted video (repackager.wixmp.com)
 	"wixmp.com", "wixstatic.com",
-	// AnV (anv.to) first-party edge — /stream/ HLS + media playlists all
+	// AnV (anv.to) first-party edge, /stream/ HLS + media playlists all
 	// live on the site's own domain, session-cookie gated
 	"anv.to",
 	// Anixo player edge (anixo.buzz/api/stream/m3u8 + /vtt, self-hosted)
@@ -58,16 +58,16 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
-	// New CDN hosts (observed 2026-08-04)
+	// New CDN hosts
 	"norami.top", "fetch.nexabloom.top",
-	// ZokoAnime embed CDN (observed 2026-09-13, referer-gated)
+	// ZokoAnime embed CDN (referer-gated)
 	"aniwatchtv.uk",
 	// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
 	"aniwatchtv.site",
 	"fast4speed.rsvp",
 	// AnimeX beep native CDN + its referer host (API returns
 	// playeng.animeapps.top URLs with a playeng referer, used as-is since
-	// the bd.aniwatchtv.site rewrite was dropped — bd Cloudflare-blocks
+	// the bd.aniwatchtv.site rewrite was dropped, bd Cloudflare-blocks
 	// datacenter egress while playeng serves it)
 	"animeapps.top",
 	// Xanime video servers (numbered xanivsrcNN.org rotate per title) +
@@ -121,19 +121,19 @@ var defaultCDNSuffixes = []string{
 	"fast4speed.com",
 	// Anikoto provider embed CDNs
 	"anikototv.to", "megaplay.buzz",
-	// Supaplay (NiN provider — anistream.one embed lineup): the shipped
+	// Supaplay (NiN provider, anistream.one embed lineup): the shipped
 	// source is its authless hls-proxy relay (supaplay.fun/hls-proxy?url=),
 	// which streams MegaPlay-catalog files on edges that block us directly
 	"supaplay.fun",
 	// Anikoto HLS CDNs (Anivexa - kryntal, atomic4cdn)
 	"kryntal.top", "cdn.kryntal.top",
 	"atomic4cdn.top", "vault-97.atomic4cdn.top", "vault-98.atomic4cdn.top",
-	// Observed Miruro provider CDN hosts (2026-08-04)
+	// Observed Miruro provider CDN hosts
 	"mikora.top",
 	"mikora.site",
 	"mikora.buzz",
 	"vidtub.mikora.top",
-	// Observed live 2026-08-05: vault-10.uwucdn.top (HLS), CF workers front
+	// Observed live: vault-10.uwucdn.top (HLS), CF workers front
 	// for rotated CDNs (morning-credit-3bcc.vibevibe.workers.dev), and
 	// a1.mp4upload.com:183 direct mp4 (non-standard port handled in Proxy).
 	"uwucdn.top",
@@ -275,7 +275,7 @@ var dynamicCDNLoadOnce sync.Once
 
 // ensureDynamicCDNLoaded restores previously learned hosts (dropping
 // expired ones) exactly once per process. A missing or corrupt file is
-// not an error — the learner simply starts cold, as before.
+// not an error, the learner simply starts cold, as before.
 func ensureDynamicCDNLoaded() {
 	dynamicCDNLoadOnce.Do(func() {
 		raw, err := os.ReadFile(dynamicCDNFilePath())
@@ -303,7 +303,7 @@ func ensureDynamicCDNLoaded() {
 }
 
 // persistDynamicCDNEntries snapshots the learned hosts to disk. Called
-// after each successful learn (learns are rare — one per new host) so a
+// after each successful learn (learns are rare, one per new host) so a
 // restart never loses more than nothing.
 func persistDynamicCDNEntries() {
 	dynamicCDNMu.RLock()
@@ -339,7 +339,7 @@ func LearnHostFromPlaylist(host string) {
 		return
 	}
 	// Never learn a host that is already covered, and never learn a
-	// non-public address — the dialer guard would reject it at connect
+	// non-public address, the dialer guard would reject it at connect
 	// time anyway, so storing it only wastes an entry.
 	if isAllowedProxyHost(host) {
 		return

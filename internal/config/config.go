@@ -24,7 +24,7 @@ func loadEnv(path string) {
 		if k, v, ok := strings.Cut(line, "="); ok {
 			k = strings.TrimSpace(k)
 			// Standard dotenv semantics: variables already present in the
-			// process environment win over the file, so an operator setting
+			// process environment win over the file, so setting
 			// ANIRAKU_SERVER_DEBUG=true in the shell is not silently reverted
 			// by a stale value in .env.
 			if _, exists := os.LookupEnv(k); exists {
@@ -47,12 +47,12 @@ type Config struct {
 
 type SyncConfig struct {
 	// OAuth credentials for MAL / AniList watch-progress sync. Leave
-	// empty to disable the feature — the UI shows "not configured".
+	// empty to disable the feature, the UI shows "not configured".
 	MALClientID         string `mapstructure:"mal_client_id"`
 	MALClientSecret     string `mapstructure:"mal_client_secret"`
 	AniListClientID     string `mapstructure:"anilist_client_id"`
 	AniListClientSecret string `mapstructure:"anilist_client_secret"`
-	// RedirectURL is the registered OAuth redirect URI — the frontend's
+	// RedirectURL is the registered OAuth redirect URI, the frontend's
 	// /sync/callback route (e.g. https://aniraku.app/sync/callback).
 	RedirectURL string `mapstructure:"oauth_redirect_url"`
 	// StateSecret signs OAuth state so callbacks can be validated
@@ -162,7 +162,7 @@ func Load(configPath string) (*Config, error) {
 	if host := os.Getenv("ANIRAKU_SERVER_HOST"); host != "" {
 		v.Set("server.host", host)
 	} else if os.Getenv("PORT") != "" {
-		// Cloud platforms inject PORT — listen publicly
+		// Cloud platforms inject PORT, listen publicly
 		v.Set("server.host", "0.0.0.0")
 	}
 	if debug := os.Getenv("ANIRAKU_SERVER_DEBUG"); debug == "true" || debug == "1" {
@@ -172,7 +172,7 @@ func Load(configPath string) (*Config, error) {
 		v.Set("server.enable_pprof", true)
 	}
 
-	// OAuth sync credentials (optional — feature disabled when absent)
+	// OAuth sync credentials (optional, feature disabled when absent)
 	if val := os.Getenv("ANIRAKU_MAL_CLIENT_ID"); val != "" {
 		v.Set("sync.mal_client_id", val)
 	}

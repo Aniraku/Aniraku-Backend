@@ -162,7 +162,7 @@ func TestProxyRejectsPrivateTargets(t *testing.T) {
 
 // TestProxyPortPolicy verifies the Proxy handler's port gate: non-standard
 // HTTP ports that CDNs legitimately use (e.g. a1.mp4upload.com:183) are no
-// longer blanket-rejected — the host allowlist gate handles those targets —
+// longer blanket-rejected, the host allowlist gate handles those targets,
 // while well-known non-HTTP service ports (SSH, databases, mail) are
 // rejected before any network activity.
 func TestProxyPortPolicy(t *testing.T) {

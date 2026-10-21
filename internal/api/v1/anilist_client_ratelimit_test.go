@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// A 429 carrying Retry-After must be honored with one honest wait and a
-// single retry — not burned through with short blind sleeps inside the ban.
+// A 429 carrying Retry-After must be honored with one full wait and a
+// single retry, not burned through with short blind sleeps inside the ban.
 func TestAniListClientHonorsRetryAfter(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
