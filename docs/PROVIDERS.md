@@ -1,4 +1,4 @@
-# Streaming providers — contributor guide
+# Streaming providers: contributor guide
 
 All provider code lives in `internal/streaming/`, orchestrated by
 `manager.go`, played through `internal/api/v1/proxy.go`. This is the
@@ -21,27 +21,26 @@ fallback order and the `/servers` merge order.
 | `kaa` | Nico, robin, D'Luff, zoro, sanji, nami, usopp, chopper, franky, brook, jimbei, then `kaa-N` (positional) | kaa.lt krussdomi **master** playlists (dual-audio) |
 | `animegg` | Sunny, Yolky, Eggy (positional per mirror tab) | animegg.org direct mp4, highest quality per tab |
 | `aniwaves` | Nami (Vidplay), Coral (MyCloud), Pearl (DatSaV/savedly), Wavy/Bubbles/Shelly (fallback) | echovideo multi-rendition HLS masters + top savedly mp4 |
-| `vidnest` | Nest | VidNest MegaPlay HLS + subs + skips (custom-b64 API) |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
 | `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **decrypted to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer) (sub+dub) |
 
 Removed providers return a `removed` error naming them explicitly
-(`miruro`, `zenime`, `tryembed`, `mkissa`, `heave`, …) — never silently fall
+(`miruro`, `zenime`, `tryembed`, `mkissa`, `heave`, …): never silently fall
 through.
 
 ## Request flows
 
-### `GET /api/v1/servers` — fan-out list
-`FindAllServers` runs every provider collector **concurrently** (45 s hard
-cap for the whole fan-out; per-collector timings logged as `collectorMs`),
+### `GET /api/v1/servers`: fan-out list
+`FindAllServers` runs every provider collector **concurrently** (85 s request
+ceiling, 12 s per collector; per-collector timings logged as `collectorMs`),
 then:
-1. `mergeZokoDownloads` — Anikoto download links ride onto Zoko servers.
-2. `mergeNiNSubtitles` — NiN borrows verified tracks (Niko → animex → Zoko).
-3. `verifyMegaVidLang` — Vidy language verification (below).
+1. `mergeZokoDownloads`: Anikoto download links ride onto Zoko servers.
+2. `mergeNiNSubtitles`: NiN borrows verified tracks (Niko → animex → Zoko).
+3. `verifyMegaVidLang`: Vidy language verification (below).
 4. Merge in fixed provider order; `attachDownloadLinks` (AnimeDL, all
    sources but FlixCloud); stable-sort by
-   playback verdict (`proxy > direct > embed > dead` — ordering hint only,
+   playback verdict (`proxy > direct > embed > dead`: ordering hint only,
    never a filter).
 5. Every source URL is wrapped into `/api/v1/proxy?...` per request
    (**copy-on-wrap**: provider resolve caches are never mutated).
@@ -49,28 +48,28 @@ then:
 Hentai titles only reach Zoko (MAL-keyed) + FlixCloud; every other
 collector is skipped before any upstream call.
 
-### `POST /api/v1/stream` — explicit / fallback resolve
-With `provider` set (family **or** cute name — `Sunny`, `Nami`, `Nest`,
+### `POST /api/v1/stream`: explicit / fallback resolve
+With `provider` set (family **or** cute name: `Sunny`, `Nami`, `Nest`,
 `Lee`, `animegg` sub-ids like `yuki` all route), only that provider
 resolves. Empty `provider` walks the fallback chain serially, first hit
 wins. `quality` filters provider-returned labels (`auto` = all).
 
-### `/api/v1/proxy` — media proxy
+### `/api/v1/proxy`: media proxy
 uTLS transport chain, SSRF dialer guard, static + dynamic CDN allowlist,
 **no redirects ever** (upstream 3xx → 502, so providers must ship final
 URLs), HLS rewrite (child URIs absolutized per RFC 3986, `al=sub/dub`
 audio-strip, per-request nonce), VOD playlist body cache (45 s, raw bytes
-only — never wrapped URLs).
+only: never wrapped URLs).
 
-## Operator rules (enforced, not optional)
+## Rules (enforced, not optional)
 
 - **Copy-on-wrap / clone-on-cache.** Provider resolve caches store *and*
   return deep copies (`cloneSourceResult`). No caller may mutate a shared
   result. (History: in-place wrapping once froze localhost URLs into every
   response.)
 - **Strict per-lang.** Sub reads sub listings, dub reads dub listings, no
-  cross fallback — except Lee, whose dub-only/sub-only gaps are genuine,
-  and explicit operator-approved exceptions documented in code. Caches are
+  cross fallback: except Lee, whose dub-only/sub-only gaps are genuine,
+  and explicit exceptions documented in code. Caches are
   keyed **with** lang.
 - **Dub subtitles: Sora-only.** Only Sora (animex) dub carries the Nico
   (kaa) subtitle files, enforced centrally in
@@ -82,54 +81,44 @@ only — never wrapped URLs).
   lists complete when adding servers.
 - **AnimeGG dub gate.** Dub lists only at ≥720p best quality; low-quality
   dubs never surface. Each tab ships its single best mp4 (mp4 has no
-  seamless switching; the player starts on the highest).
+  mid-stream quality switch; the player starts on the highest).
 - **AnimeGG prequel-shadow rejection.** A numbered sequel query answered
   by an unnumbered slug covering exactly the prequel span is the
-  prequel's listing — rejected instead of serving wrong-season content.
+  prequel's listing: rejected instead of serving wrong-season content.
 - **AnimeGG watch-page guard.** The watch page must name the requested
   episode number; mismatches drop instead of listing wrong content.
 - **MegaVid verification** (`verifyMegaVidLang`), first decisive signal
-  wins per source: (0) corroboration gate — Vidy lists only alongside
+  wins per source: (0) corroboration gate: Vidy lists only alongside
   another provider (fan-out only); (1) m3u `TYPE=AUDIO LANGUAGE`
   declarations; (2) TS PMT ISO-639 segment descriptors (ground truth);
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
-- **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/VidNest/Lee/
+- **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/Lee/
   MegaVid/Tensho never receive hentai titles.
 - **No server-list snapshot cache.** Tokenized URLs expire without a
   reliable invalidation signal; every request computes a fresh,
-  honestly-probed list. Speed comes from provider resolve caches:
+  probed list. Speed comes from provider resolve caches:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
-  VidNest/Lee/MegaVid fresh per resolve (short-lived tokens),
+  Lee/MegaVid fresh per resolve (short-lived tokens),
   Tensho show 10 min +
-  episode list/token 3 min (page token 403s when stale — refreshed
+  episode list/token 3 min (page token 403s when stale: refreshed
   once and retried).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
-  rate limit) — never `graphql.anilist.co`.
+  rate limit): never `graphql.anilist.co`.
 
-## Probes (honesty before listing)
+## Probes (verify before listing)
 
 A source lists only if reachable **from this egress** with player-shaped
 requests: `probeSegmentsLenient` (master → media → segment bytes),
 `probePlaylistsLenient` (playlist depth, warms the VOD cache),
 `probeMediaFileLenient` (direct files + magic bytes),
 `probeSegmentsStrict` (where edge alternatives exist). Verdicts are
-lenient by default — definitive blocks only. Shared helpers live in
+lenient by default: definitive blocks only. Shared helpers live in
 `segment_probe.go`; TS language parsing (`tsAudioLangs`) and m3u audio
 parsing (`m3uAudioLangs`) back the verification layers.
 
-## The relay (blocked-egress API calls only)
-
-Some JSON APIs Cloudflare-block datacenter egress
-(`new.vidnest.fun`); their minted file URLs play fine from it (verified,
-no IP binding). `ANIRAKU_RELAY_URL` (+ optional `ANIRAKU_RELAY_KEY`)
-routes **only those API calls** through `third_party/relay/worker.mjs`
-(key-gated, path-restricted — never an open proxy). Video bytes, probes
-and playback stay direct. Unset = direct with silent skip on 403.
-Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
-
-## Adding a provider — checklist
+## Adding a provider: checklist
 
 1. New file `internal/streaming/<family>.go`: `Provider` interface
    (`Name/Search/FindEpisodes/FindEpisodeSource`), own `http.Client`
@@ -145,11 +134,11 @@ Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
    `Verification: "proxy"` only when probed; `ServerNames` set.
 6. Wire `manager.go` in all places: `providers` list, `SetHostLearner`,
    alias normalization, hentai gate, explicit case, fallback chain,
-   fan-out collector (append to the slice — never hand-count the
+   fan-out collector (append to the slice: never hand-count the
    WaitGroup), merge order, getter + `try*` + `collect*`.
 7. `proxy_allowlist.go`: static suffixes for any new CDN host.
 8. Tests: pure parsing/scoring units + `httptest` fixture end-to-end
-   (override base URLs + plain client — netguard blocks fixture IPs) +
+   (override base URLs + plain client: netguard blocks fixture IPs) +
    failure/gate cases. Extend `live_probe_test.go` (env-guarded,
    never CI-blocking).
 9. Update this doc's catalog table + `docs/openapi.yaml` if routes change.
@@ -163,16 +152,19 @@ Contract: `POST /vidnest {id, episode, lang}` → upstream JSON verbatim.
   `go test -c ./internal/streaming/ -o /tmp/streaming.test`,
   copy to the server, run with
   `ANIRAKU_LIVE_PROBE=1 ANIRAKU_LIVE_PROBE_ID=.. ANIRAKU_LIVE_PROBE_EP=.. ANIRAKU_LIVE_PROBE_LANG=..`.
-  The probe prints per-provider OK/FAIL — the evidence required before
+  The probe prints per-provider OK/FAIL: the evidence required before
   claiming a provider works.
-- Deploy: `git pull --ff-only && docker compose build aniraku-api &&
-  docker compose up -d aniraku-api`, then health `200` + a live
-  `/servers` check. Always rebase before push (another actor commits).
-- Disk hard caps (incident 2026-10-02: 9.4 GB build cache filled the
-  disk → 504s): daily cron `docker builder prune -af --keep-storage
-  2GB` + `docker image prune -f`; container logs capped in compose
-  (`max-size/max-file`); journald capped at 200M. The app writes zero
-  bytes to disk (VOD cache is RAM-only).
+- Deploy: CI builds and publishes the release binary; the box runs a bare
+  systemd unit. Swap + restart:
+  build `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath
+  -ldflags="-s -w" -o aniraku-server-arm64 ./cmd/aniraku-server`,
+  copy to the box, `mv` it over `~/aniraku-bin/aniraku-server`,
+  `sudo -n systemctl restart aniraku-api.service`, then health `200`
+  + a live `/servers` check. Always rebase before push (another actor
+  commits).
+- Disk: the app writes zero bytes to disk (VOD cache is RAM-only);
+  journald capped at 200M. No build step runs on the box, so there is
+  no build cache to grow.
 - Debugging: `collectorMs` + `fan-out complete` lines show the slow
   collector; a missing `fan-out complete` with resolving providers means
   the fan-out is wedged; per-layer drop reasons log at Warn.

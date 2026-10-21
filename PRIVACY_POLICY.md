@@ -8,9 +8,9 @@ Aniraku ("we", "our") operates the backend API service for the Aniraku anime str
 
 The backend is a thin proxy and API layer. It:
 
-- Proxies video-stream requests from the Aniraku app to upstream anime hosts (Miruro), so the hosts don't see your IP address — our server connects on your behalf.
+- Proxies video-stream requests from the Aniraku app to upstream anime hosts (Miruro), so the hosts don't see your IP address: our server connects on your behalf.
 - Fetches anime metadata from AniList and search fallbacks from Jikan (MyAnimeList).
-- Reads and writes your user data (profile, watch history, bookmarks, favorites, comments, likes, settings) in Supabase — strictly scoped to your account via your signed JWT. Row-level security prevents any request from reading or modifying another account's data. The backend holds no service-level credentials for user data; every write is performed as you.
+- Reads and writes your user data (profile, watch history, bookmarks, favorites, comments, likes, settings) in Supabase: strictly scoped to your account via your signed JWT. Row-level security prevents any request from reading or modifying another account's data. The backend holds no service-level credentials for user data; every write is performed as you.
 
 ## Information We Collect
 
@@ -32,12 +32,12 @@ The backend is a thin proxy and API layer. It:
 
 ## Third-Party Services
 
-- **Supabase** — authentication and database (AWS).
-- **AniList** — anime metadata; search queries are forwarded to them.
-- **Jikan / MyAnimeList** — search fallback.
-- **Miruro** — video streaming sources, accessed through our proxy.
-- **Vercel** — frontend hosting.
-- **Render** — hosting for this backend service.
+- **Supabase**: authentication and database (AWS).
+- **AniList**: anime metadata; search queries are forwarded to them.
+- **Jikan / MyAnimeList**: search fallback.
+- **Miruro**: video streaming sources, accessed through our proxy.
+- **Vercel**: frontend hosting.
+- **Render**: hosting for this backend service.
 
 ## Data Retention
 

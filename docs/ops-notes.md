@@ -41,3 +41,21 @@ inside source comments.
 - The final server list is never snapshotted: tokenized URLs expire, and
   a cache once froze localhost health-probe URLs into public responses
   for a full TTL.
+
+## API layer history
+
+- 2026-10-14 proxy egress shaping was a temporary order (was to expire
+  2026-10-17); before touching it, re-measure the origin's egress first.
+- 2026-10-16/17 proxy memory guard + fill limiter landed after the OOM
+  wedges (kernel killed aniraku-server 3x on Oct 15-16).
+- 2026-10-17 the frontends' vercel routes went stale; cors.go sources
+  were migrated to the main production origin.
+- 2026-09-27 tmdb deadlock: episode enrichment blocked the catalog
+  Range callback through setCachedEpisodes for a cache-wide cascade.
+
+## kaa island
+
+- 2026-10-21 the cat-player Astro island's props carry full subtitle
+  metadata per track (format, language code, native name, file URL);
+  subtitle tracks are decoded from there instead of scraped from
+  bare URLs.

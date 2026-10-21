@@ -1,6 +1,6 @@
-# Aniraku Backend — Architecture
+# Aniraku Backend: Architecture
 
-A single static Go 1.25 binary (Chi v5, Zerolog) serving catalog metadata,
+A single static Go 1.26 binary (Chi v5, Zerolog) serving catalog metadata,
 multi-provider playback resolution, a hardened media proxy, and Supabase-backed
 account features. No Node/Python sidecars in the request path.
 
@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → VidNest → Lee → MegaVid → Tensho
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → Lee → MegaVid → Tensho (+ AnV, Anixo)
 ```
 
 ## Code layout (`internal/api/v1`)
@@ -32,18 +32,18 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
 
 ## Request flow
 
-1. **Edge middleware** — `RealIP` derives the client IP from the socket peer or
+1. **Edge middleware**: `RealIP` derives the client IP from the socket peer or
    the rightmost untrusted `X-Forwarded-For` entry (`ANIRAKU_TRUSTED_PROXY_CIDRS`).
    With no trusted CIDRs, XFF is ignored entirely (spoofing cannot mint fresh
    rate-limit buckets).
-2. **Rate limiting** — global bucket (default 30 req/s, burst 60) plus a tighter
+2. **Rate limiting**: global bucket (default 30 req/s, burst 60) plus a tighter
    proxy bucket (10 req/s, burst 20). Both tunable via `ANIRAKU_RATE_*` env.
-3. **Compression** — gzip on JSON API groups only. The media proxy is never
+3. **Compression**: gzip on JSON API groups only. The media proxy is never
    compressed: HLS keys/segments must arrive byte-exact.
-4. **Auth** — Supabase JWKS verification (RS256/ES256, audience + issuer +
+4. **Auth**: Supabase JWKS verification (RS256/ES256, audience + issuer +
    expiry checks). JWKS refresh is single-flight; on refresh failure the
    previous key set keeps working for a bounded grace window.
-5. **Admin gate** — `RequireAdmin` calls Supabase's `is_admin()` RPC with
+5. **Admin gate**: `RequireAdmin` calls Supabase's `is_admin()` RPC with
    `apikey: <anon key>` + `Authorization: Bearer <user JWT>`; RLS and
    `auth.uid()` scoping still apply.
 
@@ -51,18 +51,18 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
 
 The media proxy is the most sensitive surface. Defense in depth, in order:
 
-1. **Fast-fail checks** — scheme must be http(s); blocked ports; nuisance-host
+1. **Fast-fail checks**: scheme must be http(s); blocked ports; nuisance-host
    filter; hostname validate; CDN suffix allowlist.
-2. **Dialer SSRF boundary** (`internal/netguard`) — every outbound socket is
+2. **Dialer SSRF boundary** (`internal/netguard`): every outbound socket is
    validated at the `Control` hook *after DNS resolution*: loopback, private,
    CGNAT, link-local, metadata, and multicast addresses are refused. This is
    the authoritative guard (defeats rebinding/redirects/alt-encodings).
-3. **No redirects** — clients return `ErrUseLastResponse`; upstream 3xx is
+3. **No redirects**: clients return `ErrUseLastResponse`; upstream 3xx is
    never forwarded to the browser.
-4. **Playlist vouching** — only a playlist fetched from an allowlisted host may
+4. **Playlist vouching**: only a playlist fetched from an allowlisted host may
    nominate new media hosts (`LearnHostFromPlaylist`), feeding a dynamic allowlist
    with hourly cleanup, so provider CDN rotation doesn't 403 at the gate.
-5. **Header hygiene** — client-supplied `headers` JSON is filtered (`host`,
+5. **Header hygiene**: client-supplied `headers` JSON is filtered (`host`,
    `x-*`, hop-by-hop headers dropped); sensible Referer/UA defaults per CDN class.
 
 ## Caching layers
@@ -76,22 +76,22 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | Anikoto resolve | 5 min fresh + stale window | Served without re-contacting megaplay; stale backs failures. |
 | kaa slug / resolve | 24 h / 10 min (lang-keyed) | Strict per-lang keys; deep-copied on store and load. |
 | AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
-| VidNest / Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
-| Tensho show / episodes+token | 10 min / 3 min | Watch-page `AJAX_TOKEN` 403s when stale — refreshed once and retried. |
-| AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s — no in-request retries. |
+| Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
+| Tensho show / episodes+token / resolved episodes | 10 min / 3 min / 10 min | Watch-page `AJAX_TOKEN` 403s when stale, refreshed once and retried. |
+| AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s: no in-request retries. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
 | Dynamic CDN allowlist | 24 h TTL | Learned hosts (playlist-vouched) expire on read past TTL; capped at 500 entries. |
 
 ## Streaming fan-out
 
-`GetServers` fans out to all collectors concurrently (45 s hard cap,
-per-collector timings in `collectorMs`), merges in fixed provider order,
+`GetServers` fans out to all collectors concurrently (85 s request ceiling,
+12 s per collector, timings in `collectorMs`), merges in fixed provider order,
 applies the Zoko-download / NiN-subtitle / MegaVid-language merges, attaches
 AnimeDL downloads (all sources but FlixCloud), and stable-sorts by playback
 verdict (`proxy > direct >
-embed > dead` — ordering hint only, never a filter). The collector set is
-slice-driven so the WaitGroup count cannot drift. Hentai titles reach only
+embed > dead`, ordering hint only, never a filter). The collector set is
+a data table so the WaitGroup count cannot drift. Hentai titles reach only
 Zoko (MAL-keyed) + FlixCloud before any other upstream call. `Stream`
 walks the fallback chain serially with per-request quality filtering;
 explicit `provider` accepts families and cute-name aliases; `?refresh=1`
@@ -107,8 +107,8 @@ bypasses provider caches. Full rule list: [`docs/PROVIDERS.md`](./PROVIDERS.md).
 
 ## Deployment
 
-- Multi-stage Docker (`golang:1.25-alpine` → `alpine:3.20`, non-root), health
+- Multi-stage Docker (`golang:1.26-alpine` → `debian:bookworm-slim`, non-root), health
   check at `/api/v1/health` (see `render.yaml`).
 - Behind Render without `ANIRAKU_TRUSTED_PROXY_CIDRS`, all visitors share one
-  rate-limit bucket keyed on the proxy IP — safe but coarse (see README).
+  rate-limit bucket keyed on the proxy IP: safe but coarse (see README).
 - API contract: [`docs/openapi.yaml`](./openapi.yaml).
