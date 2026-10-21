@@ -158,7 +158,7 @@ func (n *kaaEpNum) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-func (n kaaEpNum) equals(ep int) bool { return float64(n) == float64(ep) }
+func (n kaaEpNum) matches(ep int) bool { return float64(n) == float64(ep) }
 
 func (n kaaEpNum) key() string { return strconv.FormatFloat(float64(n), 'f', -1, 64) }
 
@@ -418,9 +418,9 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 // The resolve cache is keyed WITH lang for the same reason: a cached sub
 // result must never leak into a dub listing or vice versa.
 //
-// Dub sources still carry the SUB (ja-JP) page's subtitle files (operator
-// subtitle rule), enforced centrally by withDubSubtitles, that is a
-// targeted subtitle fetch, not a manifest share.
+// Dub sources still carry the ja-JP (sub) page's subtitle files, merged
+// in by Manager.withDubSubtitles. That is a targeted subtitle fetch by
+// URL, not a manifest share.
 func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
@@ -455,19 +455,19 @@ func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 }
 
 // kaaLangParam returns kaa.lt's listing-language code for a request lang.
-// deadlineShapedErr reports whether an upstream failure was a
-// budget/deadline cut rather than a plain network error, deadline-shaped
-// failures must not be retried on the same context (the retry cannot find
-// the missing time).
-func deadlineShapedErr(err error) bool {
-	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
-}
-
 func kaaLangParam(lang string) string {
 	if strings.EqualFold(lang, "dub") {
 		return "en-US"
 	}
 	return "ja-JP"
+}
+
+// deadlineShapedErr reports whether an upstream failure was a
+// budget/deadline cut rather than a plain network error: deadline-shaped
+// failures must not be retried on the same context (the retry cannot find
+// the missing time).
+func deadlineShapedErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
 }
 
 func (p *KaaProvider) loadResolved(slug string, episode int, lang string) *SourceResult {
@@ -648,7 +648,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	// burned the wall (measured: 6s fail + fresh 6s walk = the 10s cut).
 	if firstPage, _, fpErr := p.fetchEpisodePage(ctx, slug, kaaLang, strconv.Itoa(episode)); fpErr == nil {
 		for i := range firstPage {
-			if firstPage[i].Number.equals(episode) && firstPage[i].Slug != "" {
+			if firstPage[i].Number.matches(episode) && firstPage[i].Slug != "" {
 				match = &firstPage[i]
 				break
 			}
@@ -659,7 +659,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 			return nil, err
 		}
 		for i := range eps {
-			if eps[i].Number.equals(episode) {
+			if eps[i].Number.matches(episode) {
 				match = &eps[i]
 				break
 			}
@@ -686,7 +686,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	// order so server names never shift.
 	type hit struct {
 		master string
-		vtts   []string
+		subs   []core.Subtitle
 		ok     bool
 	}
 	hits := make([]hit, len(players))
@@ -711,13 +711,13 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 			}
 			plCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
-			master, vtts, err := p.resolvePlayerMaster(plCtx, pl, watchURL)
+			master, subs, err := p.resolvePlayerMaster(plCtx, pl, watchURL)
 			if err != nil {
 				p.log.Warn().Str("player", pl.name).Str("src", pl.src).Err(err).
 					Msg("kaa: player resolve failed, skipping")
 				return
 			}
-			hits[i] = hit{master: master, vtts: vtts, ok: true}
+			hits[i] = hit{master: master, subs: subs, ok: true}
 		}(i, pl)
 	}
 	pWg.Wait()
@@ -748,11 +748,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	// URL, an in-provider fetch here would only duplicate that work.
 	sr := &SourceResult{Headers: headers}
 	for i, h := range playable {
-		var subs []core.Subtitle
-		for _, s := range h.vtts {
-			p.learnURLHost(s)
-			subs = append(subs, kaaSubtitleTrack(s))
-		}
+		subs := h.subs
 		p.learnURLHost(h.master)
 		sr.Sources = append(sr.Sources, core.Source{
 			URL:          h.master,
@@ -791,13 +787,115 @@ func kaaUnescape(s string) string {
 
 // kaaSubtitleTrack labels one subtitle file via the shared resolver.
 // Krussdomi encodes the language in the filename (309567_en.srt,
-// 60596_th.srt, 278072_zh-Hans.srt); bare-hash .vtt files carry no code,
-// and the player page exposes no label. Those unnamed tracks are the
-// page's default English subtitle (the identical file is labelled English
-// by animex's upstream), so "en" is the hint, never the request kind
-// "sub"/"dub", which is not a language.
+// 60596_th.srt, 278072_zh-Hans.srt); filename-coded files resolve from
+// that. Bare-hash .vtt files appear only through the player island's
+// metadata (see kaaParseSubtitleMeta), which carries the real language,
+// so this fallback keeps the en hint only for a page that loses it.
 func kaaSubtitleTrack(rawURL string) core.Subtitle {
 	return buildSubtitle(rawURL, "", "", "en")
+}
+
+// kaaSubtitleMeta is one subtitle entry decoded from the player island's
+// props block: file URL, language code, native display name.
+type kaaSubtitleMeta struct {
+	src  string
+	lang string
+	name string
+}
+
+// kaaIslandPropsRe captures one props attribute from a cat-player page.
+// The attribute is HTML-escaped JSON, so its quotes are &quot; escapes
+// and the surrounding " characters stay attribute bounds.
+var kaaIslandPropsRe = regexp.MustCompile(`props="([^"]+)"`)
+
+// kaaParseSubtitleMeta pulls the subtitle entries out of the player
+// page's island props attributes. It returns tracks in page order,
+// deduped by URL; an empty result means the page carries no island
+// metadata and the caller falls back to the bare-URL scan.
+//
+// The cat-player page embeds its playback config as an Astro island: a
+// props attribute holding a JSON blob in Astro's tagged form, plain
+// values wrapped as [0, value] and arrays as [1, elements] (objects keep
+// their shape with tagged field values). The subtitles entry carries the
+// real metadata that a URL-only scan loses: format, language code
+// (en, th, zh-Hans...), native display name and file URL. Thumbnails
+// live in a separate key and never show up here.
+func kaaParseSubtitleMeta(raw string) []kaaSubtitleMeta {
+	var out []kaaSubtitleMeta
+	seen := map[string]bool{}
+	for _, m := range kaaIslandPropsRe.FindAllStringSubmatch(raw, -1) {
+		var blob any
+		if err := json.Unmarshal([]byte(html.UnescapeString(m[1])), &blob); err != nil {
+			continue
+		}
+		obj, ok := kaaDecodeAstro(blob).(map[string]any)
+		if !ok {
+			continue
+		}
+		entries, ok := obj["subtitles"].([]any)
+		if !ok {
+			continue
+		}
+		for _, e := range entries {
+			track, ok := e.(map[string]any)
+			if !ok {
+				continue
+			}
+			format, _ := track["format"].(string)
+			if format != "srt" && format != "vtt" {
+				continue
+			}
+			src, _ := track["src"].(string)
+			if src == "" {
+				continue
+			}
+			src = kaaFixURL(src)
+			if seen[src] {
+				continue
+			}
+			seen[src] = true
+			lang, _ := track["language"].(string)
+			name, _ := track["name"].(string)
+			out = append(out, kaaSubtitleMeta{src: src, lang: lang, name: name})
+		}
+	}
+	return out
+}
+
+// kaaDecodeAstro unwraps Astro's serialization tags: [0, v] is a plain
+// value, [1, elems] an array, anything else keeps its JSON shape with
+// every field or element decoded again.
+func kaaDecodeAstro(v any) any {
+	switch t := v.(type) {
+	case []any:
+		if len(t) == 2 {
+			tag, isTag := t[0].(float64)
+			if isTag && tag == 0 {
+				return kaaDecodeAstro(t[1])
+			}
+			if isTag && tag == 1 {
+				elems, _ := t[1].([]any)
+				out := make([]any, len(elems))
+				for i, e := range elems {
+					out[i] = kaaDecodeAstro(e)
+				}
+				return out
+			}
+		}
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = kaaDecodeAstro(e)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = kaaDecodeAstro(e)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // kaaFixURL mirrors the reference scraper's _fix_url: krussdomi embeds
@@ -846,8 +944,8 @@ func kaaFindSubtitles(txt string) []string {
 }
 
 // resolvePlayerMaster verifies one embedded player and returns its master
-// playlist URL plus the player page's subtitle links.
-func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, watchURL string) (string, []string, error) {
+// playlist URL plus the player page's subtitle tracks.
+func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, watchURL string) (string, []core.Subtitle, error) {
 	raw, err := p.doText(ctx, pl.src, p.kaaHeaders(watchURL), 1<<20)
 	if err != nil {
 		return "", nil, err
@@ -857,19 +955,39 @@ func (p *KaaProvider) resolvePlayerMaster(ctx context.Context, pl kaaPlayer, wat
 	if len(masters) == 0 {
 		return "", nil, fmt.Errorf("kaa: player %q has no m3u8", pl.name)
 	}
-	vtts := kaaFindSubtitles(txt)
+	subs := p.playerSubtitles(raw, txt)
 	var lastErr error
 	for _, master := range masters {
 		if _, ok := p.probeKaaMaster(ctx, master); !ok {
 			lastErr = fmt.Errorf("kaa: master probe failed")
 			continue
 		}
-		return master, vtts, nil
+		return master, subs, nil
 	}
 	if lastErr != nil {
 		return "", nil, lastErr
 	}
 	return "", nil, fmt.Errorf("kaa: player %q unplayable", pl.name)
+}
+
+// playerSubtitles builds the server's subtitle list. Primary source is
+// the island metadata (real language per track); when a page ships none
+// of it, the bare-URL scan still finds .vtt/.srt files and resolves
+// theirs from the filename code, falling back to the English hint.
+func (p *KaaProvider) playerSubtitles(raw, txt string) []core.Subtitle {
+	var out []core.Subtitle
+	for _, m := range kaaParseSubtitleMeta(raw) {
+		p.learnURLHost(m.src)
+		out = append(out, buildSubtitle(m.src, m.lang, m.name, ""))
+	}
+	if len(out) > 0 {
+		return out
+	}
+	for _, u := range kaaFindSubtitles(txt) {
+		p.learnURLHost(u)
+		out = append(out, kaaSubtitleTrack(u))
+	}
+	return out
 }
 
 type kaaVariant struct {
