@@ -817,9 +817,11 @@ var kaaIslandPropsRe = regexp.MustCompile(`props="([^"]+)"`)
 // props attribute holding a JSON blob in Astro's tagged form, plain
 // values wrapped as [0, value] and arrays as [1, elements] (objects keep
 // their shape with tagged field values). The subtitles entry carries the
-// real metadata that a URL-only scan loses: format, language code
-// (en, th, zh-Hans...), native display name and file URL. Thumbnails
-// live in a separate key and never show up here.
+// real metadata that a URL-only scan loses: language code (two-letter
+// en/th/vi on some players, three-letter eng/ger/spa on others) and the
+// native display name; src is required, format is optional and where
+// present must be srt or vtt. Thumbnails live in a separate key and
+// never show up here.
 func kaaParseSubtitleMeta(raw string) []kaaSubtitleMeta {
 	var out []kaaSubtitleMeta
 	seen := map[string]bool{}
@@ -841,8 +843,7 @@ func kaaParseSubtitleMeta(raw string) []kaaSubtitleMeta {
 			if !ok {
 				continue
 			}
-			format, _ := track["format"].(string)
-			if format != "srt" && format != "vtt" {
+			if format, ok := track["format"].(string); ok && format != "srt" && format != "vtt" {
 				continue
 			}
 			src, _ := track["src"].(string)
