@@ -21,7 +21,7 @@ Go service layer for the Aniraku web and Android clients.
 Aniraku is open source. Voluntary support helps fund **hosting, releases, and open-source development** and never changes access to API or app features.
 > [!IMPORTANT]
 > This branch uses a **publicly hosted Anilist offline database** for metadata Helping with **no rate limits**.
-> - **Ok the rest-api Web-GUI is being disabled to make the server lightweight for Streaming and Episode focused Scraping**.Enjoy
+> - **Ok the rest-api Web-GUI is being disabled to make the server lightweight for streaming and episode routes**.Enjoy
 > - **Anilist Mirror Graphql With Same Anilist Endpoint:** [Mirror](https://graphql.aniraku.tech)
 > - **GitHub Repository:** [Shoislam0311/anilist-offline-db](https://github.com/Shoislam0311/anilist-offline-db)
 
@@ -40,15 +40,7 @@ Aniraku is open source. Voluntary support helps fund **hosting, releases, and op
 
 Aniraku-Backend keeps the client-facing API separate from provider-specific work. It handles API routing, authentication, episode metadata, playback coordination, account data, sync, and the network checks needed around upstream requests.
 
-The service is written entirely in **Go**, one binary in one container, no external services to run. Streaming resolution is fully in-process across 13 providers (see [the provider guide](docs/PROVIDERS.md)):
-
-- **Anikoto (primary)**, AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro (Niko/Momo).
-- **AnimeX**, plyr API with XOR-decoded direct URLs (Mochi, Kira, Sora, …).
-- **Zoko, NiN, kaa.lt**, direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
-- **AnimeGG, AniWaves**, direct mp4 (highest per mirror) and multi-rendition HLS.
-- **Lee, MegaVid**, direct HLS (ani.pm chain, verified-lang MegaPlay).
-- **Tensho**, zangetsu.cc flixera/4animo embeds decrypted to direct HLS (Tsuki/Kaze/Hoshi).
-- **FlixCloud (fallback)**, embed URLs for the client's embedded player.
+The service is written entirely in **Go**, one binary in one container, no external services to run. Playback is coordinated by a pluggable source layer (see [the provider guide](docs/PROVIDERS.md)): each module serves one upstream family, the manager fans requests out across the enabled modules, verifies what comes back, and falls down the chain when a module fails. Modules are enabled or disabled through configuration, and the request flow is identical for all of them.
 
 Every server list is freshly probed per request (no snapshot cache); sources play through the `/api/v1/proxy` media gateway.
 
@@ -65,9 +57,9 @@ Aniraku web / Android client
     ┌─────────┼─────────┐
     ▼         ▼         ▼
   auth    episodes   streaming
- Supabase AniZip↔TMDB 13 providers (fan-out)
- JWT/JWKS  unlimited  Anikoto → … → MegaVid → Tensho
-   │        │       + FlixCloud (embed)
+ Supabase AniZip↔TMDB pluggable sources (fan-out)
+ JWT/JWKS  unlimited  enabled modules, verified per request
+   │        │       + embed passthrough (fallback)
    ▼        ▼          │
      normalized API response
 ```
@@ -79,7 +71,7 @@ The current router includes playback, episodes, account, sync, and admin.
 | Area | Endpoints | Notes |
 |:--|:--|:--|
 | **Episodes** | `GET /api/v1/anime/{id}/episodes` | AniZip + TMDB bidirectional fallback (AniBridge + Fribb, `coverFallback` if missing) |
-| **Playback** | `POST /api/v1/stream`, `GET /api/v1/servers`, `GET /api/v1/proxy`, `GET /api/v1/download`, `GET /ani/v1/epsrc` | Anikoto decrypt → `hls` `master.m3u8` + `subtitles[]`/`intro/outro`; `proxy` is `uTLS` + `netguard` SSRF guard + CDN allowlist + HLS rewrite; `download` streams provider file links through the same allowlisted gate |
+| **Playback** | `POST /api/v1/stream`, `GET /api/v1/servers`, `GET /api/v1/proxy`, `GET /api/v1/download`, `GET /ani/v1/epsrc` | per-source verified `hls` `master.m3u8` + `subtitles[]`/`intro/outro`; `proxy` is `uTLS` + `netguard` SSRF guard + CDN allowlist + HLS rewrite; `download` streams provider file links through the same allowlisted gate |
 | **Catalog** | `search`, `trending`, `seasonal`, `browse`, `genres`, `schedule` | served through the backend's rate-limited AniList client (token bucket + circuit breaker) |
 | **Account** | `profiles`, `favorites`, `settings`, `notifications`, `logs`, `progress`, `ratings`, `continue-watching` | Supabase RLS via `supabaseRequest` (`apikey=anon` + `Bearer user JWT`) |
 | **Import/export** | `POST /api/v1/import/mal`/`anilist`, `export`, `sync` (`mal`/`anilist` OAuth), `SyncScore`/`SyncUpdate` | `resolveMalIDsToAniList` via `idMal_in` |
@@ -99,10 +91,10 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 | Media proxy | `internal/api/v1/proxy.go` (`Stream`, `GetServers`, `Proxy`, HLS rewrite, allowlist glue) |
 | Provider manager | `internal/streaming/manager.go` (fan-out/merge, fallback chain, aliases, gates, verification) |
 | Authentication | `internal/auth/` |
-| Configuration | `internal/config/` (`TMDB`, `Scraping` bases) |
+| Configuration | `internal/config/` (`TMDB`, upstream bases) |
 | Core models and errors | `internal/core/` |
 | Network safety | `internal/netguard/` (SSRF `Control` + `NoRedirects` + guarded `http.Client` factory) |
-| Streaming providers | `internal/streaming/` (13 providers, see [provider guide](docs/PROVIDERS.md)) |
+| Streaming providers | `internal/streaming/` (pluggable source modules, see [provider guide](docs/PROVIDERS.md)) |
 | TMDB resolver | `internal/tmdb/` (`resolver.go` AniBridge+Fribb, `merge.go`) |
 | API contract | [`docs/openapi.yaml`](docs/openapi.yaml) |
 | Architecture deep-dive | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
@@ -157,6 +149,6 @@ Do not commit Supabase keys, service credentials, JWT material, or other local s
 
 Upstream services have their own terms, limits, and content policies. Use the service only for media and requests you are authorized to access, and avoid unnecessary request volume.
 
-For security concerns, follow [PRIVACY_POLICY.md](PRIVACY_POLICY.md) and the repository's contribution process rather than posting sensitive details publicly.
+For security concerns, follow the private reporting process in [SECURITY.md](SECURITY.md) rather than posting sensitive details publicly.
 
 <div align="center"><sub>Go · Chi · Supabase · AniZip↔TMDB · Anikoto (direct) + FlixCloud · Docker</sub></div>
