@@ -15,7 +15,7 @@ import (
 )
 
 // tenshoFixture serves the zangetsu.cc flow: /search poster grid, watch
-// page with a fresh AJAX_TOKEN, /ajax/episodes, /ajax/server — plus both
+// page with a fresh AJAX_TOKEN, /ajax/episodes, /ajax/server, plus both
 // player embed flows the provider decrypts (FlixEra inline token, ReCloud
 // getSources) down to a probeable /p?t= HLS chain. The stale token test
 // makes the first /ajax/server call answer 403, forcing the provider to
@@ -52,7 +52,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	f := &tenshoFixture{}
 	mux := http.NewServeMux()
 
-	// Poster grid: wrong title first — exact matching must win.
+	// Poster grid: wrong title first, exact matching must win.
 	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("keyword") == "" {
 			t.Errorf("search: missing keyword")
@@ -65,7 +65,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 
 	mux.HandleFunc("/watch/"+tenshoShowPath, func(w http.ResponseWriter, r *http.Request) {
 		f.watchHits.Add(1)
-		// The real site binds the token to a session cookie — /ajax/*
+		// The real site binds the token to a session cookie, /ajax/*
 		// 403s without it.
 		w.Header().Add("Set-Cookie", "PHPSESSID=testsession00000000000000000001; Path=/; HttpOnly")
 		fmt.Fprintf(w, `<html><head><script>window.AJAX_TOKEN = %q;</script></head><body></body></html>`, tenshoToken)
@@ -112,7 +112,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	})
 
 	// FlixEra embed: the page inlines the playback proxy path (the HLS
-	// master) and subtitle tracks — this is all the decrypt step consumes.
+	// master) and subtitle tracks, this is all the decrypt step consumes.
 	mux.HandleFunc("/embed/ani/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<html><head><script>window.__EMBED_PROXY__ = "/p?t=flix-master";`+
 			`window.__EMBED_TRACKS__ = [{"file":"/p?t=flix-sub-en","label":"English","kind":"captions","default":true}];`+
@@ -126,7 +126,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	}
 	mux.HandleFunc("/embed/hd-1/", func(w http.ResponseWriter, r *http.Request) {
 		if f.hangEmbed.Load() {
-			// Hold the response until the client gives up — one hung
+			// Hold the response until the client gives up, one hung
 			// slot must never erase the survivors' results.
 			select {
 			case <-time.After(60 * time.Second):
@@ -139,8 +139,8 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	mux.HandleFunc("/embed/hd-2/", reCloudShell)
 
 	// getSources answers master + tracks (and an intro/outro the provider
-	// ignores — skip segments come from Aniskip), and rejects requests
-	// without a Referer live (404 without — measured).
+	// ignores, skip segments come from Aniskip), and rejects requests
+	// without a Referer live (404 without, measured).
 	mux.HandleFunc("/stream/getSources", func(w http.ResponseWriter, r *http.Request) {
 		if r.Referer() == "" {
 			t.Errorf("getSources: missing Referer (live endpoint 404s without it)")
@@ -169,7 +169,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 			fmt.Fprintf(w, "#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6.0,\n%s/p?t=%s-seg\n#EXT-X-ENDLIST\n",
 				f.srv.URL, strings.TrimSuffix(r.URL.Query().Get("t"), "-media"))
 		case "flix-seg", "animo-seg":
-			// MPEG-TS sync bytes — judged playable, never HTML.
+			// MPEG-TS sync bytes, judged playable, never HTML.
 			w.Header().Set("Content-Type", "video/mp2t")
 			w.Write(bytes.Repeat([]byte{0x47, 0x00, 0x10, 0x00}, 47))
 		case "flix-sub-en", "animo-sub-en":
@@ -187,7 +187,7 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 
 // assertAjaxHeaders checks the session pair the site's JS always sends:
 // token + referer headers and the PHPSESSID cookie from the same watch
-// fetch (token without cookie is rejected live — measured 403).
+// fetch (token without cookie is rejected live, measured 403).
 func assertAjaxHeaders(t *testing.T, r *http.Request, wantToken string) {
 	t.Helper()
 	if got := r.Header.Get("X-Requested-With"); got != "XMLHttpRequest" {
@@ -274,11 +274,11 @@ func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 		t.Fatalf("animo subs = %+v", subs)
 	}
 	// The players' intro/outro ride along in the live JSON but must NOT
-	// reach the result — the frontend uses Aniskip for skip segments.
+	// reach the result, the frontend uses Aniskip for skip segments.
 	if sr.Intro != nil || sr.Outro != nil {
 		t.Fatalf("Intro/Outro = %+v/%+v, want nil (Aniskip is the frontend's skip source)", sr.Intro, sr.Outro)
 	}
-	// Playback needs no Referer upstream (measured) — ship no headers.
+	// Playback needs no Referer upstream (measured), ship no headers.
 	if len(sr.Headers) != 0 {
 		t.Fatalf("Headers = %+v, want none", sr.Headers)
 	}
@@ -322,7 +322,7 @@ func TestTenshoDubLane(t *testing.T) {
 }
 
 // A stale token (403) must trigger exactly one watch-page refresh and a
-// successful retry — the failure mode observed on the live site.
+// successful retry, the failure mode observed on the live site.
 func TestTenshoStaleTokenRefresh(t *testing.T) {
 	f := newTenshoFixture(t)
 	f.rejectFirst.Store(true)
@@ -373,8 +373,8 @@ func TestTenshoFindEpisodes(t *testing.T) {
 }
 
 // When every decrypted stream fails the segment probe (CDN blocked from
-// this egress), the provider must return nil — not embed URLs, not an
-// error — so the fan-out moves on cleanly.
+// this egress), the provider must return nil, not embed URLs, not an
+// error, so the fan-out moves on cleanly.
 func TestTenshoDeadStreamsDrop(t *testing.T) {
 	f := newTenshoFixture(t)
 	f.deadStreams.Store(true)

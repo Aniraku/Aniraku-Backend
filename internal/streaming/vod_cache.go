@@ -6,13 +6,13 @@ import (
 	"time"
 )
 
-// VOD playlist body cache — the playback-startup fast path.
+// VOD playlist body cache, the playback-startup fast path.
 //
 // Every HLS session begins with a serial chain before the first frame:
 // master → media playlist → segments. For relay-backed catalogs (Supaplay)
 // the master and media hops alone cost 1.1-1.2s EACH because the relay
-// fetches upstream server-side — while the collector's honesty probe had
-// ALREADY fetched both playlists moments earlier when the server list was
+// fetches upstream server-side, while the collector's segment probe had
+// already fetched both playlists moments earlier when the server list was
 // built, then threw the bodies away. This cache keeps those bodies (and any
 // playlist the media proxy fetches) for a short TTL so the player's playlist
 // hops resolve in ~1ms instead of 1-2s. Segment bodies are never cached.
@@ -20,7 +20,7 @@ import (
 // Deliberately different from the removed serverList snapshot cache (which
 // poisoned proxied URLs and couldn't be invalidated around tokenized URLs):
 //
-//   - It stores RAW upstream playlist bytes, never wrapped/proxied URLs —
+//   - It stores RAW upstream playlist bytes, never wrapped/proxied URLs,
 //     there is no origin/base URL to poison between requests. The proxy
 //     rewrites every response per request (its own proxyBase, the al audio
 //     strip parameter, and the rn nonce are applied fresh on every hit).
@@ -64,7 +64,7 @@ func isCacheablePlaylist(body []byte) bool {
 }
 
 // VODCacheGet returns a copy of the raw cached playlist body previously
-// stored under exactURL. The caller owns the bytes and may transform them —
+// stored under exactURL. The caller owns the bytes and may transform them,
 // the proxy still runs its own rewrite (proxyBase, al strip, rn nonce) on
 // every hit; the map's buffer stays pristine for the next request.
 func VODCacheGet(exactURL string) ([]byte, bool) {

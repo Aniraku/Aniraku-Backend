@@ -12,7 +12,7 @@ import (
 
 // TestTenshoUpstreamTimeoutCapsHang pins the per-hop ceiling for tensho's
 // sequential prefix: a blackholed upstream (accepts the connection, never
-// answers — the classic egress-blocked edge) must be cut at the short
+// answers, the classic egress-blocked edge) must be cut at the short
 // per-call budget, not the shared client's 45s. One dead hop used to pin
 // the /servers fan-out for tens of seconds (see tenshoUpstreamTimeout).
 func TestTenshoUpstreamTimeoutCapsHang(t *testing.T) {

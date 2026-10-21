@@ -18,7 +18,7 @@ import (
 // carry romaji/native variants the site never lists).
 
 // fetchAnilistTitles returns every display title of one AniList media
-// (english, romaji, native + synonyms) — the candidate set for title-keyed
+// (english, romaji, native + synonyms), the candidate set for title-keyed
 // site searches.
 func fetchAnilistTitles(ctx context.Context, client *http.Client, anilistURL, idStr string) ([]string, error) {
 	id, err := strconv.Atoi(idStr)

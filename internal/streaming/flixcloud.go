@@ -58,7 +58,7 @@ func (p *FlixCloudProvider) FindEpisodes(ctx context.Context, providerID string)
 
 // fetchReanime GETs the Reanime server list and returns the raw JSON body,
 // or nil when it could not be obtained. A single retry with a short backoff
-// absorbs transient failures — including the intermittent Cloudflare JS
+// absorbs transient failures, including the intermittent Cloudflare JS
 // challenge this endpoint serves to datacenter egress ("Just a moment..."
 // HTML). Every failure logs at Warn: this provider's skips used to be
 // Debug-only, which made a fully-broken FlixCloud invisible in production.

@@ -31,7 +31,7 @@ const (
 // judged unusable for playback and dropped. The CDN's blocked shape from
 // this egress is a silent blackhole, not a fast 403; on the provider's
 // full 45s client timeout the probe alone burned the /servers fan-out's
-// whole budget (measured 2026-10-20: zoko logged at the 85000ms ctx cap).
+// whole budget (measured: zoko logged at the 85000ms ctx cap).
 // Var (not const) so tests can shrink it.
 var zokoProbeBudget = 6 * time.Second
 
@@ -276,7 +276,7 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 		// probe judged it unreachable from this egress. The MAL-keyed
 		// variant resolves to the same CDN edge over the same egress IP,
 		// so retrying it (MAL-ID lookups + second embed fetch + second
-		// probe) can only reproduce the block — measured 2026-10-20: this
+		// probe) can only reproduce the block: this
 		// double burn is exactly how zoko pinned /servers at 85s. Drop
 		// now; the gate below keeps the skip cheap for later rounds.
 		manifestUnreachable = true
@@ -297,7 +297,7 @@ func (p *ZokoProvider) FindEpisodeSource(ctx context.Context, anilistID string, 
 	}
 	malID := tmdb.FetchMalID(ctx, p.client, anilistInt)
 	if malID <= 0 {
-		// AniZip has no mapping for some titles — common for adult/hentai
+		// AniZip has no mapping for some titles, common for adult/hentai
 		// entries, and Zoko serves those ONLY MAL-keyed (its AniList index
 		// returns a page with no player payload). AniList itself always
 		// carries idMal, so it is the authoritative second source.

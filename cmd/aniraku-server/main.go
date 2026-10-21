@@ -30,7 +30,7 @@ var (
 // errors) share the same level and format.
 func buildLogger(cfg *config.Config) zerolog.Logger {
 	// JSON (default): write JSON lines directly to stderr. A zero-value
-	// ConsoleWriter must never reach zerolog.New — its nil Out makes the
+	// ConsoleWriter must never reach zerolog.New, its nil Out makes the
 	// first log write panic with a nil-pointer dereference (bytes.Buffer
 	// wrapping a nil writer).
 	var log zerolog.Logger

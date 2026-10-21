@@ -16,15 +16,15 @@ import (
 //
 // Two defects motivated this file. mapSubtitleLang used to return "en" for
 // any label outside an eight-entry switch, so a Thai track fetched with the
-// label "Thai (- ภาษาไทย)" was advertised as lang:"en" — every provider that
+// label "Thai (- ภาษาไทย)" was advertised as lang:"en", every provider that
 // shared it (anikoto, megavid, tensho, zoko, lee) reported English
 // for Indonesian, Malay, Thai and Vietnamese alike. And kaa carried the
 // request language (a track *kind*, "sub") into Subtitle.Lang for unnamed
 // files, producing lang:"sub" label:"sub", which is neither a language nor
 // a usable display name.
 //
-// Resolution now has a fixed priority — explicit lang field, then label,
-// then filename, then a provider-supplied hint — and an unresolvable
+// Resolution now has a fixed priority, explicit lang field, then label,
+// then filename, then a provider-supplied hint, and an unresolvable
 // language stays empty instead of being claimed as English.
 
 // langAliases maps a lowercased language hint onto a canonical ISO 639-1
@@ -137,8 +137,8 @@ var (
 	subFileNumCodeRe = regexp.MustCompile(`[/_.-]([A-Za-z]{2,4})[-_]?\d*\.(?:srt|vtt)$`)
 )
 
-// canonicalSubtitleLang maps any upstream hint — an explicit lang field, a
-// decorated label, a native-script name or a bare ISO code — onto a
+// canonicalSubtitleLang maps any upstream hint, an explicit lang field, a
+// decorated label, a native-script name or a bare ISO code, onto a
 // language tag. It returns "" when the hint carries no language
 // information, and never guesses "en": an empty value tells the client the
 // language is unknown, which is strictly better than claiming a Thai track
@@ -215,7 +215,7 @@ func langCodeFromSubURL(rawURL string) string {
 }
 
 // buildSubtitle resolves one track. Priority: the provider's explicit lang
-// field, then its label, then the filename, then hint — which is reserved
+// field, then its label, then the filename, then hint, which is reserved
 // for providers that know their upstream's convention (kaa's unnamed
 // krussdomi track is English) rather than a blanket default.
 //

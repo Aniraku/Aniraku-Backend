@@ -20,7 +20,7 @@ import (
 
 // LeeProvider resolves direct HLS streams through ani.pm (AniList-keyed
 // series API + playback bootstrap + settlar session + embed session).
-// Verified live 2026-10-02 from the production egress (which serves every
+// Verified live from the production egress (which serves every
 // hop; some residential egresses are challenged on settlar hosts instead).
 //
 // CHAIN (observed from the watch page traffic):
@@ -267,7 +267,7 @@ type leeEmbedSession struct {
 }
 
 // FindEpisodeSource resolves one episode for exactly the requested lang.
-// Fresh token chain per call (operator rule): media object tokens die
+// Fresh token chain per call: media object tokens die
 // fast, so nothing below the series mapping is cached.
 func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))

@@ -120,7 +120,7 @@ func TestNiNZ6Resolve(t *testing.T) {
 		t.Errorf("Referer = %q, want %q", ref, f.server.URL+"/")
 	}
 	// Supaplay's own tracks are dead from every path: the provider ships
-	// NONE even though the payload carries them — the fan-out borrows
+	// NONE even though the payload carries them, the fan-out borrows
 	// Niko/Mochi/Zoko subs instead (mergeNiNSubtitles).
 	if len(src.Subtitles) != 0 {
 		t.Errorf("subtitles = %+v, want none (borrowed at fan-out level)", src.Subtitles)

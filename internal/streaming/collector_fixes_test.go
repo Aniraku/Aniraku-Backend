@@ -7,15 +7,15 @@ import (
 	"time"
 )
 
-// Kaa resolved One Piece from the ANCHORED episodes page — the deep-walk
+// Kaa resolved One Piece from the ANCHORED episodes page, the deep-walk
 // fallback must not fire (one listing fetch total), and a completed player
 // must survive a collector cut that kills a sibling player.
 //
 // Tensho's 10-min resolved-episode cache skips the sequential prefix on
 // repeat rounds (the skip is prefix-free per verify below), and a
 // collector cut mid-slot-fan-out must ship the slots that already
-// resolved — that erase-on-cut is why Hoshi vanished from every One Piece
-// round on 2026-10-20 while its budget burned on one hung 4animo slot.
+// resolved; erase-on-cut is why Hoshi vanished from every One Piece
+// round while its budget burned on one hung 4animo slot.
 
 func TestKaaAnchoredPageSkipsDeepWalk(t *testing.T) {
 	f := newKaaFixture(t)
@@ -84,7 +84,7 @@ func TestTenshoResolvedEpisodeCacheSkipsPrefix(t *testing.T) {
 	if s2 := f.serverHits.Load(); s2 != s1 {
 		t.Fatalf("server ajax calls = %d -> %d on cached rounds: prefix reran", s1, s2)
 	}
-	// The embeds resolved FRESH in every round — same stream set as round 1.
+	// The embeds resolved FRESH in every round, same stream set as round 1.
 	if again == nil || len(again.Sources) != 3 || again.Sources[0].URL != dub.Sources[0].URL {
 		t.Fatalf("cached round sources = %+v, want the full fresh embed resolution", again)
 	}
@@ -114,11 +114,11 @@ func TestTenshoCutFanOutShipsSurvivors(t *testing.T) {
 	}
 }
 
-// Kaa's no-compromise clause: a deadline-shaped listing failure must NOT
-// refetch the listing (measured 6s fail + fresh 6s walk = guaranteed wall
-// cut), and every miss schedules ONE background resolve that fills the
-// 10-min cache the moment kaa.lt/krussdomi cooperate — later rounds then
-// serve kaa fully.
+// Kaa retry design: a deadline-shaped listing failure must NOT
+// refetch the listing (a 6s fail followed by a fresh 6s walk would
+// guarantee a wall cut). Every miss schedules ONE background resolve that
+// fills the 10-min cache the moment kaa.lt/krussdomi cooperate, later
+// rounds then serve kaa fully.
 func TestKaaDeadlineFailureSkipsWalk(t *testing.T) {
 	f := newKaaFixture(t)
 	f.hangFirstListing.Store(true)

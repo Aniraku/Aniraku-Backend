@@ -7,7 +7,7 @@ import "testing"
 // franchise entry must not win on overlap alone (observed: a 2026
 // "Dragon Ball Super: Beerus" query matching the 2015 "Dragon Ball
 // Super" listing at 0.824 and shipping its episode 1 as the wrong show).
-// Season continuations stay exempt — merged listings cover those via the
+// Season continuations stay exempt, merged listings cover those via the
 // stripped query variants and episode offsets.
 func TestAnimeGGSpecificityMismatch(t *testing.T) {
 	reject := [][3]string{

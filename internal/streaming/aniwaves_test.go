@@ -117,7 +117,7 @@ func TestAniWavesResolveDirectPassthrough(t *testing.T) {
 	p := NewAniWavesProvider(zerolog.Nop(), "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Embed-only hosts (no direct file) resolve to nothing — never shipped.
+	// Embed-only hosts (no direct file) resolve to nothing, never shipped.
 	if got := p.resolveDirect(ctx, "https://mfw09.org/e/abc123?v=1"); len(got) != 0 {
 		t.Fatalf("embed-only = %+v, want none", got)
 	}

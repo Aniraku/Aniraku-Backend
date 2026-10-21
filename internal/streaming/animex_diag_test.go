@@ -12,8 +12,8 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// TestAnimeXBlockedProvidersFiltered pins that the loli (Anzu) sub-provider —
-// which serves image-segment playlists and does not play — is filtered from
+// TestAnimeXBlockedProvidersFiltered pins that the loli (Anzu) sub-provider,
+// which serves image-segment playlists and does not play, is filtered from
 // every provider list before any network call, while playable providers
 // (yuki/Mochi, beep/Lumi, neko/Chibi, sora/Sora, zuna/Kira) are never touched.
 func TestAnimeXBlockedProvidersFiltered(t *testing.T) {
@@ -38,7 +38,7 @@ func TestAnimeXBlockedProvidersFiltered(t *testing.T) {
 }
 
 // TestAnimeXProviderTimeoutCapsHang pins the per-provider ceiling: a
-// blackholed sub-provider API (accepts the connection, never responds —
+// blackholed sub-provider API (accepts the connection, never responds,
 // the classic egress-blocked edge) must be cut at ~10s, not the shared
 // client's 45s, so one hung provider cannot hold a semaphore slot and the
 // whole tail that long.
@@ -72,10 +72,10 @@ func TestAnimeXProviderTimeoutCapsHang(t *testing.T) {
 	t.Logf("hung provider cut after %v", elapsed.Round(100*time.Millisecond))
 }
 
-// TestProbeFirstSegment pins the lenient honesty rule: definitive blocks
+// TestProbeFirstSegment pins the lenient probe rule: definitive blocks
 // (unreachable, 403, HTML error pages) drop the source, but ambiguous
 // payloads (image cloaks some CDNs serve probes while playing video fine)
-// keep it listed — worst case is today's behavior, never a regression on
+// keep it listed, worst case is today's behavior, never a regression on
 // a working stream. probeMux lives in anikoto_probe_test.go (same package).
 func TestProbeFirstSegment(t *testing.T) {
 	tsSeg := append([]byte{0x47}, []byte("video-bytes-here-ok")...)

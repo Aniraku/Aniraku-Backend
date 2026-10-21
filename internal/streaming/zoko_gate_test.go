@@ -14,12 +14,12 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// TestZokoManifestGatePinsTheFanOut pins the 2026-10-20 finding: the CDN
+// TestZokoManifestGatePinsTheFanOut pins the gate's reason: the CDN
 // blackholes zoko manifests from this egress, and the old flow (45s probe
 // timeout + MAL retry with a second 45s probe) pinned the /servers fan-out
 // at the 85000ms context cap. The fixed flow must (1) judge a blackholed
 // manifest within one short probe budget, (2) skip the MAL fallback (same
-// edge, same egress — the retry can only reproduce the block), and
+// edge, same egress, the retry can only reproduce the block), and
 // (3) return immediately for the rest of the backoff window, then recover
 // automatically once the manifest answers again.
 func TestZokoManifestGatePinsTheFanOut(t *testing.T) {

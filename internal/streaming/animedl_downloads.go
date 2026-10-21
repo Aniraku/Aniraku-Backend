@@ -20,15 +20,15 @@ import (
 // AniList ID + episode, shaped release group -> sub/dub -> quality ->
 // short-page URL. Its short pages (/download/<code>, then /go/<code>)
 // resolve in the user's browser to the original file host (pahe.win ->
-// kwik.cx — the AnimePahe releases), so the backend ships links only and
+// kwik.cx, the AnimePahe releases), so the backend ships links only and
 // never touches files.
 //
-// Adoption measured 2026-10-07 against the Zoko/Kiwi fetcher it replaces:
+// Adoption notes (vs the Zoko/Kiwi fetcher it replaces) live in docs/ops-notes.md; this fetcher:
 // latest episodes return full 360p/720p/1080p ladders in one call where
 // the Kiwi list endpoint returned zero links, sub and dub arrive together,
 // and no auth/token dance is needed. Their upstream resolver behind a 2h
 // server cache intermittently errors on first-hit lookups ("release source
-// could not be reached") — a miss is cached briefly and served as "no
+// could not be reached"), a miss is cached briefly and served as "no
 // downloads"; it is never retried inside a request (list speed first).
 var animeDlBase = "https://animedl.to"
 
@@ -47,7 +47,7 @@ const (
 // the published quality key alone ("1080p", "1080p mirror").
 type animeDlLink struct {
 	track string // "sub" | "dub"
-	group string // release group ("MTBB", "SubsPlease", ...) — ordering only
+	group string // release group ("MTBB", "SubsPlease", ...), ordering only
 	label string // quality key as published
 	url   string
 }
@@ -71,8 +71,8 @@ func resetAnimeDlCache() {
 }
 
 // fetchAnimeDlDownloads returns the requested track's download links for an
-// episode, or nil when the title/episode/track has none — including when
-// their upstream is unreachable (graceful empty, decided 2026-10-07: links
+// episode, or nil when the title/episode/track has none, including when
+// their upstream is unreachable (graceful empty: links
 // appear on a later request once their cache warms).
 func fetchAnimeDlDownloads(ctx context.Context, client *http.Client, anilistID string, episode int, track string) []core.DownloadLink {
 	if strings.TrimSpace(anilistID) == "" {
@@ -249,7 +249,7 @@ func storeAnimeDlCache(key string, links []animeDlLink) {
 }
 
 // attachDownloadLinks merges AnimeDL links into every server except
-// FlixCloud's: "all sources without the FlixCloud" — the embed player takes
+// FlixCloud's: "all sources without the FlixCloud", the embed player takes
 // no file links, every other server (embeds included) receives them.
 // Existing provider-owned links stay first; new ones append deduped by URL.
 func attachDownloadLinks(servers []core.Server, links []core.DownloadLink) []core.Server {

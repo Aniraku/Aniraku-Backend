@@ -28,7 +28,7 @@ type kaaFixture struct {
 	segmentOrigin *string
 	emptyEpisodes bool
 	// dubNoPlayers emulates shows whose en-US listing page carries zero
-	// embeds (observed: Noblesse ep1) — strict per-lang means dub fails.
+	// embeds (observed: Noblesse ep1), strict per-lang means dub fails.
 	dubNoPlayers bool
 	// floatPages emulates page markers with fractional episode numbers
 	// (observed 14.5) that must not break episode listing.
@@ -36,7 +36,7 @@ type kaaFixture struct {
 	// fractionalEpisode emulates result entries with fractional episode
 	// numbers (observed 1004.5 on long runners).
 	fractionalEpisode bool
-	// dualPlayers makes the sub watch page carry two players — the second
+	// dualPlayers makes the sub watch page carry two players, the second
 	// holds its response until the requester's context dies (partial
 	// fan-out pin). episodePageHits counts listing-page fetches (the
 	// anchored-page fast path must need exactly one for an on-page ep).
@@ -60,7 +60,7 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	mux.HandleFunc("/api/show/naruto-f3cf/episodes", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(f.episodePageHits, 1)
 		if f.hangFirstListing.CompareAndSwap(true, false) {
-			// First draw: never answer — the requester's deadline cut
+			// First draw: never answer, the requester's deadline cut
 			// releases both sides (round fails; the bg retry draws fresh).
 			<-r.Context().Done()
 			return
@@ -94,7 +94,7 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 	mux.HandleFunc("/naruto-f3cf/ep-1-subslug", func(w http.ResponseWriter, r *http.Request) {
 		if f.dualPlayers {
 			// Second player stems its response until the client gives
-			// up — the fast one must survive the cut intact.
+			// up, the fast one must survive the cut intact.
 			fmt.Fprintf(w, `<html>{name:"VidStreaming",shortName:"Vid",src:"%s/fplayer?id=1"}`+
 				`{name:"MegaCloud",shortName:"Mega",src:"%s/hangplayer?id=2"}</html>`, kaaURL, kaaURL)
 			return

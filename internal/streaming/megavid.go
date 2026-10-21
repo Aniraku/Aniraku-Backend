@@ -20,7 +20,7 @@ import (
 )
 
 // MegaVidProvider resolves direct HLS streams through megavid.buzz
-// ({mal|ani}/{id}/{ep}/{lang}/source). Verified live 2026-10-03 from the
+// ({mal|ani}/{id}/{ep}/{lang}/source). Verified live from the
 // production egress: plain HTTP, AniList- and MAL-keyed, no egress block.
 //
 // The API answers JSON:
@@ -29,13 +29,13 @@ import (
 //	"providers":[...],"tracks":[...],"chapters":[{Intro|Outro,start,end}],
 //	"type":"hls"}.
 //
-// Sources decode with the AnimeX XOR codec to direct MegaPlay files — the
+// Sources decode with the AnimeX XOR codec to direct MegaPlay files, the
 // SAME catalog Anikoto serves (identical file paths). The decoded file URL
 // ships as-is (its embedded referer rides along); per-provider re-wraps
-// are deliberately skipped — the segment probe arbitrates playability.
+// are deliberately skipped, the segment probe arbitrates playability.
 //
 // LANGUAGE RULE (operator): megavid sometimes serves the wrong audio for
-// the requested lang (dub file on a sub request and vice versa — proven
+// the requested lang (dub file on a sub request and vice versa, proven
 // live: an unreleased "dub" carried jpn segments). Sources are verified
 // in three layers (Manager.verifyMegaVidLang) and a proven mismatch is
 // dropped:
@@ -48,17 +48,17 @@ import (
 //     segments fall through.
 //  3. file identity: the decoded file path is compared against Anikoto's
 //     same-episode files (same MegaPlay catalog, identical paths); a file
-//     proving to be the other lang's encode is dropped — but only when a
+//     proving to be the other lang's encode is dropped, but only when a
 //     same-lang reference exists, so the comparison can never hide Vidy
 //     on shaky grounds.
 //
-// Anything unverifiable lists as-is — never drop blind.
+// Anything unverifiable lists as-is, never drop blind.
 //
-// FRESHNESS (operator): no resolve cache — /vid/ gateway URLs are
+// FRESHNESS (operator): no resolve cache, /vid/ gateway URLs are
 // session tokens of unknown (short) lifetime, so every lookup re-runs
 // the API call. Single cheap GET per resolve.
 //
-// SERVER NAMES (operator): single fixed cute name — Vidy. Never raw
+// SERVER NAMES (operator): single fixed cute name, Vidy. Never raw
 // mirror ids (they collide with animex display names).
 const (
 	megavidDefaultBase = "https://megavid.buzz"
@@ -130,7 +130,7 @@ func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episo
 	// Shared budget across both attempts so a hung first attempt can
 	// never leave the retry no runway. Generous: a slow-but-working
 	// megavid edge must still return its server (operators require every
-	// provider in the list) — this only bounds a true hang.
+	// provider in the list), this only bounds a true hang.
 	actx, cancel := context.WithTimeout(ctx, 35*time.Second)
 	defer cancel()
 	for attempt := 1; attempt <= 2; attempt++ {
@@ -188,8 +188,8 @@ func (p *MegaVidProvider) fetchSource(ctx context.Context, key, id string, episo
 }
 
 // FindEpisodeSource resolves one episode for the requested lang: AniList
-// key first, MAL key fallback (same fallthrough shape as zoko — one Vidy
-// server either way). Fresh API call per resolve (operator rule): /vid/
+// key first, MAL key fallback (same fallthrough shape as zoko, one Vidy
+// server either way). Fresh API call per resolve: /vid/
 // gateway URLs are session tokens of unknown lifetime. Language
 // correctness is NOT decided here; the manager verifies in two layers
 // (verifyMegaVidLang).
@@ -204,7 +204,7 @@ func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 	}
 	// MAL-id discovery overlaps the AniList resolve: TMDB's anizip mapping
 	// is cached ~24h, so prefetching concurrently costs nothing when the
-	// ani key hits — while cutting 2-4s of sequential discovery from the
+	// ani key hits, while cutting 2-4s of sequential discovery from the
 	// miss path (miss rounds measured 11.5s when id lookup -> AniList
 	// lookup -> MAL resolve -> second probe each waited on the previous).
 	malCh := make(chan int, 1)
@@ -226,7 +226,7 @@ func (p *MegaVidProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 		}
 		malStr := strconv.Itoa(malID)
 		// MAL numbering can follow a different season cut than
-		// AniList — a fallback resolve is correct only when the
+		// AniList, a fallback resolve is correct only when the
 		// mapping is 1:1, so it always logs loudly.
 		p.log.Info().Str("anilistId", anilistID).Int("malId", malID).
 			Int("episode", episode).Msg("megavid: AniList key missed, trying MAL key")
@@ -258,7 +258,7 @@ func (p *MegaVidProvider) resolveKey(ctx context.Context, key, id string, episod
 	// embedded referer (megaplay.buzz fallback).
 	referer = megavidRefererFor(raw, referer)
 	// The decoded URL is already the final direct file (verified live
-	// with its embedded referer) — never re-wrap it through the animex
+	// with its embedded referer), never re-wrap it through the animex
 	// proxy codec: that only adds a third-party hop, and the segment
 	// probe below is the arbiter of playability either way.
 	file := raw
@@ -428,7 +428,7 @@ func normalizeAudioLang(tag string) string {
 
 // m3uAudioLangs lists the normalized audio languages a master playlist
 // declares across its AUDIO renditions. Empty when the master declares
-// none (muxed single audio — unknowable at playlist level).
+// none (muxed single audio, unknowable at playlist level).
 func m3uAudioLangs(body []byte) map[string]bool {
 	out := map[string]bool{}
 	for _, m := range m3uAudioLangRe.FindAllSubmatch(body, -1) {
