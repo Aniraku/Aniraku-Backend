@@ -17,7 +17,7 @@ import (
 )
 
 // Anixo (anixo.online front, anixo.buzz player edge) resolves the site's own
-// first-party HLS relay. Verified end-to-end from VPS egress 2026-10-18:
+// first-party HLS relay. Verified end-to-end from the VPS egress:
 //
 //	GET /embed/ani/<anilistId>/<episode>/1?parentHost=anixo.online
 //	    -> the player page (their SDK's authorized-domain claim; the bare
@@ -25,19 +25,19 @@ import (
 //	       query is exactly what anixo.online's own SDK sends)
 //	    -> inline jwplayer config naming streamUrl = anixo.buzz/api/stream/
 //	       m3u8?t=<opaque token> plus a subtitles[] track array (per entry:
-//	       url, label, default, kind — tokens are base64URL)
+//	       url, label, default, kind, tokens are base64URL)
 //	GET /api/stream/m3u8?t=... -> master: one 1440x1080 variant whose child
 //	    URLs are absolute anixo.buzz/api/stream/m3u8?t=... (self-hosted edge)
 //	inner playlist -> absolute /api/stream/... segments, plain 200s
 //
 // Playback needs NO cookies and NO Referer (measured with neither), so
 // Sources work through the media proxy with plain Referer/UA headers.
-// The embed is AniList-keyed: no search, no episode list, no mapping step —
+// The embed is AniList-keyed: no search, no episode list, no mapping step,
 // the anilist ID IS the path key.
 //
 // Dub: the platform's own availability flag (hasDub on their episode-index
 // space) was false for every show probed (One Piece 21 and JJK 11061 alike)
-// and the audio delivery for a flagged dub was never observable — so this
+// and the audio delivery for a flagged dub was never observable, so this
 // provider is listed sub-only for now. A dub enablement must first be
 // verified live end-to-end; claiming a dub whose audio is unverified is
 // exactly the megavid language-swap class of bug.
@@ -56,7 +56,7 @@ var (
 	// {"success":true,"server":"Server 1 (Sora Edge)","serverId":1,
 	//  "streamUrl":"https://anixo.buzz/api/stream/m3u8?t=<token>","..."}
 	anixoStreamURLRe = regexp.MustCompile(`"streamUrl"\s*:\s*"([^"]+)"`)
-	// Track tokens are base64URL (alphabet includes '-' and '_' — observed
+	// Track tokens are base64URL (alphabet includes '-' and '_', observed
 	// live: "...EVoUFks-Y2loaDtQ...bT8-UlBXUFdSV19dX1k..."). Keeping the raw
 	// single-URL match as the fallback for older page shapes; the primary
 	// path parses the subtitles[] array (anixoSubsArrRe).
@@ -78,7 +78,7 @@ type anixoSubtitleTrack struct {
 }
 
 // parseAnixoSubtitles extracts the player page's subtitle tracks. Primary
-// shape: the subtitles[] JSON array (bound by regex, parsed as JSON — track
+// shape: the subtitles[] JSON array (bound by regex, parsed as JSON, track
 // URLs carry only base64URL characters, so no unescaped quotes inside).
 // Fallback for older page shapes: a bare vtt URL match (now base64URL-aware).
 func parseAnixoSubtitles(html string) []anixoSubtitleTrack {
@@ -121,7 +121,7 @@ func (p *AnixoProvider) FindEpisodes(ctx context.Context, providerID string) ([]
 func (p *AnixoProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	if strings.EqualFold(lang, "dub") {
 		// Sub-only platform (see header comment): a logical miss, without
-		// any breaker implications — the same shape as tensho's "no dub".
+		// any breaker implications, the same shape as tensho's "no dub".
 		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
 			Msg("anixo: dub not listed for this platform")
 		return nil, nil
@@ -154,7 +154,7 @@ func (p *AnixoProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		streamURL = strings.TrimSpace(m[1])
 	}
 	if streamURL == "" {
-		// The 403 body (domain-gate JSON) or an upstream variant change —
+		// The 403 body (domain-gate JSON) or an upstream variant change,
 		// both surface as a plain resolve failure for this round.
 		return nil, fmt.Errorf("anixo: no streamUrl in player page")
 	}
@@ -170,7 +170,7 @@ func (p *AnixoProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		subs = append(subs, buildSubtitle(t.URL, "", t.Label, "en"))
 	}
 
-	// Segment-depth honesty, playback shape: no Referer was needed for the
+	// Segment-depth probe, playback shape: no Referer was needed for the
 	// actual segment fetch (verified), but the media proxy replays the
 	// headers below anyway, so the probe matches the proxied shape.
 	if !probeSegmentsLenient(ctx, p.client, streamURL, anixoEmbedBase+"/", browserUA) {

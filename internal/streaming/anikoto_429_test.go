@@ -104,7 +104,7 @@ func TestIsMegaPlayMissing(t *testing.T) {
 	}
 }
 
-// The MAL-keyed attempt fires when the title is not carried ani-keyed —
+// The MAL-keyed attempt fires when the title is not carried ani-keyed,
 // and never when the host is rate-limiting us (same limiter). Now covered
 // through megaplayDirectKeys below; the routing rule lives in its gate
 // (malID > 0 && !isMegaPlayRateLimited(aniErr)).
@@ -204,7 +204,7 @@ func TestMegaplayDirectKeysNikoMomo(t *testing.T) {
 	}
 }
 
-// Same file on both keys collapses to Niko only — no duplicate slot.
+// Same file on both keys collapses to Niko only, no duplicate slot.
 func TestMegaplayDirectKeysSameFile(t *testing.T) {
 	server, _, _ := megaplayTestServer(
 		map[string]string{"1111": "a.m3u8", "2222": "a.m3u8"},

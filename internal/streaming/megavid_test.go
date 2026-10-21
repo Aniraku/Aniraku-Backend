@@ -203,7 +203,7 @@ func TestVerifyM3uMismatchDrops(t *testing.T) {
 		}}
 	}
 	// Master declares en+es only: sub (ja) is a proven mismatch, dub (en)
-	// is confirmed — decided at layer 1 with zero reference fetches.
+	// is confirmed, decided at layer 1 with zero reference fetches.
 	if got := m.verifyMegaVidLang(ctx, mk("sub"), nil, "7", 1, "sub", true); len(got) != 0 {
 		t.Fatalf("sub listing must drop en/es-only master, got %+v", got)
 	}
@@ -214,7 +214,7 @@ func TestVerifyM3uMismatchDrops(t *testing.T) {
 
 func TestVerifyNeverHidesWithoutReference(t *testing.T) {
 	// No Anikoto anywhere (same-set empty): even an other-lang-shaped
-	// file must list — without a same-lang reference the comparison
+	// file must list, without a same-lang reference the comparison
 	// proves nothing and must not hide Vidy. Fully hermetic (mp4 skips
 	// the playlist layer, empty providers skip every reference fetch).
 	m := &Manager{log: zerolog.Nop(), hentaiCache: map[int]hentaiEntry{}}
@@ -268,7 +268,7 @@ func TestVerifySegmentMismatchDrops(t *testing.T) {
 			Sources: []core.Source{{URL: srv.URL + "/t/master.m3u8", Type: "hls"}},
 		}}
 	}
-	// Segments declare eng: dub keeps, sub drops — ground truth at layer 2
+	// Segments declare eng: dub keeps, sub drops, ground truth at layer 2
 	// with zero reference fetches.
 	if got := m.verifyMegaVidLang(ctx, mk("dub"), nil, "7", 1, "dub", true); len(got) != 1 {
 		t.Fatalf("dub listing must keep eng segments, got %+v", got)
@@ -280,7 +280,7 @@ func TestVerifySegmentMismatchDrops(t *testing.T) {
 
 func TestVerifyCorroborationGate(t *testing.T) {
 	// Solo Vidy claim (no other provider listed the episode): hidden even
-	// though the source itself is fine — hallucinated episodes must not
+	// though the source itself is fine, hallucinated episodes must not
 	// list alone.
 	m := &Manager{log: zerolog.Nop(), hentaiCache: map[int]hentaiEntry{}}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)

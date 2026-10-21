@@ -26,39 +26,36 @@ import (
 // KaaProvider resolves streams through kaa.lt (AniList-keyed search +
 // episode listings, krussdomi embedded players, HLS masters).
 //
-// Verified live 2026-09-30 from the production egress:
+// Verified live against the production egress:
 //   - kaa.lt search / episodes / watch pages: 200, no datacenter block.
 //   - krussdomi master + quality playlists: 200 (direct and via media proxy).
-//   - krussdomi segment bytes REQUIRE `Origin: https://krussdomi.com`
+//   - krussdomi segment bytes require `Origin: https://krussdomi.com`
 //     (Referer alone 403s, every UA 404/403s without Origin). The provider
 //     therefore always ships Referer+Origin in result Headers so the media
 //     proxy forwards them (applyProxyQueryHeaders passes both through).
 //
-// LANGUAGE RULE (operator, strict per-lang): each lang reads its own
-// listing — sub resolves ja-JP pages, dub resolves en-US pages, never the
-// other. When the dub page has no players, no dub server is listed even if
-// sub resolves (observed: Noblesse ep1 has a ja-JP CatStream embed but the
-// en-US page carries zero embeds). The resolve cache is keyed WITH lang so
-// a cached sub result can never leak into a dub listing or vice versa.
-// Dub sources still carry the SUB page's subtitle files (subtitle rule).
+// Language is strict per-lang: each lang reads its own listing, sub
+// resolves ja-JP pages, dub resolves en-US pages, never the other. When
+// the dub page has no players, no dub server is listed even if sub
+// resolves (observed: Noblesse ep1 has a ja-JP CatStream embed but the
+// en-US page carries zero embeds). The resolve cache is keyed WITH lang
+// so a cached sub result can never leak into a dub listing or vice
+// versa; dub sources still carry the SUB page's subtitle files (see
+// Manager.withDubSubtitles). Dual-language shows can list two slugs for
+// the same episode: the ja-JP listing carries players while the en-US
+// listing carries none.
 //
-// Observed live 2026-10-01: ja-JP ep1 slug 67fd53 (players) vs en-US ep1
-// slug ae903e (no embeds) for the same show.
-//
-// AUDIO RULE: sources are always MASTER playlists, never quality variants.
+// Audio: sources are always MASTER playlists, never quality variants.
 // Variant playlists carry zero #EXT-X-MEDIA lines (verified), so a player
-// loading a variant directly gets whatever audio is muxed/default (observed:
-// lang=sub playing dub on anilist 130298). The master carries both AUDIO
-// renditions, and the media proxy strips the wrong one per the request's
-// al=sub/dub parameter (see stripAudioRenditions) — the player then ABRs
-// natively across the master's variants with the correct track.
+// loading a variant directly gets whatever audio is muxed/default
+// (observed: lang=sub playing dub on anilist 130298). The master carries
+// both AUDIO renditions, and the media proxy strips the wrong one per
+// the request's al=sub/dub parameter (see stripAudioRenditions); the
+// player then ABRs natively across the master's variants with the
+// correct track.
 //
-// SERVER NAMES (operator): kaa servers are named by position — nico, robin,
-// D'Luff, then the same crew scheme — never raw player names.
-//
-// SUBTITLE RULE (operator): Sora (animex) dub sources carry the Nico
-// subtitle files, enforced centrally by Manager.withDubSubtitles — every
-// other provider's dub keeps its default subtitles.
+// Server names: kaa servers are named by position (nico, robin, D'Luff,
+// then the same crew scheme), never raw player names.
 const (
 	kaaAPIBase     = "https://kaa.lt"
 	kaaKrussOrigin = "https://krussdomi.com"
@@ -70,13 +67,13 @@ const (
 	maxKaaResolveEntries = 500
 
 	// kaaListingBudget: per-call ceiling for the episode-listing fetch.
-	// Measured 2026-10-20 from the production egress on the SAME page:
-	// 0.9s, 6.2s, then 11.2s — kaa.lt's loading is wildly variable, and a
-	// listing draw slower than 6s can never complete the resolve under
-	// the 10s collector budget (watch page + players still need ~4s).
-	// Capping the draw there converts a guaranteed wall-burn into a fast
-	// fail; any round that could have succeeded inside the budget is
-	// unaffected (listing+watch+players must fit in 10s regardless).
+	// The same listing page measured 0.9s, 6.2s, then 11.2s across draws,
+	// so kaa.lt's loading is wildly variable, and a draw slower than 6s
+	// can never complete the resolve under the collector budget (watch
+	// page + players still need ~4s). Capping the draw there converts a
+	// guaranteed wall-burn into a fast fail; any round that could have
+	// succeeded inside the budget (listing + watch + players all within
+	// it) is unaffected.
 	kaaListingBudget = 6 * time.Second
 )
 
@@ -84,7 +81,7 @@ var (
 	kaaPlayerRe = regexp.MustCompile(`\{\s*name:\s*"([^"]+)"\s*,\s*shortName:\s*"([^"]+)"\s*,\s*src:\s*"([^"]+)"\s*\}`)
 	kaaCatRe    = regexp.MustCompile(`https?://[a-zA-Z0-9.\-]+/cat-player/player\?[^"'\\s]+`)
 	// Master playlists: absolute AND protocol-relative (CatStream embeds
-	// "//bl.krussdomi.com/.../master.m3u8" — the reference scraper matches
+	// "//bl.krussdomi.com/.../master.m3u8", the reference scraper matches
 	// both via (?:https?:)?// and normalizes with _fix_url).
 	kaaM3U8Re = regexp.MustCompile(`(?:https?:)?//[^\s"'<>\\&]+\.m3u8[^\s"'<>\\&]*`)
 	// Subtitle files: .vtt AND .srt (CatStream ships srt only), absolute
@@ -174,12 +171,11 @@ func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider
 	}
 	return &KaaProvider{
 		log: log,
-		// DisableKeepAlives: from this egress the poison pattern is a
-		// reused connection that never answers (python fresh-conn probes
-		// to the same hosts answered 200 in <1s while the Go client sat
-		// out its full budget on keep-alive reuse — krussdomi 2026-10-20
-		// 12:33). kaa fetches are few per round, so per-request dials
-		// cost ~30ms and buy reliable reads.
+		// DisableKeepAlives: from this egress a reused connection can go
+		// permanently silent (krussdomi; fresh-connection probes to the
+		// same hosts answered in under a second while the Go client sat
+		// out its full budget on a keep-alive). kaa fetches are few per
+		// round, so per-request dials cost ~30ms and buy reliable reads.
 		client:     kaaFreshConnClient(),
 		kaaBase:    strings.TrimRight(kaaBase, "/"),
 		anilistURL: anilistURL,
@@ -190,16 +186,15 @@ func NewKaaProvider(log zerolog.Logger, kaaBase, anilistURL string) *KaaProvider
 }
 
 // bgRetryResolve launches at most one background resolve per (slug, ep,
-// lang) after a failed round. This is the no-compromise clause: the 10s
-// collector budget bounds what a round may try, not what the provider may
-// TRY TOTAL — suppose kaa.lt's draws land 0.9s or 11s and krussdomi
-// blackholes keep-alives (both measured 2026-10-20 12:33); a round that
-// drew badly has NO second chance inside its budget, so the resolve
-// retries detached with a fresh 20s budget and fills the 10-minute
-// resolve cache the moment the upstream cooperates. Every later round
-// then serves the resolve from the cache at full strength — kaa does not
-// keep vanishing because one draw was slow. Inflight deduped by key;
-// the goroutine leaks bounded (≤1 per failing key, 20s cap, pure work).
+// lang) after a failed round. The collector budget bounds what a round
+// may attempt, not what the provider may attempt in total: kaa.lt listing
+// draws range 0.9s to 11s for the same page, and krussdomi can blackhole
+// keep-alives, so a draw that went badly gets no second chance inside its
+// budget. This retry runs detached with a fresh 20s budget and fills the
+// 10-minute resolve cache the moment the upstream cooperates; every later
+// round then serves the resolve from the cache at full strength, so kaa
+// does not keep vanishing because one draw was slow. In-flight retries
+// dedupe per key; the leak is bounded (one per failing key, 20s cap).
 func (p *KaaProvider) bgRetryResolve(anilistID int, slug string, episode int, langKey, reqLang string) {
 	key := fmt.Sprintf("%s|%d|%s", slug, episode, langKey)
 	p.mu.Lock()
@@ -359,7 +354,7 @@ func (p *KaaProvider) FindEpisodes(ctx context.Context, providerID string) ([]Ep
 // kaa.lt flags every OTHER page by its leading episode number.
 type kaaPageMark struct {
 	// Page markers are usually ints but kaa.lt sometimes emits
-	// fractional episode numbers (observed 14.5 for specials) —
+	// fractional episode numbers (observed 14.5 for specials),
 	// json.Number keeps the unmarshal from killing the resolve.
 	Eps []json.Number `json:"eps"`
 }
@@ -393,7 +388,7 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 		if len(page.Eps) == 0 {
 			continue
 		}
-		// Page 1 is already in hand (first.Result above) — only fetch
+		// Page 1 is already in hand (first.Result above), only fetch
 		// pages whose leading episode we have not seen.
 		if seen[page.Eps[0].String()] {
 			continue
@@ -418,13 +413,13 @@ func (p *KaaProvider) listEpisodes(ctx context.Context, slug, lang string, first
 
 // FindEpisodeSource resolves one episode for EXACTLY the requested lang
 // (strict per-lang rule): a sub request reads the ja-JP listing, a dub
-// request the en-US listing, and there is no cross-lang fallback — when the
+// request the en-US listing, and there is no cross-lang fallback, when the
 // dub page has no players, no dub server is listed even if sub resolves.
 // The resolve cache is keyed WITH lang for the same reason: a cached sub
 // result must never leak into a dub listing or vice versa.
 //
 // Dub sources still carry the SUB (ja-JP) page's subtitle files (operator
-// subtitle rule), enforced centrally by withDubSubtitles — that is a
+// subtitle rule), enforced centrally by withDubSubtitles, that is a
 // targeted subtitle fetch, not a manifest share.
 func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
@@ -447,7 +442,7 @@ func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	if err != nil {
 		// The miss schedules one background resolve: any moment the
 		// upstreams cooperate fills the resolve cache, and rounds after
-		// that serve kaa fully — a slow draw never benches it for a TTL.
+		// that serve kaa fully, a slow draw never benches it for a TTL.
 		p.bgRetryResolve(id, slug, episode, langKey, lang)
 		return nil, err
 	}
@@ -461,7 +456,7 @@ func (p *KaaProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 
 // kaaLangParam returns kaa.lt's listing-language code for a request lang.
 // deadlineShapedErr reports whether an upstream failure was a
-// budget/deadline cut rather than a plain network error — deadline-shaped
+// budget/deadline cut rather than a plain network error, deadline-shaped
 // failures must not be retried on the same context (the retry cannot find
 // the missing time).
 func deadlineShapedErr(err error) bool {
@@ -625,7 +620,7 @@ type kaaPlayer struct {
 	src   string
 }
 
-// kaaServerNames names kaa servers by position (operator scheme).
+// kaaServerNames names kaa servers by position.
 func kaaServerName(i int) string {
 	if i >= 0 && i < len(kaaServerNames) {
 		return kaaServerNames[i]
@@ -642,14 +637,14 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	var match *kaaEpisode
 	// Fast path: the anchored page usually carries the requested episode
 	// itself. Long runners paginate deep (One Piece = 1180 listed eps) and
-	// listEpisodes' full sequential walk takes 10-19s — over the 10s
+	// listEpisodes' full sequential walk takes 10-19s, over the 10s
 	// collector budget, which cut every One Piece round even with episode 1
-	// one hop away (2026-10-20: Kaa vanished from all OP lists). Only the
+	// one hop away (One Piece rounds once lost all Kaa servers this way). Only the
 	// rare not-on-page case falls back to the full walk.
 	//
 	// A deadline-shaped failure is NOT retried: the listing budget (6s)
 	// already consumed most of the collector budget, and kaa.lt's flaky
-	// draws resolve by round, not by instant retry — retrying here just
+	// draws resolve by round, not by instant retry, retrying here just
 	// burned the wall (measured: 6s fail + fresh 6s walk = the 10s cut).
 	if firstPage, _, fpErr := p.fetchEpisodePage(ctx, slug, kaaLang, strconv.Itoa(episode)); fpErr == nil {
 		for i := range firstPage {
@@ -683,7 +678,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	if len(players) == 0 {
 		return nil, fmt.Errorf("kaa: no embedded players on %s", watchURL)
 	}
-	// Every playable player becomes its own server (named by position) —
+	// Every playable player becomes its own server (named by position),
 	// first-win would hide working mirrors. Players are independent
 	// upstream embeds: resolving them sequentially let one tarpitted host
 	// stall the rest (observed 30s+ kaa times), so up to 3 resolve
@@ -698,7 +693,7 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	var pWg sync.WaitGroup
 	pSem := make(chan struct{}, 3)
 	for i, pl := range players {
-		// DASH-only arms carry no m3u8 — skip without an upstream call.
+		// DASH-only arms carry no m3u8, skip without an upstream call.
 		if strings.Contains(strings.ToLower(pl.src), "type=dash") {
 			continue
 		}
@@ -728,9 +723,8 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	pWg.Wait()
 	// Collector-budget cut mid-fan-out does NOT discard what resolved:
 	// players are independent, and completed ones hold complete streams
-	// (master + subtitles + headers). The budget expired 2026-10-20
-	// scenario — one player slower than the wall dropped the other two
-	// playable ones — must never erase usable sources. Dead-ctx failed
+	// (master + subtitles + headers). The expired-budget scenario, one player slower than the wall dropped the other two
+	// playable ones, must never erase usable sources. Dead-ctx failed
 	// players are simply absent from hits.
 	var playable []hit
 	for _, h := range hits {
@@ -748,10 +742,10 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 		"Referer": kaaKrussRef,
 		"Origin":  kaaKrussOrigin,
 	}
-	// Subtitles are the resolving page's own player-page files. The
-	// operator rule (dub sources carry the SUB page's files) is enforced
+	// Subtitles are the resolving page's own player-page files. Dub
+	// sources carry the SUB page's files; that pairing is enforced
 	// centrally by Manager.withDubSubtitles, which matches per upstream
-	// URL — an in-provider fetch here would only duplicate that work.
+	// URL, an in-provider fetch here would only duplicate that work.
 	sr := &SourceResult{Headers: headers}
 	for i, h := range playable {
 		var subs []core.Subtitle
@@ -800,7 +794,7 @@ func kaaUnescape(s string) string {
 // 60596_th.srt, 278072_zh-Hans.srt); bare-hash .vtt files carry no code,
 // and the player page exposes no label. Those unnamed tracks are the
 // page's default English subtitle (the identical file is labelled English
-// by animex's upstream), so "en" is the hint — never the request kind
+// by animex's upstream), so "en" is the hint, never the request kind
 // "sub"/"dub", which is not a language.
 func kaaSubtitleTrack(rawURL string) core.Subtitle {
 	return buildSubtitle(rawURL, "", "", "en")
@@ -832,7 +826,7 @@ func kaaFindMasters(txt string) []string {
 }
 
 // kaaFindSubtitles extracts unique normalized subtitle file URLs (.vtt and
-// .srt, raw as the operator rule requires). Thumbnail tracks
+// .srt, kept raw). Thumbnail tracks
 // (preview-*.vtt, served under the player's "thumbnails" key) are not
 // subtitles and are dropped.
 func kaaFindSubtitles(txt string) []string {
@@ -889,7 +883,7 @@ type kaaVariant struct {
 // like every other provider probe. Returns the master's quality variants.
 // kaaProbeFetchTimeout caps each hop at 6s: healthy krussdomi reads are
 // well under 1s, and a hung hop must not consume the whole collector
-// budget — the budget cuts everything anyway, but per-hop caps let the
+// budget, the budget cuts everything anyway, but per-hop caps let the
 // NEXT player's surviving probe use the freed time.
 const kaaProbeFetchTimeout = 6 * time.Second
 

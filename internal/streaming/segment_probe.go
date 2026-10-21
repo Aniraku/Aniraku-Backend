@@ -12,7 +12,7 @@ import (
 // browserUA is the default probe User-Agent. It MUST be a Windows Chrome
 // UA: the MegaPlay CDN edges (fetch.nexabloom.top et al) serve 403 Cloudflare
 // block pages to the X11/Linux UA while serving the identical request with a
-// Windows UA (isolated live: same URL, same client, same second — X11 403,
+// Windows UA (isolated live: same URL, same client, same second, X11 403,
 // Windows 200). Every provider probe defaults to this.
 const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
@@ -20,24 +20,24 @@ const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 
 // gate by UA class instead of IP. Measured live on Sora's segment layer
 // (bl1.advancedairesearchlab.xyz + bl1.habibikun.xyz + ...): every
 // desktop UA (Chrome/Edge/Firefox/Safari), Android UA, curl, python and
-// "no UA" get Cloudflare 403 — while iPhone Safari gets 200 with real
+// "no UA" get Cloudflare 403, while iPhone Safari gets 200 with real
 // MPEG-TS bytes (disguised as .jpg). Try this whenever a probe 403s:
 // it costs one request and unlocks sources that are otherwise dropped.
 const iosSafariUA = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1"
 
-// Shared segment-depth honesty probe (lenient verdict).
+// Shared segment-depth probe (lenient verdict).
 //
 // A reachable manifest whose segments are egress-blocked only produces a
 // spinning player (observed: quavex.top and bl1.*.xyz return Cloudflare 403
 // on every header combination while their playlists serve fine). The
-// verdict is deliberately lenient — definitive blocks only (unreachable,
-// non-2xx, HTML error pages) — so ambiguous payloads (image cloaks some
+// verdict is deliberately lenient, definitive blocks only (unreachable,
+// non-2xx, HTML error pages), so ambiguous payloads (image cloaks some
 // CDNs serve probes while playing video fine) keep a server listed instead
 // of regressing a working stream.
 //
 // Playlist hops for every probe go through fetchPlaylistCapped: within the
 // VOD cache's 45s TTL a freshly fetched identical master/media body is
-// served from the cache instead of paying the same upstream hop again —
+// served from the cache instead of paying the same upstream hop again,
 // repeat /servers rounds (the app re-asks when the user switches servers)
 // and multi-variant probes stop re-dialing identical tokenized playlists.
 // The cache stores exact-URL, raw upstream bytes only (no origin to
@@ -68,7 +68,7 @@ func probeSegmentsLenient(ctx context.Context, client *http.Client, masterURL, r
 
 // probePlaylistsLenient verifies a resolved master at playlist depth only:
 // master -> first media playlist must both serve #EXTM3U. Segment bytes are
-// deliberately not fetched — when every hop is served by a relay's own
+// deliberately not fetched, when every hop is served by a relay's own
 // servers (Supaplay's hls-proxy fetches upstream server-side, never through
 // this egress), a segment fetch proves nothing the media playlist did not,
 // while costing 0.3-1.8s on the fan-out's pacing collector. Verdict stays
@@ -89,7 +89,7 @@ func probePlaylistsLenient(ctx context.Context, client *http.Client, masterURL, 
 	return true
 }
 
-// isUpstreamGated reports whether err is an HTTP 403 from upstream — the
+// isUpstreamGated reports whether err is an HTTP 403 from upstream, the
 // signature of IP-reputation blocks (Cloudflare challenge pages) rather
 // than a missing episode. Providers map it to a silent skip so a blocked
 // network never errors playback and auto-recovers when the block lifts.
@@ -146,7 +146,7 @@ func probeSegmentsStrict(ctx context.Context, client *http.Client, fileURL, orig
 // trailing slash real browsers send ("https://host/"). MegaPlay's CDN
 // edge (fetch.nexabloom.top) 403-Cloudfront-blocks "https://megaplay.buzz"
 // (no slash) while serving the identical request with
-// "https://megaplay.buzz/" — measured same client, same second: 403 vs
+// "https://megaplay.buzz/", measured same client, same second: 403 vs
 // 200. Sending the slashless form made every segment probe read a block
 // page and misreport "blocked from this egress". Referers with an actual
 // path are returned untouched.
@@ -162,13 +162,13 @@ func normalizeOriginReferer(referer string) string {
 }
 
 // fetchURLCapped GETs url with referer/UA, bounding both time and bytes
-// (full GET capped, never Range — identical request shape to players).
+// (full GET capped, never Range, identical request shape to players).
 //
 // fetchPlaylistCapped is the playlist variant of the same shape: it serves
 // the hop first from the VOD body cache (45s TTL, exact-URL key, static-
 // playlist gated) and otherwise fetches upstream through fetchURLCapped
-// and stores the result. Probe rounds that re-run within the TTL — repeat
-// /servers rounds and multi-variant sweeps — stop paying the identical
+// and stores the result. Probe rounds that re-run within the TTL, repeat
+// /servers rounds and multi-variant sweeps, stop paying the identical
 // upstream hop; playback-startup warm-up is unchanged because the fetch
 // path still stores into the same cache.
 func fetchPlaylistCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
@@ -216,7 +216,7 @@ func fetchURLCapped(ctx context.Context, client *http.Client, rawURL, referer, u
 // which audio a stream carries, independent of playlist labels or file
 // names (verified live: a mislabeled "dub" stream declared jpn here).
 // Returns the normalized two-letter set; empty means unknown (not TS, no
-// PMT in the sampled bytes, or no language descriptors) — never a verdict
+// PMT in the sampled bytes, or no language descriptors), never a verdict
 // by itself.
 func tsAudioLangs(seg []byte) map[string]bool {
 	out := map[string]bool{}

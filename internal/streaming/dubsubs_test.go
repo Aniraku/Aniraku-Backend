@@ -9,8 +9,8 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// Operator rule: ONLY Sora (animex) dub sources carry the Nico (kaa)
-// subtitle files — Sora serves krussdomi streams, so Nico subs are
+// Subtitle pairing: ONLY Sora (animex) dub sources carry the Nico (kaa)
+// subtitle files; Sora serves krussdomi streams, so Nico subs are
 // timing-compatible. Every other provider's dub keeps its defaults.
 // These tests use the real kaa fixture provider as the subtitle origin
 // (anilist "20" ep1 sub resolves one Nico source with vtt-sub.vtt).

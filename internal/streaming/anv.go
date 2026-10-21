@@ -21,31 +21,31 @@ import (
 )
 
 // AnV (anv.to) resolves direct HLS through the site's own first-party edge.
-// Verified end-to-end from VPS egress 2026-10-18:
+// Verified end-to-end from the VPS egress:
 //
 //	GET  /anime/<slug>            -> Set-Cookie shiro_watch (the session;
 //	                                 HttpOnly, months-long validity)
 //	POST /api/episode             -> {"status":"ready","variants":[...]} keyed by
-//	                                 {anilistId, episode} — malId is optional
+//	                                 {anilistId, episode}, malId is optional
 //	                                 (measured: null malId resolves fine)
 //	GET  <stream-path>            -> master m3u8, session cookie REQUIRED
 //	                                 (403 without the jar, 200 with it)
 //
 // variants[0] = sub, variants[1] = dub; each carries three labeled sources
-// (the site labels them Orange / Pear / Banana — mapped here to Aniraku's
+// (the site labels them Orange / Pear / Banana, mapped here to Aniraku's
 // fruit theme, Mikan/Nashi/Bana, keeping each <provider-family> name theme:
 // eggs for AnimeGG, sea words for AniWaves, pets for AnimeX, sky words for
 // Tensho). Pear and Banana point at the same tokenized edge path and stay
-// separate servers for honesty, exactly like the site itself lists them.
+// separate servers, exactly like the site itself lists them.
 // The stream path is
 // relative to anv.to and every child URL under /stream/ needs the same
 // session cookie, so playback MUST go through the media proxy with the
-// cookie replayed from SourceResult.Headers — that is why probes run with
+// cookie replayed from SourceResult.Headers, that is why probes run with
 // the cookie-jarred client (identical to the playback shape) and the
 // verification verdict is "proxy".
 //
 // The AniList-keyed API makes show matching unnecessary: no title search,
-// no episode-list fetch — one session mint (the cookie persists in the
+// no episode-list fetch, one session mint (the cookie persists in the
 // provider's jar across calls) and one POST per /servers call.
 const (
 	anvBase       = "https://anv.to"
@@ -53,12 +53,12 @@ const (
 )
 
 // anvServerNames names the source slots in order (Aniraku-style fruit
-// theme: mikan = mandarin orange, nashi = Japanese pear, bana = banana —
+// theme: mikan = mandarin orange, nashi = Japanese pear, bana = banana,
 // the site's own Orange/Pear/Banana slots).
 var anvServerNames = [...]string{"Mikan", "Nashi", "Bana"}
 
 // anvEpisodeHrefRe finds the first episode/play detail link on the home
-// page — the mint target (only /anime/ pages set the session cookie).
+// page, the mint target (only /anime/ pages set the session cookie).
 var anvEpisodeHrefRe = regexp.MustCompile(`href="(/anime/[^"']{2,80})"`)
 
 type AnvProvider struct {
@@ -131,14 +131,14 @@ func (p *AnvProvider) Search(ctx context.Context, title string) ([]SearchResult,
 	return nil, nil
 }
 
-// FindEpisodes: the same logic — episode lists come from AniList upstream.
+// FindEpisodes: the same logic, episode lists come from AniList upstream.
 func (p *AnvProvider) FindEpisodes(ctx context.Context, providerID string) ([]Episode, error) {
 	return nil, nil
 }
 
 // ensureSession mints a shiro_watch cookie when the jar has none. Only
 // /anime/<slug> pages mint it (measured: /browse, /online and /recents set
-// nothing — the watch-page routing is where the mint happens), so the flow
+// nothing, the watch-page routing is where the mint happens), so the flow
 // fetches the home page, takes its first live /anime/ href and GETs that
 // detail page. That self-heals: whichever episode currently airs always
 // exists, no hardcoded slug to rot. The mint costs an extra roundtrip only
@@ -211,7 +211,7 @@ type anvSrc struct {
 	// Tracks are the platform's soft-subtitle files (WEBVTT under the same
 	// session-gated /stream/ paths): English by default plus whatever
 	// locales the episode carries (pt-BR, es, es-ES observed). The same
-	// tokens repeat across every source of a variant — shared subtitle
+	// tokens repeat across every source of a variant, shared subtitle
 	// pool, per-episode.
 	Tracks []anvTrack `json:"tracks,omitempty"`
 }
@@ -260,7 +260,7 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		}
 	}
 	if chosen == nil {
-		// Logical miss (no runtime listing yet) — mirrors tensho's
+		// Logical miss (no runtime listing yet), mirrors tensho's
 		// "not in lang" path and never pauses anything.
 		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).
 			Msg("anv: no variant for lang")

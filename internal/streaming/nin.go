@@ -20,8 +20,8 @@ import (
 // ninServerName is the display slot for the Supaplay source.
 const ninServerName = "NiN"
 
-// NiNProvider resolves Supaplay (supaplay.fun) — one of the embed providers
-// anistream.one injects into its watch page — to direct HLS sources.
+// NiNProvider resolves Supaplay (supaplay.fun), one of the embed providers
+// anistream.one injects into its watch page, to direct HLS sources.
 //
 // Supaplay's stream API is plaintext JSON end to end (no obfuscation on any
 // hop; the "encrypted-looking" tokens elsewhere in this space are the animex
@@ -36,7 +36,7 @@ const ninServerName = "NiN"
 // relay), `rawM3u8` (direct CDN edge), subtitle tracks and intro/outro skip
 // chapters. The raw edges (cdn.imgnex.top, cdn.mewstream.buzz, ...) serve
 // Cloudflare 403 to this egress while the hls-proxy relay streams the very
-// same files with no auth at all — so the proxy URL is the shipped source
+// same files with no auth at all, so the proxy URL is the shipped source
 // (Verification "proxy"). The underlying files are the MegaPlay catalog
 // Anikoto already serves: NiN is the redundancy path that keeps working
 // when the direct edges block us.
@@ -45,7 +45,7 @@ const ninServerName = "NiN"
 // every path we have (rawFile hosts are TLS-blocked from this egress,
 // Supaplay's own subtitle-proxy 404s, and the frontend's proxy hits the same
 // walls). The fan-out borrows verified sibling tracks for the same episode
-// instead — Niko, then Mochi, then Zoko (mergeNiNSubtitles in manager.go).
+// instead, Niko, then Mochi, then Zoko (mergeNiNSubtitles in manager.go).
 //
 // Hentai titles are never queried (gated at the fan-out and in the explicit
 // provider switch): Supaplay's API answers 502 for them.
@@ -109,7 +109,7 @@ type ninSkip struct {
 
 // ninSubtitle is one caption track. rawFile is the direct CDN file the
 // frontend's own proxy fetches; file is Supaplay's subtitle-proxy copy
-// (currently 404s upstream — kept only as a last-resort fallback).
+// (currently 404s upstream, kept only as a last-resort fallback).
 type ninSubtitle struct {
 	File    string `json:"file"`
 	RawFile string `json:"rawFile"`
@@ -154,7 +154,7 @@ type ninCacheResponse struct {
 // RACING the one-call z-6 endpoint against the two-step resolver chain and
 // taking the first payload with a usable m3u8. Measured latencies swing per
 // run (z-6 2.5-5.2s, chain ~1.3-1.8s), so racing is what actually sets the
-// collector's floor — and with the server-list snapshot gone this collector
+// collector's floor, and with the server-list snapshot gone this collector
 // runs on every request. Returns nil (no error) when the episode simply
 // does not exist on either path.
 func (p *NiNProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
@@ -235,7 +235,7 @@ func (p *NiNProvider) buildSourceResult(ctx context.Context, data *ninEpisodeDat
 
 	// Subtitles are NOT taken from Supaplay: rawFile hosts are TLS-blocked
 	// from this egress, Supaplay's own subtitle-proxy 404s, and the
-	// frontend's proxy hits the same wall — the tracks simply never play.
+	// frontend's proxy hits the same wall, the tracks simply never play.
 	// The fan-out borrows verified sibling tracks instead (mergeNiNSubtitles:
 	// Niko -> Mochi -> Zoko), so a standalone result carries none.
 

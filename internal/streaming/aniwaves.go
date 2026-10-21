@@ -25,7 +25,7 @@ import (
 
 // AniWavesProvider resolves direct HLS/mp4 streams through aniwaves.ru
 // (filter search + watch detail + ajax episode/server/source chain +
-// echovideo extractors). Verified live 2026-10-02 from the production
+// echovideo extractors). Verified live against the production
 // egress: every hop serves 200 with plain HTTP.
 //
 // PIPELINE (ported from the reference scraper):
@@ -45,12 +45,12 @@ import (
 //     ships with Quality "auto"; the menu lists real levels.
 //   - Savedly mp4s ship only as that mirror's single HIGHEST file
 //     (resilience spare, same rule as animegg).
-//   - Embed-only servers (no direct file) are never shipped — flixcloud
+//   - Embed-only servers (no direct file) are never shipped, flixcloud
 //     owns embeds.
 //   - No dub gate: dub HLS masters carry full renditions, so every dub
 //     the listing carries is listed (strict per-lang, no cross fallback).
 //
-// SERVER NAMES (operator): cute per-upstream names — Nami (Vidplay),
+// SERVER NAMES (operator): cute per-upstream names, Nami (Vidplay),
 // Coral (MyCloud), Pearl (DatSaV/savedly); unknown mirrors fall back to
 // Wavy/Bubbles/Shelly positionally. Never raw upstream labels.
 const (
@@ -1045,7 +1045,7 @@ func (p *AniWavesProvider) extractEchovideo(ctx context.Context, embedURL string
 
 var (
 	// Path-only on purpose (the reference scraper also pins the host, but a
-	// non-echovideo /embed-N/ URL simply 404s getSources and skips — same
+	// non-echovideo /embed-N/ URL simply 404s getSources and skips, same
 	// outcome, and path matching keeps the flow testable off-host).
 	aniwavesEchoURLRe = regexp.MustCompile(`(?i)/embed-(?:[01]|20)/([^/]+)`)
 	aniwavesM3U8Re    = regexp.MustCompile(`(?i)\.m3u8(\?|$)`)
@@ -1057,7 +1057,7 @@ var (
 // master whose playlists serve but whose segments are egress-blocked or
 // deleted would otherwise list a server that can only spin at playback
 // (observed class: upstream file removals after listing). Variants are
-// tried highest-bandwidth first — the player's default path — so a dead
+// tried highest-bandwidth first, the player's default path, so a dead
 // top rendition falls through to a live one instead of killing the mirror.
 func (p *AniWavesProvider) probeAniWavesMaster(ctx context.Context, master, referer string) bool {
 	mhead, ok := fetchURLCapped(ctx, p.client, master, referer, browserUA, 65536, 6*time.Second)
@@ -1273,7 +1273,7 @@ func (p *AniWavesProvider) resolveEpisode(ctx context.Context, id, episode int, 
 	sr := &SourceResult{Headers: map[string]string{"Referer": aniwavesPlaybackReferer}}
 	// Mirrors are independent upstream hosts; resolving them sequentially
 	// meant one tarpitted embed host (45s client timeout x2 attempts each
-	// for fetchSource + extractEchovideo) stalled every mirror behind it —
+	// for fetchSource + extractEchovideo) stalled every mirror behind it,
 	// observed 40s+ provider times on an otherwise healthy chain. Resolve
 	// up to 3 mirrors concurrently, each under its own deadline: a mirror
 	// that can't answer in 15s isn't one worth serving. Results assemble

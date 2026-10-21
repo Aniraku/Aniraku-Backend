@@ -41,7 +41,7 @@ const (
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
 // Generous on purpose: Hana/animex regularly needs 30-35s to resolve, and
-// operators require every provider to appear in the list — a slow-but-
+// operators require every provider to appear in the list, a slow-but-
 // working sub-provider must return its server, never be cut for being
 // slow. 35s only bounds a true hang (dead embed / blocked CDN). A var so
 // tests can shrink it.
@@ -52,12 +52,12 @@ var animexProviderTimeout = 35 * time.Second
 // the hedge never fires; a hung request used to eat the whole provider
 // budget (observed: yuki held the full timeout and cost the Mochi slot
 // on a cold cache). Hedging recovers a flap while a merely slow attempt
-// still returns by itself — nothing that works today can regress.
+// still returns by itself, nothing that works today can regress.
 const animexAPIHedgeDelay = 8 * time.Second
 
 // animexPlyrTimeout bounds waiting on the plyr page (slug + provider
 // list). It has its own internal retry, and the fallback path (anilistID
-// + static provider list) lists every core slot anyway — so a hung plyr
+// + static provider list) lists every core slot anyway, so a hung plyr
 // page must not stall the whole collector.
 const animexPlyrTimeout = 10 * time.Second
 
@@ -68,7 +68,7 @@ var animexProviders = []string{"beep", "yuki", "neko", "sora"}
 
 // animexBlockedProviders lists sub-providers that must never be offered,
 // regardless of what the plyr page lists. loli ("Anzu") serves image-segment
-// playlists (numbered .jpg payloads) — it does not play, so it is hard-
+// playlists (numbered .jpg payloads), it does not play, so it is hard-
 // excluded before any network call. Everything else is resolved and gated
 // only by the manifest reachability probe: no content sniffing in the drop
 // path, because providers like yuki (Mochi) cloak probe requests with image
@@ -101,7 +101,7 @@ var animexProviderNames = map[string]string{
 
 // animexProviderDefaultReferer maps provider IDs to their default referer.
 // Trailing slashes matter: the megaplay CDN 403s slashless origin referers
-// (see normalizeOriginReferer) — the slash form is what real browsers send.
+// (see normalizeOriginReferer), the slash form is what real browsers send.
 var animexProviderDefaultReferer = map[string]string{
 	"yuki": "https://megaplay.buzz/",
 	"sora": "https://krussdomi.com/",
@@ -124,7 +124,7 @@ func (e *animexChallengeError) Error() string {
 
 // animexRateLimitError marks an HTTP 429 from the AnimeX API
 // (pp.animex.one): our fingerprint is over its source budget. Retrying is
-// actively harmful — it deepens the throttle — so callers must back off
+// actively harmful, it deepens the throttle, so callers must back off
 // until retryAfter elapses and serve stale meanwhile.
 type animexRateLimitError struct {
 	status     int
@@ -289,7 +289,7 @@ func (p *AnimeXProvider) invalidateSession() {
 }
 
 // FindEpisodeSource resolves the first available AnimeX stream (plyr API,
-// XOR-decoded direct m3u8 + subtitles). Contract: exactly one SourceResult —
+// XOR-decoded direct m3u8 + subtitles). Contract: exactly one SourceResult,
 // used by the fast /stream fallback path.
 //
 // The AnimeX API expects a slug ID (e.g. "bleach-thousand-year-blood-war-the-calamity-ts6ov"),
@@ -321,7 +321,7 @@ func (p *AnimeXProvider) FindAllEpisodeSources(ctx context.Context, anilistID st
 // resolveAllProviders is the shared resolver behind FindEpisodeSource and
 // FindAllEpisodeSources.
 //
-// The plyr page gives the authoritative per-language provider list — episodes
+// The plyr page gives the authoritative per-language provider list, episodes
 // that only exist on a provider missing from our static list (e.g. loli) are
 // exactly the ones that otherwise "don't show up". Providers resolve with
 // bounded concurrency (3): wide enough to stay well inside the fan-out
@@ -335,7 +335,7 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 	}
 
 	// Fetch the plyr page (slug + provider list) and establish the
-	// Cloudflare clearance session concurrently — independent requests
+	// Cloudflare clearance session concurrently, independent requests
 	// (the jar is goroutine-safe), saving ~300-600ms off every call.
 	// One short-backoff retry on the plyr page: it intermittently serves
 	// the Cloudflare challenge.
@@ -417,7 +417,7 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 			}
 			start := time.Now()
 			res, err := attempt()
-			// Fast failure (not a hang): likely a transient edge flap —
+			// Fast failure (not a hang): likely a transient edge flap,
 			// one immediate retry converts most into hits. Slow failures
 			// are left alone to avoid piling retries onto hangs, and
 			// legitimate empties (no error) are never retried.
@@ -461,7 +461,7 @@ func animexStaleKey(anilistID string, episode int, lang, providerID string) stri
 	return anilistID + "/" + strconv.Itoa(episode) + "/" + lang + "/" + providerID
 }
 
-// storeStale remembers a good result (deep-copied — callers keep using
+// storeStale remembers a good result (deep-copied, callers keep using
 // theirs, and future readers must never observe a mutated entry).
 func (p *AnimeXProvider) storeStale(key string, sr *SourceResult) {
 	p.staleMu.Lock()
@@ -544,7 +544,7 @@ func cloneSourceResult(sr *SourceResult) *SourceResult {
 
 // shouldRetryProvider reports whether a failed sub-provider resolve is
 // worth one immediate retry: real errors that failed fast (transient edge
-// flaps — the usual reason a working server like Mochi misses one list).
+// flaps, the usual reason a working server like Mochi misses one list).
 // Slow failures (hangs, long challenge storms) and legitimate empties (no
 // error, nothing listed) are never retried. Rate limits are never retried:
 // the API is explicitly asking for fewer requests, and an immediate second
@@ -605,7 +605,7 @@ func (p *AnimeXProvider) setCooldown(d time.Duration) {
 //	servers:{subProviders:[{id:"beep",default:true,...},...],dubProviders:[...]},
 //	id:"bleach-...-ts6ov",anilistId:185874,...
 //
-// The provider list is authoritative — the site only offers what it lists
+// The provider list is authoritative, the site only offers what it lists
 // here, so querying exactly these IDs (in listed order) is what makes every
 // available episode show up.
 func (p *AnimeXProvider) fetchPlyrData(ctx context.Context, anilistID string, episode int, lang string) (string, []string, error) {
@@ -703,7 +703,7 @@ func extractPlyrSlug(html string) (string, error) {
 			continue
 		}
 
-		// Check in the FULL html what comes right after the closing quote.
+		// Check in the full HTML what comes right after the closing quote.
 		// Show-level: ,anilistId:  Provider-level: ,default: or },...
 		absoluteQuoteEnd := pos + 4 + endQuote + 1
 		if absoluteQuoteEnd+1 < len(html) {
@@ -732,7 +732,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	// further hedged at animexAPIHedgeDelay).
 	ctx, cancel := context.WithTimeout(ctx, animexProviderTimeout)
 	defer cancel()
-	// 1. Call the AnimeX API with browser-like headers — hedged: if the
+	// 1. Call the AnimeX API with browser-like headers, hedged: if the
 	// first attempt has not answered within animexAPIHedgeDelay, a second
 	// one runs in parallel and the first to finish wins (see the const's
 	// comment). Each attempt builds its own request.
@@ -772,7 +772,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		defer resp.Body.Close()
 
 		if resp.StatusCode == http.StatusForbidden {
-			// Cloudflare challenge/block — transient, retryable via a fresh
+			// Cloudflare challenge/block, transient, retryable via a fresh
 			// plyr session.
 			out.err = &animexChallengeError{status: resp.StatusCode}
 			return out
@@ -822,7 +822,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	// Browsers cannot attach those headers themselves, so playback always
 	// goes through the Aniraku media proxy: every source ships with
 	// Verification "proxy" and the provider headers attached to the result.
-	// A failed probe is not fatal — the proxy egress and residential clients
+	// A failed probe is not fatal, the proxy egress and residential clients
 	// can reach CDNs that block this server.
 	referer := apiResp.Headers["Referer"]
 	if referer == "" {
@@ -841,18 +841,18 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	// qualities, and the serial probe loop (HEAD + first segment +
 	// possible iOS retry, per source) was the fan-out's wall clock: 25 s+
 	// cold on big shows while the API hop itself takes 1-2 s. The
-	// per-source rules are unchanged — desktop pair first, one atomic
+	// per-source rules are unchanged, desktop pair first, one atomic
 	// retry of the whole pair with the iOS UA on definitive failure, drop
-	// only definitive blocks — only their order. Probes hit CDN origins,
+	// only definitive blocks, only their order. Probes hit CDN origins,
 	// never the animex API, so the fingerprint source budget is untouched.
 	//
 	// Adoption (iOS header flip) is decided across ALL kept sources: any
 	// source that cleared only via iOS ships headers with the iOS UA,
 	// same as the serial loop's late adoption. The one deliberate
-	// simplification: a serial quirk that silently KEPT sources failing
-	// both UAs after an earlier source had adopted is gone — definitive
+	// simplification: a serial quirk that silently kept sources failing
+	// both UAs after an earlier source had adopted is gone, definitive
 	// failures are dropped in every regime (those sources were unplayable
-	// everywhere, the honest verdict the probe ladder exists for).
+	// everywhere; the probe ladder exists to prove that).
 	type probeVerdict struct {
 		keep      bool
 		neededIOS bool
@@ -898,7 +898,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		}
 	}
 	// probeSource returns the per-source verdict: HEAD + first segment with
-	// ua, then — only on definitive failure and when allowed — the whole
+	// ua, then, only on definitive failure and when allowed, the whole
 	// pair retried once with the iOS UA. Verdict grounds stay identical to
 	// the serial loop (nothing here reads or writes shared state).
 	probeSource := func(directURL, quality, ua string, allowIOSRetry bool) probeVerdict {
@@ -948,7 +948,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 			}
 
 			// Apply domain rewrites (vivibebe→hawk, etc.)
-			// Only apply global rewrites — never re-encode into CDN proxy.
+			// Only apply global rewrites, never re-encode into CDN proxy.
 			for _, rw := range animexGlobalRewrites {
 				directURL = rw(directURL)
 			}
@@ -957,14 +957,14 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 			p.learnURLHost(directURL) // The media proxy shares this server's egress: a manifest the probe
 			// cannot reach would 403 through the proxy too, so it is dropped
 			// instead of surfacing a server that can only produce 502s. The
-			// same honesty rule extends one level deeper: a reachable manifest
+			// same rule extends one level deeper: a reachable manifest
 			// whose segments are egress-blocked only produces a spinning
-			// player. NOTE: a 403 is not automatically an egress block —
+			// player. NOTE: a 403 is not automatically an egress block,
 			// Sora's bl1.* segment layer 403s every desktop/Android UA while
 			// serving iPhone Safari, so a failed pair is retried with the iOS
 			// UA before condemning the source.
 			//
-			// The segment verdict is deliberately lenient — definitive blocks
+			// The segment verdict is deliberately lenient, definitive blocks
 			// only (unreachable, non-2xx, HTML error pages). Ambiguous payloads
 			// (image cloaks some CDNs serve probes while playing video fine)
 			// keep the server listed: worst case is today's behavior, never a
@@ -1014,7 +1014,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 		headers["Referer"] = referer
 	}
 	if adoptedIOS {
-		// The probe cleared the segments with the iOS UA — playback must
+		// The probe cleared the segments with the iOS UA, playback must
 		// send the same one (bl1.* 403s desktop/Android UAs outright).
 		headers["User-Agent"] = iosSafariUA
 	} else if headers["User-Agent"] == "" {
@@ -1031,7 +1031,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 }
 
 // ---------------------------------------------------------------------------
-// AnimeX proxy URL codec — XOR + base64url encoding/decoding
+// AnimeX proxy URL codec, XOR + base64url encoding/decoding
 // ---------------------------------------------------------------------------
 
 // EncodeAnimeXProxyURL encodes a raw URL + referer into the CDN proxy format.
@@ -1113,7 +1113,7 @@ func (p *AnimeXProvider) fetchHead(ctx context.Context, rawURL, referer, userAge
 	req.Header.Set("User-Agent", ua)
 	if referer != "" {
 		// Normalized: slashless origin referers 403 on the megaplay CDN
-		// (same trap that hid Niko) — yuki's fallback is exactly
+		// (same trap that hid Niko), yuki's fallback is exactly
 		// "https://megaplay.buzz" without the trailing slash.
 		req.Header.Set("Referer", normalizeOriginReferer(referer))
 	}
@@ -1134,7 +1134,7 @@ func (p *AnimeXProvider) fetchHead(ctx context.Context, rawURL, referer, userAge
 }
 
 // probeHLSHead verifies a manifest URL answers from this egress with a real
-// HLS playlist. It intentionally inspects the manifest only — no segment
+// HLS playlist. It intentionally inspects the manifest only, no segment
 // fetching, no content classification: probe requests are not always served
 // the same bytes players get (yuki/Mochi's CDN answers probes with image
 // payloads while the stream plays fine), so deeper verdicts misfire.
@@ -1147,7 +1147,7 @@ func (p *AnimeXProvider) probeHLSHead(ctx context.Context, manifestURL, referer,
 }
 
 // sanitizeSubtitleURL repairs malformed subtitle URLs from upstream APIs
-// (observed: https:///subbl.krussdomi.com/... with an empty host — the API
+// (observed: https:///subbl.krussdomi.com/... with an empty host, the API
 // drops a slash) by promoting the first path segment to the host, and
 // rejects URLs that are still unusable so broken tracks never list.
 // Relative URLs are rejected outright: without a host they can never play.
@@ -1179,8 +1179,8 @@ func sanitizeSubtitleURL(raw string) (string, bool) {
 	return u.String(), true
 }
 
-// playlist is fetchable from this egress (definitive blocks only —
-// unreachable, non-2xx, HTML error pages — so ambiguous payloads never
+// playlist is fetchable from this egress (definitive blocks only,
+// unreachable, non-2xx, HTML error pages, so ambiguous payloads never
 // regress a working stream). Shared shape with the Anikoto segment probe;
 // the verdict here is intentionally the lenient half (no magic-byte
 // requirement) because sub-providers have no edge alternatives to fall
@@ -1190,7 +1190,7 @@ func (p *AnimeXProvider) probeFirstSegment(ctx context.Context, masterURL, refer
 }
 
 // ---------------------------------------------------------------------------
-// Per-provider URL rewrites — mirrors the client-side Xr() / Jr[] / Zr[] logic
+// Per-provider URL rewrites, mirrors the client-side Xr() / Jr[] / Zr[] logic
 // ---------------------------------------------------------------------------
 
 // animexGlobalRewrites are applied to all provider URLs before provider-specific

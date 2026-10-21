@@ -12,8 +12,8 @@ import (
 
 // TestFanOutCollectorsBoundedByBudget pins the cold-/servers contract: the
 // response must land within the collector budget even when a collector's
-// upstream blackholes, because latency IS the slowest collector
-// (2026-10-20: one dead zoko upstream pinned cold fetches at 20-85s).
+// upstream blackholes, because latency is the slowest collector (a dead
+// zoko upstream once pinned cold fetches at 20-85s).
 // The budget must cut the hung collector and still return promptly.
 func TestFanOutCollectorsBoundedByBudget(t *testing.T) {
 	old := collectorBudget

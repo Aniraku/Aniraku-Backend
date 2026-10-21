@@ -7,7 +7,7 @@ import (
 )
 
 // TestRateLimitNeverRetried guards the throttle death spiral: a 429 must
-// neither trigger the immediate fast-failure retry nor a hedged duplicate —
+// neither trigger the immediate fast-failure retry nor a hedged duplicate,
 // every extra hit while throttled extends the throttle.
 func TestRateLimitNeverRetried(t *testing.T) {
 	limited := &animexRateLimitError{status: 429, retryAfter: 20 * time.Second}

@@ -126,7 +126,7 @@ type StreamResult struct {
 	Servers   []Server          `json:"servers,omitempty"` // working Miruro sub-providers
 	Downloads []DownloadLink    `json:"downloads,omitempty"`
 	// Intro/Outro are Miruro-provided skip segments (seconds). The client
-	// shows manual "Skip Intro / Skip Credits" buttons — never auto-skips.
+	// shows manual "Skip Intro / Skip Credits" buttons, never auto-skips.
 	Intro *SkipTimestamp `json:"intro,omitempty"`
 	Outro *SkipTimestamp `json:"outro,omitempty"`
 }
@@ -151,7 +151,7 @@ type Source struct {
 	Quality   string     `json:"quality"`
 	Subtitles []Subtitle `json:"subtitles"`
 	// Verification is a soft verdict ("proxy", "direct", "embed", "dead")
-	// from the server-side playback probe. It is an ordering hint only —
+	// from the server-side playback probe. It is an ordering hint only,
 	// CDNs serve different clients differently, so it never filters
 	// providers. Clients use it to pick the most reliable path first.
 	Verification string `json:"verification,omitempty"`

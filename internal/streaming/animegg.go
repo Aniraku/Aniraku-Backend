@@ -24,7 +24,7 @@ import (
 
 // AnimeGGProvider resolves direct mp4 streams through animegg.org
 // (AniList-keyed search + series match + watch-page mirrors + embed
-// videoSources). Verified live 2026-10-02 from the production egress:
+// videoSources). Verified live against the production egress:
 // search / series / watch / embed all serve 200 with plain HTTP, and the
 // /play/ mp4 URLs 302 to vidcache.net file bytes.
 //
@@ -39,10 +39,10 @@ import (
 // The /play/ mp4 URLs 302 to vidcache.net file hosts, and the media proxy
 // never follows redirects by design (it refuses 3xx rather than relaying
 // clients to unreviewed targets). The provider therefore resolves every
-// mp4 to its FINAL redirect target before shipping it — the server list
+// mp4 to its FINAL redirect target before shipping it, the server list
 // only ever carries the playable file URL, never the /play/ hop.
 //
-// SOURCE RULES (operator):
+// SOURCE RULES:
 //   - One source per mirror tab, always that tab's HIGHEST quality mp4.
 //     The frontend starts playback on the highest rendition, so shipping
 //     lower mp4s would only add dead menu entries that restart playback.
@@ -51,7 +51,7 @@ import (
 //     not surface as a source.
 //   - Embed fallbacks are never shipped (flixcloud owns embeds).
 //
-// SERVER NAMES (operator): positional cute names — Sunny (1st tab), Yolky
+// SERVER NAMES: positional cute names, Sunny (1st tab), Yolky
 // (2nd), Eggy (3rd+). Never raw mirror labels.
 const (
 	animeggDefaultBase = "https://www.animegg.org"
@@ -84,13 +84,13 @@ type AnimeGGProvider struct {
 
 	// Outage breaker. While animegg.org is unreachable or sick, the full
 	// resolve ladder (20s timeouts x retries x multi-page scrapes) used to
-	// burn 40-80s of every /servers call and still end in zero servers —
+	// burn 40-80s of every /servers call and still end in zero servers,
 	// dead weight for the whole fan-out (the response waits for the
 	// slowest collector by design). After a network-health strike the
 	// network path pauses: calls fail fast with zero results, which is
 	// exactly what a failing run delivered, minus the wait. Each pause
 	// doubles up to the cap; when one expires a single full probe run
-	// happens — success lifts the pause instantly, failure re-opens (and
+	// happens, success lifts the pause instantly, failure re-opens (and
 	// extends) it. Healthy animegg resolves in seconds, so caches and
 	// probe runs keep the provider zero-latency to return when the site
 	// recovers.
@@ -137,7 +137,7 @@ func NewAnimeGGProvider(log zerolog.Logger, base, anilistURL string) *AnimeGGPro
 		log: log,
 		// HTTP timeout stays generous (was 45s): a slow-but-working
 		// AnimeGG edge must still return its server rather than being
-		// cut from the list. 20s bounds true hangs only — every real
+		// cut from the list. 20s bounds true hangs only, every real
 		// page here answers in well under 3s.
 		client:     &http.Client{Timeout: 20 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
@@ -186,7 +186,7 @@ func (p *AnimeGGProvider) noteOutageHealth(healthy bool) {
 	if until.After(p.outageUntil) {
 		p.outageUntil = until
 	}
-	p.log.Info().Time("until", until).Dur("pause", d).Msg("animegg: outage pause opened — network path skipped until, probe run re-checks on expiry")
+	p.log.Info().Time("until", until).Dur("pause", d).Msg("animegg: outage pause opened, network path skipped until, probe run re-checks on expiry")
 }
 
 // networkOutageErr classifies a resolve error as network-health pain
@@ -440,7 +440,7 @@ func animeggTitleScore(query, candidate, slug string) float64 {
 	// without this, the parent franchise entry scores ~0.8 on overlap
 	// alone and its episode 1 ships as the wrong show (observed: a 2026
 	// "Beerus" query matching the 2015 "Dragon Ball Super" listing).
-	// Season continuations are exempt — merged listings cover those.
+	// Season continuations are exempt, merged listings cover those.
 	if animeggExtraSpecificity(query, candidate) >= 4 {
 		return base * 0.4
 	}
@@ -829,7 +829,7 @@ var (
 
 // animeggPartNumbers extracts the season/part/cour/chapter/movie numbers
 // titles carry ("Season 2" -> 2, "Part 4" -> 4). Roman numerals
-// ("II") and unnumbered titles yield nothing — the shadow rule below
+// ("II") and unnumbered titles yield nothing, the shadow rule below
 // only fires on explicit digit qualifiers.
 func animeggPartNumbers(titles []string) []string {
 	seen := map[string]bool{}
@@ -977,7 +977,7 @@ var animeggWatchTitleEpRe = regexp.MustCompile(`(?i)<title>[^<]*?\bepisode\s+(\d
 
 // animeggWatchEpisode extracts the episode number the watch page claims
 // to be ("Watch One Piece Episode 5 | ..."). Pages without a readable
-// marker return ok=false (unverifiable — never a failure by itself).
+// marker return ok=false (unverifiable, never a failure by itself).
 func animeggWatchEpisode(watchHTML string) (int, bool) {
 	m := animeggWatchTitleEpRe.FindStringSubmatch(watchHTML)
 	if m == nil {
@@ -1082,7 +1082,7 @@ func (p *AnimeGGProvider) absURL(file string) string {
 // resolveMP4Final follows the /play/ redirect chain to the final file URL
 // (vidcache.net) and verifies it serves media bytes. The media proxy
 // refuses 3xx by design, so shipping the unredirected /play/ URL would only
-// produce "upstream media redirect blocked" at playback — the probe must
+// produce "upstream media redirect blocked" at playback, the probe must
 // both verify AND resolve. Returns the final URL.
 func (p *AnimeGGProvider) resolveMP4Final(ctx context.Context, playURL string) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -1171,7 +1171,7 @@ func (p *AnimeGGProvider) storeShow(id int, slug, title string) {
 }
 
 // FindEpisodeSource resolves one episode for exactly the requested lang.
-// Strict per-lang like kaa: sub reads sub badges/tabs, dub reads dub — no
+// Strict per-lang like kaa: sub reads sub badges/tabs, dub reads dub, no
 // cross-lang fallback. Dub below 720p best quality is hidden entirely.
 func (p *AnimeGGProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
@@ -1201,7 +1201,7 @@ func (p *AnimeGGProvider) FindEpisodeSource(ctx context.Context, anilistID strin
 		p.noteOutageHealth(sr != nil && len(sr.Sources) > 0 && elapsed < outagePauseProbeMin)
 	} else if networkOutageErr(err) || elapsed >= outagePauseProbeMin {
 		// Network pain or a pathological runtime opens the pause; a clean
-		// logical miss ("not listed") on a healthy site does not — the
+		// logical miss ("not listed") on a healthy site does not, the
 		// breaker is global and must never hide healthy providers over
 		// one show's absence.
 		p.noteOutageHealth(false)
@@ -1284,7 +1284,7 @@ func (p *AnimeGGProvider) resolveEpisode(ctx context.Context, id, episode int, l
 	}
 	// Wrong-episode guard: the watch page names its own episode number.
 	// A positive mismatch means the listing pointed at the wrong content
-	// — never ship it. Unmarked pages skip the check.
+	//, never ship it. Unmarked pages skip the check.
 	if n, ok := animeggWatchEpisode(watchHTML); ok && n != providerEp {
 		p.log.Warn().Str("anilistId", strconv.Itoa(id)).Int("episode", episode).
 			Int("providerEp", providerEp).Int("pageEp", n).

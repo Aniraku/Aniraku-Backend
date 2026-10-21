@@ -20,7 +20,7 @@ import (
 )
 
 // Tensho resolves zangetsu.cc (the Zangetsu hianime-family catalog),
-// verified end-to-end from VPS egress 2026-10-07. The site guards its
+// verified end-to-end from the VPS egress. The site guards its
 // episode endpoints with a session-bound pair: the watch page mints both a
 // PHPSESSID cookie and a window.AJAX_TOKEN, and /ajax/* answers 403 unless
 // the same session cookie + token arrive together (measured: token without
@@ -33,7 +33,7 @@ import (
 //	/ajax/server?episodeId=<id>&sub=&dub=        -> server slots (cookie + token)
 //
 // The ajax responses carry no playable media: server slots map to flixera.co
-// and cdn.4animo.xyz embed pages (the site's own loadPlayer switch — s-1
+// and cdn.4animo.xyz embed pages (the site's own loadPlayer switch, s-1
 // FlixEra, s-2 M-Cloud/hd-1, s-3 R-Cloud/hd-2). Tensho never ships those
 // embed URLs: each player page is decrypted to the direct stream the player
 // itself would play (every provider returns decrypted URLs; FlixCloud is the
@@ -42,7 +42,7 @@ import (
 //	flixera:  embed page -> window.__EMBED_PROXY__ = "/p?t=..." -> HLS master;
 //	          window.__EMBED_TRACKS__ = [...] -> subtitle tracks
 //	4animo:   embed page -> var sourcesUrl = '/stream/getSources?t=...'
-//	          -> GET with the embed page as Referer (404 without — measured)
+//	          -> GET with the embed page as Referer (404 without, measured)
 //	          -> JSON: sources[].file = "/p?t=..." (HLS master) + tracks[]
 //
 // Both players' /p?t= URLs are ReCloud proxy paths answering
@@ -50,7 +50,7 @@ import (
 // 200; playback itself needs no Referer). Every master is probed at segment
 // depth before shipping and blocked slots are dropped. The site's episodes
 // ajax already carries "<aniId>/<ep>" in its ani/mal fields (e.g. "16498/1"),
-// which is what puts the episode number into the flixera/hd-2 path — a
+// which is what puts the episode number into the flixera/hd-2 path, a
 // bare id serves a playback-less shell page (measured).
 
 const (
@@ -65,9 +65,9 @@ const (
 
 	// Resolved-episode cache: one episode's identity + slot lists are
 	// stable for minutes, so repeat rounds skip the whole sequential
-	// prefix (watch session → episodes ajax → server ajax) — measured
+	// prefix (watch session → episodes ajax → server ajax), measured
 	// 3-6s on One Piece-listing size, exactly what pushed still-cold
-	// rounds past the 10s collector budget (2026-10-20).
+	// rounds past the collector budget.
 	tenshoResolvedTTL        = 10 * time.Minute
 	maxTenshoResolvedEntries = 500
 
@@ -76,7 +76,7 @@ const (
 )
 
 // tenshoServerNames labels Zangetsu's server slots positionally (s-1
-// flixera, s-2 hd-1, s-3 hd-2) — extras past the third collide on the last
+// flixera, s-2 hd-1, s-3 hd-2), extras past the third collide on the last
 // name inside appendNamedServers, so FindEpisodeSource caps at three.
 var tenshoServerNames = [...]string{"Tsuki", "Kaze", "Hoshi"}
 
@@ -106,7 +106,7 @@ type tenshoTrack struct {
 }
 
 // tenshoEmbed is one player embed decrypted to the stream it would play.
-// The players also report intro/outro skip segments — deliberately unused:
+// The players also report intro/outro skip segments, deliberately unused:
 // the frontend gets its skip data from Aniskip, not from providers.
 type tenshoEmbed struct {
 	m3u8 string
@@ -131,7 +131,7 @@ type tenshoEpisode struct {
 
 type tenshoEpisodesEntry struct {
 	list []tenshoEpisode
-	// sess is the watch-page pair the ajax endpoints require — token
+	// sess is the watch-page pair the ajax endpoints require, token
 	// without the session cookie is rejected with 403.
 	sess    tenshoSession
 	expires time.Time
@@ -156,7 +156,7 @@ type tenshoServerResp struct {
 	Dub []tenshoServerSlot `json:"dub"`
 }
 
-// tenshoResolvedEntry caches one episode's identity + slot lists — the
+// tenshoResolvedEntry caches one episode's identity + slot lists, the
 // prefix's strictly sequential outcome (findShow → session+episodes →
 // server ajax). The embed resolution itself is never cached: streams must
 // stay probe-verified each round.
@@ -179,8 +179,8 @@ type TenshoProvider struct {
 	anilistURL string
 	// flixera/animo are the two player hosts. They default to the live
 	// sites; tests inject one fixture server for all of them (the
-	// NewLeeProvider embedBase precedent) so the whole decrypt flow —
-	// embed page -> token -> stream JSON -> m3u8 probe — runs locally.
+	// NewLeeProvider embedBase pattern) so the whole decrypt flow,
+	// embed page -> token -> stream JSON -> m3u8 probe, runs locally.
 	flixera   string
 	animo     string
 	learnHost func(string)
@@ -232,24 +232,20 @@ func (p *TenshoProvider) learnURLHost(raw string) {
 	p.learnHost(u.Hostname())
 }
 
-// get fetches a page (browser headers) and returns its Set-Cookie pairs —
+// get fetches a page (browser headers) and returns its Set-Cookie pairs,
 // the watch page's PHPSESSID is required by the ajax endpoints. status
 // 403 is returned, not an error, so the caller can refresh and retry.
 // tenshoUpstreamTimeout: per-call ceiling for every upstream read through
 // p.get / p.ajaxGet. The fan-out waits for the slowest collector, and one
-// blackholed hop up tensho's strictly sequential prefix (AniList titles →
-// search → watch page → episodes ajax → server ajax) used to eat the
-// shared client's full 45s — that pinning produced the 20-35s tensho rows
-// measured in collectorMs on 2026-10-20 (with 1.8-3s rounds when upstream
-// was healthy, so time comes from hangs, not honest work). The animex
-// precedent caps this same class at ~10s; anything slower on a page or
-// ajax endpoint is unusable for playback that round anyway. Var so tests
-// can shrink it.
-//
-// 6s (2026-10-20 evening): healthy hops measured 0.1-2s; the observed
+// blackholed hop in tensho's strictly sequential prefix (AniList titles →
+// search → watch page → episodes ajax → server ajax) once ate the shared
+// client's full 45s and pinned rounds at 20-35s while healthy hops ran
+// 1.8-3s. Reads slower than 10s are unusable for playback that round
+// anyway. The value is 6s: healthy hops measure 0.1-2s, and the observed
 // failure mode is a poisoned keep-alive path that never answers and
-// burned the whole 10s collector wall every round. Failing dead hops at
-// 6s frees the remaining budget for the slots that do answer.
+// burned the whole collector wall every round. Failing dead hops at 6s
+// frees the remaining budget for the slots that answer. Var so tests can
+// shrink it.
 var tenshoUpstreamTimeout = 6 * time.Second
 
 func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, string, []*http.Cookie, error) {
@@ -279,7 +275,7 @@ func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, 
 
 // ajaxGet calls one /ajax endpoint with the session pair the page JS
 // sends: X-Page-Token + the PHPSESSID cookie from the same watch fetch
-// (token without cookie = 403 — measured).
+// (token without cookie = 403, measured).
 func (p *TenshoProvider) ajaxGet(ctx context.Context, rawURL string, sess tenshoSession) (int, string, error) {
 	ajaxCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
 	defer cancel()
@@ -319,7 +315,7 @@ func joinCookies(cookies []*http.Cookie) string {
 }
 
 // Search lists zangetsu shows by keyword. SearchResult.ID is the watch
-// path (slug-id) — what FindEpisodes and the watch URL consume.
+// path (slug-id), what FindEpisodes and the watch URL consume.
 func (p *TenshoProvider) Search(ctx context.Context, title string) ([]SearchResult, error) {
 	rawURL := p.base + "/search?keyword=" + url.QueryEscape(title)
 	status, body, _, err := p.get(ctx, rawURL, p.base+"/")
@@ -532,7 +528,7 @@ func (p *TenshoProvider) storeResolvedEpisode(path string, ep tenshoEpisode, sub
 // slot) is the flixera player keyed by the episode's ani/mal ids, s-2 is
 // the 4animo hd-1 player keyed by episode id, s-3 is the 4animo hd-2
 // player keyed by ani/mal. The ani/mal fields carry "<id>/<ep>" (e.g.
-// "16498/1"), which is what puts the episode number in the path — flixera
+// "16498/1"), which is what puts the episode number in the path, flixera
 // serves a playback-less shell for a bare id (measured 7504-byte page).
 func (p *TenshoProvider) embedURL(slot string, ep tenshoEpisode, lang string) string {
 	switch slot {
@@ -646,7 +642,7 @@ func (p *TenshoProvider) resolveFlixera(embed *url.URL, page string) (*tenshoEmb
 		return nil, fmt.Errorf("tensho: unusable playback token on %s", embed.Path)
 	}
 	out := &tenshoEmbed{m3u8: master}
-	// window.__EMBED_TRACKS__ = [ ... ] — a JSON array; decode it with the
+	// window.__EMBED_TRACKS__ = [ ... ], a JSON array; decode it with the
 	// streaming decoder so labels containing brackets cannot truncate a
 	// regex.
 	if i := strings.Index(page, tenshoFlixTracksMark); i >= 0 {
@@ -689,9 +685,9 @@ func tenshoSubs(tracks []tenshoTrack, base *url.URL) []core.Subtitle {
 
 // FindEpisodeSource resolves one episode to direct (decrypted) HLS streams
 // for lang: every server slot's embed page is fetched and decrypted to the
-// master the player would play, then probed at segment depth — dead slots
+// master the player would play, then probed at segment depth, dead slots
 // are dropped. Returns nil (no error) when the show, episode, language or
-// server list is absent — the fan-out treats that as "this provider has
+// server list is absent, the fan-out treats that as "this provider has
 // nothing".
 func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID string, episode int, lang string) (*SourceResult, error) {
 	langKey := "sub"
@@ -707,7 +703,7 @@ func (p *TenshoProvider) FindEpisodeSource(ctx context.Context, providerID strin
 	// Resolved-episode cache: repeat rounds within the TTL skip the whole
 	// sequential prefix (episodeList session fetch + episodes ajax +
 	// server ajax ≈ 3-6s on deep listings) and go straight to the embed
-	// fan-out — the part that consumes the 10s collector budget on
+	// fan-out, the part that consumes the 10s collector budget on
 	// long-runner rounds. Slot lists may be stale for a refresh that
 	// happened inside the window; the embed resolution itself never is.
 	if rv := p.loadResolvedEpisode(show.path, episode); rv != nil {
@@ -817,8 +813,8 @@ func (p *TenshoProvider) resolveSlots(ctx context.Context, showID string, slots 
 					Msg("tensho: embed resolve failed, skipping slot")
 				return
 			}
-			// Segment-depth honesty: a reachable master whose segments are
-			// blocked only spins at playback. Probe with NO Referer — that is
+			// Segment-depth probe: a reachable master whose segments are
+			// blocked only spins at playback. Probe with NO Referer, that is
 			// exactly the shape playback takes through the media proxy, so a
 			// passing probe cannot mask a referer-gated source.
 			if !probeSegmentsLenient(sCtx, p.client, res.m3u8, "", browserUA) {
@@ -832,9 +828,9 @@ func (p *TenshoProvider) resolveSlots(ctx context.Context, showID string, slots 
 	sWg.Wait()
 	// A collector-budget cut mid-fan-out does NOT discard what resolved:
 	// slots are independent upstreams, and completed ones hold complete
-	// streams (master + subtitles). The 2026-10-20 bug shape — one hung
+	// streams (master + subtitles). The bug shape, one hung
 	// slot burning the wall cut the whole collector at context deadline,
-	// erasing the other slots that had already resolved — is why Hoshi
+	// erasing the other slots that had already resolved, is why Hoshi
 	// vanished from every One Piece round. Survivors ship as a partial.
 	for i := range slots {
 		if !slotHits[i].ok {

@@ -4,7 +4,7 @@ import (
 	"testing"
 )
 
-// Tokens observed live on 185874 ep9 (2026-10-20): base64URL — the alphabet
+// Tokens observed live on 185874 ep9: base64URL, the alphabet
 // carries '-' and '_'. The old single-URL regex (base64 alphabet only) could
 // never terminate a match on such tokens, silently yielding zero subtitles.
 const anixoLiveTokenEn = "NSwrbztrHFBVWlZQXldcUV4XBBkaHwNLXVxCFE4OTnQ5LjI4MBIGDRcXBBACRgYEBwUDC0ARHxseEVoUFks-Y2loaDtQBwdSVFVXBFAMUwkPXQ1ZRkYWQBEQRlhOOz85bT8-UlBXUFdSV19dX1kKDg4MWUJDSxJCFEMTQHUoKT8qNhQNBxBLERQGCwI1WzMIAAheBwYH"
@@ -36,7 +36,7 @@ func TestParseAnixoSubtitles(t *testing.T) {
 }
 
 func TestParseAnixoSubtitlesFallbackBareURL(t *testing.T) {
-	// Older page shape: a bare vtt URL, no subtitles[] array — and the
+	// Older page shape: a bare vtt URL, no subtitles[] array, and the
 	// token still carries base64URL chars, which the fallback regex must
 	// now match.
 	bare := `{other:1,"url":"` + anixoTrackURL(anixoLiveTokenEn) + `"}`
@@ -53,7 +53,7 @@ func TestParseAnixoSubtitlesFallbackBareURL(t *testing.T) {
 }
 
 func TestParseAnixoSubtitlesNone(t *testing.T) {
-	// streamUrl-only page (episode ships no captions) must stay nil — not
+	// streamUrl-only page (episode ships no captions) must stay nil, not
 	// an empty slice from a stray empty-array match.
 	if got := parseAnixoSubtitles(`"streamUrl":"https://anixo.buzz/api/stream/m3u8?t=abc",
 		"subtitles":[]`); got != nil {

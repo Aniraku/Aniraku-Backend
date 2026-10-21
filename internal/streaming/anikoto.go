@@ -107,8 +107,8 @@ func (p *AnikotoProvider) FindEpisodeSource(ctx context.Context, providerID stri
 	}
 	key := providerID + "/" + strconv.Itoa(episode) + "/" + lang
 	// Fresh serve: a successful resolve stays playable for minutes (file
-	// URLs are stable, tokens outlive the window), so repeat lookups —
-	// /servers fires on every player open — return instantly without
+	// URLs are stable, tokens outlive the window), so repeat lookups,
+	// /servers fires on every player open, return instantly without
 	// re-contacting megaplay. This also stops the probe bursts that make
 	// Cloudflare rate-limit this egress into fake "blocked" verdicts.
 	if fresh := p.loadAnikotoFresh(key); fresh != nil {
@@ -194,9 +194,9 @@ func (p *AnikotoProvider) loadAnikotoFresh(key string) *SourceResult {
 // the key-resolve flow at a fake server.
 var megaplayBase = "https://megaplay.buzz"
 
-// megaplayDirectKeys resolves both megaplay.buzz keys for an episode — the
+// megaplayDirectKeys resolves both megaplay.buzz keys for an episode, the
 // AniList-keyed page (Niko slot) and, when malID > 0, the MAL-keyed page
-// (Momo slot) — merging them into one result with per-source slot names.
+// (Momo slot), merging them into one result with per-source slot names.
 // Serial, not parallel: if the AniList attempt proves the host is
 // rate-limiting us, the MAL page (same limiter) is skipped instead of
 // doubling down on a limiting host. A MAL result identical to the AniList
@@ -268,7 +268,7 @@ func (p *AnikotoProvider) megaplayMALID(ctx context.Context, anilistID string) i
 // isMegaPlayMissing reports the "title not carried under this key" failure:
 // the page answers 200 but carries no data-id, so the embed resolver fails
 // with "embed file id not found". Anything else (decrypt failure, blocked
-// CDN, rate limit) is a different problem the other key will not fix — same
+// CDN, rate limit) is a different problem the other key will not fix, same
 // host, usually the same edges.
 func isMegaPlayMissing(err error) bool {
 	if err == nil {
@@ -279,7 +279,7 @@ func isMegaPlayMissing(err error) bool {
 
 // megaplayOrigin derives the API origin for a megaplay embed URL. All
 // megaplay.buzz API routes (getSourcesNew, getSources) live at the host
-// root — including for nested player paths like /videojs/stream/..., whose
+// root, including for nested player paths like /videojs/stream/..., whose
 // naive /stream/ split would point at a non-existent
 // /videojs/stream/getSourcesNew (404 on every edge, misreported as
 // blocked). Other hosts keep the legacy split behavior.
@@ -320,7 +320,7 @@ func (p *AnikotoProvider) megaplayDirectURL(ctx context.Context, embedURL, label
 	if file == "" {
 		return nil, fmt.Errorf("embed returned no file")
 	}
-	// Every CDN edge probed blocked from this egress — the media proxy would
+	// Every CDN edge probed blocked from this egress, the media proxy would
 	// 403 too. Return an error so the caller falls through to other providers.
 	if !pOK {
 		p.log.Info().Str("file", file).Msg("megaplay direct: no playable CDN edge from this egress")
@@ -459,7 +459,7 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 		}
 	}
 	// Anivexa parity: fetch embed page with spoofed Referer (hianimes.re)
-	// and Chrome 124 UA — the embed servers validate referer and reject
+	// and Chrome 124 UA, the embed servers validate referer and reject
 	// requests that come from anikototv.to or the embed origin itself.
 	embedReq, err := http.NewRequestWithContext(ctx, http.MethodGet, embedURL, nil)
 	if err != nil {
@@ -492,7 +492,7 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 	// JSON); the legacy endpoint returns an AES-encrypted "enc" blob instead
 	// of sources.file. Try New first, fall back to legacy + decrypt.
 	// MegaPlay's own JS appends the embed's ?s= variant (tcdn/bcdn) to every
-	// getSources call — the variant picks the CDN edge (tcdn -> megap.shiora
+	// getSources call, the variant picks the CDN edge (tcdn -> megap.shiora
 	// .site, bcdn/default -> fetch.nexabloom.top). Passing it through is what
 	// makes tcdn embeds resolve to an edge that does not block datacenter
 	// IPs.
@@ -569,7 +569,7 @@ func resolveMegaPlayEmbed(ctx context.Context, client *http.Client, embedURL str
 // (429/403/5xx + challenge statuses). The worker's Cloudflare egress
 // passes where ours is refused (verified live: real embed pages + working
 // getSourcesNew through it). Used ONLY as a fallback after a direct
-// failure — never primary — so normal traffic never depends on
+// failure, never primary, so normal traffic never depends on
 // third-party generosity. ANIRAKU_MEGAPLAY_WORKER overrides without a
 // rebuild; empty disables the fallback.
 var megaplayWorkerBase = megaplayWorkerBaseFromEnv()
@@ -605,7 +605,7 @@ func needsWorkerRetry(resp *http.Response, err error) bool {
 
 // fetchWithWorkerFallback performs req directly, retrying once through the
 // CORS worker proxy when Cloudflare blocks our egress. On worker failure
-// the ORIGINAL outcome is returned, so callers never see a worse error
+// the original outcome is returned, so callers never see a worse error
 // than they would have without the fallback.
 func fetchWithWorkerFallback(ctx context.Context, client *http.Client, req *http.Request) (*http.Response, error) {
 	resp, err := client.Do(req)
@@ -639,7 +639,7 @@ func fetchWithWorkerFallback(ctx context.Context, client *http.Client, req *http
 
 // megaPlayEdgeVariants returns the s-param variants to try for an embed,
 // with the embed's own variant first. MegaPlay's getSources picks the CDN
-// edge server-side and the mapping rotates — the same embed can hand back a
+// edge server-side and the mapping rotates, the same embed can hand back a
 // datacenter-blocked edge (bcdn/default -> fetch.nexabloom.top) one call and
 // an open edge (tcdn -> shiora/akirax/mikora) the next.
 func megaPlayEdgeVariants(embedURL string) []string {
@@ -705,7 +705,7 @@ func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL 
 			// 429 too. Break instead of burning ~3 requests per
 			// remaining variant on a verdict that's already known, and
 			// record the rate limit (even over an earlier different
-			// failure) so callers know the whole host is limiting us —
+			// failure) so callers know the whole host is limiting us,
 			// not that the title is missing under this key.
 			if isMegaPlayRateLimited(dErr) {
 				if firstDecErr == nil || !isMegaPlayRateLimited(firstDecErr) {
@@ -734,7 +734,7 @@ func resolveMegaPlayPlayable(ctx context.Context, client *http.Client, embedURL 
 // isMegaPlayRateLimited reports whether an embed-resolve error is the host
 // rate-limiting this egress (HTTP 429). resolveMegaPlayEmbed surfaces the
 // embed-page status verbatim ("embed page returned HTTP 429: ..."), so a
-// substring match is precise — no other error in this chain carries a bare
+// substring match is precise, no other error in this chain carries a bare
 // 429.
 func isMegaPlayRateLimited(err error) bool {
 	if err == nil {
@@ -851,7 +851,7 @@ func absInt(n int) int {
 // scoreShowCandidate is the Anivexa additive scorer, ported exactly: exact
 // title matches dominate (+1000/+900/+800), partial matches add smaller
 // bonuses, mismatched modifiers subtract heavily, and length difference is
-// a mild tiebreaker. No threshold — the top score wins.
+// a mild tiebreaker. No threshold, the top score wins.
 func scoreShowCandidate(cand titleCand, meta anilistMeta) float64 {
 	score := 0.0
 	candName := normTitle(cand.name)
@@ -908,8 +908,8 @@ func scoreShowCandidate(cand titleCand, meta anilistMeta) float64 {
 
 // filterLatinKeywords keeps at most max Latin-script queries, preserving
 // order (English and romaji come first from keywords()). Non-Latin queries
-// can never match a Latin-script catalog — verified live against
-// anikototv.to — so they are dropped before any request is made. Shared by
+// can never match a Latin-script catalog, verified live against
+// anikototv.to, so they are dropped before any request is made. Shared by
 // the Anikoto and OGFLix resolvers.
 func filterLatinKeywords(keywords []string, max int) []string {
 	out := make([]string, 0, len(keywords))
@@ -954,8 +954,8 @@ type titleCand struct {
 }
 
 // fetchAniListMetaFor is the shared AniList meta lookup. Primary source is
-// AniList GraphQL; when AniList is down — it has recurring global outages
-// (403 "temporarily disabled", 429 rate limits) — it falls back to AniZip,
+// AniList GraphQL; when AniList is down, it has recurring global outages
+// (403 "temporarily disabled", 429 rate limits), it falls back to AniZip,
 // which mirrors the same mappings keyed by AniList ID.
 func fetchAniListMetaFor(ctx context.Context, client *http.Client, anilistID string) (anilistMeta, error) {
 	meta, err := fetchAniListMetaUpstream(ctx, client, anilistID)
