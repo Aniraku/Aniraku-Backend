@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// Regression test for the 2026-09-27 production incident: setCachedEpisodes
+// Regression test for a production incident: setCachedEpisodes
 // acquired entry.mu.Lock() and then called evictEpisodeCacheIfNeeded(), whose
-// Range callback re-acquired the SAME entry's RLock — Go's RWMutex is not
+// Range callback re-acquired the SAME entry's RLock, Go's RWMutex is not
 // reentrant, so the second write to any anime deadlocked the goroutine,
 // poisoned the entry forever, and cascaded through every later cache write
 // until no /episodes request could complete (context-blind, so the 45s
@@ -24,7 +24,7 @@ func TestSetCachedEpisodesUpdateNoDeadlock(t *testing.T) {
 		defer close(done)
 		id := 777000111
 		setCachedEpisodes(id, map[int]*EpisodeMetadata{1: {Number: 1}})
-		// Second and third writes to the SAME existing entry — the trigger
+		// Second and third writes to the SAME existing entry, the trigger
 		// that deadlocked production.
 		setCachedEpisodes(id, map[int]*EpisodeMetadata{2: {Number: 2}})
 		setCachedEpisodes(id, map[int]*EpisodeMetadata{3: {Number: 3}})
@@ -54,8 +54,8 @@ func TestSetCachedEpisodesUpdateNoDeadlock(t *testing.T) {
 	clearTestCaches(t)
 }
 
-// Hammer: concurrent readers, writers (new + update paths), and evictions —
-// the exact production mix — must finish and leave the cache coherent.
+// Hammer: concurrent readers, writers (new + update paths), and evictions,
+// the exact production mix, must finish and leave the cache coherent.
 // Run under -race in CI; a lock cycle hangs this test and the go test
 // timeout turns it red.
 func TestEpisodeCacheConcurrentHammer(t *testing.T) {
@@ -73,7 +73,7 @@ func TestEpisodeCacheConcurrentHammer(t *testing.T) {
 				base := 770000000 + w*perWorker
 				for i := 0; i < perWorker; i++ {
 					id := base + i
-					// New-entry write, update write, read, evict — every
+					// New-entry write, update write, read, evict, every
 					// path production takes, from every worker at once.
 					setCachedEpisodes(id, map[int]*EpisodeMetadata{1: {Number: 1}})
 					setCachedEpisodes(id, map[int]*EpisodeMetadata{2: {Number: 2}})

@@ -38,8 +38,8 @@ type Handlers struct {
 	downloadClient *http.Client
 
 	// Media-proxy clients: same transports as their API counterparts but
-	// WITHOUT http.Client.Timeout. That timeout is end-to-end — it covers
-	// streaming the response body — so a 30s cap aborts large/slow HLS
+	// WITHOUT http.Client.Timeout. That timeout is end-to-end, it covers
+	// streaming the response body, so a 30s cap aborts large/slow HLS
 	// segments mid-transfer and the browser sees ERR_INCOMPLETE_CHUNKED_ENCODING.
 	// Boundaries for these clients: 15s dial timeout, 30s response-header
 	// timeout (h1), and the proxy request's context (client disconnect).

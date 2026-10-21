@@ -195,7 +195,7 @@ func FetchAnisearchEpisodes(ctx context.Context, client *http.Client, anilistID 
 
 // anisearchEpisodesURL resolves the canonical /episodes page URL.
 // anisearch.com 301s bare/wrong slugs to canonical, and our HTTP clients
-// refuse redirects — so read the Location header manually (no follow needed).
+// refuse redirects, so read the Location header manually (no follow needed).
 func anisearchEpisodesURL(ctx context.Context, client *http.Client, anisearchID int) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/anime/%d", AnisearchBase, anisearchID), nil)
 	if err != nil {

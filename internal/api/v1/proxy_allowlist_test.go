@@ -21,7 +21,7 @@ func TestIsAllowedProxyHost(t *testing.T) {
 		"storage.googleapis.com",
 		"cdn.miruro.tv",
 		"185.237.106.79",
-		// Observed live 2026-08-05 via the Miruro API
+		// Observed live via the Miruro API
 		"tools.fast4speed.rsvp",
 		"vault-10.uwucdn.top",
 		"morning-credit-3bcc.vibevibe.workers.dev",

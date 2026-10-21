@@ -27,7 +27,7 @@ func TestResolveURLForms(t *testing.T) {
 
 // isPlaylistBody is the backstop for playlist legs that no URL or
 // content-type hint identifies (query-suffixed masters, extension-less
-// variant URLs, cloaked image/jpeg types) — and the guard that keeps
+// variant URLs, cloaked image/jpeg types), and the guard that keeps
 // binary tripping a hint out of the playlist rewriter.
 func TestIsPlaylistBody(t *testing.T) {
 	if !isPlaylistBody([]byte("#EXTM3U\n#EXT-X-VERSION:3\n")) {
@@ -49,7 +49,7 @@ func TestIsPlaylistBody(t *testing.T) {
 }
 
 // The exact echovideo master shape: root-relative variant legs under a
-// query-suffixed master URL. Every leg must come out proxied-absolute —
+// query-suffixed master URL. Every leg must come out proxied-absolute,
 // raw or double-pathed legs 404 against our own domain and black out.
 func TestRewriteRootRelativeVariantLegs(t *testing.T) {
 	h := &Handlers{}

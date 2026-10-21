@@ -76,7 +76,7 @@ var adminHTTPClient = netguard.NewHTTPClient(10 * time.Second)
 //
 // Header roles mirror supabaseRequest: the apikey header must carry the
 // project's ANON key (the gateway rejects anything that is not a project
-// key with "Invalid API key" — a user JWT is not a project key), while the
+// key with "Invalid API key" (a user JWT is not a project key), while the
 // Authorization bearer carries the user's JWT, which PostgREST resolves to
 // the authenticated role so auth.uid() inside is_admin() evaluates for the
 // actual caller. anonKey is passed explicitly rather than read from a
@@ -89,7 +89,7 @@ func RequireAdmin(supabaseURL, anonKey string, log zerolog.Logger) func(http.Han
 			userID := GetUserID(ctx)
 			if userID == "" {
 				// Authenticate first: run the standard middleware chain
-				// (router applies authMiddleware before this) — if missing,
+				// (router applies authMiddleware before this) if missing,
 				// fail closed.
 				http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 				return

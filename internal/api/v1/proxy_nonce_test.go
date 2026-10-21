@@ -40,7 +40,7 @@ func TestRewriteEmitsStableURLs(t *testing.T) {
 // TestStripProxyNoncePreservesSignedQueries guards the two properties of
 // the cache-busting strip: our rn param disappears, and every other param
 // keeps its exact bytes and order. A ParseQuery+Encode round-trip instead
-// reorders params and appends "=" to nameless ones — animeheaven signs
+// reorders params and appends "=" to nameless ones, animeheaven signs
 // ?<md5>&<md5> order-sensitively and answers 404 to the re-encoded form
 // (observed live: direct fetch 206, through the proxy 404).
 func TestStripProxyNoncePreservesSignedQueries(t *testing.T) {

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Origin fill limiter (2026-10-16, memory hardening after the OOM wedges).
+// Origin fill limiter (memory hardening after the OOM wedges).
 //
 // The origin box runs on 836 MB of RAM. Every /proxy cache miss is one
 // upstream connection + goroutine + buffers held for the whole paced copy,
@@ -20,8 +20,8 @@ import (
 // required a manual reboot.
 //
 // The limiter bounds how many upstream fills may run at once. Requests
-// that find all slots busy queue briefly — bounded by the shorter of the
-// client's remaining budget and the queue hold — then get a clean 503
+// that find all slots busy queue briefly, bounded by the shorter of the
+// client's remaining budget and the queue hold, then get a clean 503
 // (Retry-After) they can retry, instead of silently pushing the box into
 // the swap thrash that previously only a reboot cleared. Cache hits (VOD
 // cache, key cache) bypass the limiter on purpose: they cost no upstream
@@ -95,7 +95,7 @@ func (f *fillLimiter) acquire(ctx context.Context) (released func(), ok bool) {
 }
 
 // Memory caps for the two paths that buffer upstream bodies before
-// rewriting (2026-10-16). Playlists are tens of KiB (the VOD cache itself
+// rewriting. Playlists are tens of KiB (the VOD cache itself
 // stores at most 256 KiB) and encryption keys are 16 bytes, so anything
 // approaching these ceilings is not the media type the URL claims; past
 // the cap the bytes are streamed instead of buffered.

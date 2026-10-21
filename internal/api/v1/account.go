@@ -320,7 +320,7 @@ func (h *Handlers) UpdateProfile(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid profile payload")
 		return
 	}
-	// Only known profile columns may be written — a caller-supplied map
+	// Only known profile columns may be written, a caller-supplied map
 	// could otherwise carry id, email, role or any other column straight
 	// into the PostgREST PATCH.
 	allowed := map[string]bool{

@@ -153,7 +153,7 @@ func TestNoRedirectsPolicy(t *testing.T) {
 // TestNewHTTPClientRefusedRedirect: a 3xx must surface as the 3xx response
 // itself (ErrUseLastResponse), never be followed. Uses example.com so the
 // guarded client can actually complete the request (loopback is blocked by
-// design — see TestNewHTTPClientBlocksLoopbackDial); the test only asserts
+// design, see TestNewHTTPClientBlocksLoopbackDial); the test only asserts
 // that the redirect policy holds for whatever the server returns.
 func TestNewHTTPClientRefusedRedirect(t *testing.T) {
 	if testing.Short() {
@@ -166,9 +166,9 @@ func TestNewHTTPClientRefusedRedirect(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	// Whatever example.com answers (404 etc.), the client must not have
-	// followed any redirect chain silently — a followed chain would end in a
+	// followed any redirect chain silently, a followed chain would end in a
 	// 200, and the transport would have dialed the redirect target.
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		t.Errorf("got a 3xx (%d) after transport had redirects refused — impossible unless policy broken", resp.StatusCode)
+		t.Errorf("got a 3xx (%d) after transport had redirects refused, impossible unless policy broken", resp.StatusCode)
 	}
 }

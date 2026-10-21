@@ -13,19 +13,19 @@ import (
 
 // Control is a net.Dialer.Control hook. It runs after DNS resolution,
 // immediately before the socket connects, and inspects the concrete IP the OS
-// is about to dial. Validating here — rather than on the hostname — is what
-// makes it robust: DNS rebinding, HTTP redirects, and alternate IP encodings
+// is about to dial. Validating here, rather than on the hostname, covers every
+// lookup exploit at once: DNS rebinding, HTTP redirects, and alternate IP encodings
 // all funnel through this same check, because they all must eventually connect
 // to an actual address. No private address passes: the retired relay
-// splice exemption (10.77.0.0/30) is gone — private space is private
+// splice exemption (10.77.0.0/30) is gone, private space is private
 // again, and no egress trick re-grants it.
 //
 // The one exception is deliberate, operator-granted and exact: hosts listed
-// in ANIRAKU_PRIVATE_BRIDGE_HOSTS (comma-separated ip:port — currently the
+// in ANIRAKU_PRIVATE_BRIDGE_HOSTS (comma-separated ip:port, currently the
 // self-hosted AniList mirror collocated with the backend on the same VPS).
 // The match happens on the concrete post-DNS ip:port, so redirects or a
 // DNS trick to any OTHER private address still fail; the media proxy's
-// allowlist path never consults this — proxy targets stay public-only.
+// allowlist path never consults this, proxy targets stay public-only.
 func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
@@ -45,9 +45,9 @@ func Control(_ /*network*/ string, address string, _ syscall.RawConn) error {
 }
 
 // allowedBridge reports whether address (ip:port as the dialer presented
-// it) is on the operator bridge exception list. The list is re-derived
-// whenever ANIRAKU_PRIVATE_BRIDGE_HOSTS changes value, so operators can
-// adjust it across service restarts and tests can exercise both sides.
+// it) is on the bridge exception list. The list is re-derived
+// whenever ANIRAKU_PRIVATE_BRIDGE_HOSTS changes value, so it can be
+// adjusted across service restarts and tests can exercise both sides.
 func allowedBridge(address string) bool {
 	raw := os.Getenv("ANIRAKU_PRIVATE_BRIDGE_HOSTS")
 	bridgeMu.Lock()
@@ -84,8 +84,8 @@ func parseBridges(raw string) map[string]bool {
 }
 
 // IsPublicIP reports whether ip is a globally routable unicast address.
-// Everything else — loopback, private, link-local, CGNAT, ULA, multicast,
-// unspecified, and the cloud metadata address — is rejected.
+// Everything else, loopback, private, link-local, CGNAT, ULA, multicast,
+// unspecified, and the cloud metadata address, is rejected.
 func IsPublicIP(ip net.IP) bool {
 	if ip.IsLoopback() || ip.IsUnspecified() ||
 		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
@@ -98,7 +98,7 @@ func IsPublicIP(ip net.IP) bool {
 		return false
 	}
 	if ip4 := ip.To4(); ip4 != nil {
-		// 100.64.0.0/10 CGNAT (RFC6598) — not covered by IsPrivate.
+		// 100.64.0.0/10 CGNAT (RFC6598), not covered by IsPrivate.
 		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
 			return false
 		}
@@ -111,7 +111,7 @@ func IsPublicIP(ip net.IP) bool {
 		if ip4[0] == 0 {
 			return false
 		}
-		// 240.0.0.0/4 — reserved (class E) plus the limited broadcast
+		// 240.0.0.0/4, reserved (class E) plus the limited broadcast
 		// 255.255.255.255. IsMulticast only matches 224/4, so this range
 		// must be rejected explicitly.
 		if ip4[0] >= 240 {

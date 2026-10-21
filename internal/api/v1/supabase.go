@@ -45,7 +45,7 @@ func (h *Handlers) supabaseRequest(ctx context.Context, method, path string, bod
 	// These two headers do different jobs and cannot share a value. apikey
 	// identifies the project to the gateway; the Authorization bearer is the
 	// user's JWT, which PostgREST resolves to the 'authenticated' role so RLS
-	// applies per-user. The anon key grants no data access on its own — it
+	// applies per-user. The anon key grants no data access on its own, it
 	// only gets the request past the gateway.
 	req.Header.Set("apikey", apiKey)
 	req.Header.Set("Authorization", "Bearer "+token)

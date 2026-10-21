@@ -58,7 +58,7 @@ func TestStripAudioRenditionsDubKeepsEnglish(t *testing.T) {
 	if countAudio(out, "English") != 1 {
 		t.Fatalf("dub strip dropped the English rendition:\n%s", out)
 	}
-	// The surviving English rendition had no DEFAULT flag — the strip must
+	// The surviving English rendition had no DEFAULT flag, the strip must
 	// promote it so a compliant player lands on it.
 	if strings.Count(out, "DEFAULT=YES") != 1 || !strings.Contains(out, `NAME="English"`) {
 		t.Errorf("surviving English rendition not promoted to DEFAULT=YES:\n%s", out)

@@ -1,4 +1,4 @@
-// ponytail: REST client — no GraphQL, no rate limiter, no retries
+// ponytail: REST client, no GraphQL, no rate limiter, no retries
 // Kitsu has no hard rate limit for reasonable use. Cache aggressively upstream.
 package kitsu
 
@@ -380,7 +380,7 @@ func mapAnime(kid string, attrs kaAnime) anilist.Anime {
 		}{ID: attrs.YoutubeVideoID, Site: "youtube"}
 	}
 
-	// ponytail: fallback chain for poster images — Kitsu can have empty posterImage
+	// ponytail: fallback chain for poster images, Kitsu can have empty posterImage
 	img := anilist.Image{}
 	if attrs.PosterImage.Original != "" {
 		img.ExtraLarge = attrs.PosterImage.Original
@@ -818,7 +818,7 @@ func (c *Client) GetSchedule(ctx context.Context, page, perPage int) (*anilist.B
 }
 
 func (c *Client) BrowseAdult(ctx context.Context, page, perPage int) (*anilist.BrowseResponse, error) {
-	// ponytail: skip NSFW on Kitsu — no clean adult filter
+	// ponytail: skip NSFW on Kitsu, no clean adult filter
 	result := &anilist.BrowseResponse{}
 	result.Data.Page.PageInfo.Total = 0
 	result.Data.Page.Media = []anilist.Anime{}

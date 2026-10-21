@@ -11,7 +11,7 @@ import (
 // Regression: proxySources used to rewrite source URLs in place. Provider
 // resolve caches (kaa, animex/anikoto stale) share their SourceResult
 // backing arrays across requests, so the first request's proxyBase + al
-// froze into every later response — production sub requests served local
+// froze into every later response, production sub requests served local
 // 127.0.0.1 links with al=dub. Wrapping must copy and leave the input
 // untouched, so each request gets its own base + al.
 func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
@@ -46,7 +46,7 @@ func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 }
 
 // mp4 direct sources (mp4upload, animex variants) wrap through the
-// proxy like hls — never raw — but carry no al (single-audio muxed).
+// proxy like hls, never raw, but carry no al (single-audio muxed).
 func TestProxySourcesWrapsMP4WithoutAl(t *testing.T) {
 	req := httptest.NewRequest("GET", "https://api.aniraku.tech/api/v1/servers?lang=dub", nil)
 	srcs := []core.Source{{URL: "https://www.mp4upload.com/file.mp4", Type: "mp4", Quality: "auto"}}

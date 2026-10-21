@@ -10,7 +10,7 @@ import (
 // playlist legs like ReCloud's /p?t= don't match the ".m3u8" Range exclusion,
 // so a player that ranges every request upstream-answers its playlists with
 // 206. The old code rejected every non-200 and playback died as soon as the
-// 45 s VOD cache went cold (observed live 2026-10-07).
+// 45 s VOD cache went cold (observed live).
 func TestClassifyPlaylistResponse(t *testing.T) {
 	t.Parallel()
 

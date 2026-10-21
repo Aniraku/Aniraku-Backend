@@ -8,7 +8,7 @@ import (
 
 func allowedOrigins() map[string]bool {
 	allowed := map[string]bool{
-		// Miruro frontend (this repo) runs on :3000 — keep both loopbacks.
+		// Miruro frontend (this repo) runs on :3000, keep both loopbacks.
 		"http://127.0.0.1:3000":  true,
 		"http://localhost:3000":  true,
 		"http://127.0.0.1:43211": true,
@@ -20,7 +20,7 @@ func allowedOrigins() map[string]bool {
 		"https://aniraku.tech":      true,
 		"https://www.aniraku.tech":  true,
 		"https://test.aniraku.tech": true,
-		// Frontends migrated off vercel (2026-10-17): production + test now
+		// Frontends migrated off vercel: production + test now
 		// live on Cloudflare Pages; runs-on.dev renamed to run-on.dev.
 		"https://aniraku.pages.dev":      true,
 		"https://test-aniraku.pages.dev": true,

@@ -33,7 +33,7 @@ func testContext(userID, rawToken string) context.Context {
 // "Invalid API key"), Authorization must carry the caller's own JWT so
 // is_admin()'s auth.uid() evaluates for the real user. This test locks in
 // the fix for the bug where apikey was set to the user JWT, which made the
-// admin RPC 401 at the gateway for every caller — including real admins.
+// admin RPC 401 at the gateway for every caller, including real admins.
 func TestRequireAdminSendsAnonKeyAndUserJWT(t *testing.T) {
 	allowLoopbackEgress(t)
 	const (

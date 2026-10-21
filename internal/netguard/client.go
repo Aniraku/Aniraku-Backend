@@ -57,7 +57,7 @@ func guardedDialer() *net.Dialer {
 // disables HTTP/2 whenever a custom DialContext is set. Without h2 the TLS
 // handshake only advertises "http/1.1" in ALPN, which changes the JA3/JA4
 // fingerprint enough for Cloudflare to serve the JS challenge page instead
-// of the API response — measured 0/6 challenged requests with h2 off vs
+// of the API response, measured 0/6 challenged requests with h2 off vs
 // 6/6 clean with it on, from a datacenter egress, same URL and UA
 // (reanime.to, the FlixCloud upstream). Never remove this field.
 func NewTransport() *http.Transport {

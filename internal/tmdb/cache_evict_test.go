@@ -17,7 +17,7 @@ func clearTestCaches(t *testing.T) {
 	})
 }
 
-// Expired entries must go, fresh ones must stay, and the cap must hold —
+// Expired entries must go, fresh ones must stay, and the cap must hold,
 // eviction is behavior-preserving (a dropped entry is just a refetch).
 func TestEvictResponseCacheIfNeeded(t *testing.T) {
 	clearTestCaches(t)

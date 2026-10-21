@@ -7,7 +7,7 @@ import (
 
 // Exported helpers for handlers (100% perfect mapping needs same validation as JS)
 
-// IsGenericEpisodeLabel matches "Episode 1", "Ep 1", "EP1 · 1P" etc — considered not a real title
+// IsGenericEpisodeLabel matches "Episode 1", "Ep 1", "EP1 · 1P" etc, considered not a real title
 func IsGenericEpisodeLabel(s string) bool {
 	t := strings.TrimSpace(s)
 	if t == "" {

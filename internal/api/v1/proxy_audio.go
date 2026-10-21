@@ -4,8 +4,8 @@ import "strings"
 
 // Dual-audio track selection for the HLS rewrite.
 //
-// Some upstream manifests are dual-audio — they carry BOTH the dub (English)
-// and the sub/original (Japanese) rendition in one master — and serve that
+// Some upstream manifests are dual-audio, they carry BOTH the dub (English)
+// and the sub/original (Japanese) rendition in one master, and serve that
 // SAME manifest for a sub request and a dub request (observed on Sora /
 // krussdomi for anilist 130298: type=sub and type=dub return the byte-identical
 // master; the official Kickassanime site shows the same wrong-track bug).
@@ -17,7 +17,7 @@ import "strings"
 // an `al` (audio language) parameter set from the request's lang at wrap
 // time, and the rewrite strips every AUDIO rendition that does not match it.
 // After the strip only the correct track exists, so no player-side selection
-// logic — default flags, track order, frontend heuristics — can pick the
+// logic, default flags, track order, frontend heuristics, can pick the
 // wrong one. Masters without dual audio (no match, or a single rendition)
 // are returned byte-identical.
 
@@ -81,7 +81,7 @@ func m3u8AttrValue(attrs []string, key string) string {
 //   - Only runs for al=sub/al=dub; any other value returns content unchanged.
 //   - Only acts on groups where at least one rendition matches AND at least
 //     one does not (nothing to strip → unchanged).
-//   - If no rendition in a group matches, the group is left untouched —
+//   - If no rendition in a group matches, the group is left untouched,
 //     there is nothing correct to keep, so current behavior is preserved.
 //   - The surviving rendition of every touched group gets DEFAULT=YES so a
 //     standards-compliant player lands on it even without explicit selection.
