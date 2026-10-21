@@ -159,13 +159,13 @@ type SourceResult struct {
 // (multi-rendition HLS masters) ride next; Lee (ani.pm direct HLS) rides
 // (verified-lang MegaPlay) rides after Lee; Tensho (zangetsu.cc:
 // flixera/4animo embeds decrypted to direct HLS + probed) rides after
-// MegaVid. (Heave removed 2026-10-07: every animeheaven.me gate — any
-// episode, any show — served the same 3.7-second preroll ad instead of the
-// episode. Zenime removed 2026-09-30: arms API unreliable. OGFLix removed:
+// MegaVid. (Heave removed: every animeheaven.me gate, any
+// episode, any show, served the same 3.7-second preroll ad instead of the
+// episode. Zenime removed: arms API unreliable. OGFLix removed:
 // api.anizen.tr challenged every request and every resolved edge was blocked
-// — pure fan-out latency for nothing.)
+// , pure fan-out latency for nothing.)
 //
-// NOTE (operator): kaa.lt decrypted stream URLs are dual-language — one
+// NOTE (operator): kaa.lt decrypted stream URLs are dual-language, one
 // resolved URL serves both sub (ja-JP) and dub (en-US). A future kaa.lt
 // provider must resolve once and share the result across langs, never fetch
 // per-lang. Reference scraper: /home/ichigoat/kaa_stream_scraper.py
@@ -252,7 +252,7 @@ func (m *Manager) GetSourcesForProvider(ctx context.Context, episode int, provid
 // fallback chain, explicit provider requests) while it is unreliable.
 // Currently unpaused: streams are back, reliability re-verified.
 // Flip back to true if it degrades again; no other change needed.
-// NOTE: download links no longer touch zokoanime.video at all — they come
+// NOTE: download links no longer touch zokoanime.video at all, they come
 // from AnimeDL (animedl_downloads.go, a separate domain), so this flag
 // never affects them.
 const zokoPaused = false
@@ -339,7 +339,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
 	case "nin", "supaplay":
-		// Supaplay (anistream's embed lineup) — SFW titles only: the
+		// Supaplay (anistream's embed lineup), SFW titles only: the
 		// hentai reject above short-circuits adult titles before any
 		// upstream call (Supaplay's API 502s them).
 		result, err := m.tryNiN(ctx, animeID, episode, lang, quality)
@@ -507,27 +507,23 @@ func containsHentai(genres []string) bool {
 	return false
 }
 
-// FindAllServers lists every selectable server per lang (quality selection
-// preserved). Ordering is deterministic: best playback verdict first (proxy >
-// direct > embed > dead), then provider order. No server is hidden — dead
-// providers simply contribute nothing.
-// genres is used to skip providers that should not serve certain content
-// collectorBudget: hard wall-clock ceiling for EVERY fan-out collector
-// (each provider + the downloads fetch). Cold /servers latency IS its
-// slowest collector, and the outer contract is 15s max end-to-end —
-// edge + transfer measured ~1-2.5s on top of the server bound, so the
-// budget is 12s: honest-but-slow providers keep their room inside the
-// contract instead of being trimmed at 10s (2026-10-20: the user-facing
-// symptom that drove the zoko gate and the tensho per-hop caps — a
-// single tarpitted upstream pinned the response at 20-85s). The budget
-// does not discard partial progress blindly: inner ops inherit this
-// deadline, so a cut collector returns whatever it managed to gather
-// (kaa/tensho ship surviving slots; measured in fanout tests), and the
-// slowest one is logged for the next culprit hunt. Var so tests can
-// shrink it.
+// collectorBudget: wall-clock ceiling for every fan-out collector (each
+// provider plus the downloads fetch). Cold /servers latency is its
+// slowest collector; the outer contract is 15s end-to-end with ~1-2.5s
+// measured for edge + transfer, so the budget is 12s and slow-but-working
+// providers keep their room. The budget never strands finished work:
+// inner ops inherit this deadline, so a cut collector returns what it
+// already gathered (kaa/tensho ship surviving slots; covered by fanout
+// tests), and the slowest collector is logged for the next culprit hunt.
+// Var so tests can shrink it.
 var collectorBudget = 12 * time.Second
 
-// (e.g. Anikoto is skipped for Hentai titles).
+// FindAllServers lists every selectable server per lang (quality selection
+// preserved). Ordering is deterministic: best playback verdict first (proxy >
+// direct > embed > dead), then provider order. No server is hidden, dead
+// providers simply contribute nothing. genres is used to skip providers
+// that should not serve certain content (e.g. Anikoto is skipped for
+// Hentai titles).
 func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) []core.Server {
 	if lang == "" {
 		lang = "sub"
@@ -552,185 +548,113 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	}
 	anilistID := fmt.Sprintf("%d", animeID)
 
-	// No snapshot cache: tokenized URLs (megaplay ?token=, proxied nonces)
-	// expire without a reliable invalidation signal, and a cached list also
-	// froze whichever request base first wrapped it — a localhost health
-	// probe once poisoned every public response for a full TTL with
-	// http://127.0.0.1 URLs. Every request computes a fresh, honestly
-	// probed list instead; speed comes from the collectors themselves.
+	// No snapshot cache for the final list: tokenized URLs (megaplay
+	// ?token=, proxied nonces) expire without a reliable invalidation
+	// signal, and a cached list once froze 127.0.0.1 health-probe URLs
+	// into every public response for a full TTL. Collectors probe fresh
+	// each round; speed comes from them, not from a cache.
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers, avServers, axoServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, leeServers, mvServers, tsServers, avServers, axoServers []core.Server
 	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
-	// Per-collector wall time, logged after the merge: the fan-out's
-	// response latency IS its slowest collector, so every round needs the
-	// culprit visible instead of guessed.
 	fanStart := time.Now()
 	var dmu sync.Mutex
+	// collectorMs: wall time per collector, logged after the merge. The
+	// fan-out's latency IS its slowest collector, so the culprit gets
+	// measured, not guessed.
 	collectorMs := map[string]int64{}
 
-	// Per-collector budget + timing, logged after the merge: the fan-out's
-	// response latency IS its slowest collector, so every round needs the
-	// culprit visible instead of guessed.
+	// run: per-collector budget + timing. Each collector gets its own
+	// deadline off the request context, so a dead upstream cannot pin the
+	// response past the ceiling (the inner ops inherit it and fail fast).
 	run := func(name string, fn func(context.Context) []core.Server) []core.Server {
 		start := time.Now()
 		bctx, cancel := context.WithTimeout(ctx, collectorBudget)
 		out := fn(bctx)
 		cancel()
-		ms := time.Since(start).Milliseconds()
 		dmu.Lock()
-		collectorMs[name] = ms
+		collectorMs[name] = time.Since(start).Milliseconds()
 		dmu.Unlock()
 		return out
 	}
 
-	// Fan-out collectors as data: the WaitGroup count derives from the
-	// slice, never a hand-maintained number — adding or removing a
-	// provider cannot wedge wg.Wait() again (observed 2026-10-02: a stale
-	// Add(11) deadlocked every /servers call after a provider removal).
-	// Anikoto, AnimeX, NiN, AnimeGG, AniWaves, VidNest, Tensho, AnV and
-	// Anixo are never queried for hentai titles (hentai gate — Supaplay's
-	// API 502s them). Zoko and FlixCloud serve them:
-	// Zoko only via its MAL-keyed path (its AniList index carries no
-	// hentai), FlixCloud via Reanime.
-	collectors := []func(){
-		func() {
-			if !hentai {
-				akServers = run("anikoto", func(cctx context.Context) []core.Server {
-					return m.collectAnikotoServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				axServers = run("animex", func(cctx context.Context) []core.Server {
-					return m.collectAnimeXServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !zokoPaused {
-				zkServers = run("zoko", func(cctx context.Context) []core.Server {
-					return m.collectZokoServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			fcServers = run("flixcloud", func(cctx context.Context) []core.Server {
-				return m.collectFlixServers(cctx, anilistID, episode, lang)
-			})
-		},
-		func() {
-			if !hentai {
-				nnServers = run("nin", func(cctx context.Context) []core.Server {
-					return m.collectNiNServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				kaServers = run("kaa", func(cctx context.Context) []core.Server {
-					return m.collectKaaServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				agServers = run("animegg", func(cctx context.Context) []core.Server {
-					return m.collectAnimeGGServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				awServers = run("aniwaves", func(cctx context.Context) []core.Server {
-					return m.collectAniWavesServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				leeServers = run("lee", func(cctx context.Context) []core.Server {
-					return m.collectLeeServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				mvServers = run("megavid", func(cctx context.Context) []core.Server {
-					return m.collectMegaVidServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				tsServers = run("tensho", func(cctx context.Context) []core.Server {
-					return m.collectTenshoServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				avServers = run("anv", func(cctx context.Context) []core.Server {
-					return m.collectAnvServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			if !hentai {
-				axoServers = run("anixo", func(cctx context.Context) []core.Server {
-					return m.collectAnixoServers(cctx, anilistID, episode, lang)
-				})
-			}
-		},
-		func() {
-			// Runs alongside the provider fan-out (not after it): a slow
-			// provider must never starve the download fetch of context
-			// budget. Same collectorBudget as the providers — a download
-			// resolution above it cannot serve the app's UI in time.
-			start := time.Now()
-			actx, cancel := context.WithTimeout(ctx, collectorBudget)
-			adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
-			cancel()
-			dmu.Lock()
-			collectorMs["animedlDownloads"] = time.Since(start).Milliseconds()
-			dmu.Unlock()
-		},
+	// Fan-out as data: every collector is one entry, waited as one batch.
+	// enabled is computed per request: Anikoto, AnimeX, NiN, AnimeGG,
+	// AniWaves, Tensho, AnV and Anixo are never queried for hentai titles
+	// (their APIs 502 those), while Zoko keeps serving via its MAL-keyed
+	// path and FlixCloud via Reanime. Zoko additionally has its own
+	// out-pause switch (zokoPaused) from the resolve gate.
+	type fanOutEntry struct {
+		name    string
+		dst     *[]core.Server
+		fn      func(context.Context, string, int, string) []core.Server
+		enabled bool
 	}
-	wg.Add(len(collectors))
-	for _, collect := range collectors {
-		go func(fn func()) {
+	entries := []fanOutEntry{
+		{"anikoto", &akServers, m.collectAnikotoServers, !hentai},
+		{"animex", &axServers, m.collectAnimeXServers, !hentai},
+		{"zoko", &zkServers, m.collectZokoServers, !zokoPaused},
+		{"flixcloud", &fcServers, m.collectFlixServers, true},
+		{"nin", &nnServers, m.collectNiNServers, !hentai},
+		{"kaa", &kaServers, m.collectKaaServers, !hentai},
+		{"animegg", &agServers, m.collectAnimeGGServers, !hentai},
+		{"aniwaves", &awServers, m.collectAniWavesServers, !hentai},
+		{"lee", &leeServers, m.collectLeeServers, !hentai},
+		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
+		{"tensho", &tsServers, m.collectTenshoServers, !hentai},
+		{"anv", &avServers, m.collectAnvServers, !hentai},
+		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
+	}
+	for _, e := range entries {
+		e := e
+		wg.Add(1)
+		go func() {
 			defer wg.Done()
-			fn()
-		}(collect)
+			*e.dst = run(e.name, func(cctx context.Context) []core.Server {
+				return e.fn(cctx, anilistID, episode, lang)
+			})
+		}()
 	}
+
+	// AnimeDL downloads run alongside the providers, never after them: a
+	// slow provider must not starve the download fetch of context budget,
+	// and the response waits for it like any other collector.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		start := time.Now()
+		actx, cancel := context.WithTimeout(ctx, collectorBudget)
+		adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
+		cancel()
+		dmu.Lock()
+		collectorMs["animedlDownloads"] = time.Since(start).Milliseconds()
+		dmu.Unlock()
+	}()
 	wg.Wait()
 
 	// Merged downloads for Zoko: Zoko's own link plus the already-fetched
-	// Anikoto download links together — falling back to one downloads-only
+	// Anikoto download links together, falling back to one downloads-only
 	// Anikoto lookup when Anikoto streams were all CDN-blocked (no servers,
 	// but downloads may still exist). No extra network call in the common
-	// case — akServers was fetched in parallel above. The whole Anikoto
+	// case, akServers was fetched in parallel above. The whole Anikoto
 	// merge is skipped for hentai titles: it would send them to a gated
 	// provider.
 	zkServers = mergeZokoDownloads(ctx, m, zkServers, akServers, anilistID, episode, lang, hentai)
 	nnServers = mergeNiNSubtitles(nnServers, akServers, axServers, zkServers, lang)
-	// MegaVid verification (operator rules): language checks plus the
-	// corroboration gate — Vidy lists only alongside another provider.
 	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang,
 		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
-			len(agServers)+len(awServers)+len(vnServers)+len(leeServers)+len(akServers)+
+			len(agServers)+len(awServers)+len(leeServers)+len(akServers)+
 			len(tsServers) > 0)
 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, vnServers, leeServers, mvServers, tsServers, avServers, axoServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, leeServers, mvServers, tsServers, avServers, axoServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL download links (fetched in parallel above): attach to every
-	// server except FlixCloud's — "all sources without the FlixCloud"; the
+	// server except FlixCloud's, "all sources without the FlixCloud"; the
 	// embed player takes no file links, other providers' links stay first.
 	if len(adlLinks) > 0 {
 		allServers = attachDownloadLinks(allServers, adlLinks)
@@ -753,7 +677,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 
 // appendNamedServers maps a provider's source list onto display names
 // (Niko/Momo, Yuta/Syota/Mike, ...). When there are more sources than names,
-// extras collide on the last name — on a collision the source with the
+// extras collide on the last name, on a collision the source with the
 // richer subtitle track list wins, the other is dropped, so a display name
 // never appears twice in the server list.
 func appendNamedServers(out []core.Server, serverNames []string, provider, lang string, sr *SourceResult) []core.Server {
@@ -764,7 +688,7 @@ func appendNamedServers(out []core.Server, serverNames []string, provider, lang 
 			name = serverNames[i]
 		}
 		// A result may name its own sources (Anikoto: Niko for the
-		// AniList-keyed stream, Momo for the MAL-keyed one) — that wins
+		// AniList-keyed stream, Momo for the MAL-keyed one), that wins
 		// over positional naming so each key keeps its slot even when
 		// the other key is missing.
 		if len(sr.ServerNames) == len(sr.Sources) && sr.ServerNames[i] != "" {
@@ -862,7 +786,7 @@ func (m *Manager) collectZokoServers(ctx context.Context, anilistID string, epis
 
 // collectNiNServers maps Supaplay (NiN) sources to the single "NiN" server.
 // The shipped URL is Supaplay's authless hls-proxy relay, probe-verified
-// before it can surface (Zoko-style honesty: a relay the probe cannot reach
+// before it can surface (a relay the probe cannot reach
 // would only produce 502s through the media proxy).
 func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
@@ -888,7 +812,7 @@ func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episo
 
 // mergeZokoDownloads merges the Anikoto download links into the Zoko
 // servers alongside Zoko's own link (deduped by URL, Zoko's own first).
-// Stream sources are never mixed — only Downloads. Anikoto direct-only
+// Stream sources are never mixed, only Downloads. Anikoto direct-only
 // resolution carries no download links, so in practice this merges nothing
 // today; the loop stays for any future provider-side downloads. hentai
 // titles skip the merge entirely: Anikoto is gated for them, so only
@@ -912,14 +836,14 @@ func mergeZokoDownloads(ctx context.Context, m *Manager, zkServers, akServers []
 // et al) -> Zoko. Supaplay's own tracks are unusable from every path we
 // have (rawFile hosts TLS-blocked from this egress, its subtitle-proxy 404s,
 // the frontend's proxy hits the same walls), while the borrowed tracks point
-// at hosts the frontend already proxies fine — same episode, same timings.
+// at hosts the frontend already proxies fine, same episode, same timings.
 // Without a donor NiN simply ships no subs; it never resurrects its own.
 func mergeNiNSubtitles(nnServers, akServers, axServers, zkServers []core.Server, lang string) []core.Server {
 	if len(nnServers) == 0 {
 		return nnServers
 	}
 	// Dub listings carry their default subtitles, except Sora (animex),
-	// whose sources already received the nico files via withDubSubtitles —
+	// whose sources already received the nico files via withDubSubtitles,
 	// never overwrite those with provider dub files; only fill sources
 	// that somehow have none (nico unavailable for the title).
 	fillEmptyOnly := strings.EqualFold(lang, "dub")
@@ -1109,7 +1033,7 @@ func (m *Manager) tryAnimeX(ctx context.Context, animeID int, episode int, lang,
 
 // collectAnimeXServers maps AnimeX sources to servers. Every sub-provider
 // the plyr page lists (Mochi/yuki, Chibi/neko, Kira/zuna, Lumi/beep, Anzu/loli,
-// Sora, ...) that resolves becomes its own named server — first source wins
+// Sora, ...) that resolves becomes its own named server, first source wins
 // if a sub-provider returns several. Results keep their per-provider
 // Referer/UA headers (result-level), so they must map 1:1 onto servers.
 func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
@@ -1142,7 +1066,7 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 
 // tryZoko resolves a ZokoAnime stream (frontend "zoko" -> backend ZokoAnime
 // /stream/ani/{anilistId}/{ep}/{sub|dub}). The stream itself always comes
-// from ZokoAnime, probe-verified + proxied — never Anikoto direct.
+// from ZokoAnime, probe-verified + proxied, never Anikoto direct.
 // Downloads are Zoko's own links only (Anikoto direct-only resolution
 // carries no download links).
 func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
@@ -1168,7 +1092,7 @@ func (m *Manager) tryZoko(ctx context.Context, animeID int, episode int, lang, q
 
 // tryNiN resolves a Supaplay stream (anistream embed lineup; provider "nin").
 // Probe-verified inside the provider; hentai titles never reach it (the
-// explicit switch rejects them — Supaplay 502s its API for hentai).
+// explicit switch rejects them, Supaplay 502s its API for hentai).
 func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	nn := m.getNiNProvider()
 	if nn == nil {
@@ -1191,7 +1115,7 @@ func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, qu
 }
 
 // tryKaa resolves a kaa.lt stream (krussdomi HLS master) for exactly the
-// requested lang — strict per-lang: no dub server is listed when the en-US
+// requested lang, strict per-lang: no dub server is listed when the en-US
 // page has no players, even if sub resolves.
 func (m *Manager) tryKaa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	ka := m.getKaaProvider()
@@ -1225,7 +1149,7 @@ func (m *Manager) getKaaProvider() *KaaProvider {
 	return nil
 }
 
-// withDubSubtitles enforces the operator rule: Sora (animex) dub sources
+// withDubSubtitles enforces the sub/dub pairing: Sora (animex) dub sources
 // carry the Nico (kaa) subtitle files. Sora serves krussdomi streams, so
 // Nico subs are timing-compatible; every other provider's dub keeps its
 // default subtitles. kaa is fetched only for Sora dub requests; when kaa
@@ -1283,7 +1207,7 @@ func (m *Manager) withDubSubtitles(ctx context.Context, provider, lang, anilistI
 }
 
 // sameSubtitleURLs reports whether two subtitle lists carry the same files
-// in order (tags may differ — only the file identity matters for the
+// in order (tags may differ, only the file identity matters for the
 // dub-uses-sub-files rule).
 func sameSubtitleURLs(a, b []core.Subtitle) bool {
 	if len(a) != len(b) {
@@ -1340,7 +1264,7 @@ func (m *Manager) getAniWavesProvider() *AniWavesProvider {
 }
 
 // tryAnimeGG resolves an AnimeGG direct mp4 (highest quality per mirror;
-// dub below 720p never resolves — the provider hides it).
+// dub below 720p never resolves, the provider hides it).
 func (m *Manager) tryAnimeGG(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	ag := m.getAnimeGGProvider()
 	if ag == nil {
@@ -1435,11 +1359,7 @@ func (m *Manager) collectAniWavesServers(ctx context.Context, anilistID string, 
 	return out
 }
 
-// tryVidNest resolves a VidNest MegaPlay HLS master (fresh per call, subs
-// and skip chapters included).
-
-// collectVidNestServers maps VidNest sources to the single "Nest" server.
-
+// getLeeProvider returns the registered Lee provider, or nil when absent.
 func (m *Manager) getLeeProvider() *LeeProvider {
 	for _, p := range m.providers {
 		if le, ok := p.(*LeeProvider); ok {
@@ -1505,7 +1425,7 @@ func (m *Manager) getMegaVidProvider() *MegaVidProvider {
 }
 
 // tryMegaVid resolves a MegaVid source and verifies its audio language
-// against Anikoto's same-episode files (operator rule): a proven swap is
+// against Anikoto's same-episode files: a proven swap is
 // dropped, unverifiable titles list as-is.
 func (m *Manager) tryMegaVid(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	mv := m.getMegaVidProvider()
@@ -1639,7 +1559,7 @@ func (m *Manager) megavidSegmentLangs(ctx context.Context, masterURL, referer st
 
 // megavidMasterLangs returns the audio languages a master playlist
 // declares across its AUDIO renditions. Unknown (false) when the master
-// declares none (muxed single audio) or cannot be read — deeper layers
+// declares none (muxed single audio) or cannot be read, deeper layers
 // decide those. Recently probed playlists come from the VOD cache, so the
 // common path costs zero upstream calls.
 func (m *Manager) megavidMasterLangs(ctx context.Context, masterURL, referer string) (map[string]bool, bool) {
@@ -1823,18 +1743,18 @@ func (m *Manager) collectAnixoServers(ctx context.Context, anilistID string, epi
 // decisive signal wins per source:
 //
 //  1. m3u audio declarations: a master whose AUDIO renditions name
-//     languages but not the requested one is a proven swap — dropped.
+//     languages but not the requested one is a proven swap, dropped.
 //     Masters declaring nothing (muxed audio) fall through.
 //  2. segment audio descriptors: the first segment's TS PMT names the
 //     carried audio (ground truth, verified live against a mislabeled
 //     "dub"); a mismatch drops, unreadable segments fall through.
 //  3. file identity: the decoded file path compared against Anikoto's
 //     same-episode files (same MegaPlay catalog); a file proving to be
-//     the other lang's encode is dropped — but only when a same-lang
+//     the other lang's encode is dropped, but only when a same-lang
 //     reference exists. Without one, an other-lang match proves nothing
 //     (dual-audio single file) and never hides the server.
 //
-// Anything unverifiable lists as-is — never drop blind. The other-lang
+// Anything unverifiable lists as-is, never drop blind. The other-lang
 // reference fetch runs only when some source misses the same-lang set,
 // so the common confirmed case costs zero extra upstream calls.
 func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []core.Server, anilistID string, episode int, lang string, hasOthers bool) []core.Server {
@@ -1848,7 +1768,7 @@ func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []
 	if !hasOthers {
 		m.log.Info().Str("provider", "megavid").
 			Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
-			Msg("megavid: solo claim, no corroborating provider — hiding Vidy")
+			Msg("megavid: solo claim, no corroborating provider, hiding Vidy")
 		return nil
 	}
 	want := wantAudioLang(lang)
@@ -1900,7 +1820,7 @@ func (m *Manager) verifyMegaVidLang(ctx context.Context, mvServers, akServers []
 					break
 				}
 			}
-			// Layer 3: file identity against the trusted catalog — but a
+			// Layer 3: file identity against the trusted catalog, but a
 			// drop needs a real same-lang reference behind it. Without
 			// one (Anikoto carries nothing here), an other-lang match
 			// proves nothing (dual-audio single file) and must not hide
