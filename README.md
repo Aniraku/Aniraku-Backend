@@ -26,7 +26,7 @@ Aniraku is open source. Voluntary support helps fund **hosting, releases, and op
 > - **GitHub Repository:** [Shoislam0311/anilist-offline-db](https://github.com/Shoislam0311/anilist-offline-db)
 
 > [!CAUTION]
->If it has saved you time, a small donation keeps it up. And the library keeps growing — **missing an anime?** Email [`sho.islam0311@proton.me`](mailto:sho.islam0311@proton.me) and it'll get added.
+>If it has saved you time, a small donation keeps it up. And the library keeps growing. **Missing an anime?** Email [`sho.islam0311@proton.me`](mailto:sho.islam0311@proton.me) and it'll get added.
 
 <p align="center">
   <a href="https://patreon.com/ShoIslam"><img src="https://img.shields.io/badge/Support_on_Patreon-FF4D4D?style=for-the-badge&logo=patreon&logoColor=white" alt="Support on Patreon" /></a>
@@ -40,15 +40,15 @@ Aniraku is open source. Voluntary support helps fund **hosting, releases, and op
 
 Aniraku-Backend keeps the client-facing API separate from provider-specific work. It handles API routing, authentication, episode metadata, playback coordination, account data, sync, and the network checks needed around upstream requests.
 
-The service is written entirely in **Go** — one binary in one container, no external services to run. Streaming resolution is fully in-process across 13 providers (see [the provider guide](docs/PROVIDERS.md)):
+The service is written entirely in **Go**, one binary in one container, no external services to run. Streaming resolution is fully in-process across 13 providers (see [the provider guide](docs/PROVIDERS.md)):
 
-- **Anikoto (primary)** — AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro (Niko/Momo).
-- **AnimeX** — plyr API with XOR-decoded direct URLs (Mochi, Kira, Sora, …).
-- **Zoko, NiN, kaa.lt** — direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
-- **AnimeGG, AniWaves** — direct mp4 (highest per mirror) and multi-rendition HLS.
-- **VidNest, Lee, MegaVid** — direct HLS (MegaPlay catalog, ani.pm chain, verified-lang MegaPlay).
-- **Tensho** — zangetsu.cc flixera/4animo embeds decrypted to direct HLS (Tsuki/Kaze/Hoshi).
-- **FlixCloud (fallback)** — embed URLs for the client's embedded player.
+- **Anikoto (primary)**, AniList ID → show resolve → episode data-ids → server list → embed decrypt → verified `m3u8` + subtitles + intro/outro (Niko/Momo).
+- **AnimeX**, plyr API with XOR-decoded direct URLs (Mochi, Kira, Sora, …).
+- **Zoko, NiN, kaa.lt**, direct HLS (Zoko; Supaplay relay; krussdomi dual-audio masters).
+- **AnimeGG, AniWaves**, direct mp4 (highest per mirror) and multi-rendition HLS.
+- **Lee, MegaVid**, direct HLS (ani.pm chain, verified-lang MegaPlay).
+- **Tensho**, zangetsu.cc flixera/4animo embeds decrypted to direct HLS (Tsuki/Kaze/Hoshi).
+- **FlixCloud (fallback)**, embed URLs for the client's embedded player.
 
 Every server list is freshly probed per request (no snapshot cache); sources play through the `/api/v1/proxy` media gateway.
 
@@ -65,7 +65,7 @@ Aniraku web / Android client
     ┌─────────┼─────────┐
     ▼         ▼         ▼
   auth    episodes   streaming
- Supabase AniZip↔TMDB 11 providers (fan-out)
+ Supabase AniZip↔TMDB 13 providers (fan-out)
  JWT/JWKS  unlimited  Anikoto → … → MegaVid → Tensho
    │        │       + FlixCloud (embed)
    ▼        ▼          │
@@ -89,7 +89,7 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 
 ## Stack
 
-`Go 1.25` · `Chi v5` · `Zerolog` · `Supabase JWT/JWKS` · `Docker` · `Render`
+`Go 1.26` · `Chi v5` · `Zerolog` · `Supabase JWT/JWKS` · `Docker` · `Render`
 
 | Responsibility | Location |
 |:--|:--|
@@ -109,13 +109,13 @@ All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is k
 
 ## Configuration
 
-The default configuration is in [`config.yaml`](config.yaml). Secrets are read from environment variables (see `.env.example`) rather than being committed. **Never commit real keys** — and note that deleting a file from git does not remove it from history; secrets must be rotated after any leak.
+The default configuration is in [`config.yaml`](config.yaml). Secrets are read from environment variables (see `.env.example`) rather than being committed. **Never commit real keys**, and note that deleting a file from git does not remove it from history; secrets must be rotated after any leak.
 
 **Key areas:**
 - `server.host/port/debug`, `ui_dist`;
-- `supabase.url/anon_key/service_key/jwt_aud` — `jwks_url` is derived automatically (`{url}/auth/v1/.well-known/jwks.json`), override with `ANIRAKU_SUPABASE_JWKS_URL` only if needed;
-- `tmdb.read_access_token/api_base/image_base/anibridge_api` — `TMDB_READ_ACCESS_TOKEN` (v4) for episode fallback;
-- `scraping.animex_base/flixcloud_base/anizip_base` — override via `ANIRAKU_*` env vars;
+- `supabase.url/anon_key/service_key/jwt_aud`, `jwks_url` is derived automatically (`{url}/auth/v1/.well-known/jwks.json`), override with `ANIRAKU_SUPABASE_JWKS_URL` only if needed;
+- `tmdb.read_access_token/api_base/image_base/anibridge_api`, `TMDB_READ_ACCESS_TOKEN` (v4) for episode fallback;
+- `scraping.animex_base/flixcloud_base/anizip_base`, override via `ANIRAKU_*` env vars;
 - `logging.level/format`, `update.channel/url`.
 
 The default local address is `127.0.0.1:43211` with bounded `Read/Write/Idle` timeouts and `SIGINT`/`SIGTERM` shutdown.
@@ -124,7 +124,7 @@ See `.env.example` for a template (placeholders, no real keys).
 
 ### Deployment notes
 
-- **Trusted proxies & rate limiting** — `ANIRAKU_TRUSTED_PROXY_CIDRS` (comma-separated CIDRs) declares reverse proxies whose `X-Forwarded-For` entries may be trusted; the rightmost untrusted entry becomes the client IP used for rate limiting and logging. With **no** CIDRs configured, `X-Forwarded-For` is ignored entirely and the socket peer is used. Behind Render (default `render.yaml`) that means all visitors share one rate-limit bucket keyed on the proxy IP — safe against spoofing, but coarse. Render publishes no stable proxy CIDRs, so the safe default is left in place; set the variable only when terminating TLS somewhere with *known* CIDRs (e.g. Cloudflare). Never trust client-supplied XFF entries directly — spoofed values mint fresh rate-limit buckets.
+- **Trusted proxies & rate limiting**: `ANIRAKU_TRUSTED_PROXY_CIDRS` (comma-separated CIDRs) declares reverse proxies whose `X-Forwarded-For` entries may be trusted; the rightmost untrusted entry becomes the client IP used for rate limiting and logging. With **no** CIDRs configured, `X-Forwarded-For` is ignored entirely and the socket peer is used. Behind Render (default `render.yaml`) that means all visitors share one rate-limit bucket keyed on the proxy IP, safe against spoofing, but coarse. Render publishes no stable proxy CIDRs, so the safe default is left in place; set the variable only when terminating TLS somewhere with *known* CIDRs (e.g. Cloudflare). Never trust client-supplied XFF entries directly, spoofed values mint fresh rate-limit buckets.
 
 ## Embedded API interface
 
@@ -149,7 +149,7 @@ docker build -t aniraku-backend .
 docker run --rm -p 43211:43211 --env-file .env aniraku-backend
 ```
 
-`render.yaml` and `Dockerfile` (multi-stage `golang:1.25-alpine` → `alpine:3.20`, non-root) describe deployment.
+`render.yaml` and `Dockerfile` (multi-stage `golang:1.26-alpine` → `alpine:3.20`, non-root) describe deployment.
 
 ## Security and upstream use
 
