@@ -23,7 +23,7 @@ fallback order and the `/servers` merge order.
 | `aniwaves` | Nami (Vidplay), Coral (MyCloud), Pearl (DatSaV/savedly), Wavy/Bubbles/Shelly (fallback) | echovideo multi-rendition HLS masters + top savedly mp4 |
 | `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
-| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **decrypted to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer) (sub+dub) |
+| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **decrypted to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer); sprite-preview tracks (`kind:"thumbnails"`, label "Subtitles") are dropped from the track list (sub+dub) |
 
 Removed providers return a `removed` error naming them explicitly
 (`miruro`, `zenime`, `tryembed`, `mkissa`, `heave`, …): never silently fall

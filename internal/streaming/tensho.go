@@ -99,10 +99,15 @@ var (
 	tenshoFlixTracksMark = "window.__EMBED_TRACKS__"
 )
 
-// tenshoTrack is one player track (both players share the shape).
+// tenshoTrack is one player track (both players share the shape). kind
+// separates real text tracks ("captions", occasionally "subtitles") from
+// sprite previews: the thumbnail track rides along under the label
+// "Subtitles" and no language field exists on any track (captured on
+// hd-2 getSources), so kind is the only label-vs-sprite signal.
 type tenshoTrack struct {
 	File  string `json:"file"`
 	Label string `json:"label"`
+	Kind  string `json:"kind"`
 }
 
 // tenshoEmbed is one player embed decrypted to the stream it would play.
@@ -671,9 +676,15 @@ func tenshoAbs(base *url.URL, ref string) string {
 }
 
 // tenshoSubs converts player tracks to core subtitles (label -> lang code).
+// Kind is the only text-vs-sprite signal: sprite previews arrive with kind
+// "thumbnails" under the label "Subtitles" (captured on hd-2 getSources),
+// and no track carries a language field, so labels carry the language.
 func tenshoSubs(tracks []tenshoTrack, base *url.URL) []core.Subtitle {
 	var subs []core.Subtitle
 	for _, t := range tracks {
+		if t.Kind == "thumbnails" {
+			continue
+		}
 		u := tenshoAbs(base, t.File)
 		if u == "" {
 			continue

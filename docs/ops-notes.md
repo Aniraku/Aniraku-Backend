@@ -59,3 +59,16 @@ inside source comments.
   metadata per track (format, language code, native name, file URL);
   subtitle tracks are decoded from there instead of scraped from
   bare URLs.
+
+## tensho tracks
+
+- 2026-10-21 hd-2 getSources tracks carry no language field on any entry;
+  kind is the shape's only metadata ("captions" for text, "thumbnails"
+  for the sprite preview). The sprite rides along under the label
+  "Subtitles" and reached Hoshi's subtitle list as a langless track;
+  tenshoSubs now drops kind "thumbnails". Caption labels are decorated
+  ("Spanish (Latin American)", "French (European)") and resolve through
+  label aliasing.
+- 2026-10-21 episode embeds key on ani/mal per-episode values that
+  already embed the episode ("185874/9"): /embed/ani/185874/9/sub, not
+  /embed/ani/<ep-less>/sub, which 404s.

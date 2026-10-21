@@ -115,7 +115,8 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 	// master) and subtitle tracks, this is all the decrypt step consumes.
 	mux.HandleFunc("/embed/ani/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<html><head><script>window.__EMBED_PROXY__ = "/p?t=flix-master";`+
-			`window.__EMBED_TRACKS__ = [{"file":"/p?t=flix-sub-en","label":"English","kind":"captions","default":true}];`+
+			`window.__EMBED_TRACKS__ = [{"file":"/p?t=flix-sub-en","label":"English","kind":"captions","default":true},`+
+			`{"file":"/p?t=flix-sprite","label":"Subtitles","kind":"thumbnails","default":false}];`+
 			`</script></head><body></body></html>`)
 	})
 
@@ -147,7 +148,13 @@ func newTenshoFixture(t *testing.T) *tenshoFixture {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"sources":[{"file":"/p?t=animo-master","type":"hls"}],
- "tracks":[{"file":"/p?t=animo-sub-en","label":"English","kind":"captions","default":true}],
+ "tracks":[
+  {"file":"/p?t=animo-sub-en","label":"English","kind":"captions","default":true},
+  {"file":"/p?t=animo-sub-de","label":"German","kind":"captions","default":false},
+  {"file":"/p?t=animo-sub-es","label":"Spanish (Latin American)","kind":"captions","default":false},
+  {"file":"/p?t=animo-sub-fr","label":"French (European)","kind":"captions","default":false},
+  {"file":"/p?t=animo-sprite","label":"Subtitles","kind":"thumbnails","default":false}
+ ],
  "intro":{"start":138,"end":215},"outro":{"start":1452,"end":1542},
  "server":"hd-1","episodeTitle":"Episode 1"}`)
 	})
@@ -265,13 +272,28 @@ func TestTenshoFindEpisodeSourceSub(t *testing.T) {
 			t.Fatalf("source %d URL = %q, want %q", i, s.URL, wantURLs[i])
 		}
 	}
-	// Both players ship subtitle tracks alongside the stream token.
+	// Both players ship subtitle tracks alongside the stream token, and
+	// both carry the sprite preview (kind "thumbnails", label
+	// "Subtitles") that hd-2 getSources ships live; it must never reach
+	// the result.
 	if subs := sr.Sources[0].Subtitles; len(subs) != 1 ||
 		subs[0].URL != f.srv.URL+"/p?t=flix-sub-en" || subs[0].Lang != "en" || subs[0].Label != "English" {
 		t.Fatalf("flixera subs = %+v", subs)
 	}
-	if subs := sr.Sources[1].Subtitles; len(subs) != 1 || subs[0].URL != f.srv.URL+"/p?t=animo-sub-en" {
-		t.Fatalf("animo subs = %+v", subs)
+	// Animo's caption labels are decorated exactly as hd-2 getSources
+	// ships them; label aliasing resolves the language, kind kills the
+	// sprite.
+	wantAnimoLang := []string{"en", "de", "es", "fr"}
+	if subs := sr.Sources[1].Subtitles; len(subs) != len(wantAnimoLang) {
+		t.Fatalf("animo subs = %+v, want %d caption tracks", subs, len(wantAnimoLang))
+	}
+	for i, sub := range sr.Sources[1].Subtitles {
+		if sub.Lang != wantAnimoLang[i] {
+			t.Fatalf("animo sub %d = %s/%s, want lang %q", i, sub.Lang, sub.Label, wantAnimoLang[i])
+		}
+		if strings.Contains(sub.URL, "animo-sprite") || sub.Label == "Subtitles" {
+			t.Fatalf("animo sub %d = %+v, sprite leaked", i, sub)
+		}
 	}
 	// The players' intro/outro ride along in the live JSON but must NOT
 	// reach the result, the frontend uses Aniskip for skip segments.
