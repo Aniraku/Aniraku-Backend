@@ -151,4 +151,4 @@ Upstream services have their own terms, limits, and content policies. Use the se
 
 For security concerns, follow the private reporting process in [SECURITY.md](SECURITY.md) rather than posting sensitive details publicly.
 
-<div align="center"><sub>Go · Chi · Supabase · AniZip↔TMDB · Anikoto (direct) + FlixCloud · Docker</sub></div>
+<div align="center"><sub>Go · Chi · Supabase · Docker</sub></div>
