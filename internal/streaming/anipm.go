@@ -94,7 +94,11 @@ func NewAniPMProvider(log zerolog.Logger, base, embedBase string) *AniPMProvider
 		embedBase:  strings.TrimRight(embedBase, "/"),
 		anilistURL: core.AnilistGraphQLEndpoint(),
 		useCurrent: true,
-		usePartner: true,
+		// HLS only: the provider resolves ani.pm's direct playback (settlar
+		// chain -> direct HLS master, Verification:"proxy"). The documented
+		// Partner-API embed frame is deliberately not used (resolvePartnerEmbed
+		// is kept, unused, for an easy fallback if that decision changes).
+		usePartner: false,
 		series:     make(map[int]*anipmSeriesEntry),
 	}
 }
