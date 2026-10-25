@@ -344,6 +344,13 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	if strings.EqualFold(es.Kind, "mp4") || regexpMatchMP4(master) {
 		typ = "mp4"
 	}
+	resolved, ok := p.resolveFinalSource(ctx, master, referer, typ)
+	if !ok {
+		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
+			Msg("lee: source redirect or fetch failed, dropping source")
+		return nil, nil
+	}
+	master = resolved
 	if typ == "hls" {
 		if !probeSegmentsLenient(ctx, p.client, master, referer, browserUA) {
 			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
@@ -393,6 +400,49 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		Outro:       outro,
 	}
 	return sr, nil
+}
+
+// resolveFinalSource follows the source URL once before it reaches the media
+// proxy. The proxy intentionally rejects redirects, so publishing a valid
+// player URL that only redirects at playback creates a server that appears in
+// /servers but cannot start. The returned URL is the final request URL.
+func (p *LeeProvider) resolveFinalSource(ctx context.Context, rawURL, referer, typ string) (string, bool) {
+	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("User-Agent", browserUA)
+	if referer != "" {
+		req.Header.Set("Referer", referer)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return "", false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, vodCacheMaxBody+1))
+	if err != nil || len(body) == 0 || len(body) > vodCacheMaxBody {
+		return "", false
+	}
+	if typ == "hls" && !strings.Contains(string(body), "#EXTM3U") {
+		return "", false
+	}
+	if typ == "mp4" && !segmentBytesPlayable(body) {
+		return "", false
+	}
+	finalURL := rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	if typ == "hls" {
+		VODCacheSet(finalURL, body)
+	}
+	return finalURL, true
 }
 
 // regexpMatchMP4 reports a .mp4 file suffix (query-tolerant) without

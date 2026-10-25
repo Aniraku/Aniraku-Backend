@@ -50,7 +50,7 @@ func newLeeFixture(t *testing.T) *leeFixture {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"source":%q,"kind":"hls","audioLang":"en","subtitles":[{"url":%q,"label":"English","lang":"en"}]}`,
-			base+"/m/master.m3u8", base+"/s/en.vtt")
+			base+"/m/start", base+"/s/en.vtt")
 	})
 	mux.HandleFunc("/api/anime/skip", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -58,6 +58,9 @@ func newLeeFixture(t *testing.T) *leeFixture {
 	})
 	mux.HandleFunc("/m/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n/m/media.m3u8\n")
+	})
+	mux.HandleFunc("/m/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, base+"/m/master.m3u8", http.StatusTemporaryRedirect)
 	})
 	mux.HandleFunc("/m/media.m3u8", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "#EXTM3U\n#EXTINF:10,\n/m/seg.ts\n")

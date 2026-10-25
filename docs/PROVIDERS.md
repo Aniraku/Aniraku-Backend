@@ -48,7 +48,8 @@ then:
 Identical requests share one cold fan-out and then reuse its raw server list
 for 90 seconds. An incomplete list missing kaa or tensho is held for only 5
 seconds so the next request can retry quickly. A collector that returns empty
-reuses its last good result for 10 minutes, or 2 hours for kaa and tensho.
+or loses a previously verified slot reuses that slot for 10 minutes, or 2
+hours for kaa and tensho.
 The keys include title, episode, language, content gate, and provider. Only raw
 upstream values are stored; proxy URLs are built per request. `refresh=1`
 bypasses the snapshot and last-good fallback.

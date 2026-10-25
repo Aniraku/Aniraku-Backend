@@ -103,19 +103,23 @@ func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Se
 	c.lists[key] = serverSnapshot{servers: cloneServers(servers), storedAt: now, expires: now.Add(ttl)}
 }
 
-// stabilizeProvider records a non-empty collector result. If the next round
-// returns empty, it serves the last good result instead of letting a timeout,
-// rate limit, or one failed probe remove that provider from the list.
+// stabilizeProvider records collector results. If a later round returns an
+// empty or partial list, it retains previously verified server slots instead
+// of letting a timeout, rate limit, or one failed probe remove them.
 // allowFallback is false for refresh=1 requests.
 func (c *serverStabilityCache) stabilizeProvider(key providerRequestKey, fresh []core.Server, allowFallback bool, now time.Time) ([]core.Server, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(fresh) > 0 {
+		retained := false
+		if previous, ok := c.providers[key]; ok && now.Sub(previous.storedAt) <= providerSnapshotTTL(key.provider) {
+			fresh, retained = mergeProviderServers(fresh, previous.servers), true
+		}
 		if len(c.providers) >= maxProviderSnapshots {
 			removeOldestProviderSnapshot(c.providers)
 		}
 		c.providers[key] = serverSnapshot{servers: cloneServers(fresh), storedAt: now}
-		return fresh, false
+		return fresh, retained
 	}
 	if !allowFallback {
 		return fresh, false
@@ -129,6 +133,25 @@ func (c *serverStabilityCache) stabilizeProvider(key providerRequestKey, fresh [
 		return fresh, false
 	}
 	return cloneServers(entry.servers), true
+}
+
+func mergeProviderServers(fresh, previous []core.Server) []core.Server {
+	if len(previous) == 0 {
+		return fresh
+	}
+	seen := make(map[string]struct{}, len(fresh))
+	merged := cloneServers(fresh)
+	for _, server := range fresh {
+		seen[server.Provider+"\x00"+server.Name] = struct{}{}
+	}
+	for _, server := range previous {
+		key := server.Provider + "\x00" + server.Name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		merged = append(merged, cloneServers([]core.Server{server})[0])
+	}
+	return merged
 }
 
 func providerSnapshotTTL(provider string) time.Duration {

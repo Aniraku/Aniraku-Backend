@@ -82,7 +82,7 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
 | Server-list snapshot | 90 s complete / 5 s incomplete | Raw provider URLs only; complete means kaa and tensho are present. `refresh=1` bypasses it. |
-| Per-provider last good | 10 min / 2 h kaa+tensho | Reused only when a collector returns empty; keyed by title, episode, language, content gate, and provider. |
+| Per-provider last good | 10 min / 2 h kaa+tensho | Previously verified slots are retained across empty or partial collector results; keyed by title, episode, language, content gate, and provider. |
 | Dynamic CDN allowlist | 24 h TTL | Learned hosts (playlist-vouched) expire on read past TTL; capped at 500 entries. |
 
 ## Streaming fan-out

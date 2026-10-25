@@ -44,8 +44,13 @@ inside source comments.
 - 2026-10-25 server-list flapping came from treating every transient empty
   collector as the provider's current truth. Identical cold requests now
   coalesce, complete lists stay fixed for 90 seconds, incomplete lists retry
-  after 5 seconds, and each provider can reuse its last good result. kaa and
-  tensho keep that fallback for 2 hours; other providers keep it for 10 minutes.
+  after 5 seconds, and each provider can reuse its last good result, including
+  previously verified slots lost from a partial probe. kaa and tensho keep that
+  fallback for 2 hours; other providers keep it for 10 minutes.
+- 2026-10-25 playback validation found provider URLs that passed a collector
+  probe but returned a redirect at the media proxy, which intentionally refuses
+  redirects. Tensho and Lee now resolve the final HLS URL before publication;
+  local validation passed every returned source for the available lanes.
 
 ## API layer history
 

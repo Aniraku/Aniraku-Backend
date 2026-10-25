@@ -42,7 +42,7 @@ Aniraku-Backend keeps the client-facing API separate from provider-specific work
 
 The service is written entirely in **Go**, one binary in one container, no external services to run. Playback is coordinated by a pluggable source layer (see [the provider guide](docs/PROVIDERS.md)): each module serves one upstream family, the manager fans requests out across the enabled modules, verifies what comes back, and falls down the chain when a module fails. Modules are enabled or disabled through configuration, and the request flow is identical for all of them.
 
-Server lists use a live fan-out with a short stability window. Identical requests reuse the same raw provider set, transient empty collectors fall back to their last good result, and `refresh=1` forces a new round. Sources play through the `/api/v1/proxy` media gateway.
+Server lists use a live fan-out with a short stability window. Identical requests reuse the same raw provider set, transient empty or partial collectors retain previously verified slots, and `refresh=1` forces a new round. Sources play through the `/api/v1/proxy` media gateway.
 
 Episode titles/thumbnails are resolved via **AniZip + TMDB** (AniBridge verified mappings + Fribb fallback, bidirectional).
 

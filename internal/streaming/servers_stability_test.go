@@ -96,6 +96,26 @@ func TestServerStabilityRetainsProviderAfterTransientEmpty(t *testing.T) {
 	}
 }
 
+func TestServerStabilityRetainsProviderSlotsAfterPartialProbeMiss(t *testing.T) {
+	cache := newServerStabilityCache()
+	key := providerRequestKey{
+		serverRequestKey: serverRequestKey{animeID: 21, episode: 1, lang: "sub"},
+		provider:         "tensho",
+	}
+	now := time.Now()
+	cache.stabilizeProvider(key, []core.Server{
+		stabilityTestServer("tensho", "Kaze"),
+		stabilityTestServer("tensho", "Hoshi"),
+	}, true, now)
+
+	got, reused := cache.stabilizeProvider(key, []core.Server{
+		stabilityTestServer("tensho", "Kaze"),
+	}, true, now.Add(time.Minute))
+	if !reused || len(got) != 2 || got[0].Name != "Kaze" || got[1].Name != "Hoshi" {
+		t.Fatalf("partial probe miss dropped a previously verified slot: reused=%v got=%+v", reused, got)
+	}
+}
+
 func TestServerStabilityRefreshSkipsProviderFallback(t *testing.T) {
 	cache := newServerStabilityCache()
 	key := providerRequestKey{

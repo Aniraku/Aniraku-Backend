@@ -278,6 +278,40 @@ func (p *TenshoProvider) get(ctx context.Context, rawURL, referer string) (int, 
 	return resp.StatusCode, string(body), resp.Cookies(), nil
 }
 
+// resolveMasterURL follows the player master through its provider-owned
+// redirect and returns the final playlist URL. The media proxy refuses 3xx
+// responses, so shipping the pre-redirect /p?t= URL would pass the collector
+// probe but fail when playback starts. The fetched master is also placed in
+// the raw VOD cache so the segment-depth probe does not pay for it twice.
+func (p *TenshoProvider) resolveMasterURL(ctx context.Context, rawURL string) (string, bool) {
+	masterCtx, cancel := context.WithTimeout(ctx, tenshoUpstreamTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(masterCtx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", false
+	}
+	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("Accept", "application/vnd.apple.mpegurl,application/x-mpegURL,*/*")
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return "", false
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, vodCacheMaxBody+1))
+	if err != nil || len(body) > vodCacheMaxBody || !strings.Contains(string(body), "#EXTM3U") {
+		return "", false
+	}
+	finalURL := rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	VODCacheSet(finalURL, body)
+	return finalURL, true
+}
+
 // ajaxGet calls one /ajax endpoint with the session pair the page JS
 // sends: X-Page-Token + the PHPSESSID cookie from the same watch fetch
 // (token without cookie = 403, measured).
@@ -824,6 +858,13 @@ func (p *TenshoProvider) resolveSlots(ctx context.Context, showID string, slots 
 					Msg("tensho: embed resolve failed, skipping slot")
 				return
 			}
+			finalMaster, ok := p.resolveMasterURL(sCtx, res.m3u8)
+			if !ok {
+				p.log.Info().Str("slot", slot.ServerName).Str("url", res.m3u8).
+					Msg("tensho: master unavailable, dropping slot")
+				return
+			}
+			res.m3u8 = finalMaster
 			// Segment-depth probe: a reachable master whose segments are
 			// blocked only spins at playback. Probe with NO Referer, that is
 			// exactly the shape playback takes through the media proxy, so a

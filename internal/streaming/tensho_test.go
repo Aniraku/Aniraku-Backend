@@ -229,6 +229,31 @@ func tenshoTestCtx(t *testing.T) context.Context {
 	return ctx
 }
 
+func TestTenshoResolvesMasterRedirectBeforeShipping(t *testing.T) {
+	mux := http.NewServeMux()
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	mux.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, server.URL+"/master.m3u8", http.StatusMovedPermanently)
+	})
+	mux.HandleFunc("/master.m3u8", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		fmt.Fprint(w, "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000000\n/media.m3u8\n")
+	})
+
+	p := &TenshoProvider{client: server.Client()}
+	got, ok := p.resolveMasterURL(tenshoTestCtx(t), server.URL+"/start")
+	if !ok {
+		t.Fatal("redirecting HLS master was rejected")
+	}
+	if want := server.URL + "/master.m3u8"; got != want {
+		t.Fatalf("master URL = %q, want final redirect target %q", got, want)
+	}
+	if body, cached := VODCacheGet(got); !cached || !bytes.Contains(body, []byte("#EXTM3U")) {
+		t.Fatal("final master body was not warmed for the segment probe")
+	}
+}
+
 func TestTenshoSearch(t *testing.T) {
 	f := newTenshoFixture(t)
 	p := newTenshoTestProvider(f)
