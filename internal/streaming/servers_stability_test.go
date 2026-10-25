@@ -58,6 +58,24 @@ func TestServerStabilitySnapshotReturnsDeepCopy(t *testing.T) {
 	}
 }
 
+func TestServerStabilityListKeepsMissingProviderInStableOrder(t *testing.T) {
+	cache := newServerStabilityCache()
+	key := serverRequestKey{animeID: 21, episode: 1, lang: "sub"}
+	now := time.Now()
+	previous := []core.Server{
+		stabilityTestServer("animex", "Mochi"),
+		stabilityTestServer("lee", "Lee"),
+		stabilityTestServer("tensho", "Kaze"),
+	}
+	cache.storeList(key, previous, now)
+	got := cache.storeList(key, []core.Server{
+		stabilityTestServer("animex", "Mochi"),
+	}, now.Add(time.Second))
+	if len(got) != 3 || got[0].Provider != "animex" || got[1].Provider != "lee" || got[2].Provider != "tensho" {
+		t.Fatalf("fresh incomplete list dropped or reordered verified servers: %+v", got)
+	}
+}
+
 func TestServerStabilityRetriesIncompleteCriticalSnapshotSoon(t *testing.T) {
 	cache := newServerStabilityCache()
 	key := serverRequestKey{animeID: 21, episode: 1, lang: "sub"}

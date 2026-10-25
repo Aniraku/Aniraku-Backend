@@ -84,12 +84,15 @@ func (c *serverStabilityCache) loadList(key serverRequestKey, now time.Time) ([]
 	return cloneServers(entry.servers), true
 }
 
-func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Server, now time.Time) {
+func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Server, now time.Time) []core.Server {
 	if len(servers) == 0 {
-		return
+		return servers
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if previous, ok := c.lists[key]; ok {
+		servers = mergeListSnapshot(servers, previous.servers, previous.storedAt, now)
+	}
 	if len(c.lists) >= maxServerListSnapshots {
 		removeOldestServerSnapshot(c.lists)
 	}
@@ -101,6 +104,44 @@ func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Se
 		ttl = incompleteServerListTTL
 	}
 	c.lists[key] = serverSnapshot{servers: cloneServers(servers), storedAt: now, expires: now.Add(ttl)}
+	return cloneServers(servers)
+}
+
+// mergeListSnapshot keeps the last verified provider/server slot when a fresh
+// round misses it. Current sources win for an existing slot; the prior list
+// supplies only missing slots whose provider-specific last-good lifetime has
+// not elapsed. The previous order remains authoritative, so one fresh round
+// cannot reorder the visible server list.
+func mergeListSnapshot(fresh, previous []core.Server, previousAt, now time.Time) []core.Server {
+	if len(previous) == 0 {
+		return fresh
+	}
+	current := make(map[string]core.Server, len(fresh))
+	for _, server := range fresh {
+		current[server.Provider+"\x00"+server.Name] = server
+	}
+	seen := make(map[string]struct{}, len(previous)+len(fresh))
+	merged := make([]core.Server, 0, len(previous)+len(fresh))
+	for _, server := range previous {
+		key := server.Provider + "\x00" + server.Name
+		if currentServer, ok := current[key]; ok {
+			merged = append(merged, cloneServers([]core.Server{currentServer})[0])
+			seen[key] = struct{}{}
+			continue
+		}
+		if now.Sub(previousAt) <= providerSnapshotTTL(server.Provider) {
+			merged = append(merged, cloneServers([]core.Server{server})[0])
+			seen[key] = struct{}{}
+		}
+	}
+	for _, server := range fresh {
+		key := server.Provider + "\x00" + server.Name
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		merged = append(merged, cloneServers([]core.Server{server})[0])
+	}
+	return merged
 }
 
 // stabilizeProvider records collector results. If a later round returns an

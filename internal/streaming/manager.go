@@ -736,7 +736,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
 	if len(allServers) > 0 && ctx.Err() == nil {
-		stability.storeList(cacheKey, allServers, time.Now())
+		allServers = stability.storeList(cacheKey, allServers, time.Now())
 	}
 
 	m.log.Info().
