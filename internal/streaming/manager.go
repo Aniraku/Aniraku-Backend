@@ -670,7 +670,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 			stable, reused := stability.stabilizeProvider(providerRequestKey{
 				serverRequestKey: cacheKey,
 				provider:         e.name,
-			}, fresh, !refresh, time.Now())
+			}, fresh, true, time.Now())
 			if reused {
 				dmu.Lock()
 				providerFallbacks++
@@ -713,7 +713,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	mvServers, mvReused = stability.stabilizeProvider(providerRequestKey{
 		serverRequestKey: cacheKey,
 		provider:         "megavid",
-	}, mvServers, !refresh, time.Now())
+	}, mvServers, true, time.Now())
 	if mvReused {
 		providerFallbacks++
 	}
@@ -1135,6 +1135,28 @@ func (m *Manager) collectAnimeXServers(ctx context.Context, anilistID string, ep
 			}
 			sr = m.withDubSubtitles(ctx, "animex", lang, anilistID, episode, sr)
 			out = appendNamedServers(out, []string{name}, "animex", lang, sr)
+		}
+	}
+	// The broad provider sweep is deliberately strict and can lose every
+	// sub-provider when one plyr/API draw is challenged, even though the
+	// normal first-source resolver can still return a playable source. Keep
+	// that working Animex path visible instead of publishing no Animex server.
+	if !hasProvider(out, "animex") {
+		_, parseErr := strconv.Atoi(anilistID)
+		ax := m.getAnimeXProvider()
+		var sr *SourceResult
+		var err error
+		if parseErr == nil && ax != nil {
+			sr, err = ax.FindEpisodeSource(ctx, anilistID, episode, lang)
+			sr = m.withDubSubtitles(ctx, "animex", lang, anilistID, episode, sr)
+		}
+		if err == nil && sr != nil && len(sr.Sources) > 0 {
+			name := sr.ServerName
+			if name == "" {
+				name = "Hana"
+			}
+			out = appendNamedServers(out, []string{name}, "animex", lang, sr)
+			m.log.Info().Str("provider", "animex").Msg("servers: retained primary Animex source after provider sweep miss")
 		}
 	}
 	return out

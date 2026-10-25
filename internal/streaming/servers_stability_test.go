@@ -125,9 +125,9 @@ func TestServerStabilityRefreshSkipsProviderFallback(t *testing.T) {
 	now := time.Now()
 	cache.stabilizeProvider(key, []core.Server{stabilityTestServer("kaa", "Nico")}, true, now)
 
-	got, reused := cache.stabilizeProvider(key, nil, false, now.Add(time.Minute))
-	if reused || len(got) != 0 {
-		t.Fatalf("refresh must expose the fresh empty result: reused=%v got=%+v", reused, got)
+	got, reused := cache.stabilizeProvider(key, nil, true, now.Add(time.Minute))
+	if !reused || len(got) != 1 {
+		t.Fatalf("refresh must retain the last verified provider: reused=%v got=%+v", reused, got)
 	}
 }
 

@@ -106,7 +106,9 @@ func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Se
 // stabilizeProvider records collector results. If a later round returns an
 // empty or partial list, it retains previously verified server slots instead
 // of letting a timeout, rate limit, or one failed probe remove them.
-// allowFallback is false for refresh=1 requests.
+// A refresh bypasses the full-list snapshot, but last-good provider results
+// remain eligible. Refresh must discover improvements without deleting a
+// previously verified provider when the upstream is having a bad draw.
 func (c *serverStabilityCache) stabilizeProvider(key providerRequestKey, fresh []core.Server, allowFallback bool, now time.Time) ([]core.Server, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
