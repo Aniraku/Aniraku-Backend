@@ -30,6 +30,14 @@ func newLeeFixture(t *testing.T) *leeFixture {
 			{"number":2,"sourceNumber":2,"title":"Episode 2","sub":true,"dub":true},
 			{"number":3,"sourceNumber":3,"title":"Episode 3","sub":false,"dub":false}]}`)
 	})
+	mux.HandleFunc("/api/anime/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `[{"id":900,"routeId":"test-series-900","title":"Test Anime","anilistId":"7"}]`)
+	})
+	mux.HandleFunc("/api/anime/series/test-series-900", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"id":900,"routeId":"test-series-900","anilistId":"7","malId":700,"episodes":[{"number":1,"sourceNumber":1,"sub":false,"dub":true},{"number":2,"sourceNumber":2,"sub":true,"dub":true}]}`)
+	})
 	mux.HandleFunc("/api/anime/playback-bootstrap/settlar/900", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		w.Header().Set("Content-Type", "application/json")
@@ -77,7 +85,25 @@ func newLeeFixture(t *testing.T) *leeFixture {
 func newLeeTestProvider(f *leeFixture) *LeeProvider {
 	p := NewLeeProvider(zerolog.Nop(), f.base, f.base)
 	p.client = f.server.Client()
+	p.useCurrent = false
 	return p
+}
+
+func TestLeeCurrentRouteResolve(t *testing.T) {
+	f := newLeeFixture(t)
+	p := NewLeeProvider(zerolog.Nop(), f.base, f.base)
+	p.client = f.server.Client()
+	p.anilistURL = f.base + "/anilist"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	sr, err := p.FindEpisodeSource(ctx, "7", 1, "dub")
+	if err != nil {
+		t.Fatalf("current route resolve: %v", err)
+	}
+	if sr == nil || len(sr.Sources) != 1 || !strings.HasSuffix(sr.Sources[0].URL, "/m/master.m3u8") {
+		t.Fatalf("current route source = %+v", sr)
+	}
 }
 
 func TestLeeDubResolve(t *testing.T) {

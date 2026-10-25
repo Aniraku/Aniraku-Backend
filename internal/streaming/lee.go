@@ -51,11 +51,13 @@ const (
 )
 
 type LeeProvider struct {
-	log       zerolog.Logger
-	client    *http.Client
-	base      string
-	embedBase string
-	learnHost func(host string)
+	log        zerolog.Logger
+	client     *http.Client
+	base       string
+	embedBase  string
+	anilistURL string
+	useCurrent bool
+	learnHost  func(host string)
 
 	mu     sync.Mutex
 	series map[int]*leeSeriesEntry
@@ -64,6 +66,8 @@ type LeeProvider struct {
 type leeSeriesEntry struct {
 	settlarID int
 	malID     int
+	anilistID string
+	current   bool
 	episodes  []leeEpisode
 	fetched   time.Time
 }
@@ -83,11 +87,13 @@ func NewLeeProvider(log zerolog.Logger, base, embedBase string) *LeeProvider {
 		embedBase = leeEmbedBase
 	}
 	return &LeeProvider{
-		log:       log,
-		client:    &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
-		base:      strings.TrimRight(base, "/"),
-		embedBase: strings.TrimRight(embedBase, "/"),
-		series:    make(map[int]*leeSeriesEntry),
+		log:        log,
+		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
+		base:       strings.TrimRight(base, "/"),
+		embedBase:  strings.TrimRight(embedBase, "/"),
+		anilistURL: core.AnilistGraphQLEndpoint(),
+		useCurrent: true,
+		series:     make(map[int]*leeSeriesEntry),
 	}
 }
 
@@ -201,6 +207,13 @@ func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntr
 	}
 	p.mu.Unlock()
 
+	if p.useCurrent {
+		if current, err := p.resolveCurrentSeries(ctx, id); err == nil && current != nil {
+			p.storeSeries(id, current)
+			return current, nil
+		}
+	}
+
 	var sj leeSeriesJSON
 	if err := p.getJSON(ctx, fmt.Sprintf("%s/api/anime/ani/%d?phase=core&routes=e4", p.base, id), p.base+"/", &sj); err != nil {
 		return nil, err
@@ -208,7 +221,7 @@ func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntr
 	if sj.SettlarID <= 0 || len(sj.Episodes) == 0 {
 		return nil, fmt.Errorf("lee: no series mapping for anilist %d", id)
 	}
-	entry := &leeSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, fetched: time.Now()}
+	entry := &leeSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
 	for _, e := range sj.Episodes {
 		if e.Number < 1 {
 			continue
@@ -223,6 +236,11 @@ func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntr
 	if len(entry.episodes) == 0 {
 		return nil, fmt.Errorf("lee: no episodes for anilist %d", id)
 	}
+	p.storeSeries(id, entry)
+	return entry, nil
+}
+
+func (p *LeeProvider) storeSeries(id int, entry *leeSeriesEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for k, e := range p.series {
@@ -237,6 +255,79 @@ func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntr
 		}
 	}
 	p.series[id] = entry
+}
+
+type leeCurrentSearchItem struct {
+	ID        int    `json:"id"`
+	RouteID   string `json:"routeId"`
+	Title     string `json:"title"`
+	AniListID string `json:"anilistId"`
+}
+
+type leeCurrentSeries struct {
+	ID        int    `json:"id"`
+	RouteID   string `json:"routeId"`
+	AniListID string `json:"anilistId"`
+	MalID     int    `json:"malId"`
+	Episodes  []struct {
+		Number       int  `json:"number"`
+		SourceNumber any  `json:"sourceNumber"`
+		HasSub       bool `json:"sub"`
+		HasDub       bool `json:"dub"`
+	} `json:"episodes"`
+}
+
+func (p *LeeProvider) resolveCurrentSeries(ctx context.Context, id int) (*leeSeriesEntry, error) {
+	titles, err := fetchAnilistTitles(ctx, p.client, p.anilistURL, strconv.Itoa(id))
+	if err != nil {
+		return nil, err
+	}
+	var hits []leeCurrentSearchItem
+	for _, title := range titles {
+		u := p.base + "/api/anime/search?q=" + url.QueryEscape(title)
+		if err := p.getJSON(ctx, u, p.base+"/", &hits); err == nil && len(hits) > 0 {
+			break
+		}
+	}
+	if len(hits) == 0 {
+		return nil, fmt.Errorf("lee: current search returned no results")
+	}
+	var match leeCurrentSearchItem
+	for _, item := range hits {
+		if item.AniListID == strconv.Itoa(id) {
+			match = item
+			break
+		}
+		if match.RouteID == "" && normTitleKey(item.Title) == normTitleKey(titles[0]) {
+			match = item
+		}
+	}
+	if match.RouteID == "" {
+		return nil, fmt.Errorf("lee: current search has no matching route")
+	}
+	var series leeCurrentSeries
+	if err := p.getJSON(ctx, p.base+"/api/anime/series/"+url.PathEscape(match.RouteID)+"?routes=e4", p.base+"/", &series); err != nil {
+		return nil, err
+	}
+	if series.ID <= 0 {
+		series.ID = match.ID
+	}
+	entry := &leeSeriesEntry{
+		settlarID: series.ID, malID: series.MalID, anilistID: strconv.Itoa(id), current: true,
+		fetched: time.Now(),
+	}
+	for _, episode := range series.Episodes {
+		if episode.Number < 1 {
+			continue
+		}
+		entry.episodes = append(entry.episodes, leeEpisode{
+			number: episode.Number, sourceNumber: leeSourceNumber(episode.SourceNumber, episode.Number),
+			hasSub: episode.HasSub, hasDub: episode.HasDub,
+		})
+	}
+	if len(entry.episodes) == 0 {
+		return nil, fmt.Errorf("lee: current series has no episodes")
+	}
 	return entry, nil
 }
 
