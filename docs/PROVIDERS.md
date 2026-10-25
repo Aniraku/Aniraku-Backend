@@ -32,8 +32,8 @@ through.
 ## Request flows
 
 ### `GET /api/v1/servers`: fan-out list
-`FindAllServers` runs every provider collector **concurrently** (85 s request
-ceiling, 12 s per collector; per-collector timings logged as `collectorMs`),
+`FindAllServers` runs every enabled provider collector **concurrently** (15 s
+total, 12 s per collector; per-collector timings logged as `collectorMs`),
 then:
 1. `mergeZokoDownloads`: Anikoto download links ride onto Zoko servers.
 2. `mergeNiNSubtitles`: NiN borrows verified tracks (Niko → animex → Zoko).
@@ -44,6 +44,14 @@ then:
    never a filter).
 5. Every source URL is wrapped into `/api/v1/proxy?...` per request
    (**copy-on-wrap**: provider resolve caches are never mutated).
+
+Identical requests share one cold fan-out and then reuse its raw server list
+for 90 seconds. An incomplete list missing kaa or tensho is held for only 5
+seconds so the next request can retry quickly. A collector that returns empty
+reuses its last good result for 10 minutes, or 2 hours for kaa and tensho.
+The keys include title, episode, language, content gate, and provider. Only raw
+upstream values are stored; proxy URLs are built per request. `refresh=1`
+bypasses the snapshot and last-good fallback.
 
 Hentai titles only reach Zoko (MAL-keyed) + FlixCloud; every other
 collector is skipped before any upstream call.
@@ -95,9 +103,9 @@ only: never wrapped URLs).
   Unverifiable lists; every drop logs its layer reason.
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/Lee/
   MegaVid/Tensho never receive hentai titles.
-- **No server-list snapshot cache.** Tokenized URLs expire without a
-  reliable invalidation signal; every request computes a fresh,
-  probed list. Speed comes from provider resolve caches:
+- **Short server-list stability cache.** Raw results are snapshotted for 90
+  seconds (5 seconds when kaa or tensho is missing). Request-specific proxy
+  URLs never enter the cache. Longer-lived provider resolve caches remain:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
   Lee/MegaVid fresh per resolve (short-lived tokens),

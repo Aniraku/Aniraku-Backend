@@ -169,7 +169,7 @@ paths:
     get:
       tags: [playback]
       summary: All selectable servers for an episode
-      description: Fans out to every provider concurrently and ranks by playback verdict.
+      description: Fans out to enabled providers concurrently, keeps repeated requests stable for a short window, and ranks by playback verdict. Pass refresh=1 to force a new round.
       security: []
       parameters:
         - name: animeId

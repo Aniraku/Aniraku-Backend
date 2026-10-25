@@ -81,21 +81,27 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s: no in-request retries. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
+| Server-list snapshot | 90 s complete / 5 s incomplete | Raw provider URLs only; complete means kaa and tensho are present. `refresh=1` bypasses it. |
+| Per-provider last good | 10 min / 2 h kaa+tensho | Reused only when a collector returns empty; keyed by title, episode, language, content gate, and provider. |
 | Dynamic CDN allowlist | 24 h TTL | Learned hosts (playlist-vouched) expire on read past TTL; capped at 500 entries. |
 
 ## Streaming fan-out
 
-`GetServers` fans out to all collectors concurrently (85 s request ceiling,
+`GetServers` fans out to all enabled collectors concurrently (15 s total,
 12 s per collector, timings in `collectorMs`), merges in fixed provider order,
 applies the Zoko-download / NiN-subtitle / MegaVid-language merges, attaches
 AnimeDL downloads (all sources but FlixCloud), and stable-sorts by playback
 verdict (`proxy > direct >
 embed > dead`, ordering hint only, never a filter). The collector set is
 a data table so the WaitGroup count cannot drift. Hentai titles reach only
-Zoko (MAL-keyed) + FlixCloud before any other upstream call. `Stream`
+Zoko (MAL-keyed) + FlixCloud before any other upstream call. Same-key cold
+requests share one fan-out. A short raw-result snapshot keeps sequential
+requests stable, while per-provider last-good results prevent one timeout or
+probe miss from removing a working provider. `Stream`
 walks the fallback chain serially with per-request quality filtering;
 explicit `provider` accepts families and cute-name aliases; `?refresh=1`
-bypasses provider caches. Full rule list: [`docs/PROVIDERS.md`](./PROVIDERS.md).
+bypasses the server-list stability layer. Full rule list:
+[`docs/PROVIDERS.md`](./PROVIDERS.md).
 
 ## Observability
 

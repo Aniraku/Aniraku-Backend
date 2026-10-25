@@ -38,9 +38,14 @@ inside source comments.
 - A hand-counted WaitGroup Add() once deadlocked every /servers call
   after a provider removal; the fan-out is now a data table whose count
   derives from its own length.
-- The final server list is never snapshotted: tokenized URLs expire, and
-  a cache once froze localhost health-probe URLs into public responses
-  for a full TTL.
+- A cache once froze localhost health-probe URLs into public responses for a
+  full TTL. The current stability cache stores raw upstream results only;
+  request-specific proxy URLs are added after every load.
+- 2026-10-25 server-list flapping came from treating every transient empty
+  collector as the provider's current truth. Identical cold requests now
+  coalesce, complete lists stay fixed for 90 seconds, incomplete lists retry
+  after 5 seconds, and each provider can reuse its last good result. kaa and
+  tensho keep that fallback for 2 hours; other providers keep it for 10 minutes.
 
 ## API layer history
 

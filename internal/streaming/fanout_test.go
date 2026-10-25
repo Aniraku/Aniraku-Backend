@@ -67,3 +67,56 @@ func TestFindAllServersCompletes(t *testing.T) {
 		t.Fatalf("Sunny missing from servers: %+v", servers)
 	}
 }
+
+func TestFindAllServersHonorsHentaiCollectorGate(t *testing.T) {
+	f := newAnimeGGFixture(t)
+	ag := NewAnimeGGProvider(zerolog.Nop(), f.base, f.base+"/anilist")
+	ag.client = f.server.Client()
+	m := &Manager{
+		log:         zerolog.Nop(),
+		providers:   []Provider{ag},
+		httpClient:  &http.Client{Transport: errTransport{}},
+		hentaiCache: map[int]hentaiEntry{},
+	}
+
+	servers := m.FindAllServers(context.Background(), 21, 1, "sub", []string{"Hentai"})
+	if len(servers) != 0 {
+		t.Fatalf("hentai-gated AnimeGG collector ran anyway: %+v", servers)
+	}
+}
+
+func TestFindAllServersRetainsProviderAfterTransientCollectorFailure(t *testing.T) {
+	f := newAnimeGGFixture(t)
+	ag := NewAnimeGGProvider(zerolog.Nop(), f.base, f.base+"/anilist")
+	ag.client = f.server.Client()
+	m := &Manager{
+		log:         zerolog.Nop(),
+		providers:   []Provider{ag},
+		httpClient:  &http.Client{Transport: errTransport{}},
+		hentaiCache: map[int]hentaiEntry{},
+	}
+
+	first := m.FindAllServers(context.Background(), 21, 1, "sub", []string{"Action"})
+	if !hasProvider(first, "animegg") {
+		t.Fatalf("fixture did not produce AnimeGG on the first round: %+v", first)
+	}
+
+	// Expire only the short full-list snapshot, then make the real collector
+	// fail. The per-provider last-good entry must carry Sunny into round two.
+	key := serverRequestKey{animeID: 21, episode: 1, lang: "sub"}
+	cache := m.stability()
+	cache.mu.Lock()
+	entry := cache.lists[key]
+	entry.expires = time.Now().Add(-time.Second)
+	cache.lists[key] = entry
+	cache.mu.Unlock()
+	ag.mu.Lock()
+	ag.resolved = make(map[animeggResolveKey]*animeggResolvedEntry)
+	ag.mu.Unlock()
+	ag.client = &http.Client{Transport: errTransport{}}
+
+	second := m.FindAllServers(context.Background(), 21, 1, "sub", []string{"Action"})
+	if !hasProvider(second, "animegg") {
+		t.Fatalf("transient collector failure removed AnimeGG: first=%+v second=%+v", first, second)
+	}
+}

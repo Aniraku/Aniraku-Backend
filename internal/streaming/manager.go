@@ -58,6 +58,12 @@ func (v PlaybackVerdict) String() string {
 type Manager struct {
 	log       zerolog.Logger
 	providers []Provider
+
+	// Server-list stability is separate from provider caches. It keeps raw
+	// results stable across identical requests and coalesces concurrent cold
+	// fan-outs; the HTTP layer still wraps every URL per request.
+	stabilityMu     sync.Mutex
+	serverStability *serverStabilityCache
 	// LearnHost, when set, receives hosts the provider chain itself verified
 	// (probed stream manifests, subtitle tracks, download links) so the HTTP
 	// layer can feed the media-proxy CDN allowlist and provider CDN rotation
@@ -188,8 +194,9 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAnvProvider(log),
 			NewAnixoProvider(log),
 		},
-		httpClient:  &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
-		hentaiCache: map[int]hentaiEntry{},
+		httpClient:      &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
+		hentaiCache:     map[int]hentaiEntry{},
+		serverStability: newServerStabilityCache(),
 	}
 	return m
 }
@@ -518,23 +525,24 @@ func containsHentai(genres []string) bool {
 // Var so tests can shrink it.
 var collectorBudget = 12 * time.Second
 
+const serverFanOutLifetime = 15 * time.Second
+
 // FindAllServers lists every selectable server per lang (quality selection
 // preserved). Ordering is deterministic: best playback verdict first (proxy >
 // direct > embed > dead), then provider order. No server is hidden, dead
 // providers simply contribute nothing. genres is used to skip providers
 // that should not serve certain content (e.g. Anikoto is skipped for
 // Hentai titles).
-func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) []core.Server {
+func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, lang string, genres []string) (result []core.Server) {
 	if lang == "" {
 		lang = "sub"
 	}
 
-	// No hard cap on the whole fan-out beyond the handler's own request
-	// lifetime (90s in the handler, which also lifts the server-wide
-	// WriteTimeout): each collector below runs under collectorBudget, so
-	// the response bound is that ceiling rather than a dead upstream's
-	// client timeout.
-	ctx, cancel := context.WithTimeout(ctx, 85*time.Second)
+	// Bound genre lookup, fan-out, and post-processing together. Each
+	// collector has its tighter budget below, while this deadline protects
+	// the merge path and keeps the cold endpoint inside its 15-second contract.
+	managerDeadline := time.Now().Add(serverFanOutLifetime)
+	ctx, cancel := context.WithDeadline(ctx, managerDeadline)
 	defer cancel()
 
 	// All providers run AT ONCE (fan-out), then merge in fixed provider
@@ -546,13 +554,50 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	if !hentai && len(genres) == 0 {
 		hentai = m.isHentaiTitle(ctx, animeID)
 	}
+	if ctx.Err() != nil {
+		return nil
+	}
 	anilistID := fmt.Sprintf("%d", animeID)
 
-	// No snapshot cache for the final list: tokenized URLs (megaplay
-	// ?token=, proxied nonces) expire without a reliable invalidation
-	// signal, and a cached list once froze 127.0.0.1 health-probe URLs
-	// into every public response for a full TTL. Collectors probe fresh
-	// each round; speed comes from them, not from a cache.
+	// A short raw-result snapshot keeps repeated identical requests from
+	// seeing a different provider set on every upstream wobble. Proxy URLs
+	// and request nonces are added by the HTTP handler after this function,
+	// so they can never be frozen in this cache. refresh=1 forces a new round.
+	cacheKey := serverRequestKey{animeID: animeID, episode: episode, lang: lang, hentai: hentai}
+	stability := m.stability()
+	refresh := IsRefresh(ctx)
+	if !refresh {
+		if cached, ok := stability.loadList(cacheKey, time.Now()); ok {
+			m.log.Info().
+				Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
+				Int("servers", len(cached)).
+				Msg("servers: stability snapshot hit")
+			return cached
+		}
+	}
+
+	// Identical cold requests share one fan-out. Without this, concurrent
+	// viewers can each observe a different subset and race to replace the
+	// stability snapshot with whichever upstreams answered in that round.
+	flightKey := serverFlightKey{serverRequestKey: cacheKey, refresh: refresh}
+	flight, leader := stability.beginFlight(flightKey)
+	if !leader {
+		select {
+		case <-flight.done:
+			return cloneServers(flight.servers)
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	// The elected request owns shared work for every waiter. Let that work
+	// finish if the elected client disconnects, but preserve the manager's
+	// absolute deadline so a detached fan-out cannot outlive the request budget.
+	leaderCtx, leaderCancel := context.WithDeadline(context.WithoutCancel(ctx), managerDeadline)
+	defer leaderCancel()
+	ctx = leaderCtx
+	defer func() {
+		stability.finishFlight(flightKey, flight, result)
+	}()
 
 	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, leeServers, mvServers, tsServers, avServers, axoServers []core.Server
 	var adlLinks []core.DownloadLink
@@ -564,6 +609,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// fan-out's latency IS its slowest collector, so the culprit gets
 	// measured, not guessed.
 	collectorMs := map[string]int64{}
+	providerFallbacks := 0
 
 	// run: per-collector budget + timing. Each collector gets its own
 	// deadline off the request context, so a dead upstream cannot pin the
@@ -608,12 +654,29 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	}
 	for _, e := range entries {
 		e := e
+		if !e.enabled {
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			*e.dst = run(e.name, func(cctx context.Context) []core.Server {
+			fresh := run(e.name, func(cctx context.Context) []core.Server {
 				return e.fn(cctx, anilistID, episode, lang)
 			})
+			if e.name == "megavid" {
+				*e.dst = fresh
+				return
+			}
+			stable, reused := stability.stabilizeProvider(providerRequestKey{
+				serverRequestKey: cacheKey,
+				provider:         e.name,
+			}, fresh, !refresh, time.Now())
+			if reused {
+				dmu.Lock()
+				providerFallbacks++
+				dmu.Unlock()
+			}
+			*e.dst = stable
 		}()
 	}
 
@@ -646,6 +709,14 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
 			len(agServers)+len(awServers)+len(leeServers)+len(akServers)+
 			len(tsServers) > 0)
+	var mvReused bool
+	mvServers, mvReused = stability.stabilizeProvider(providerRequestKey{
+		serverRequestKey: cacheKey,
+		provider:         "megavid",
+	}, mvServers, !refresh, time.Now())
+	if mvReused {
+		providerFallbacks++
+	}
 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
@@ -664,15 +735,20 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})
+	if len(allServers) > 0 && ctx.Err() == nil {
+		stability.storeList(cacheKey, allServers, time.Now())
+	}
 
 	m.log.Info().
 		Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).
 		Int("servers", len(allServers)).
+		Int("providerFallbacks", providerFallbacks).
 		Int64("totalMs", time.Since(fanStart).Milliseconds()).
 		Interface("collectorMs", collectorMs).
 		Msg("servers: fan-out complete")
 
-	return allServers
+	result = allServers
+	return result
 }
 
 // appendNamedServers maps a provider's source list onto display names

@@ -209,12 +209,9 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 120s: no provider gets cut for being slow. The slowest real
-	// resolver (Hana/animex) needs 30-35s, and the fan-out below gives
-	// every collector room to finish on its own before this bounds the
-	// total lifetime. This only stops a truly dead embed from hanging
-	// the connection open forever.
-	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	// The manager bounds lookup, fan-out, and merging to 15 seconds. Keep a
+	// small handler margin for URL wrapping and JSON encoding.
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	if r.URL.Query().Get("refresh") == "1" || r.URL.Query().Get("refresh") == "true" {
 		ctx = streaming.WithRefresh(ctx)
@@ -228,14 +225,6 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	}
 	if servers == nil {
 		servers = []core.Server{}
-	}
-	// The fan-out above (up to the 85s collector lifetime) exceeds the
-	// server-wide 60s WriteTimeout. Without lifting the write deadline,
-	// a slow provider chain gets the connection killed mid-response and
-	// the client sees nothing after waiting it out. The request context
-	// (120s) still bounds the total lifetime.
-	if rc := http.NewResponseController(w); rc != nil {
-		_ = rc.SetWriteDeadline(time.Time{})
 	}
 	h.respondJSON(w, http.StatusOK, servers)
 }
