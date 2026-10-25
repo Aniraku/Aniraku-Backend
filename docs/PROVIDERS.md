@@ -21,7 +21,7 @@ fallback order and the `/servers` merge order.
 | `kaa` | Nico, robin, D'Luff, zoro, sanji, nami, usopp, chopper, franky, brook, jimbei, then `kaa-N` (positional) | kaa.lt krussdomi **master** playlists (dual-audio) |
 | `animegg` | Sunny, Yolky, Eggy (positional per mirror tab) | animegg.org direct mp4, highest quality per tab |
 | `aniwaves` | Nami (Vidplay), Coral (MyCloud), Pearl (DatSaV/savedly), Wavy/Bubbles/Shelly (fallback) | echovideo multi-rendition HLS masters + top savedly mp4 |
-| `lee` | Lee | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
+| `anipm` | Nuri | ani.pm direct HLS (series → bootstrap → settlar session → embed session) |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
 | `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **resolved to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer); sprite-preview tracks (`kind:"thumbnails"`, label "Subtitles") are dropped from the track list (sub+dub) |
 
@@ -59,7 +59,7 @@ collector is skipped before any upstream call.
 
 ### `POST /api/v1/stream`: explicit / fallback resolve
 With `provider` set (family **or** cute name: `Sunny`, `Nami`, `Nest`,
-`Lee`, `animegg` sub-ids like `yuki` all route), only that provider
+`Nuri`, `animegg` sub-ids like `yuki` all route), only that provider
 resolves. Empty `provider` walks the fallback chain serially, first hit
 wins. `quality` filters provider-returned labels (`auto` = all).
 
@@ -77,7 +77,7 @@ only: never wrapped URLs).
   result. (History: in-place wrapping once froze localhost URLs into every
   response.)
 - **Strict per-lang.** Sub reads sub listings, dub reads dub listings, no
-  cross fallback: except Lee, whose dub-only/sub-only gaps are genuine,
+  cross fallback: except Nuri, whose dub-only/sub-only gaps are genuine,
   and explicit exceptions documented in code. Caches are
   keyed **with** lang.
 - **Dub subtitles: Sora-only.** Only Sora (animex) dub carries the Nico
@@ -102,14 +102,14 @@ only: never wrapped URLs).
   declarations; (2) TS PMT ISO-639 segment descriptors (ground truth);
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
-- **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/Lee/
+- **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/anipm/
   MegaVid/Tensho never receive hentai titles.
 - **Short server-list stability cache.** Raw results are snapshotted for 90
   seconds (5 seconds when kaa or tensho is missing). Request-specific proxy
   URLs never enter the cache. Longer-lived provider resolve caches remain:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
-  Lee/MegaVid fresh per resolve (short-lived tokens),
+  anipm/MegaVid fresh per resolve (short-lived tokens),
   Tensho show 10 min +
   episode list/token 3 min (page token 403s when stale: refreshed
   once and retried).

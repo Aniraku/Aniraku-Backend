@@ -18,7 +18,7 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
-// LeeProvider resolves direct HLS streams through ani.pm (AniList-keyed
+// AniPMProvider resolves direct HLS streams through ani.pm (AniList-keyed
 // series API + playback bootstrap + settlar session + embed session).
 // Verified live from the production egress (which serves every
 // hop; some residential egresses are challenged on settlar hosts instead).
@@ -42,66 +42,68 @@ import (
 //     cached 24h.
 //   - Skip chapters via /api/anime/skip are best-effort (often {}).
 const (
-	leeDefaultBase      = "https://ani.pm"
-	leeEmbedBase        = "https://embed.settlar.io"
-	leeReferer          = "https://ani.pm/"
-	leeServerName       = "Lee"
-	leeSeriesTTL        = 24 * time.Hour
-	maxLeeSeriesEntries = 500
+	anipmDefaultBase = "https://ani.pm"
+	anipmEmbedBase   = "https://embed.settlar.io"
+	anipmReferer     = "https://ani.pm/"
+	anipmServerName  = "Nuri"
+	anipmSeriesTTL   = 24 * time.Hour
+	maxAniPMEntries  = 500
 )
 
-type LeeProvider struct {
+type AniPMProvider struct {
 	log        zerolog.Logger
 	client     *http.Client
 	base       string
 	embedBase  string
 	anilistURL string
 	useCurrent bool
+	usePartner bool
 	learnHost  func(host string)
 
 	mu     sync.Mutex
-	series map[int]*leeSeriesEntry
+	series map[int]*anipmSeriesEntry
 }
 
-type leeSeriesEntry struct {
+type anipmSeriesEntry struct {
 	settlarID int
 	malID     int
 	anilistID string
 	current   bool
-	episodes  []leeEpisode
+	episodes  []anipmEpisode
 	fetched   time.Time
 }
 
-type leeEpisode struct {
+type anipmEpisode struct {
 	number       int
 	sourceNumber string
 	hasSub       bool
 	hasDub       bool
 }
 
-func NewLeeProvider(log zerolog.Logger, base, embedBase string) *LeeProvider {
+func NewAniPMProvider(log zerolog.Logger, base, embedBase string) *AniPMProvider {
 	if strings.TrimSpace(base) == "" {
-		base = leeDefaultBase
+		base = anipmDefaultBase
 	}
 	if strings.TrimSpace(embedBase) == "" {
-		embedBase = leeEmbedBase
+		embedBase = anipmEmbedBase
 	}
-	return &LeeProvider{
+	return &AniPMProvider{
 		log:        log,
 		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
 		embedBase:  strings.TrimRight(embedBase, "/"),
 		anilistURL: core.AnilistGraphQLEndpoint(),
 		useCurrent: true,
-		series:     make(map[int]*leeSeriesEntry),
+		usePartner: true,
+		series:     make(map[int]*anipmSeriesEntry),
 	}
 }
 
-func (p *LeeProvider) Name() string { return "lee" }
+func (p *AniPMProvider) Name() string { return "anipm" }
 
-func (p *LeeProvider) SetHostLearner(fn func(host string)) { p.learnHost = fn }
+func (p *AniPMProvider) SetHostLearner(fn func(host string)) { p.learnHost = fn }
 
-func (p *LeeProvider) learnURLHost(raw string) {
+func (p *AniPMProvider) learnURLHost(raw string) {
 	if p.learnHost == nil {
 		return
 	}
@@ -112,15 +114,15 @@ func (p *LeeProvider) learnURLHost(raw string) {
 	p.learnHost(u.Hostname())
 }
 
-func (p *LeeProvider) Search(ctx context.Context, title string) ([]SearchResult, error) {
-	return nil, fmt.Errorf("lee search not implemented")
+func (p *AniPMProvider) Search(ctx context.Context, title string) ([]SearchResult, error) {
+	return nil, fmt.Errorf("anipm search not implemented")
 }
 
-func (p *LeeProvider) FindEpisodes(ctx context.Context, providerID string) ([]Episode, error) {
-	return nil, fmt.Errorf("lee episode listing not implemented")
+func (p *AniPMProvider) FindEpisodes(ctx context.Context, providerID string) ([]Episode, error) {
+	return nil, fmt.Errorf("anipm episode listing not implemented")
 }
 
-func (p *LeeProvider) getJSON(ctx context.Context, rawURL, referer string, out any) error {
+func (p *AniPMProvider) getJSON(ctx context.Context, rawURL, referer string, out any) error {
 	var lastErr error
 	for attempt := 1; attempt <= 2; attempt++ {
 		actx, cancel := context.WithTimeout(ctx, 12*time.Second)
@@ -157,24 +159,24 @@ func (p *LeeProvider) getJSON(ctx context.Context, rawURL, referer string, out a
 			continue
 		}
 		if status == http.StatusTooManyRequests || status >= 500 {
-			lastErr = fmt.Errorf("lee: GET %s -> HTTP %d", rawURL, status)
+			lastErr = fmt.Errorf("anipm: GET %s -> HTTP %d", rawURL, status)
 			continue
 		}
 		if status != http.StatusOK {
-			return fmt.Errorf("lee: GET %s -> HTTP %d", rawURL, status)
+			return fmt.Errorf("anipm: GET %s -> HTTP %d", rawURL, status)
 		}
 		if err := json.Unmarshal(body, out); err != nil {
-			return fmt.Errorf("lee: json %s: %w", rawURL, err)
+			return fmt.Errorf("anipm: json %s: %w", rawURL, err)
 		}
 		return nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("lee: request failed")
+		lastErr = fmt.Errorf("anipm: request failed")
 	}
 	return lastErr
 }
 
-type leeSeriesJSON struct {
+type anipmSeriesJSON struct {
 	SettlarID int `json:"settlarId"`
 	MalID     int `json:"malId"`
 	Episodes  []struct {
@@ -185,7 +187,7 @@ type leeSeriesJSON struct {
 	} `json:"episodes"`
 }
 
-func leeSourceNumber(v any, fallback int) string {
+func anipmSourceNumber(v any, fallback int) string {
 	switch n := v.(type) {
 	case string:
 		if strings.TrimSpace(n) != "" {
@@ -199,9 +201,9 @@ func leeSourceNumber(v any, fallback int) string {
 	return strconv.Itoa(fallback)
 }
 
-func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntry, error) {
+func (p *AniPMProvider) resolveSeries(ctx context.Context, id int) (*anipmSeriesEntry, error) {
 	p.mu.Lock()
-	if e, ok := p.series[id]; ok && time.Since(e.fetched) < leeSeriesTTL {
+	if e, ok := p.series[id]; ok && time.Since(e.fetched) < anipmSeriesTTL {
 		p.mu.Unlock()
 		return e, nil
 	}
@@ -211,44 +213,46 @@ func (p *LeeProvider) resolveSeries(ctx context.Context, id int) (*leeSeriesEntr
 		if current, err := p.resolveCurrentSeries(ctx, id); err == nil && current != nil {
 			p.storeSeries(id, current)
 			return current, nil
+		} else if err != nil {
+			p.log.Debug().Err(err).Int("anilistId", id).Msg("anipm: current route unavailable, trying legacy route")
 		}
 	}
 
-	var sj leeSeriesJSON
+	var sj anipmSeriesJSON
 	if err := p.getJSON(ctx, fmt.Sprintf("%s/api/anime/ani/%d?phase=core&routes=e4", p.base, id), p.base+"/", &sj); err != nil {
 		return nil, err
 	}
 	if sj.SettlarID <= 0 || len(sj.Episodes) == 0 {
-		return nil, fmt.Errorf("lee: no series mapping for anilist %d", id)
+		return nil, fmt.Errorf("anipm: no series mapping for anilist %d", id)
 	}
-	entry := &leeSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
+	entry := &anipmSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
 	for _, e := range sj.Episodes {
 		if e.Number < 1 {
 			continue
 		}
-		entry.episodes = append(entry.episodes, leeEpisode{
+		entry.episodes = append(entry.episodes, anipmEpisode{
 			number:       e.Number,
-			sourceNumber: leeSourceNumber(e.SourceNumber, e.Number),
+			sourceNumber: anipmSourceNumber(e.SourceNumber, e.Number),
 			hasSub:       e.HasSub,
 			hasDub:       e.HasDub,
 		})
 	}
 	if len(entry.episodes) == 0 {
-		return nil, fmt.Errorf("lee: no episodes for anilist %d", id)
+		return nil, fmt.Errorf("anipm: no episodes for anilist %d", id)
 	}
 	p.storeSeries(id, entry)
 	return entry, nil
 }
 
-func (p *LeeProvider) storeSeries(id int, entry *leeSeriesEntry) {
+func (p *AniPMProvider) storeSeries(id int, entry *anipmSeriesEntry) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for k, e := range p.series {
-		if time.Since(e.fetched) > leeSeriesTTL {
+		if time.Since(e.fetched) > anipmSeriesTTL {
 			delete(p.series, k)
 		}
 	}
-	if len(p.series) >= maxLeeSeriesEntries {
+	if len(p.series) >= maxAniPMEntries {
 		for k := range p.series {
 			delete(p.series, k)
 			break
@@ -257,14 +261,14 @@ func (p *LeeProvider) storeSeries(id int, entry *leeSeriesEntry) {
 	p.series[id] = entry
 }
 
-type leeCurrentSearchItem struct {
+type anipmCurrentSearchItem struct {
 	ID        int    `json:"id"`
 	RouteID   string `json:"routeId"`
 	Title     string `json:"title"`
 	AniListID string `json:"anilistId"`
 }
 
-type leeCurrentSeries struct {
+type anipmCurrentSeries struct {
 	ID        int    `json:"id"`
 	RouteID   string `json:"routeId"`
 	AniListID string `json:"anilistId"`
@@ -277,12 +281,12 @@ type leeCurrentSeries struct {
 	} `json:"episodes"`
 }
 
-func (p *LeeProvider) resolveCurrentSeries(ctx context.Context, id int) (*leeSeriesEntry, error) {
+func (p *AniPMProvider) resolveCurrentSeries(ctx context.Context, id int) (*anipmSeriesEntry, error) {
 	titles, err := fetchAnilistTitles(ctx, p.client, p.anilistURL, strconv.Itoa(id))
 	if err != nil {
 		return nil, err
 	}
-	var hits []leeCurrentSearchItem
+	var hits []anipmCurrentSearchItem
 	for _, title := range titles {
 		u := p.base + "/api/anime/search?q=" + url.QueryEscape(title)
 		if err := p.getJSON(ctx, u, p.base+"/", &hits); err == nil && len(hits) > 0 {
@@ -290,9 +294,9 @@ func (p *LeeProvider) resolveCurrentSeries(ctx context.Context, id int) (*leeSer
 		}
 	}
 	if len(hits) == 0 {
-		return nil, fmt.Errorf("lee: current search returned no results")
+		return nil, fmt.Errorf("anipm: current search returned no results")
 	}
-	var match leeCurrentSearchItem
+	var match anipmCurrentSearchItem
 	for _, item := range hits {
 		if item.AniListID == strconv.Itoa(id) {
 			match = item
@@ -303,16 +307,16 @@ func (p *LeeProvider) resolveCurrentSeries(ctx context.Context, id int) (*leeSer
 		}
 	}
 	if match.RouteID == "" {
-		return nil, fmt.Errorf("lee: current search has no matching route")
+		return nil, fmt.Errorf("anipm: current search has no matching route")
 	}
-	var series leeCurrentSeries
+	var series anipmCurrentSeries
 	if err := p.getJSON(ctx, p.base+"/api/anime/series/"+url.PathEscape(match.RouteID)+"?routes=e4", p.base+"/", &series); err != nil {
 		return nil, err
 	}
 	if series.ID <= 0 {
 		series.ID = match.ID
 	}
-	entry := &leeSeriesEntry{
+	entry := &anipmSeriesEntry{
 		settlarID: series.ID, malID: series.MalID, anilistID: strconv.Itoa(id), current: true,
 		fetched: time.Now(),
 	}
@@ -320,18 +324,18 @@ func (p *LeeProvider) resolveCurrentSeries(ctx context.Context, id int) (*leeSer
 		if episode.Number < 1 {
 			continue
 		}
-		entry.episodes = append(entry.episodes, leeEpisode{
-			number: episode.Number, sourceNumber: leeSourceNumber(episode.SourceNumber, episode.Number),
+		entry.episodes = append(entry.episodes, anipmEpisode{
+			number: episode.Number, sourceNumber: anipmSourceNumber(episode.SourceNumber, episode.Number),
 			hasSub: episode.HasSub, hasDub: episode.HasDub,
 		})
 	}
 	if len(entry.episodes) == 0 {
-		return nil, fmt.Errorf("lee: current series has no episodes")
+		return nil, fmt.Errorf("anipm: current series has no episodes")
 	}
 	return entry, nil
 }
 
-type leeBootstrap struct {
+type anipmBootstrap struct {
 	Availability struct {
 		Sub bool `json:"sub"`
 		Dub bool `json:"dub"`
@@ -339,11 +343,11 @@ type leeBootstrap struct {
 	Selection string `json:"settlarSelection"`
 }
 
-type leeSession struct {
+type anipmSession struct {
 	EmbedURL string `json:"embedUrl"`
 }
 
-type leeEmbedSession struct {
+type anipmEmbedSession struct {
 	Source    string `json:"source"`
 	Kind      string `json:"kind"`
 	AudioLang string `json:"audioLang"`
@@ -360,20 +364,25 @@ type leeEmbedSession struct {
 // FindEpisodeSource resolves one episode for exactly the requested lang.
 // Fresh token chain per call: media object tokens die
 // fast, so nothing below the series mapping is cached.
-func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
-		return nil, fmt.Errorf("lee: bad anilist id %q", anilistID)
+		return nil, fmt.Errorf("anipm: bad anilist id %q", anilistID)
 	}
 	langKey := "sub"
 	if strings.EqualFold(lang, "dub") {
 		langKey = "dub"
 	}
+	if p.usePartner {
+		if result, partnerErr := p.resolvePartnerEmbed(ctx, id, episode, langKey); partnerErr == nil && result != nil {
+			return result, nil
+		}
+	}
 	series, err := p.resolveSeries(ctx, id)
 	if err != nil {
 		return nil, err
 	}
-	var ep *leeEpisode
+	var ep *anipmEpisode
 	for i := range series.episodes {
 		if series.episodes[i].number == episode {
 			ep = &series.episodes[i]
@@ -381,13 +390,13 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		}
 	}
 	if ep == nil {
-		return nil, fmt.Errorf("lee: episode %d not listed", episode)
+		return nil, fmt.Errorf("anipm: episode %d not listed", episode)
 	}
 	if langKey == "sub" && !ep.hasSub || langKey == "dub" && !ep.hasDub {
 		return nil, nil
 	}
 	referer := fmt.Sprintf("%s/anime/", p.base)
-	var boot leeBootstrap
+	var boot anipmBootstrap
 	bootURL := fmt.Sprintf("%s/api/anime/playback-bootstrap/settlar/%d?ep=%s&lang=%s&backup=1",
 		p.base, series.settlarID, url.QueryEscape(ep.sourceNumber), langKey)
 	if err := p.getJSON(ctx, bootURL, referer, &boot); err != nil {
@@ -402,9 +411,9 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		return nil, nil
 	}
 	if strings.TrimSpace(boot.Selection) == "" {
-		return nil, fmt.Errorf("lee: no playback selection for episode %d", episode)
+		return nil, fmt.Errorf("anipm: no playback selection for episode %d", episode)
 	}
-	var sess leeSession
+	var sess anipmSession
 	sessURL := fmt.Sprintf("%s/api/anime/settlar/session?selection=%s&provider=anipm&ep=%d&channel=%s&telemetry=0",
 		p.base, url.QueryEscape(boot.Selection), episode, langKey)
 	if err := p.getJSON(ctx, sessURL, referer, &sess); err != nil {
@@ -418,9 +427,9 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		token = sess.EmbedURL[i+3:]
 	}
 	if token == "" {
-		return nil, fmt.Errorf("lee: no embed token for episode %d", episode)
+		return nil, fmt.Errorf("anipm: no embed token for episode %d", episode)
 	}
-	var es leeEmbedSession
+	var es anipmEmbedSession
 	if err := p.getJSON(ctx, p.embedBase+"/api/embed/session?t="+url.QueryEscape(token), referer, &es); err != nil {
 		if isUpstreamGated(err) {
 			return nil, nil
@@ -438,14 +447,14 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	resolved, ok := p.resolveFinalSource(ctx, master, referer, typ)
 	if !ok {
 		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
-			Msg("lee: source redirect or fetch failed, dropping source")
+			Msg("anipm: source redirect or fetch failed, dropping source")
 		return nil, nil
 	}
 	master = resolved
 	if typ == "hls" {
 		if !probeSegmentsLenient(ctx, p.client, master, referer, browserUA) {
 			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
-				Msg("lee: master blocked from this egress, dropping source")
+				Msg("anipm: master blocked from this egress, dropping source")
 			return nil, nil
 		}
 	} else if !probeMediaFileLenient(ctx, p.client, master, referer, browserUA) {
@@ -475,7 +484,7 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	}
 
 	p.log.Info().Int("animeId", id).Int("episode", episode).
-		Str("lang", langKey).Int("subs", len(subs)).Msg("lee resolved")
+		Str("lang", langKey).Int("subs", len(subs)).Msg("anipm resolved")
 	intro, outro := p.fetchSkip(ctx, series.malID, id, episode, langKey)
 	sr := &SourceResult{
 		Sources: []core.Source{{
@@ -486,18 +495,71 @@ func (p *LeeProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 			Verification: "proxy",
 		}},
 		Headers:     map[string]string{"Referer": referer},
-		ServerNames: []string{leeServerName},
+		ServerNames: []string{anipmServerName},
 		Intro:       intro,
 		Outro:       outro,
 	}
 	return sr, nil
 }
 
+type anipmPartnerSeries struct {
+	Episodes []struct {
+		Number    int `json:"number"`
+		Available struct {
+			Sub bool `json:"sub"`
+			Dub bool `json:"dub"`
+		} `json:"available"`
+		Embed struct {
+			Sub string `json:"sub"`
+			Dub string `json:"dub"`
+		} `json:"embed"`
+	} `json:"episodeList"`
+}
+
+// resolvePartnerEmbed uses Ani.pm's documented read-only Partner API. It
+// returns the official player frame rather than scraping private playback
+// endpoints, so normal browser access and the provider's own challenge flow
+// remain intact.
+func (p *AniPMProvider) resolvePartnerEmbed(ctx context.Context, id, episode int, lang string) (*SourceResult, error) {
+	var payload struct {
+		Data anipmPartnerSeries `json:"data"`
+	}
+	path := fmt.Sprintf("%s/api/partner/v1/series/%d", p.base, id)
+	if err := p.getJSON(ctx, path, p.base+"/", &payload); err != nil {
+		return nil, err
+	}
+	for _, item := range payload.Data.Episodes {
+		if item.Number != episode {
+			continue
+		}
+		embed := item.Embed.Sub
+		available := item.Available.Sub
+		if lang == "dub" {
+			embed = item.Embed.Dub
+			available = item.Available.Dub
+		}
+		if !available || embed == "" {
+			return nil, nil
+		}
+		return &SourceResult{
+			Sources: []core.Source{{
+				URL:          embed,
+				Type:         "embed",
+				Quality:      "auto",
+				Verification: "embed",
+			}},
+			Headers:    map[string]string{},
+			ServerName: anipmServerName,
+		}, nil
+	}
+	return nil, nil
+}
+
 // resolveFinalSource follows the source URL once before it reaches the media
 // proxy. The proxy intentionally rejects redirects, so publishing a valid
 // player URL that only redirects at playback creates a server that appears in
 // /servers but cannot start. The returned URL is the final request URL.
-func (p *LeeProvider) resolveFinalSource(ctx context.Context, rawURL, referer, typ string) (string, bool) {
+func (p *AniPMProvider) resolveFinalSource(ctx context.Context, rawURL, referer, typ string) (string, bool) {
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, rawURL, nil)
@@ -548,7 +610,7 @@ func regexpMatchMP4(rawURL string) bool {
 
 // fetchSkip reads intro/outro chapters best-effort; empty on any failure
 // (skip data must never fail playback).
-func (p *LeeProvider) fetchSkip(ctx context.Context, malID, anilistID, episode int, lang string) (intro, outro *core.SkipTimestamp) {
+func (p *AniPMProvider) fetchSkip(ctx context.Context, malID, anilistID, episode int, lang string) (intro, outro *core.SkipTimestamp) {
 	if malID <= 0 {
 		return nil, nil
 	}

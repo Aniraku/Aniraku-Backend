@@ -184,7 +184,7 @@ type TenshoProvider struct {
 	anilistURL string
 	// flixera/animo are the two player hosts. They default to the live
 	// sites; tests inject one fixture server for all of them (the
-	// NewLeeProvider embedBase pattern) so the whole decrypt flow,
+	// NewAniPMProvider embedBase pattern) so the whole decrypt flow,
 	// embed page -> token -> stream JSON -> m3u8 probe, runs locally.
 	flixera   string
 	animo     string

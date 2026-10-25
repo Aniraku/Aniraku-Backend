@@ -12,14 +12,14 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// leeFixture serves the full watch chain: ani mapping, bootstrap,
+// anipmFixture serves the full watch chain: ani mapping, bootstrap,
 // settlar session, embed session, HLS playlists with real bytes.
-type leeFixture struct {
+type anipmFixture struct {
 	server *httptest.Server
 	base   string
 }
 
-func newLeeFixture(t *testing.T) *leeFixture {
+func newAniPMFixture(t *testing.T) *anipmFixture {
 	t.Helper()
 	var base string
 	mux := http.NewServeMux()
@@ -79,19 +79,35 @@ func newLeeFixture(t *testing.T) *leeFixture {
 	srv := httptest.NewServer(mux)
 	base = srv.URL
 	t.Cleanup(srv.Close)
-	return &leeFixture{server: srv, base: base}
+	return &anipmFixture{server: srv, base: base}
 }
 
-func newLeeTestProvider(f *leeFixture) *LeeProvider {
-	p := NewLeeProvider(zerolog.Nop(), f.base, f.base)
+func newAniPMTestProvider(f *anipmFixture) *AniPMProvider {
+	p := NewAniPMProvider(zerolog.Nop(), f.base, f.base)
 	p.client = f.server.Client()
 	p.useCurrent = false
+	p.usePartner = false
 	return p
 }
 
-func TestLeeCurrentRouteResolve(t *testing.T) {
-	f := newLeeFixture(t)
-	p := NewLeeProvider(zerolog.Nop(), f.base, f.base)
+func TestAniPMPartnerEmbedContract(t *testing.T) {
+	f := newAniPMFixture(t)
+	p := NewAniPMProvider(zerolog.Nop(), f.base, f.base)
+	p.client = f.server.Client()
+	p.usePartner = true
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// No partner fixture route is installed here, so the documented contract
+	// fails closed and the test confirms the legacy fixture remains isolated.
+	if got, err := p.resolvePartnerEmbed(ctx, 7, 1, "dub"); err == nil && got != nil {
+		t.Fatalf("unexpected partner fixture result: %+v", got)
+	}
+}
+
+func TestAniPMCurrentRouteResolve(t *testing.T) {
+	f := newAniPMFixture(t)
+	p := NewAniPMProvider(zerolog.Nop(), f.base, f.base)
 	p.client = f.server.Client()
 	p.anilistURL = f.base + "/anilist"
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -106,9 +122,9 @@ func TestLeeCurrentRouteResolve(t *testing.T) {
 	}
 }
 
-func TestLeeDubResolve(t *testing.T) {
-	f := newLeeFixture(t)
-	p := newLeeTestProvider(f)
+func TestAniPMDubResolve(t *testing.T) {
+	f := newAniPMFixture(t)
+	p := newAniPMTestProvider(f)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -126,8 +142,8 @@ func TestLeeDubResolve(t *testing.T) {
 	if src.Type != "hls" || src.Quality != "auto" || src.Verification != "proxy" {
 		t.Errorf("meta = type %q quality %q verification %q", src.Type, src.Quality, src.Verification)
 	}
-	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "Lee" {
-		t.Errorf("ServerNames = %v, want [Lee]", sr.ServerNames)
+	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "Nuri" {
+		t.Errorf("ServerNames = %v, want [Nuri]", sr.ServerNames)
 	}
 	if len(src.Subtitles) != 1 || src.Subtitles[0].Lang != "en" {
 		t.Errorf("subtitles = %+v, want 1 English track", src.Subtitles)
@@ -140,9 +156,9 @@ func TestLeeDubResolve(t *testing.T) {
 	}
 }
 
-func TestLeeDubOnlyTitleHidesSub(t *testing.T) {
-	f := newLeeFixture(t)
-	p := newLeeTestProvider(f)
+func TestAniPMDubOnlyTitleHidesSub(t *testing.T) {
+	f := newAniPMFixture(t)
+	p := newAniPMTestProvider(f)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -157,8 +173,8 @@ func TestLeeDubOnlyTitleHidesSub(t *testing.T) {
 	}
 }
 
-func TestLeeBadAnilistID(t *testing.T) {
-	p := NewLeeProvider(zerolog.Nop(), "", "")
+func TestAniPMBadAnilistID(t *testing.T) {
+	p := NewAniPMProvider(zerolog.Nop(), "", "")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := p.FindEpisodeSource(ctx, "xx", 1, "dub"); err == nil {

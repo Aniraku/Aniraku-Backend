@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → Lee → MegaVid → Tensho (+ AnV, Anixo)
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → AniPM → MegaVid → Tensho (+ AnV, Anixo)
 ```
 
 ## Code layout (`internal/api/v1`)
@@ -76,7 +76,7 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | Anikoto resolve | 5 min fresh + stale window | Served without re-contacting megaplay; stale backs failures. |
 | kaa slug / resolve | 24 h / 10 min (lang-keyed) | Strict per-lang keys; deep-copied on store and load. |
 | AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
-| Lee / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
+| AniPM / MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
 | Tensho show / episodes+token / resolved episodes | 10 min / 3 min / 10 min | Watch-page `AJAX_TOKEN` 403s when stale, refreshed once and retried. |
 | AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s: no in-request retries. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |

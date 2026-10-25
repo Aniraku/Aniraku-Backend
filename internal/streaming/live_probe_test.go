@@ -88,8 +88,8 @@ func TestLiveProviderProbe(t *testing.T) {
 	go probe("aniwaves", func() ([]core.Server, error) {
 		return m.collectAniWavesServers(ctx, anilistID, episode, lang), nil
 	})
-	go probe("lee", func() ([]core.Server, error) {
-		return m.collectLeeServers(ctx, anilistID, episode, lang), nil
+	go probe("anipm", func() ([]core.Server, error) {
+		return m.collectAniPMServers(ctx, anilistID, episode, lang), nil
 	})
 	go probe("megavid", func() ([]core.Server, error) {
 		return m.collectMegaVidServers(ctx, anilistID, episode, lang), nil
