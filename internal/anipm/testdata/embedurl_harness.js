@@ -1,23 +1,26 @@
 // Differential harness: runs the ORIGINAL ani.pm Player SDK
-// (testdata/sdk-v1.js, fetched from https://ani.pm/embed/sdk/v1.js) over a JSON
-// array of option objects and prints a JSON array of results: {url} on success
-// or {error:{code,message}} on failure.
+// (https://ani.pm/embed/sdk/v1.js) over a JSON array of option objects and
+// prints a JSON array of results: {url} on success or {error:{code,message}} on
+// failure.
 //
-//   node embedurl_harness.js <options.json>
+//   node embedurl_harness.js <sdk.js path> <options.json>
 //
-// It is executed by differential_test.go; it is not part of the Go build.
+// It is executed by differential_test.go; it is not part of the Go build. The
+// SDK path is supplied by the test (a hash-verified local copy or a
+// hash-verified fetch) so no third-party bundle is vendored in the repo.
 'use strict'
 
 const fs = require('fs')
 const path = require('path')
-const sdk = require(path.join(__dirname, 'sdk-v1.js'))
 
-const file = process.argv[2]
-if (!file) {
-  process.stderr.write('usage: node embedurl_harness.js <options.json>\n')
+const sdkPath = process.argv[2]
+const file = process.argv[3]
+if (!sdkPath || !file) {
+  process.stderr.write('usage: node embedurl_harness.js <sdk.js> <options.json>\n')
   process.exit(2)
 }
 
+const sdk = require(path.resolve(sdkPath))
 const cases = JSON.parse(fs.readFileSync(file, 'utf8'))
 const out = cases.map((options) => {
   try {

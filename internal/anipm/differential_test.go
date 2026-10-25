@@ -1,25 +1,44 @@
 package anipm
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
+)
+
+// The reference SDK is NOT vendored in this repository. It is either a local,
+// git-ignored copy at sdkLocal or fetched from sdkURL, and in both cases it must
+// hash to sdkSHA256 before it is trusted. Update the pin deliberately if ani.pm
+// ships a new bundle.
+const (
+	sdkURL    = "https://ani.pm/embed/sdk/v1.js"
+	sdkSHA256 = "48f6b2dd442fdc366b641e99df4caeac661ffa0a6eb46d9e7a68cf665d4f4109"
+	sdkLocal  = "testdata/sdk-v1.js"
+	harnessJS = "testdata/embedurl_harness.js"
 )
 
 // TestDifferentialEmbedURL is the core reconstruction check: it builds a large,
 // deterministic matrix of options, computes the Go EmbedURL for each, runs the
-// ORIGINAL SDK (testdata/sdk-v1.js) over the identical JSON through Node, and
-// requires every URL and error code/message to match.
+// ORIGINAL SDK over the identical JSON through Node, and requires every URL and
+// error code/message to match.
 //
-// Node is required; the test skips (with a clear reason) when it is absent so
-// the package still builds and tests offline.
+// Node is required. The test skips (with a clear reason) when Node is absent, or
+// when the SDK is neither available locally nor fetchable — the repository
+// carries no third-party bundle, so an offline run without a local copy simply
+// skips rather than fail.
 func TestDifferentialEmbedURL(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not found in PATH; skipping differential test against the original SDK")
 	}
+	sdkPath := resolveSDK(t)
 
 	matrix := embedURLMatrix()
 
@@ -33,8 +52,7 @@ func TestDifferentialEmbedURL(t *testing.T) {
 		t.Fatalf("write options: %v", err)
 	}
 
-	harness := filepath.Join("testdata", "embedurl_harness.js")
-	cmd := exec.Command(node, harness, optsFile)
+	cmd := exec.Command(node, harnessJS, sdkPath, optsFile)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("node harness: %v\n%s", err, out)
@@ -91,9 +109,59 @@ func TestDifferentialEmbedURL(t *testing.T) {
 	}
 	if mismatches > 0 {
 		t.Fatalf("%d/%d cases diverged from the original SDK", mismatches, len(matrix))
-	} else {
-		t.Logf("all %d cases match the original SDK", len(matrix))
 	}
+	t.Logf("all %d cases match the original SDK", len(matrix))
+}
+
+// resolveSDK returns a path to a SHA-256-verified copy of the SDK: a local,
+// git-ignored testdata/sdk-v1.js when present, otherwise a fetch written to a
+// temp dir. A hash mismatch is fatal (a changed upstream must be reviewed), a
+// missing/local-offline case skips.
+func resolveSDK(t *testing.T) string {
+	t.Helper()
+	if data, err := os.ReadFile(sdkLocal); err == nil {
+		if got := sha256Hex(data); got != sdkSHA256 {
+			t.Fatalf("%s SHA-256 = %s, want %s (delete the stale copy; the test will re-fetch)", sdkLocal, got, sdkSHA256)
+		}
+		abs, err := filepath.Abs(sdkLocal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return abs
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, sdkURL, nil)
+	if err != nil {
+		t.Skipf("SDK fetch request failed (%v); skipping differential test", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "application/javascript,text/javascript,*/*")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Skipf("SDK not available locally and fetch failed (%v); skipping differential test", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Skipf("SDK fetch returned HTTP %d; skipping differential test", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		t.Skipf("SDK fetch read failed (%v); skipping differential test", err)
+	}
+	if got := sha256Hex(data); got != sdkSHA256 {
+		t.Fatalf("fetched SDK SHA-256 = %s, want %s (ani.pm changed the bundle; update the pin deliberately)", got, sdkSHA256)
+	}
+	path := filepath.Join(t.TempDir(), "sdk-v1.js")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write fetched SDK: %v", err)
+	}
+	return path
+}
+
+func sha256Hex(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 func jmarshal(v any) string {

@@ -1,0 +1,6 @@
+# Third-party ani.pm SDK artifacts are intentionally NOT tracked: vendoring the
+# served bundle in the repo is a DMCA/vendor-code exposure we avoid. The
+# differential test fetches and SHA-256-verifies it at test time (see
+# ../differential_test.go), or uses a local copy placed here and ignores it.
+sdk-v1.js
+sdk-v1.d.ts
