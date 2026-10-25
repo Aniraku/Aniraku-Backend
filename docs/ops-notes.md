@@ -6,16 +6,16 @@ inside source comments.
 
 ## Provider checks
 
-- 2026-10-25 anipm: provider renamed from the placeholder "lee" to first-class
-  `anipm` (display name Nuri). Same ani.pm direct-HLS chain
-  (series → bootstrap → settlar session → embed session), `Verification: "proxy"`;
-  the whole `lee`/`Lee` identifier is gone from code, tests and docs.
+- 2026-10-25 ani.pm: the experimental provider path was removed after the
+  VPS egress consistently received Cloudflare 403/1106 responses. The
+  documented Partner API and official embed remain outside the backend
+  provider catalog until a supported production access path exists.
 - 2026-09-30 kaa: kaa.lt search/listings/watch 200 from this egress, no
   datacenter block; krussdomi masters 200 direct and via the media proxy;
   segment bytes need `Origin: https://krussdomi.com` (Referer alone 403s).
 - 2026-10-01 kaa: same show, two listing slugs (ja-JP ep1 vs en-US ep1),
   dub lane can carry zero embeds while sub resolves.
-- 2026-10-02 animegg, aniwaves, anipm: flows verified end-to-end from the
+- 2026-10-02 animegg, aniwaves: flows verified end-to-end from the
   production egress.
 - 2026-10-03 megavid: MegaPlay shape `({mal|ani}/{id}/{ep}/{lang}/source)`verified.
 - 2026-10-07 tensho: zangetsu flow verified end-to-end; animedl downloader
@@ -53,7 +53,7 @@ inside source comments.
   fallback for 2 hours; other providers keep it for 10 minutes.
 - 2026-10-25 playback validation found provider URLs that passed a collector
   probe but returned a redirect at the media proxy, which intentionally refuses
-  redirects. Tensho and AniPM now resolve the final HLS URL before publication;
+  redirects. Tensho now resolves the final HLS URL before publication;
   local validation passed every returned source for the available lanes.
 
 ## API layer history

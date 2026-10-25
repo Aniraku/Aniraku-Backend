@@ -64,14 +64,14 @@ func TestServerStabilityListKeepsMissingProviderInStableOrder(t *testing.T) {
 	now := time.Now()
 	previous := []core.Server{
 		stabilityTestServer("animex", "Mochi"),
-		stabilityTestServer("anipm", "Nuri"),
+		stabilityTestServer("megavid", "Vidy"),
 		stabilityTestServer("tensho", "Kaze"),
 	}
 	cache.storeList(key, previous, now)
 	got := cache.storeList(key, []core.Server{
 		stabilityTestServer("animex", "Mochi"),
 	}, now.Add(time.Second))
-	if len(got) != 3 || got[0].Provider != "animex" || got[1].Provider != "anipm" || got[2].Provider != "tensho" {
+	if len(got) != 3 || got[0].Provider != "animex" || got[1].Provider != "megavid" || got[2].Provider != "tensho" {
 		t.Fatalf("fresh incomplete list dropped or reordered verified servers: %+v", got)
 	}
 }

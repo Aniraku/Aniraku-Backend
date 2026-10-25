@@ -36,8 +36,6 @@ var defaultCDNSuffixes = []string{
 	"megavid.buzz",
 	// MegaPlay file host + subtitle host
 	"vidnest.fun", "new.vidnest.fun", "megaplay.shiora.top", "stellarfrontier.world",
-	// ani.pm (AniPM provider) + settlar file hosts
-	"ani.pm", "embed.settlar.io", "media.settlar.io",
 	// Zoko dramahot CDN (kept: still served by zoko)
 	"hls.dramahot.top",
 	// Wix-hosted video (repackager.wixmp.com)

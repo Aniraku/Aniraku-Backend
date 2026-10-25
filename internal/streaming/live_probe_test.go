@@ -88,9 +88,6 @@ func TestLiveProviderProbe(t *testing.T) {
 	go probe("aniwaves", func() ([]core.Server, error) {
 		return m.collectAniWavesServers(ctx, anilistID, episode, lang), nil
 	})
-	go probe("anipm", func() ([]core.Server, error) {
-		return m.collectAniPMServers(ctx, anilistID, episode, lang), nil
-	})
 	go probe("megavid", func() ([]core.Server, error) {
 		return m.collectMegaVidServers(ctx, anilistID, episode, lang), nil
 	})
@@ -99,7 +96,7 @@ func TestLiveProviderProbe(t *testing.T) {
 	})
 
 	okCount := 0
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 9; i++ {
 		r := <-results
 		status := "FAIL"
 		if r.err == nil && r.sources > 0 {
@@ -108,5 +105,5 @@ func TestLiveProviderProbe(t *testing.T) {
 		}
 		t.Logf("provider %-9s %s servers=%d sources=%d err=%v", r.name, status, r.servers, r.sources, r.err)
 	}
-	t.Logf("probe result: %d/10 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
+	t.Logf("probe result: %d/9 providers returned sources for anilist %d ep %d lang %s", okCount, animeID, episode, lang)
 }

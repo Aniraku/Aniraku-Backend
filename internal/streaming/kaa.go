@@ -670,11 +670,28 @@ func (p *KaaProvider) resolveEpisode(ctx context.Context, id int, slug string, e
 	}
 	watchURL := fmt.Sprintf("%s/%s/ep-%d-%s", p.kaaBase, slug, episode, match.Slug)
 
-	raw, err := p.doText(ctx, watchURL, p.kaaHeaders(p.kaaBase+"/"), 1<<20)
-	if err != nil {
-		return nil, err
-	}
+	raw, watchErr := p.doText(ctx, watchURL, p.kaaHeaders(p.kaaBase+"/"), 1<<20)
 	players := kaaExtractPlayers(raw)
+	if watchErr != nil || len(players) == 0 {
+		// Episode slugs rotate on kaa.lt. A cached listing can therefore
+		// return a valid 200 watch page with no players while the fresh
+		// listing points at the playable slug. Redraw the exact language
+		// listing once before declaring the provider unavailable.
+		if freshPage, _, freshErr := p.fetchEpisodePage(ctx, slug, kaaLang, strconv.Itoa(episode)); freshErr == nil {
+			for i := range freshPage {
+				if freshPage[i].Number.matches(episode) && freshPage[i].Slug != "" && freshPage[i].Slug != match.Slug {
+					match = &freshPage[i]
+					watchURL = fmt.Sprintf("%s/%s/ep-%d-%s", p.kaaBase, slug, episode, match.Slug)
+					raw, watchErr = p.doText(ctx, watchURL, p.kaaHeaders(p.kaaBase+"/"), 1<<20)
+					players = kaaExtractPlayers(raw)
+					break
+				}
+			}
+		}
+	}
+	if watchErr != nil {
+		return nil, watchErr
+	}
 	if len(players) == 0 {
 		return nil, fmt.Errorf("kaa: no embedded players on %s", watchURL)
 	}

@@ -40,7 +40,8 @@ type kaaFixture struct {
 	// holds its response until the requester's context dies (partial
 	// fan-out pin). episodePageHits counts listing-page fetches (the
 	// anchored-page fast path must need exactly one for an on-page ep).
-	dualPlayers bool
+	dualPlayers   bool
+	rotateListing atomic.Bool
 	// hangFirstListing makes the FIRST listing fetch hold until the
 	// requester's context dies; later fetches get a good page. This is
 	// the kaa.lt flaky-draw simulation the bg-retry pin uses.
@@ -71,6 +72,9 @@ func newKaaFixture(t *testing.T) *kaaFixture {
 		slug := "subslug"
 		if r.URL.Query().Get("lang") == "en-US" {
 			slug = "dubslug"
+		}
+		if f.rotateListing.CompareAndSwap(true, false) {
+			slug = "stale-slug"
 		}
 		if f.emptyEpisodes {
 			fmt.Fprint(w, `{"result":[],"pages":[]}`)
@@ -240,6 +244,23 @@ func TestKaaDubMissingWhenNoPlayers(t *testing.T) {
 	}
 	if _, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub"); err != nil {
 		t.Fatalf("sub must still resolve: %v", err)
+	}
+}
+
+func TestKaaRefreshesRotatedEpisodeSlug(t *testing.T) {
+	f := newKaaFixture(t)
+	f.rotateListing.Store(true)
+	p := newKaaTestProvider(f)
+
+	sr, err := p.FindEpisodeSource(kaaTestCtx(t), "20", 1, "sub")
+	if err != nil {
+		t.Fatalf("rotated slug resolve: %v", err)
+	}
+	if sr == nil || len(sr.Sources) != 1 || sr.ServerNames[0] != "Nico" {
+		t.Fatalf("sources = %+v, want the refreshed Nico player", sr)
+	}
+	if got := atomic.LoadInt64(f.episodePageHits); got != 2 {
+		t.Fatalf("listing fetches = %d, want initial plus one refresh", got)
 	}
 }
 
