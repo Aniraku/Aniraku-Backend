@@ -6,10 +6,6 @@ inside source comments.
 
 ## Provider checks
 
-- 2026-10-25 ani.pm: the experimental provider path was removed after the
-  VPS egress consistently received Cloudflare 403/1106 responses. The
-  documented Partner API and official embed remain outside the backend
-  provider catalog until a supported production access path exists.
 - 2026-09-30 kaa: kaa.lt search/listings/watch 200 from this egress, no
   datacenter block; krussdomi masters 200 direct and via the media proxy;
   segment bytes need `Origin: https://krussdomi.com` (Referer alone 403s).
