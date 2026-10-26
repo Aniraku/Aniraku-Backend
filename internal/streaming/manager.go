@@ -115,6 +115,9 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if zb, ok := p.(*ZenbuProvider); ok {
 			zb.SetHostLearner(fn)
 		}
+		if mk, ok := p.(*MkissaProvider); ok {
+			mk.SetHostLearner(fn)
+		}
 	}
 }
 
@@ -187,6 +190,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAniWavesProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
 			NewZenbuProvider(log, "", ""),
+			NewMkissaProvider(log),
 			NewAnvProvider(log),
 			NewAnixoProvider(log),
 		},
@@ -280,6 +284,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		provider = "zenbu"
 	case "megavid", "vidy":
 		provider = "megavid"
+	case "mkissa":
+		provider = "mkissa"
 	}
 	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
@@ -290,7 +296,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "megavid", "zenbu", "anv", "mikan", "nashi", "bana", "anixo", "kohaku":
+		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "megavid", "zenbu", "anv", "mikan", "nashi", "bana", "anixo", "kohaku", "mkissa":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -418,8 +424,17 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anixo: no sources for this episode")
-	case "mkissa", "heave", "animeheaven":
+	case "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
+	case "mkissa":
+		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("mkissa: no sources for this episode")
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
@@ -462,6 +477,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryZenbu(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAnv(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
@@ -580,7 +597,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		stability.finishFlight(flightKey, flight, result)
 	}()
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, avServers, axoServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, mkServers, avServers, axoServers []core.Server
 	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -629,6 +646,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		{"aniwaves", &awServers, m.collectAniWavesServers, !hentai},
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
+		{"mkissa", &mkServers, m.collectMkissaServers, !hentai},
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
 	}
@@ -688,7 +706,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang,
 		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
 			len(agServers)+len(awServers)+len(akServers)+
-			len(zbServers) > 0)
+			len(zbServers)+len(mkServers) > 0)
 	var mvReused bool
 	mvServers, mvReused = stability.stabilizeProvider(providerRequestKey{
 		serverRequestKey: cacheKey,
@@ -701,7 +719,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, avServers, axoServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, mkServers, avServers, axoServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL download links (fetched in parallel above): attach to every
@@ -1609,6 +1627,36 @@ func (m *Manager) getZenbuProvider() *ZenbuProvider {
 	return nil
 }
 
+func (m *Manager) getMkissaProvider() *MkissaProvider {
+	for _, p := range m.providers {
+		if mk, ok := p.(*MkissaProvider); ok {
+			return mk
+		}
+	}
+	return nil
+}
+
+// tryMkissa resolves Mkissa direct m3u8/mp4 sources.
+func (m *Manager) tryMkissa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	mk := m.getMkissaProvider()
+	if mk == nil {
+		return nil, fmt.Errorf("mkissa provider not configured")
+	}
+
+	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying mkissa")
+
+	anilistID := fmt.Sprintf("%d", animeID)
+	source, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
+	if err != nil {
+		return nil, fmt.Errorf("mkissa failed: %w", err)
+	}
+	if source == nil || len(source.Sources) == 0 {
+		return nil, nil
+	}
+
+	return m.applyQualityFilter(source, quality), nil
+}
+
 // tryZenbu resolves the zen-bu.cc stream index (primary + mirror edges).
 func (m *Manager) tryZenbu(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	zb := m.getZenbuProvider()
@@ -1708,6 +1756,28 @@ func (m *Manager) collectZenbuServers(ctx context.Context, anilistID string, epi
 			continue
 		}
 		out = appendNamedServers(out, zenbuServerNames[:], "zenbu", lang, sr)
+	}
+	return out
+}
+
+// collectMkissaServers maps Mkissa direct sources to their cute server names.
+func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		mk, ok := prov.(*MkissaProvider)
+		if !ok {
+			continue
+		}
+		sr, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "mkissa").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		out = appendNamedServers(out, []string{"Chuu"}, "mkissa", lang, sr)
 	}
 	return out
 }

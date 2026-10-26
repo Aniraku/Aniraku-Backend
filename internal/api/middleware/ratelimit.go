@@ -19,6 +19,8 @@ type RateLimiter struct {
 	burst       int           // max tokens
 	interval    time.Duration // refill interval
 	maxVisitors int
+	stop        chan struct{}
+	stopped     bool
 }
 
 func NewRateLimiter(rate, burst int, interval time.Duration) *RateLimiter {
@@ -28,14 +30,32 @@ func NewRateLimiter(rate, burst int, interval time.Duration) *RateLimiter {
 		burst:       burst,
 		interval:    interval,
 		maxVisitors: 10000,
+		stop:        make(chan struct{}),
 	}
 	go rl.cleanup()
 	return rl
 }
 
+// Stop halts the background cleanup goroutine. Call on server shutdown to
+// avoid leaking a goroutine on every restart.
+func (rl *RateLimiter) Stop() {
+	rl.mu.Lock()
+	if rl.stopped {
+		rl.mu.Unlock()
+		return
+	}
+	rl.stopped = true
+	close(rl.stop)
+	rl.mu.Unlock()
+}
+
 func (rl *RateLimiter) cleanup() {
 	for {
-		time.Sleep(10 * time.Minute)
+		select {
+		case <-rl.stop:
+			return
+		case <-time.After(10 * time.Minute):
+		}
 		rl.mu.Lock()
 		stale := make([]string, 0)
 		for ip, v := range rl.visitors {

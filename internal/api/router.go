@@ -32,7 +32,7 @@ func envInt(key string, def int) int {
 // only when the server config opts in.
 var http_pprof = newPprofMux()
 
-func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
+func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.RateLimiter, *middleware.RateLimiter) {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RealIP)
@@ -172,5 +172,5 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) *chi.Mux {
 		_, _ = w.Write([]byte(`{"error":"not found"}`))
 	})
 
-	return r
+	return r, rl, proxyRL
 }

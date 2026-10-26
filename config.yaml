@@ -7,7 +7,10 @@ server:
 supabase:
   url: ${ANIRAKU_SUPABASE_URL}
   anon_key: ${ANIRAKU_SUPABASE_ANON_KEY}
+  # service_key: reserved for future admin RPCs; not used by supabaseRequest
   service_key: ${ANIRAKU_SUPABASE_SERVICE_KEY}
+  # graphql_url: custom AniList GraphQL host (defaults to graphql.aniraku.tech)
+  graphql_url: ${ANIRAKU_GRAPHQL_URL}
   jwt_aud: authenticated
   # jwks_url is derived by the server from supabase.url as
   # {url}/auth/v1/.well-known/jwks.json — the correct Supabase path.

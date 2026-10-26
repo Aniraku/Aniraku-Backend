@@ -799,6 +799,11 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Cap download size so one client can't hold a connection and the
+	// proxy fill semaphore indefinitely with a multi-GB file.
+	const downloadMaxBytes = 200 << 20 // 200 MiB
+	body := io.LimitReader(resp.Body, downloadMaxBytes)
+
 	ct := resp.Header.Get("Content-Type")
 	if ct == "" {
 		ct = "video/mp4"
@@ -818,7 +823,7 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", "attachment")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(shapeWriter(w), resp.Body)
+	io.Copy(shapeWriter(w), body)
 }
 
 func requestPublicBaseURL(r *http.Request) string {

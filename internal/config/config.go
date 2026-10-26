@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -9,10 +10,13 @@ import (
 	"github.com/spf13/viper"
 )
 
-func loadEnv(path string) {
+func loadEnv(path string) error {
 	f, err := os.Open(path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil // no .env file is fine; env vars come from the process
+		}
+		return fmt.Errorf("load env: %w", err)
 	}
 	defer f.Close()
 	s := bufio.NewScanner(f)
@@ -33,6 +37,7 @@ func loadEnv(path string) {
 			os.Setenv(k, strings.TrimSpace(v))
 		}
 	}
+	return nil
 }
 
 type Config struct {
@@ -88,9 +93,16 @@ type ScrapingConfig struct {
 }
 
 type SupabaseConfig struct {
-	URL        string `mapstructure:"url"`
-	AnonKey    string `mapstructure:"anon_key"`
+	URL     string `mapstructure:"url"`
+	AnonKey string `mapstructure:"anon_key"`
+	// ServiceKey is reserved for future admin RPCs. It is intentionally not
+	// used by supabaseRequest (which uses the caller's JWT + anon key), so
+	// keeping it here does not change behavior. Leave empty unless you have
+	// a specific admin use for it.
 	ServiceKey string `mapstructure:"service_key"`
+	// GraphQL endpoint for AniList metadata. Defaults to the public mirror;
+	// set ANIRAKU_GRAPHQL_URL to use your own hosted instance.
+	GraphQLURL string `mapstructure:"graphql_url"`
 	JWTAud     string `mapstructure:"jwt_aud"`
 	JWKSURL    string `mapstructure:"jwks_url"`
 }
@@ -106,7 +118,9 @@ type UpdateConfig struct {
 }
 
 func Load(configPath string) (*Config, error) {
-	loadEnv(".env")
+	if err := loadEnv(".env"); err != nil {
+		return nil, err
+	}
 
 	v := viper.GetViper()
 
@@ -116,6 +130,7 @@ func Load(configPath string) (*Config, error) {
 	v.SetDefault("server.ui_dist", "embedded")
 	v.SetDefault("server.debug", false)
 	v.SetDefault("supabase.jwt_aud", "authenticated")
+	v.SetDefault("supabase.graphql_url", "https://graphql.aniraku.tech")
 
 	v.SetDefault("logging.level", "info")
 	v.SetDefault("logging.format", "json")
@@ -190,6 +205,9 @@ func Load(configPath string) (*Config, error) {
 	}
 	if val := os.Getenv("ANIRAKU_OAUTH_STATE_SECRET"); val != "" {
 		v.Set("sync.oauth_state_secret", val)
+	}
+	if val := os.Getenv("ANIRAKU_GRAPHQL_URL"); val != "" {
+		v.Set("supabase.graphql_url", val)
 	}
 	if val := os.Getenv("TMDB_READ_ACCESS_TOKEN"); val != "" {
 		v.Set("tmdb.read_access_token", val)

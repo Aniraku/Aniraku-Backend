@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → MegaVid → Zenbu (+ AnV, Anixo)
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → MegaVid → Zenbu → Mkissa (+ AnV, Anixo)
 ```
 
 ## Code layout (`internal/api/v1`)
@@ -78,6 +78,8 @@ The media proxy is the most sensitive surface. Defense in depth, in order:
 | AnimeGG / AniWaves show + resolve | 24 h / 10 min (lang-keyed) | Same copy discipline. |
 | MegaVid episode | none (fresh per resolve) | Short-lived signed/session tokens. |
 | Zenbu index episode | none (fresh per resolve) | The index hands short-lived edge URLs; each resolve re-reads it and probes every slot. |
+| Mkissa show slug | 24 h | AniList → mkissa show id mapping. |
+| Mkissa resolve | 30 min | Secured GraphQL resolve + AES-GCM decrypted sources, deep-copied. |
 | AnimeDL download links | 60 min / 60 s miss | Parsed group→track→quality response; a miss (their flapping upstream) resolves empty for 60 s: no in-request retries. |
 | VOD playlist bodies | 45 s | Raw upstream bytes only (never wrapped URLs); static playlists only; 256 entries × 256 KiB. |
 | Hentai verdict | 10 min | Per title; caller-passed genres skip the lookup. |
