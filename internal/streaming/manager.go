@@ -426,15 +426,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		return nil, fmt.Errorf("anixo: no sources for this episode")
 	case "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
-	case "mkissa":
-		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("mkissa: no sources for this episode")
+	// case "mkissa": disabled: NEED_CAPTCHA from VPS egress, slows /stream fallback
 	case "miruro", "hop", "bonk", "bee", "moo", "ally", "pewe", "kiwi", "mimi", "ogflix", "zenime", "tryembed", "astro", "beta", "skye", "zen", "pocky", "linda", "minto":
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
@@ -477,8 +469,6 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryZenbu(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
-			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAnv(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
@@ -597,7 +587,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		stability.finishFlight(flightKey, flight, result)
 	}()
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, mkServers, avServers, axoServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, avServers, axoServers []core.Server
 	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -646,7 +636,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		{"aniwaves", &awServers, m.collectAniWavesServers, !hentai},
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
-		{"mkissa", &mkServers, m.collectMkissaServers, !hentai},
+		// {"mkissa", &mkServers, m.collectMkissaServers, !hentai}, // disabled: NEED_CAPTCHA from VPS egress, slows fan-out
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
 	}
@@ -706,7 +696,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	mvServers = m.verifyMegaVidLang(ctx, mvServers, akServers, anilistID, episode, lang,
 		len(axServers)+len(zkServers)+len(fcServers)+len(nnServers)+len(kaServers)+
 			len(agServers)+len(awServers)+len(akServers)+
-			len(zbServers)+len(mkServers) > 0)
+			len(zbServers) > 0)
 	var mvReused bool
 	mvServers, mvReused = stability.stabilizeProvider(providerRequestKey{
 		serverRequestKey: cacheKey,
@@ -719,7 +709,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, mkServers, avServers, axoServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, avServers, axoServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL download links (fetched in parallel above): attach to every
