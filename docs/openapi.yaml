@@ -851,7 +851,7 @@ components:
           items: { $ref: "#/components/schemas/Subtitle" }
         verification:
           type: string
-          description: Soft playback verdict — proxy | direct | embed | dead.
+          description: Soft playback verdict: proxy | direct | embed | dead.
           enum: [proxy, direct, embed, dead]
 
     DownloadLink:

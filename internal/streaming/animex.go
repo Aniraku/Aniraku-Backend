@@ -838,7 +838,7 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	// would 403 on the very segments we just verified. Probes use the
 	// provider's configured UA and may clear through iOS Safari (below).
 	//
-	// Probes run in parallel. One Piece–scale sub-providers ship many
+	// Probes run in parallel. One Piece scale sub-providers ship many
 	// qualities, and the serial probe loop (HEAD + first segment +
 	// possible iOS retry, per source) was the fan-out's wall clock: 25 s+
 	// cold on big shows while the API hop itself takes 1-2 s. The

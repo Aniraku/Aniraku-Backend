@@ -220,7 +220,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	// Hard total budget for every upstream stage below. The stages run
 	// serially (AniZip + AniList + count fallbacks + TMDB resolve + cover),
-	// each with its own 15–50s timeout, summed they can exceed the server's
+	// each with its own 15-50s timeout, summed they can exceed the server's
 	// 60s WriteTimeout, at which point the connection is killed before a
 	// single byte is written and the browser sees ERR_TIMED_OUT with zero
 	// log lines (production incident: /anime/21/episodes hung >180s while
