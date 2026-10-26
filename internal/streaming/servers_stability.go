@@ -97,7 +97,7 @@ func (c *serverStabilityCache) storeList(key serverRequestKey, servers []core.Se
 		removeOldestServerSnapshot(c.lists)
 	}
 	ttl := serverListStabilityTTL
-	if !key.hentai && (!hasProvider(servers, "kaa") || !hasProvider(servers, "tensho")) {
+	if !key.hentai && (!hasProvider(servers, "kaa") || !hasProvider(servers, "zenbu")) {
 		// Retry incomplete cold rounds quickly. Once both critical providers
 		// have returned successfully, their last-good entries keep later
 		// transient misses from making the snapshot incomplete again.
@@ -198,7 +198,7 @@ func mergeProviderServers(fresh, previous []core.Server) []core.Server {
 }
 
 func providerSnapshotTTL(provider string) time.Duration {
-	if provider == "kaa" || provider == "tensho" {
+	if provider == "kaa" || provider == "zenbu" {
 		return criticalLastGoodTTL
 	}
 	return providerLastGoodTTL

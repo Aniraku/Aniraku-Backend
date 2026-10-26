@@ -91,8 +91,8 @@ func TestLiveProviderProbe(t *testing.T) {
 	go probe("megavid", func() ([]core.Server, error) {
 		return m.collectMegaVidServers(ctx, anilistID, episode, lang), nil
 	})
-	go probe("tensho", func() ([]core.Server, error) {
-		return m.collectTenshoServers(ctx, anilistID, episode, lang), nil
+	go probe("zenbu", func() ([]core.Server, error) {
+		return m.collectZenbuServers(ctx, anilistID, episode, lang), nil
 	})
 
 	okCount := 0

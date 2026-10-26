@@ -121,7 +121,7 @@ func (p *AnixoProvider) FindEpisodes(ctx context.Context, providerID string) ([]
 func (p *AnixoProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	if strings.EqualFold(lang, "dub") {
 		// Sub-only platform (see header comment): a logical miss, without
-		// any breaker implications, the same shape as tensho's "no dub".
+		// any breaker implications, the same shape as zenbu's "no dub".
 		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
 			Msg("anixo: dub not listed for this platform")
 		return nil, nil

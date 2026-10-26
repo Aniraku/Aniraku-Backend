@@ -35,7 +35,7 @@ import (
 // (the site labels them Orange / Pear / Banana, mapped here to Aniraku's
 // fruit theme, Mikan/Nashi/Bana, keeping each <provider-family> name theme:
 // eggs for AnimeGG, sea words for AniWaves, pets for AnimeX, sky words for
-// Tensho). Pear and Banana point at the same tokenized edge path and stay
+// Zenbu). Pear and Banana point at the same tokenized edge path and stay
 // separate servers, exactly like the site itself lists them.
 // The stream path is
 // relative to anv.to and every child URL under /stream/ needs the same
@@ -260,7 +260,7 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		}
 	}
 	if chosen == nil {
-		// Logical miss (no runtime listing yet), mirrors tensho's
+		// Logical miss (no runtime listing yet), mirrors zenbu's
 		// "not in lang" path and never pauses anything.
 		p.log.Info().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).
 			Msg("anv: no variant for lang")
@@ -323,7 +323,7 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		s := chosen.Sources[i]
 		// Soft subtitles: every /stream/ VTT lives under the same session
 		// cookie; the media proxy client-side wrap replays Server.Headers
-		// on the raw URLs (same rule tensho's flixera tracks follow).
+		// on the raw URLs (same rule zenbu's caption tracks follow).
 		subs := make([]core.Subtitle, 0, len(s.Tracks))
 		for _, tr := range s.Tracks {
 			subURL := anvAbs(tr.Src)

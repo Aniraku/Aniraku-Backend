@@ -72,7 +72,7 @@ func TestBuildSubtitle(t *testing.T) {
 		{"animex lowercased label in lang", "https://x/ind-5.vtt", "indonesian (- bahasa indonesia)", "Indonesian (- Bahasa Indonesia)", "", "id", "Indonesian"},
 		{"animex thai", "https://x/tha-3.vtt", "thai (- ภาษาไทย)", "Thai (- ภาษาไทย)", "", "th", "Thai"},
 		{"animex vietnamese", "https://x/vie-4.vtt", "vietnamese (- tiếng việt)", "Vietnamese (- Tiếng Việt)", "", "vi", "Vietnamese"},
-		// Decorated labels resolve (anikoto/megavid/tensho cases)
+		// Decorated labels resolve (anikoto/megavid/zenbu cases)
 		{"decorated indonesian", "https://6a8y6.broforgotsave.online/anime/a/b/subtitles/ind-5.vtt", "", "Indonesian (- Bahasa Indonesia)", "", "id", "Indonesian"},
 		{"decorated malay", "https://x/subtitles/may-6.vtt", "", "Malay (- Bahasa Melayu)", "", "ms", "Malay"},
 		{"decorated thai", "https://x/subtitles/tha-3.vtt", "", "Thai (- ภาษาไทย)", "", "th", "Thai"},

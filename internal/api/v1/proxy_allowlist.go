@@ -24,8 +24,6 @@ var defaultCDNSuffixes = []string{
 	// FlixCloud embed CDN
 	"flixcloud.cc", "flixcloud.com",
 	"fetch8.flixcloud.cc", "fetch9.flixcloud.cc", "fetch10.flixcloud.cc", "vault-95.atomic4cdn.top",
-	// Tensho player streams (flixera.co + 4animo ReCloud CDN)
-	"flixera.co", "4animo.xyz",
 	// Direct mp4 mirrors
 	"animegg.org",
 	// AnimeGG mp4 file host (302 target of /play/ URLs)
@@ -33,7 +31,7 @@ var defaultCDNSuffixes = []string{
 	// AniWaves site + echovideo extractors + savedly mp4 host
 	"aniwaves.ru", "echovideo.to", "echovideo.ru", "savedly.net",
 	// MegaVid file host (same AnimeX codec family, direct API)
-	"megavid.buzz",
+	"megavid.buzz", "megavid.se",
 	// MegaPlay file host + subtitle host
 	"vidnest.fun", "new.vidnest.fun", "megaplay.shiora.top", "stellarfrontier.world",
 	// Zoko dramahot CDN (kept: still served by zoko)

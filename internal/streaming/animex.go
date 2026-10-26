@@ -40,7 +40,7 @@ const (
 )
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
-// Generous on purpose: Hana/animex regularly needs 30-35s to resolve, and
+// Generous on purpose: a slow Animex sub-provider regularly needs 30-35s, and
 // operators require every provider to appear in the list, a slow-but-
 // working sub-provider must return its server, never be cut for being
 // slow. 35s only bounds a true hang (dead embed / blocked CDN). A var so
@@ -97,6 +97,7 @@ var animexProviderNames = map[string]string{
 	"uwu":  "Koharu",
 	"beep": "Lumi",
 	"loli": "Anzu",
+	"nero": "Hana",
 }
 
 // animexProviderDefaultReferer maps provider IDs to their default referer.
@@ -1000,7 +1001,9 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 
 	serverName := animexProviderNames[providerID]
 	if serverName == "" {
-		serverName = "Hana"
+		// New sub-providers keep their own slot under one shared name
+		// instead of vanishing into the Hana fallback.
+		serverName = "Nuri"
 	}
 	p.log.Info().Str("provider", serverName).Str("lang", lang).Int("sources", len(sources)).Msg("animex: resolved")
 

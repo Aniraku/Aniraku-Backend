@@ -14,7 +14,7 @@ fallback order and the `/servers` merge order.
 | Family (`provider`) | Display servers (`name`) | What it serves |
 |:--|:--|:--|
 | `anikoto` | Niko (AniList-keyed), Momo (MAL-keyed) | MegaPlay direct HLS, verified segments |
-| `animex` | Mochi/yuki, Chibi/neko, Kira/zuna, Sora, Koharu/uwu, Lumi/beep, Anzu/loli, Hana (fallback) | plyr API, direct URLs |
+| `animex` | Mochi/yuki, Chibi/neko, Kira/zuna, Sora, Koharu/uwu, Lumi/beep, Anzu/loli, Hana/nero, Nuri (new ids) | plyr API, direct URLs |
 | `zoko` | Zoko | ZokoAnime direct HLS (AniList → MAL fallback), probe-verified |
 | `flixcloud` | Yuta, Syota, Mike (by access-ID order) | Reanime **embeds** for the embedded player |
 | `nin` | NiN | Supaplay hls-proxy relay, playlist-verified; subtitles borrowed from siblings |
@@ -22,11 +22,12 @@ fallback order and the `/servers` merge order.
 | `animegg` | Sunny, Yolky, Eggy (positional per mirror tab) | animegg.org direct mp4, highest quality per tab |
 | `aniwaves` | Nami (Vidplay), Coral (MyCloud), Pearl (DatSaV/savedly), Wavy/Bubbles/Shelly (fallback) | echovideo multi-rendition HLS masters + top savedly mp4 |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
-| `tensho` | Tsuki, Kaze, Hoshi | zangetsu.cc (Zangetsu) fresh-page `AJAX_TOKEN` → `/ajax/episodes` + `/ajax/server` → flixera/4animo embed pages **resolved to direct HLS** (`/p?t=` masters, probed at segment depth; ReCloud `getSources` needs the embed Referer); sprite-preview tracks (`kind:"thumbnails"`, label "Subtitles") are dropped from the track list (sub+dub) |
+| `zenbu` | Yuzu, Ume (shorekeeper), Ringo, Budo, Kaki, Kuri (encore), Biwa, Ichijiku (roccia), Melon, Suika (carlotta) | zen-bu.cc stream index (`megadown.zen-bu.cc/episodes/<anilistId>/<ep>?provider=<id>`): one `audio`-tagged HLS master per entry on Cloudflare Worker edges, every published URL probed master → child → segment; roccia/carlotta are sub-only, dub entries come only from shorekeeper/encore; label-less sprite tracks are dropped |
 
 Removed providers return a `removed` error naming them explicitly
-(`miruro`, `zenime`, `tryembed`, `mkissa`, `heave`, …): never silently fall
-through.
+(`miruro`, `zenime`, `tryembed`, `mkissa`, `heave`, `tensho`, …): never
+silently fall through. `tensho` is gone because zangetsu.cc stopped
+answering; `zenbu` replaces it with the same AniList-keyed role.
 
 ## Request flows
 
@@ -45,10 +46,10 @@ then:
    (**copy-on-wrap**: provider resolve caches are never mutated).
 
 Identical requests share one cold fan-out and then reuse its raw server list
-for 90 seconds. An incomplete list missing kaa or tensho is held for only 5
+for 90 seconds. An incomplete list missing kaa or zenbu is held for only 5
 seconds so the next request can retry quickly. A collector that returns empty
 or loses a previously verified slot reuses that slot for 10 minutes, or 2
-hours for kaa and tensho.
+hours for kaa and zenbu.
 The keys include title, episode, language, content gate, and provider. Only raw
 upstream values are stored; proxy URLs are built per request. `refresh=1`
 bypasses the snapshot and last-good fallback.
@@ -102,16 +103,14 @@ only: never wrapped URLs).
   (3) file identity vs Anikoto (drop only with a same-lang reference).
   Unverifiable lists; every drop logs its layer reason.
 - **Hentai gate.** Anikoto/AnimeX/NiN/kaa/AnimeGG/AniWaves/
-  MegaVid/Tensho never receive hentai titles.
+  MegaVid/Zenbu never receive hentai titles.
 - **Short server-list stability cache.** Raw results are snapshotted for 90
-  seconds (5 seconds when kaa or tensho is missing). Request-specific proxy
+  seconds (5 seconds when kaa or zenbu is missing). Request-specific proxy
   URLs never enter the cache. Longer-lived provider resolve caches remain:
   Anikoto 5 min fresh (+stale), kaa slug 24 h + resolve 10 min
   (lang-keyed), AnimeGG/AniWaves show 24 h + resolve 10 min,
   MegaVid fresh per resolve (short-lived tokens),
-  Tensho show 10 min +
-  episode list/token 3 min (page token 403s when stale: refreshed
-  once and retried).
+  Zenbu index episode | none (fresh per resolve).
 - **Upstream AniList endpoint is `https://graphql.aniraku.tech`** (zero
   rate limit): never `graphql.anilist.co`.
 

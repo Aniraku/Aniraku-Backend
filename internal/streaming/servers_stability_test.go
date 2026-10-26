@@ -65,13 +65,13 @@ func TestServerStabilityListKeepsMissingProviderInStableOrder(t *testing.T) {
 	previous := []core.Server{
 		stabilityTestServer("animex", "Mochi"),
 		stabilityTestServer("megavid", "Vidy"),
-		stabilityTestServer("tensho", "Kaze"),
+		stabilityTestServer("zenbu", "Ringo"),
 	}
 	cache.storeList(key, previous, now)
 	got := cache.storeList(key, []core.Server{
 		stabilityTestServer("animex", "Mochi"),
 	}, now.Add(time.Second))
-	if len(got) != 3 || got[0].Provider != "animex" || got[1].Provider != "megavid" || got[2].Provider != "tensho" {
+	if len(got) != 3 || got[0].Provider != "animex" || got[1].Provider != "megavid" || got[2].Provider != "zenbu" {
 		t.Fatalf("fresh incomplete list dropped or reordered verified servers: %+v", got)
 	}
 }
@@ -83,12 +83,12 @@ func TestServerStabilityRetriesIncompleteCriticalSnapshotSoon(t *testing.T) {
 	cache.storeList(key, []core.Server{stabilityTestServer("kaa", "Nico")}, now)
 
 	if _, ok := cache.loadList(key, now.Add(incompleteServerListTTL+time.Millisecond)); ok {
-		t.Fatal("snapshot missing Tensho stayed cached instead of allowing a quick retry")
+		t.Fatal("snapshot missing Zenbu stayed cached instead of allowing a quick retry")
 	}
 
 	cache.storeList(key, []core.Server{
 		stabilityTestServer("kaa", "Nico"),
-		stabilityTestServer("tensho", "Tsuki"),
+		stabilityTestServer("zenbu", "Yuzu"),
 	}, now)
 	if _, ok := cache.loadList(key, now.Add(incompleteServerListTTL+time.Millisecond)); !ok {
 		t.Fatal("complete critical snapshot expired at the incomplete-list TTL")
@@ -99,9 +99,9 @@ func TestServerStabilityRetainsProviderAfterTransientEmpty(t *testing.T) {
 	cache := newServerStabilityCache()
 	key := providerRequestKey{
 		serverRequestKey: serverRequestKey{animeID: 21, episode: 1, lang: "sub"},
-		provider:         "tensho",
+		provider:         "zenbu",
 	}
-	want := []core.Server{stabilityTestServer("tensho", "Tsuki")}
+	want := []core.Server{stabilityTestServer("zenbu", "Yuzu")}
 	now := time.Now()
 
 	got, reused := cache.stabilizeProvider(key, want, true, now)
@@ -109,7 +109,7 @@ func TestServerStabilityRetainsProviderAfterTransientEmpty(t *testing.T) {
 		t.Fatalf("fresh provider result was not used: reused=%v got=%+v", reused, got)
 	}
 	got, reused = cache.stabilizeProvider(key, nil, true, now.Add(time.Minute))
-	if !reused || len(got) != 1 || got[0].Provider != "tensho" {
+	if !reused || len(got) != 1 || got[0].Provider != "zenbu" {
 		t.Fatalf("transient empty result dropped the provider: reused=%v got=%+v", reused, got)
 	}
 }
@@ -118,18 +118,18 @@ func TestServerStabilityRetainsProviderSlotsAfterPartialProbeMiss(t *testing.T) 
 	cache := newServerStabilityCache()
 	key := providerRequestKey{
 		serverRequestKey: serverRequestKey{animeID: 21, episode: 1, lang: "sub"},
-		provider:         "tensho",
+		provider:         "zenbu",
 	}
 	now := time.Now()
 	cache.stabilizeProvider(key, []core.Server{
-		stabilityTestServer("tensho", "Kaze"),
-		stabilityTestServer("tensho", "Hoshi"),
+		stabilityTestServer("zenbu", "Ringo"),
+		stabilityTestServer("zenbu", "Budo"),
 	}, true, now)
 
 	got, reused := cache.stabilizeProvider(key, []core.Server{
-		stabilityTestServer("tensho", "Kaze"),
+		stabilityTestServer("zenbu", "Ringo"),
 	}, true, now.Add(time.Minute))
-	if !reused || len(got) != 2 || got[0].Name != "Kaze" || got[1].Name != "Hoshi" {
+	if !reused || len(got) != 2 || got[0].Name != "Ringo" || got[1].Name != "Budo" {
 		t.Fatalf("partial probe miss dropped a previously verified slot: reused=%v got=%+v", reused, got)
 	}
 }
@@ -217,7 +217,7 @@ func TestFindAllServersUsesFreshStabilitySnapshot(t *testing.T) {
 	key := serverRequestKey{animeID: 21, episode: 1, lang: "sub"}
 	want := []core.Server{
 		stabilityTestServer("kaa", "Nico"),
-		stabilityTestServer("tensho", "Tsuki"),
+		stabilityTestServer("zenbu", "Yuzu"),
 	}
 	m.stability().storeList(key, want, time.Now())
 

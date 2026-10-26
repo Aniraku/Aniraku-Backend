@@ -6,6 +6,16 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-10-26 zenbu: zen-bu.cc index verified end-to-end from the VPS
+  egress; megadown JSON, Worker-edge masters, child playlists and segment
+  bytes all 200. shorekeeper 2 sub + 2 dub, encore 4 + 4, roccia and
+  carlotta 2 sub each, no shared URLs between pools. `suisui` and
+  `mornye` (koyeb host) resolve a master but serve no segment.
+- 2026-10-26 animex: plyr lists `nero` as the new default sub-provider;
+  mapped to Hana. Every listed provider returns exactly one source per
+  episode, so the hidden 2-3 sources were not there; unknown ids now
+  publish as Nuri instead of collapsing into Hana. nero hands out
+  `s-91.megavid.se` masters, allowlisted.
 - 2026-09-30 kaa: kaa.lt search/listings/watch 200 from this egress, no
   datacenter block; krussdomi masters 200 direct and via the media proxy;
   segment bytes need `Origin: https://krussdomi.com` (Referer alone 403s).
