@@ -58,6 +58,8 @@ var defaultCDNSuffixes = []string{
 	"norami.top", "fetch.nexabloom.top",
 	// ZokoAnime embed CDN (referer-gated)
 	"aniwatchtv.uk",
+	// NovusCloud embed edge (novuscloud.buzz/p?t=...)
+	"novuscloud.buzz",
 	// AnimeX CDN proxy (cdnx.aniwatchtv.site/uwu/)
 	"aniwatchtv.site",
 	"fast4speed.rsvp",
