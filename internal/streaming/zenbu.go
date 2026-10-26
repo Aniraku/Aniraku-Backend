@@ -243,7 +243,7 @@ func (p *ZenbuProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 			URL:          slot.source.URL,
 			Type:         "hls",
 			Quality:      "auto",
-			Subtitles:    zenbuSubtitles(slot.source),
+			Subtitles:    zenbuSubtitles(slot.source, p.site),
 			Verification: "proxy",
 		}
 		p.learnURLHost(source.URL)
@@ -269,7 +269,7 @@ func countErrors(errs []error) int {
 	return n
 }
 
-func zenbuSubtitles(source zenbuSource) []core.Subtitle {
+func zenbuSubtitles(source zenbuSource, site string) []core.Subtitle {
 	var subs []core.Subtitle
 	for _, track := range source.Subtitles {
 		if strings.TrimSpace(track.URL) == "" || strings.TrimSpace(track.Label) == "" {
@@ -277,7 +277,12 @@ func zenbuSubtitles(source zenbuSource) []core.Subtitle {
 			// belong in the subtitle list.
 			continue
 		}
-		subs = append(subs, buildSubtitle(track.URL, "", track.Label, "en"))
+		url := strings.TrimSpace(track.URL)
+		// Resolve relative subtitle URLs against the site origin.
+		if !strings.HasPrefix(url, "http") {
+			url = strings.TrimRight(site, "/") + url
+		}
+		subs = append(subs, buildSubtitle(url, "", track.Label, "en"))
 	}
 	return subs
 }

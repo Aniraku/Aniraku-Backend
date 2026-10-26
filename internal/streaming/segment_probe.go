@@ -115,13 +115,23 @@ func probeMediaFileLenient(ctx context.Context, client *http.Client, fileURL, re
 // probeSubtitleLenient verifies a subtitle track (VTT) is actually served
 // from this egress: 2xx + WEBVTT magic header. VTT files are plain text,
 // not binary media, so probeMediaFileLenient's magic-byte check would
-// reject them. WebVTT files always start with "WEBVTT".
+// reject them. Some servers prepend a BOM or whitespace before "WEBVTT",
+// so we tolerate leading bytes and check for the signature anywhere in the
+// first 64 bytes.
 func probeSubtitleLenient(ctx context.Context, client *http.Client, fileURL, referer, ua string) bool {
 	body, ok := fetchURLCapped(ctx, client, fileURL, referer, ua, 32768, 10*time.Second)
 	if !ok {
 		return false
 	}
-	return strings.HasPrefix(string(body), "WEBVTT")
+	head := strings.ToLower(strings.TrimSpace(string(body[:min(64, len(body))])))
+	return strings.HasPrefix(head, "webvtt") || strings.Contains(head, "webvtt")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // probeSegmentsStrict verifies a resolved master playlist is actually
