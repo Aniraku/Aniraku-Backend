@@ -30,25 +30,25 @@ const (
 	maxNovuscloudResolveEntries = 500
 )
 
-// novuscloudMirror is one Cloudflare mirror (hd-1, hd-2) and its server name.
+// novuscloudMirror is one Cloudflare mirror and its cute server name.
 type novuscloudMirror struct {
 	mirror string
 	server string
 }
 
 var novuscloudMirrors = []novuscloudMirror{
-	{mirror: "hd-1", server: "Novus-hd1"},
-	{mirror: "hd-2", server: "Novus-hd2"},
-	{mirror: "hd-3", server: "Novus-hd3"},
-	{mirror: "hd-4", server: "Novus-hd4"},
+	{mirror: "hd-1", server: "Nova"},
+	{mirror: "hd-2", server: "Nebula"},
+	{mirror: "hd-3", server: "Stella"},
+	{mirror: "hd-4", server: "Lyra"},
 }
 
-// novuscloudServerNames maps mirror IDs to cute server names.
+// novuscloudServerNames maps mirror IDs to cute space-themed server names.
 var novuscloudServerNames = map[string]string{
-	"hd-1": "Novus-hd1",
-	"hd-2": "Novus-hd2",
-	"hd-3": "Novus-hd3",
-	"hd-4": "Novus-hd4",
+	"hd-1": "Nova",
+	"hd-2": "Nebula",
+	"hd-3": "Stella",
+	"hd-4": "Lyra",
 }
 
 type novuscloudSource struct {
@@ -143,6 +143,10 @@ func (p *NovuscloudProvider) FindEpisodeSource(ctx context.Context, anilistID st
 		lang = "sub"
 	}
 
+	// Per-mirror timeout so a slow or blocked mirror doesn't drag down the
+	// whole fan-out. 8s per mirror is enough for embed + API + probe.
+	mirrorTimeout := 8 * time.Second
+
 	var out *SourceResult
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -150,7 +154,9 @@ func (p *NovuscloudProvider) FindEpisodeSource(ctx context.Context, anilistID st
 		wg.Add(1)
 		go func(mirror novuscloudMirror) {
 			defer wg.Done()
-			sr, err := p.resolveMirror(ctx, id, episode, lang, mirror)
+			mirrorCtx, cancel := context.WithTimeout(ctx, mirrorTimeout)
+			defer cancel()
+			sr, err := p.resolveMirror(mirrorCtx, id, episode, lang, mirror)
 			if err != nil || sr == nil {
 				return
 			}
@@ -302,8 +308,9 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 		if !strings.HasPrefix(subURL, "http") {
 			subURL = p.site + subURL
 		}
-		// Probe the subtitle track (VTT) before attaching.
-		if !probeMediaFileLenient(ctx, p.client, subURL, p.site+"/", browserUA) {
+		// Probe the subtitle track (VTT) before attaching. VTT files are
+		// plain text, not binary media, so they need their own probe.
+		if !probeSubtitleLenient(ctx, p.client, subURL, p.site+"/", browserUA) {
 			p.log.Info().Str("url", subURL).Str("mirror", mirror.server).Msg("novuscloud: subtitle blocked from this egress, dropping")
 			continue
 		}

@@ -106,8 +106,8 @@ func TestNovuscloudResolvesAllMirrors(t *testing.T) {
 		t.Fatal("expected sources from at least one mirror")
 	}
 	validNames := map[string]bool{
-		"Novus-hd1": true, "Novus-hd2": true,
-		"Novus-hd3": true, "Novus-hd4": true,
+		"Nova": true, "Nebula": true,
+		"Stella": true, "Lyra": true,
 	}
 	seen := map[string]bool{}
 	for i, name := range sr.ServerNames {
