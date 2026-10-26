@@ -39,12 +39,16 @@ type novuscloudMirror struct {
 var novuscloudMirrors = []novuscloudMirror{
 	{mirror: "hd-1", server: "Novus-hd1"},
 	{mirror: "hd-2", server: "Novus-hd2"},
+	{mirror: "hd-3", server: "Novus-hd3"},
+	{mirror: "hd-4", server: "Novus-hd4"},
 }
 
 // novuscloudServerNames maps mirror IDs to cute server names.
 var novuscloudServerNames = map[string]string{
 	"hd-1": "Novus-hd1",
 	"hd-2": "Novus-hd2",
+	"hd-3": "Novus-hd3",
+	"hd-4": "Novus-hd4",
 }
 
 type novuscloudSource struct {
@@ -181,7 +185,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 	}
 
 	// Step 1: fetch the embed page to extract the getSources token.
-	embedURL := fmt.Sprintf("%s/embed/hd-%s/ani/%d/%d/%s?k=1", p.site, mirror.mirror, id, episode, lang)
+	embedURL := fmt.Sprintf("%s/embed/%s/ani/%d/%d/%s?k=1", p.site, mirror.mirror, id, episode, lang)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, embedURL, nil)
 	if err != nil {
 		return nil, err
@@ -286,8 +290,37 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 		sr.ServerNames = append(sr.ServerNames, mirror.server)
 	}
 
+	// Collect subtitle tracks from the API response. Caption tracks (kind
+	// "captions") with a URL are attached to every video source from this
+	// mirror — subtitles belong to the episode, not to a specific CDN URL.
+	var subs []core.Subtitle
+	for _, tr := range parsed.Tracks {
+		if strings.TrimSpace(tr.Kind) != "captions" || strings.TrimSpace(tr.File) == "" {
+			continue
+		}
+		subURL := strings.TrimSpace(tr.File)
+		if !strings.HasPrefix(subURL, "http") {
+			subURL = p.site + subURL
+		}
+		// Probe the subtitle track (VTT) before attaching.
+		if !probeMediaFileLenient(ctx, p.client, subURL, p.site+"/", browserUA) {
+			p.log.Info().Str("url", subURL).Str("mirror", mirror.server).Msg("novuscloud: subtitle blocked from this egress, dropping")
+			continue
+		}
+		p.learnURLHost(subURL)
+		label := strings.TrimSpace(tr.Label)
+		if label == "" {
+			label = strings.TrimSpace(tr.Kind)
+		}
+		subs = append(subs, buildSubtitle(subURL, "", label, "en"))
+	}
+
 	if len(sr.Sources) == 0 {
 		return nil, nil
+	}
+	// Attach subtitles to every source from this mirror.
+	for i := range sr.Sources {
+		sr.Sources[i].Subtitles = subs
 	}
 	p.storeResolved(key, sr)
 	return sr, nil

@@ -91,7 +91,7 @@ func newNovuscloudTestProvider(f *novuscloudFixture) *NovuscloudProvider {
 	return p
 }
 
-func TestNovuscloudResolvesBothMirrors(t *testing.T) {
+func TestNovuscloudResolvesAllMirrors(t *testing.T) {
 	f := newNovuscloudFixture(t)
 	p := newNovuscloudTestProvider(f)
 
@@ -105,16 +105,25 @@ func TestNovuscloudResolvesBothMirrors(t *testing.T) {
 	if sr == nil || len(sr.Sources) == 0 {
 		t.Fatal("expected sources from at least one mirror")
 	}
+	validNames := map[string]bool{
+		"Novus-hd1": true, "Novus-hd2": true,
+		"Novus-hd3": true, "Novus-hd4": true,
+	}
+	seen := map[string]bool{}
 	for i, name := range sr.ServerNames {
-		if name != "Novus-hd1" && name != "Novus-hd2" {
-			t.Fatalf("server %d = %q, want Novus-hd1 or Novus-hd2", i, name)
+		if !validNames[name] {
+			t.Fatalf("server %d = %q, want one of Novus-hd1..hd4", i, name)
 		}
+		seen[name] = true
 		if sr.Sources[i].Type != "hls" || sr.Sources[i].Verification != "proxy" {
 			t.Fatalf("source %d = %+v, want a proxied HLS master", i, sr.Sources[i])
 		}
 		if !strings.HasPrefix(sr.Sources[i].URL, f.media.URL) {
 			t.Fatalf("source %d URL = %q, want media server URL", i, sr.Sources[i].URL)
 		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("no mirrors resolved")
 	}
 }
 

@@ -1814,11 +1814,11 @@ func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, ep
 	return out
 }
 
-// collectNovuscloudServers maps NovusCloud mirror sources to their server
-// names (Novus-hd1, Novus-hd2). Each mirror's sources carry their own name
-// set by the provider.
+// collectNovuscloudServers maps NovusCloud mirror sources to their cute
+// server names (Novus-hd1, Novus-hd2, Novus-hd3, Novus-hd4). FindEpisodeSource
+// already resolves every mirror in parallel with per-mirror names, so we
+// call it once — not once per mirror — to avoid duplicates.
 func (m *Manager) collectNovuscloudServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
-	var out []core.Server
 	for _, prov := range m.providers {
 		nv, ok := prov.(*NovuscloudProvider)
 		if !ok {
@@ -1833,9 +1833,21 @@ func (m *Manager) collectNovuscloudServers(ctx context.Context, anilistID string
 		if sr == nil || len(sr.Sources) == 0 {
 			continue
 		}
-		out = appendNamedServers(out, []string{"Novuscloud"}, "novuscloud", lang, sr)
+		out := make([]core.Server, 0, len(sr.Sources))
+		for i := range sr.Sources {
+			name := sr.ServerNames[i]
+			out = append(out, core.Server{
+				Name:      name,
+				Provider:  "novuscloud",
+				Lang:      lang,
+				Sources:   []core.Source{sr.Sources[i]},
+				Headers:   sr.Headers,
+				Downloads: sr.Downloads,
+			})
+		}
+		return out
 	}
-	return out
+	return nil
 }
 
 // collectAnvServers maps AnV (anv.to) sources onto Aniraku-style fruit
