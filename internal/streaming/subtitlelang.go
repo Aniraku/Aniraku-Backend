@@ -249,7 +249,12 @@ func buildSubtitle(rawURL, explicitLang, label, hint string) core.Subtitle {
 	// labels (Thai, Vietnamese, etc.) are preserved as-is since they're
 	// already distinct from "English".
 	stripped := display
+	// Strip at "(", "[", or " - " to isolate the base language name.
 	if i := strings.IndexAny(stripped, "(["); i > 0 {
+		stripped = strings.TrimSpace(stripped[:i])
+	}
+	// Also handle " - " separator (e.g., "English - Forced", "English - SDH")
+	if i := strings.Index(stripped, " - "); i > 0 {
 		stripped = strings.TrimSpace(stripped[:i])
 	}
 	_, isLangName := langAliases[strings.ToLower(stripped)]
