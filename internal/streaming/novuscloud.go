@@ -86,23 +86,34 @@ type NovuscloudProvider struct {
 	log       zerolog.Logger
 	client    *http.Client
 	site      string
+	mirror    string // hd-1, hd-2, hd-3, hd-4
+	server    string // Nova, Nebula, Stella, Lyra
 	learnHost func(string)
 
 	mu       sync.Mutex
-	slugs    map[string]*novuscloudSlugEntry
 	resolved map[novuscloudResolveKey]*novuscloudResolvedEntry
 }
 
-func NewNovuscloudProvider(log zerolog.Logger, site string) *NovuscloudProvider {
+func NewNovuscloudProvider(log zerolog.Logger, site, mirror, server string) *NovuscloudProvider {
 	if strings.TrimSpace(site) == "" {
 		site = novuscloudSiteDefault
 	}
 	site = strings.TrimRight(site, "/")
+	if strings.TrimSpace(mirror) == "" {
+		mirror = "hd-1"
+	}
+	if strings.TrimSpace(server) == "" {
+		server = novuscloudServerNames[mirror]
+		if server == "" {
+			server = "Nova"
+		}
+	}
 	return &NovuscloudProvider{
 		log:      log,
 		client:   &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		site:     site,
-		slugs:    make(map[string]*novuscloudSlugEntry),
+		mirror:   mirror,
+		server:   server,
 		resolved: make(map[novuscloudResolveKey]*novuscloudResolvedEntry),
 	}
 }
@@ -144,54 +155,30 @@ func (p *NovuscloudProvider) FindEpisodeSource(ctx context.Context, anilistID st
 	}
 
 	// Per-mirror timeout so a slow or blocked mirror doesn't drag down the
-	// whole fan-out. 8s per mirror is enough for embed + API + probe.
-	mirrorTimeout := 8 * time.Second
+	// whole fan-out. 8s is enough for embed + API + probe.
+	mirrorCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
 
-	var out *SourceResult
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	for _, m := range novuscloudMirrors {
-		wg.Add(1)
-		go func(mirror novuscloudMirror) {
-			defer wg.Done()
-			mirrorCtx, cancel := context.WithTimeout(ctx, mirrorTimeout)
-			defer cancel()
-			sr, err := p.resolveMirror(mirrorCtx, id, episode, lang, mirror)
-			if err != nil || sr == nil {
-				return
-			}
-			mu.Lock()
-			if out == nil {
-				out = &SourceResult{
-					Headers: map[string]string{
-						"Referer":    p.site + "/",
-						"User-Agent": browserUA,
-					},
-				}
-			}
-			out.Sources = append(out.Sources, sr.Sources...)
-			out.ServerNames = append(out.ServerNames, sr.ServerNames...)
-			mu.Unlock()
-		}(m)
+	sr, err := p.resolveMirror(mirrorCtx, id, episode, lang)
+	if err != nil {
+		return nil, err
 	}
-	wg.Wait()
-
-	if out == nil || len(out.Sources) == 0 {
+	if sr == nil || len(sr.Sources) == 0 {
 		return nil, nil
 	}
-	return out, nil
+	return sr, nil
 }
 
 // resolveMirror fetches the embed page, extracts the getSources token, calls
 // the API, and probes every returned source URL.
-func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode int, lang string, mirror novuscloudMirror) (*SourceResult, error) {
-	key := novuscloudResolveKey{showID: strconv.Itoa(id), episode: episode, mirror: mirror.mirror, lang: lang}
+func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode int, lang string) (*SourceResult, error) {
+	key := novuscloudResolveKey{showID: strconv.Itoa(id), episode: episode, mirror: p.mirror, lang: lang}
 	if cached := p.loadResolved(key); cached != nil {
 		return cached, nil
 	}
 
 	// Step 1: fetch the embed page to extract the getSources token.
-	embedURL := fmt.Sprintf("%s/embed/%s/ani/%d/%d/%s?k=1", p.site, mirror.mirror, id, episode, lang)
+	embedURL := fmt.Sprintf("%s/embed/%s/ani/%d/%d/%s?k=1", p.site, p.mirror, id, episode, lang)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, embedURL, nil)
 	if err != nil {
 		return nil, err
@@ -205,7 +192,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("novuscloud: embed HTTP %d (%s)", resp.StatusCode, mirror.server)
+		return nil, fmt.Errorf("novuscloud: embed HTTP %d (%s)", resp.StatusCode, p.server)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -217,7 +204,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 	re := regexp.MustCompile(`sourcesUrl\s*=\s*'/stream/getSources\?t=([^']+)'`)
 	m := re.FindStringSubmatch(html)
 	if len(m) < 2 {
-		return nil, fmt.Errorf("novuscloud: no sourcesUrl token in embed page (%s)", mirror.server)
+		return nil, fmt.Errorf("novuscloud: no sourcesUrl token in embed page (%s)", p.server)
 	}
 	token := m[1]
 
@@ -237,7 +224,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("novuscloud: getSources HTTP %d (%s)", resp.StatusCode, mirror.server)
+		return nil, fmt.Errorf("novuscloud: getSources HTTP %d (%s)", resp.StatusCode, p.server)
 	}
 	rb, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -283,7 +270,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 			ok = probeMediaFileLenient(ctx, p.client, u, p.site+"/", browserUA)
 		}
 		if !ok {
-			p.log.Info().Str("url", u).Str("mirror", mirror.server).Msg("novuscloud: source blocked from this egress, dropping")
+			p.log.Info().Str("url", u).Str("mirror", p.server).Msg("novuscloud: source blocked from this egress, dropping")
 			continue
 		}
 		p.learnURLHost(u)
@@ -293,7 +280,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 			Quality:      "auto",
 			Verification: "proxy",
 		})
-		sr.ServerNames = append(sr.ServerNames, mirror.server)
+		sr.ServerNames = append(sr.ServerNames, p.server)
 	}
 
 	// Collect subtitle tracks from the API response. Caption tracks (kind
@@ -311,7 +298,7 @@ func (p *NovuscloudProvider) resolveMirror(ctx context.Context, id int, episode 
 		// Probe the subtitle track (VTT) before attaching. VTT files are
 		// plain text, not binary media, so they need their own probe.
 		if !probeSubtitleLenient(ctx, p.client, subURL, p.site+"/", browserUA) {
-			p.log.Info().Str("url", subURL).Str("mirror", mirror.server).Msg("novuscloud: subtitle blocked from this egress, dropping")
+			p.log.Info().Str("url", subURL).Str("mirror", p.server).Msg("novuscloud: subtitle blocked from this egress, dropping")
 			continue
 		}
 		p.learnURLHost(subURL)

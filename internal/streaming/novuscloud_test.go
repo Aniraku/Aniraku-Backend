@@ -83,7 +83,7 @@ func (f *novuscloudFixture) site() string {
 }
 
 func newNovuscloudTestProvider(f *novuscloudFixture) *NovuscloudProvider {
-	p := NewNovuscloudProvider(zerolog.Nop(), f.site())
+	p := NewNovuscloudProvider(zerolog.Nop(), f.site(), "hd-1", "Nova")
 	// httptest servers are loopback: the netguard transport's SSRF guard
 	// would block them, so tests use a plain client (production always
 	// uses the guarded one built by NewNovuscloudProvider).
