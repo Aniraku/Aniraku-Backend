@@ -240,26 +240,31 @@ func buildSubtitle(rawURL, explicitLang, label, hint string) core.Subtitle {
 	if display == "" {
 		return core.Subtitle{URL: rawURL, Lang: lang, Label: langDisplay(lang)}
 	}
-	if lang != "" && canonicalSubtitleLang(display) == lang {
-		stripped := display
-		if i := strings.IndexAny(stripped, "(["); i > 0 {
-			stripped = strings.TrimSpace(stripped[:i])
-		}
-		_, isLangName := langAliases[strings.ToLower(stripped)]
-		hasNonASCII := false
-		for _, r := range display {
-			if r > 127 {
-				hasNonASCII = true
-				break
-			}
-		}
-		// Pure language name (possibly decorated or native-script):
-		// use the standard English display name.
-		// "English 2" is not an alias key and has no decoration,
-		// so it survives intact.
-		if isLangName || hasNonASCII || stripped != display {
-			return core.Subtitle{URL: rawURL, Lang: lang, Label: langDisplay(lang)}
-		}
+	// If the label is just a bare ASCII language name (possibly with native
+	// script decoration), use the standardized display name so all providers
+	// agree. But when the label carries extra distinguishing info — "(SDH)",
+	// "(Full Subtitles)", "(Episode Name (Restyled By …))", etc. — keep it
+	// intact so distinct tracks stay distinguishable instead of collapsing
+	// every English track into the same "English" label. Native-script
+	// labels (Thai, Vietnamese, etc.) are preserved as-is since they're
+	// already distinct from "English".
+	stripped := display
+	if i := strings.IndexAny(stripped, "(["); i > 0 {
+		stripped = strings.TrimSpace(stripped[:i])
+	}
+	_, isLangName := langAliases[strings.ToLower(stripped)]
+	if lang != "" && canonicalSubtitleLang(display) == lang && isLangName && stripped == display && isASCII(display) && !strings.Contains(display, " ") {
+		return core.Subtitle{URL: rawURL, Lang: lang, Label: langDisplay(lang)}
 	}
 	return core.Subtitle{URL: rawURL, Lang: lang, Label: display}
+}
+
+// isASCII reports whether s contains only ASCII code points.
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }
