@@ -253,8 +253,23 @@ func buildSubtitle(rawURL, explicitLang, label, hint string) core.Subtitle {
 		stripped = strings.TrimSpace(stripped[:i])
 	}
 	_, isLangName := langAliases[strings.ToLower(stripped)]
-	if lang != "" && canonicalSubtitleLang(display) == lang && isLangName && stripped == display && isASCII(display) && !strings.Contains(display, " ") {
+	// Normalize bare language names only when the caller explicitly
+	// provided a lang. When lang was derived from the label itself
+	// (explicitLang == ""), keep the label as-is so native-script names
+	// like "ภาษาไทย" stay as "ภาษาไทย" instead of being normalized to
+	// "Thai".
+	if lang != "" && explicitLang != "" && canonicalSubtitleLang(display) == lang && isLangName && stripped == display {
 		return core.Subtitle{URL: rawURL, Lang: lang, Label: langDisplay(lang)}
+	}
+	// When the label carries extra distinguishing info beyond the bare
+	// language name ("Japanese (SDH)", "English (Full Subtitles)", etc.),
+	// append it to lang so distinct tracks stay distinguishable even when
+	// filtered by lang code.
+	if lang != "" && canonicalSubtitleLang(display) == lang && isLangName && stripped != display {
+		distinguishing := strings.TrimSpace(display[len(stripped):])
+		if distinguishing != "" {
+			return core.Subtitle{URL: rawURL, Lang: lang + " " + distinguishing, Label: display}
+		}
 	}
 	return core.Subtitle{URL: rawURL, Lang: lang, Label: display}
 }

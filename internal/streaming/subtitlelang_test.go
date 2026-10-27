@@ -69,15 +69,15 @@ func TestBuildSubtitle(t *testing.T) {
 		// Explicit lang field wins and is normalized (animex cases)
 		{"animex english", "https://x/eng-2.vtt", "english", "English", "", "en", "English"},
 		{"animex eng", "https://x/f.vtt", "eng", "English", "", "en", "English"},
-		{"animex lowercased label in lang", "https://x/ind-5.vtt", "indonesian (- bahasa indonesia)", "Indonesian (- Bahasa Indonesia)", "", "id", "Indonesian (- Bahasa Indonesia)"},
-		{"animex thai", "https://x/tha-3.vtt", "thai (- ภาษาไทย)", "Thai (- ภาษาไทย)", "", "th", "Thai (- ภาษาไทย)"},
-		{"animex vietnamese", "https://x/vie-4.vtt", "vietnamese (- tiếng việt)", "Vietnamese (- Tiếng Việt)", "", "vi", "Vietnamese (- Tiếng Việt)"},
+		{"animex lowercased label in lang", "https://x/ind-5.vtt", "indonesian (- bahasa indonesia)", "Indonesian (- Bahasa Indonesia)", "", "id (- Bahasa Indonesia)", "Indonesian (- Bahasa Indonesia)"},
+		{"animex thai", "https://x/tha-3.vtt", "thai (- ภาษาไทย)", "Thai (- ภาษาไทย)", "", "th (- ภาษาไทย)", "Thai (- ภาษาไทย)"},
+		{"animex vietnamese", "https://x/vie-4.vtt", "vietnamese (- tiếng việt)", "Vietnamese (- Tiếng Việt)", "", "vi (- Tiếng Việt)", "Vietnamese (- Tiếng Việt)"},
 		// Decorated labels keep their distinguishing info so distinct tracks
 		// don't collapse into the same label
-		{"decorated indonesian", "https://6a8y6.broforgotsave.online/anime/a/b/subtitles/ind-5.vtt", "", "Indonesian (- Bahasa Indonesia)", "", "id", "Indonesian (- Bahasa Indonesia)"},
-		{"decorated malay", "https://x/subtitles/may-6.vtt", "", "Malay (- Bahasa Melayu)", "", "ms", "Malay (- Bahasa Melayu)"},
-		{"decorated thai", "https://x/subtitles/tha-3.vtt", "", "Thai (- ภาษาไทย)", "", "th", "Thai (- ภาษาไทย)"},
-		{"decorated vietnamese", "https://x/subtitles/vie-4.vtt", "", "Vietnamese (- Tiếng Việt)", "", "vi", "Vietnamese (- Tiếng Việt)"},
+		{"decorated indonesian", "https://6a8y6.broforgotsave.online/anime/a/b/subtitles/ind-5.vtt", "", "Indonesian (- Bahasa Indonesia)", "", "id (- Bahasa Indonesia)", "Indonesian (- Bahasa Indonesia)"},
+		{"decorated malay", "https://x/subtitles/may-6.vtt", "", "Malay (- Bahasa Melayu)", "", "ms (- Bahasa Melayu)", "Malay (- Bahasa Melayu)"},
+		{"decorated thai", "https://x/subtitles/tha-3.vtt", "", "Thai (- ภาษาไทย)", "", "th (- ภาษาไทย)", "Thai (- ภาษาไทย)"},
+		{"decorated vietnamese", "https://x/subtitles/vie-4.vtt", "", "Vietnamese (- Tiếng Việt)", "", "vi (- Tiếng Việt)", "Vietnamese (- Tiếng Việt)"},
 		// Native-script labels are kept as-is (distinct from each other)
 		{"native thai", "https://x/tha-3.vtt", "", "ภาษาไทย", "", "th", "ภาษาไทย"},
 		{"native vietnamese", "https://x/vie-4.vtt", "", "Tiếng Việt", "", "vi", "Tiếng Việt"},
