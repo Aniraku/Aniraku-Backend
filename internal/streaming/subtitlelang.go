@@ -240,7 +240,7 @@ func buildSubtitle(rawURL, explicitLang, label, hint string) core.Subtitle {
 	if display == "" {
 		return core.Subtitle{URL: rawURL, Lang: lang, Label: langDisplay(lang)}
 	}
-	// If the label is just a bare ASCII language name (possibly with native
+	// If the label is just a bare language name (possibly with native
 	// script decoration), use the standardized display name so all providers
 	// agree. But when the label carries extra distinguishing info — "(SDH)",
 	// "(Full Subtitles)", "(Episode Name (Restyled By …))", etc. — keep it
