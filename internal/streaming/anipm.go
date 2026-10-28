@@ -47,8 +47,11 @@ const (
 	anipmEmbedBase   = "https://embed.settlar.io"
 	anipmReferer     = "https://ani.pm/"
 	anipmServerName  = "Yui"
-	anipmSeriesTTL   = 24 * time.Hour
-	maxAniPMEntries  = 500
+	// Chrome 131: embed.settlar.io's Cloudflare 403s the older shared
+	// browserUA (Chrome 124); a current UA passes.
+	anipmUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+	anipmSeriesTTL  = 24 * time.Hour
+	maxAniPMEntries = 500
 )
 
 type AniPMProvider struct {
@@ -165,7 +168,7 @@ func (p *AniPMProvider) getJSON(ctx context.Context, rawURL, referer string, out
 			cancel()
 			return err
 		}
-		req.Header.Set("User-Agent", browserUA)
+		req.Header.Set("User-Agent", anipmUserAgent)
 		req.Header.Set("Accept", "application/json")
 		if referer != "" {
 			req.Header.Set("Referer", referer)
@@ -412,6 +415,7 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		return nil, fmt.Errorf("anipm: episode %d not listed", episode)
 	}
 	if langKey == "sub" && !ep.hasSub || langKey == "dub" && !ep.hasDub {
+		p.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).Msg("anipm: episode flag missing lang")
 		return nil, nil
 	}
 	referer := fmt.Sprintf("%s/anime/", p.base)
@@ -420,6 +424,7 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		p.base, series.settlarID, url.QueryEscape(ep.sourceNumber), langKey)
 	if err := p.getJSON(ctx, bootURL, referer, &boot); err != nil {
 		if isUpstreamGated(err) {
+			p.log.Debug().Err(err).Str("anilistId", anilistID).Int("episode", episode).Msg("anipm: bootstrap gated")
 			return nil, nil
 		}
 		return nil, err
@@ -427,6 +432,7 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	if langKey == "sub" && !boot.Availability.Sub || langKey == "dub" && !boot.Availability.Dub {
 		// Never fall back to the API's effectiveLanguage: a dub-only
 		// title must not surface a dub server in a sub listing.
+		p.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).Msg("anipm: bootstrap availability lacks lang")
 		return nil, nil
 	}
 	if strings.TrimSpace(boot.Selection) == "" {
@@ -437,6 +443,7 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		p.base, url.QueryEscape(boot.Selection), episode, langKey)
 	if err := p.getJSON(ctx, sessURL, referer, &sess); err != nil {
 		if isUpstreamGated(err) {
+			p.log.Debug().Err(err).Str("anilistId", anilistID).Int("episode", episode).Msg("anipm: session gated")
 			return nil, nil
 		}
 		return nil, err
@@ -451,12 +458,14 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	var es anipmEmbedSession
 	if err := p.getJSON(ctx, p.embedBase+"/api/embed/session?t="+url.QueryEscape(token), referer, &es); err != nil {
 		if isUpstreamGated(err) {
+			p.log.Debug().Err(err).Str("anilistId", anilistID).Int("episode", episode).Msg("anipm: embed gated")
 			return nil, nil
 		}
 		return nil, err
 	}
 	master := strings.TrimSpace(es.Source)
 	if master == "" {
+		p.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).Msg("anipm: embed session returned empty source")
 		return nil, nil
 	}
 	typ := "hls"
@@ -471,12 +480,12 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	}
 	master = resolved
 	if typ == "hls" {
-		if !probeSegmentsLenient(ctx, p.client, master, referer, browserUA) {
+		if !probeSegmentsLenient(ctx, p.client, master, referer, anipmUserAgent) {
 			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
 				Msg("anipm: master blocked from this egress, dropping source")
 			return nil, nil
 		}
-	} else if !probeMediaFileLenient(ctx, p.client, master, referer, browserUA) {
+	} else if !probeMediaFileLenient(ctx, p.client, master, referer, anipmUserAgent) {
 		return nil, nil
 	}
 	p.learnURLHost(master)
@@ -533,7 +542,7 @@ func (p *AniPMProvider) resolveFinalSource(ctx context.Context, rawURL, referer,
 	if err != nil {
 		return "", false
 	}
-	req.Header.Set("User-Agent", browserUA)
+	req.Header.Set("User-Agent", anipmUserAgent)
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
