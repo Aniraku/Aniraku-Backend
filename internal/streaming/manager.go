@@ -197,6 +197,7 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewNovuscloudProvider(log, "", "hd-4", "Lyra"),
 			NewAnvProvider(log),
 			NewAnixoProvider(log),
+			NewAniPMProvider(log, "", ""),
 		},
 		httpClient:      &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		hentaiCache:     map[int]hentaiEntry{},
@@ -602,7 +603,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		stability.finishFlight(flightKey, flight, result)
 	}()
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers []core.Server
 	var adlLinks []core.DownloadLink
 	var wg sync.WaitGroup
 
@@ -655,6 +656,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		{"novuscloud", &nvServers, m.collectNovuscloudServers, !hentai},
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
+		{"anipm", &pmServers, m.collectAniPMServers, !hentai},
 	}
 	for _, e := range entries {
 		e := e
@@ -725,7 +727,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// Provider merge order is fixed (direct first, embeds and the newest
 	// providers last); playback-verdict ranking below reorders by health.
 	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers} {
+	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL download links (fetched in parallel above): attach to every
@@ -1878,6 +1880,27 @@ func (m *Manager) collectAnvServers(ctx context.Context, anilistID string, episo
 }
 
 // collectAnixoServers maps Anixo's single Sora-Edge slot to its own server.
+func (m *Manager) collectAniPMServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
+	var out []core.Server
+	for _, prov := range m.providers {
+		apm, ok := prov.(*AniPMProvider)
+		if !ok {
+			continue
+		}
+		sr, err := apm.FindEpisodeSource(ctx, anilistID, episode, lang)
+		if err != nil {
+			m.log.Warn().Err(err).Str("provider", "anipm").Str("anilistId", anilistID).
+				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
+			continue
+		}
+		if sr == nil || len(sr.Sources) == 0 {
+			continue
+		}
+		out = appendNamedServers(out, []string{anipmServerName}, "anipm", lang, sr)
+	}
+	return out
+}
+
 func (m *Manager) collectAnixoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
 	var out []core.Server
 	for _, prov := range m.providers {

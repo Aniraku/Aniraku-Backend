@@ -45,6 +45,9 @@ var defaultCDNSuffixes = []string{
 	"anixo.buzz",
 	// Miruro's own domains
 	"miruro.tv", "miruro.cc", "miruro.be",
+	// Ani.pm direct HLS (Yui server): settlar embed/master hosts + ani.pm
+	// same-origin assets. Subtitles also live on media.settlar.io.
+	"ani.pm", "settlar.io",
 	// Common video CDN platforms
 	"cloudfront.net", "akamaized.net", "storage.googleapis.com", "googleapis.com",
 	"bunnycdn.com", "fastly.net", "fastlylb.net",
