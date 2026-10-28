@@ -4,12 +4,29 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/metadata/anilist"
 	"github.com/Aniraku/Aniraku-Backend/internal/tmdb"
 	"github.com/go-chi/chi/v5"
 )
+
+// Logo lookups chain several upstreams (AniList gate, AniBridge, Fribb,
+// TMDB search, TMDB images), so results are memoized: logos are static
+// assets, unlike the ephemeral streaming tokens.
+const (
+	logoPositiveTTL = 24 * time.Hour
+	logoNegativeTTL = 2 * time.Hour
+)
+
+type logoCacheEntry struct {
+	logo string
+	at   time.Time
+	miss bool
+}
+
+var logoCache sync.Map // anime id -> logoCacheEntry
 
 // GetAnimeLogo serves the title logo (wordmark) for an AniList ID. The ID
 // must exist on AniList first; the logo is then mapped to TMDB through the
@@ -23,23 +40,53 @@ func (h *Handlers) GetAnimeLogo(w http.ResponseWriter, r *http.Request) {
 		h.respondError(w, http.StatusBadRequest, "invalid anime ID")
 		return
 	}
+	if e, ok := logoCache.Load(id); ok {
+		entry := e.(logoCacheEntry)
+		ttl := logoPositiveTTL
+		expiry := entry.logo
+		if entry.miss {
+			ttl = logoNegativeTTL
+			expiry = ""
+		}
+		if time.Since(entry.at) < ttl {
+			if expiry == "" {
+				h.respondError(w, http.StatusNotFound, "logo not found")
+				return
+			}
+			h.respondJSON(w, http.StatusOK, map[string]string{"logo": expiry})
+			return
+		}
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
-	// Existence gate first: AniList is the source of truth for IDs.
-	anime, err := h.getAnimeFromAniList(ctx, id)
-	if err != nil || anime == nil {
+	// The AniList gate and the mapping/logo chain are independent: run
+	// them concurrently so the hops overlap instead of adding up.
+	type gate struct {
+		anime *anilist.Anime
+		err   error
+	}
+	gateCh := make(chan gate, 1)
+	go func() {
+		anime, err := h.getAnimeFromAniList(ctx, id)
+		gateCh <- gate{anime, err}
+	}()
+	logo := tmdb.FetchTmdbLogo(ctx, h.httpClient, h.cfg.TMDB.ReadAccessToken, id)
+	g := <-gateCh
+	if g.err != nil || g.anime == nil {
+		logoCache.Store(id, logoCacheEntry{at: time.Now(), miss: true})
 		h.respondError(w, http.StatusNotFound, "anime not found")
 		return
 	}
-	logo := tmdb.FetchTmdbLogo(ctx, h.httpClient, h.cfg.TMDB.ReadAccessToken, id)
 	if logo == "" {
 		// No mapping knows this title: fall back to TMDB title search.
-		logo = h.logoByTitle(ctx, anime)
+		logo = h.logoByTitle(ctx, g.anime)
 	}
 	if logo == "" {
+		logoCache.Store(id, logoCacheEntry{at: time.Now(), miss: true})
 		h.respondError(w, http.StatusNotFound, "logo not found")
 		return
 	}
+	logoCache.Store(id, logoCacheEntry{logo: logo, at: time.Now()})
 	h.respondJSON(w, http.StatusOK, map[string]string{"logo": logo})
 }
 
