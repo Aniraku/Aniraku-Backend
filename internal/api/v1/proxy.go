@@ -904,17 +904,41 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 		return h.proxyHTTPClient.Do(req)
 	}
 
-	resp, err := h.proxyH2Client.Do(req)
-	if err == nil {
+	// A Cloudflare 403 challenge is a *successful* HTTP response, so a
+	// transport that trips bot detection does not surface as an error.
+	// Fall through the chain on 403/429 as well; the final fallback is a
+	// plain-Go-TLS IPv4-only client whose response is returned as-is.
+	chain := []struct {
+		client *http.Client
+		last   bool
+	}{
+		{h.proxyH2Client, false},
+		{h.proxyH1Client, false},
+		{h.proxyGoTLSClient, false},
+		// ponytail: IPv4-only plain Go TLS end of chain, for hosts (e.g.
+		// settlar) where Cloudflare blocks IPv6 egress outright.
+		{h.proxyGoTLS4Client, true},
+	}
+	var lastErr error
+	for _, c := range chain {
+		resp, err := c.client.Do(req)
+		if c.last {
+			return resp, err
+		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+			// Drain and close so the connection can be reused.
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			lastErr = fmt.Errorf("upstream %d on transport attempt", resp.StatusCode)
+			continue
+		}
 		return resp, nil
 	}
-	resp, err = h.proxyH1Client.Do(req)
-	if err == nil {
-		return resp, nil
-	}
-	// ponytail: standard Go TLS fallback, utls Chrome fingerprint triggers
-	// bot detection on some CDNs (nekostream, watching.onl). Native Go TLS works fine.
-	return h.proxyGoTLSClient.Do(req)
+	return nil, lastErr
 }
 
 // applyProxyQueryHeaders applies the ?headers= JSON to a proxy upstream

@@ -238,37 +238,34 @@ func (p *AniPMProvider) resolveSeries(ctx context.Context, id int) (*anipmSeries
 	}
 	p.mu.Unlock()
 
+	var sj anipmSeriesJSON
+	if err := p.getJSON(ctx, fmt.Sprintf("%s/api/anime/ani/%d?phase=core&routes=e4", p.base, id), p.base+"/", &sj); err != nil {
+		p.log.Debug().Err(err).Int("anilistId", id).Msg("anipm: legacy route unavailable, trying current route")
+	} else if sj.SettlarID > 0 && len(sj.Episodes) > 0 {
+		entry := &anipmSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
+		for _, e := range sj.Episodes {
+			if e.Number < 1 {
+				continue
+			}
+			entry.episodes = append(entry.episodes, anipmEpisode{
+				number:       e.Number,
+				sourceNumber: anipmSourceNumber(e.SourceNumber, e.Number),
+				hasSub:       e.HasSub,
+				hasDub:       e.HasDub,
+			})
+		}
+		if len(entry.episodes) > 0 {
+			p.storeSeries(id, entry)
+			return entry, nil
+		}
+	}
+	// Legacy route miss/failure: fall back to the current-route path
+	// (AniList title search → series by routeId), which costs extra hops.
 	if entry, err := p.resolveCurrentSeries(ctx, id); err == nil && entry != nil {
 		p.storeSeries(id, entry)
 		return entry, nil
-	} else if err != nil {
-		p.log.Debug().Err(err).Int("anilistId", id).Msg("anipm: current route unavailable, trying legacy route")
 	}
-
-	var sj anipmSeriesJSON
-	if err := p.getJSON(ctx, fmt.Sprintf("%s/api/anime/ani/%d?phase=core&routes=e4", p.base, id), p.base+"/", &sj); err != nil {
-		return nil, err
-	}
-	if sj.SettlarID <= 0 || len(sj.Episodes) == 0 {
-		return nil, fmt.Errorf("anipm: no series mapping for anilist %d", id)
-	}
-	entry := &anipmSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
-	for _, e := range sj.Episodes {
-		if e.Number < 1 {
-			continue
-		}
-		entry.episodes = append(entry.episodes, anipmEpisode{
-			number:       e.Number,
-			sourceNumber: anipmSourceNumber(e.SourceNumber, e.Number),
-			hasSub:       e.HasSub,
-			hasDub:       e.HasDub,
-		})
-	}
-	if len(entry.episodes) == 0 {
-		return nil, fmt.Errorf("anipm: no episodes for anilist %d", id)
-	}
-	p.storeSeries(id, entry)
-	return entry, nil
+	return nil, fmt.Errorf("anipm: no series mapping for anilist %d", id)
 }
 
 func (p *AniPMProvider) storeSeries(id int, entry *anipmSeriesEntry) {

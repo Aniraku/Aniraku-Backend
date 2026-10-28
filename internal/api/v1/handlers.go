@@ -43,11 +43,12 @@ type Handlers struct {
 	// segments mid-transfer and the browser sees ERR_INCOMPLETE_CHUNKED_ENCODING.
 	// Boundaries for these clients: 15s dial timeout, 30s response-header
 	// timeout (h1), and the proxy request's context (client disconnect).
-	proxyH2Client    *http.Client
-	proxyH1Client    *http.Client
-	proxyHTTPClient  *http.Client
-	proxyGoTLSClient *http.Client
-	keyCache         sync.Map
+	proxyH2Client     *http.Client
+	proxyH1Client     *http.Client
+	proxyHTTPClient   *http.Client
+	proxyGoTLSClient  *http.Client
+	proxyGoTLS4Client *http.Client
+	keyCache          sync.Map
 	// Browse/trending cache with TTL
 	browseCache    sync.Map
 	browseCacheTTL time.Duration
@@ -161,6 +162,19 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		proxyGoTLSClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext:           baseDialer.DialContext,
+				MaxIdleConnsPerHost:   10,
+				ResponseHeaderTimeout: 30 * time.Second,
+			},
+			CheckRedirect: netguard.NoRedirects,
+		},
+		// Same as above but IPv4-only: Cloudflare blocks IPv6 egress outright
+		// on some hosts (VPS gets 403/1106), so this is the last-resort
+		// fallback in doRequest.
+		proxyGoTLS4Client: &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return baseDialer.DialContext(ctx, "tcp4", addr)
+				},
 				MaxIdleConnsPerHost:   10,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
