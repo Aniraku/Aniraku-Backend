@@ -660,9 +660,43 @@ func FetchTmdbLogo(ctx context.Context, client *http.Client, token string, anili
 		}
 	}
 	if movies, _ := extractTmdbMovieMappings(payload, anilistID); len(movies) > 0 {
-		return pickTmdbLogo(ctx, client, token, "movie", movies[0].MovieID)
+		if u := pickTmdbLogo(ctx, client, token, "movie", movies[0].MovieID); u != "" {
+			return u
+		}
+	}
+	// AniBridge carries no TMDB id for many titles; the Fribb list covers
+	// most of those (cached 24h as one bulk fetch).
+	if fribb, ferr := getFribbMappings(ctx, client, anilistID); ferr == nil {
+		for _, mp := range fribb {
+			kind, id := "tv", mp.ShowID
+			if mp.Type == "movie" {
+				kind, id = "movie", mp.MovieID
+			}
+			if u := pickTmdbLogo(ctx, client, token, kind, id); u != "" {
+				return u
+			}
+		}
 	}
 	return ""
+}
+
+// FetchTmdbLogoByTitle resolves a logo through a TMDB title search, for
+// titles no mapping service knows yet. kind is "tv" or "movie".
+func FetchTmdbLogoByTitle(ctx context.Context, client *http.Client, token, kind, title string) string {
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(title) == "" {
+		return ""
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	if kind != "movie" {
+		kind = "tv"
+	}
+	id := resolveTmdbIDByTitle(ctx, client, token, kind, title)
+	if id <= 0 {
+		return ""
+	}
+	return pickTmdbLogo(ctx, client, token, kind, id)
 }
 
 func pickTmdbLogo(ctx context.Context, client *http.Client, token, kind string, id int) string {
@@ -1297,7 +1331,7 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 		if len(mappings) > 0 || title == "" {
 			return
 		}
-		tmdbID := resolveTmdbIDByTitle(ctx, client, token, title)
+		tmdbID := resolveTmdbIDByTitle(ctx, client, token, "tv", title)
 		if tmdbID <= 0 {
 			return
 		}
@@ -1751,19 +1785,21 @@ func looksLikeRanges(m map[string]string) bool {
 	return false
 }
 
-// resolveTmdbIDByTitle finds a TMDB TV show id from a human title using
+// resolveTmdbIDByTitle finds a TMDB id from a human title using
 // TMDB's own search API (always reachable; replaces the MAL/Jikan bridge).
+// kind is "tv" or "movie" (movie results carry the name in "title", tv
+// results in "name").
 // Exact name match wins; a lone result is accepted; otherwise the first
 // result is taken only when its name contains the query.
-func resolveTmdbIDByTitle(ctx context.Context, client *http.Client, token, title string) int {
+func resolveTmdbIDByTitle(ctx context.Context, client *http.Client, token, kind, title string) int {
 	title = strings.TrimSpace(title)
 	if title == "" || strings.TrimSpace(token) == "" {
 		return 0
 	}
-	key := cacheKey("tmdb-title-search", strings.ToLower(title))
+	key := cacheKey("tmdb-title-search", map[string]any{"kind": kind, "title": strings.ToLower(title)})
 	val, err := cached(key, MappingTTL, func() (any, error) {
-		u := fmt.Sprintf("%s/search/tv?query=%s&language=en-US&page=1&include_adult=true",
-			TMDBAPIBase, url.QueryEscape(title))
+		u := fmt.Sprintf("%s/search/%s?query=%s&language=en-US&page=1&include_adult=true",
+			TMDBAPIBase, kind, url.QueryEscape(title))
 		return requestJson(ctx, client, u,
 			map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token},
 			"TMDB_SEARCH_UNAVAILABLE", "TMDB search is unavailable.")
@@ -1781,6 +1817,9 @@ func resolveTmdbIDByTitle(ctx context.Context, client *http.Client, token, title
 	for i, raw := range results {
 		m, _ := raw.(map[string]any)
 		name := strings.ToLower(text(m["name"]))
+		if name == "" {
+			name = strings.ToLower(text(m["title"]))
+		}
 		idPtr := positiveInteger(m["id"])
 		if idPtr == nil || *idPtr <= 0 {
 			continue
