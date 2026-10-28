@@ -639,6 +639,88 @@ func FetchTmdbFallbackPoster(ctx context.Context, client *http.Client, token str
 	return ""
 }
 
+// FetchTmdbLogo returns the best title logo (wordmark) for an AniList ID,
+// using the same AniList→TMDB mapping the episode fetcher relies on.
+// Preference: English logo, then the textless original ("null" language),
+// then any language. Empty string when there is no mapping or no logo.
+func FetchTmdbLogo(ctx context.Context, client *http.Client, token string, anilistID int) string {
+	if anilistID <= 0 || strings.TrimSpace(token) == "" {
+		return ""
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	payload, err := getMapping(ctx, client, anilistID)
+	if err != nil {
+		return ""
+	}
+	if shows, _ := extractTmdbShowMappings(payload, anilistID); len(shows) > 0 {
+		if u := pickTmdbLogo(ctx, client, token, "tv", shows[0].ShowID); u != "" {
+			return u
+		}
+	}
+	if movies, _ := extractTmdbMovieMappings(payload, anilistID); len(movies) > 0 {
+		return pickTmdbLogo(ctx, client, token, "movie", movies[0].MovieID)
+	}
+	return ""
+}
+
+func pickTmdbLogo(ctx context.Context, client *http.Client, token, kind string, id int) string {
+	imgs, err := getTmdbImages(ctx, client, token, kind, id)
+	if err != nil {
+		return ""
+	}
+	logos, _ := imgs["logos"].([]any)
+	return safeStillUrl(pickLogoPath(logos))
+}
+
+// pickLogoPath selects the best logo file path: English first, textless
+// (no language) second, then whatever comes first. Pure so it is testable
+// without HTTP.
+func pickLogoPath(logos []any) string {
+	byEn, byNone, first := "", "", ""
+	for _, raw := range logos {
+		l, _ := raw.(map[string]any)
+		path := text(l["file_path"])
+		if path == "" {
+			continue
+		}
+		if first == "" {
+			first = path
+		}
+		lang := l["iso_639_1"]
+		s, ok := lang.(string)
+		switch {
+		case ok && s == "en" && byEn == "":
+			byEn = path
+		case !ok && byNone == "":
+			byNone = path
+		}
+	}
+	if byEn != "" {
+		return byEn
+	}
+	if byNone != "" {
+		return byNone
+	}
+	return first
+}
+
+func getTmdbImages(ctx context.Context, client *http.Client, token, kind string, id int) (map[string]any, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, newResolverError("TMDB_NOT_CONFIGURED", "TMDB metadata is not configured.", 503)
+	}
+	u := fmt.Sprintf("%s/%s/%d/images?include_image_language=en,null", TMDBAPIBase, kind, id)
+	key := cacheKey("tmdb-images", map[string]any{"kind": kind, "id": id})
+	val, err := cached(key, SeasonTTL, func() (any, error) {
+		return requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB images are unavailable.")
+	})
+	if err != nil {
+		return nil, err
+	}
+	return val.(map[string]any), nil
+}
+
 // ResolveEpisodesWithAnizip resolves episode metadata using AniZip + TMDB bidirectional merge.
 func ResolveEpisodesWithAnizip(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int) (*ResolveResult, error) {
 	// Fetch TMDB metadata
@@ -931,7 +1013,8 @@ func continuationSeasonNumbers(show map[string]any, afterSeasonNumber int) []int
 
 func safeStillUrl(path string) string {
 	p := strings.TrimSpace(path)
-	if matched, _ := regexp.MatchString(`^\/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp)$`, p); !matched {
+	// .svg included: TMDB title logos are commonly vector files.
+	if matched, _ := regexp.MatchString(`^\/[A-Za-z0-9_-]+\.(?:jpg|jpeg|png|webp|svg)$`, p); !matched {
 		return ""
 	}
 	return TMDBImageBase + p
