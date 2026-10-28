@@ -1,6 +1,10 @@
 package streaming
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/core"
+)
 
 func TestCanonicalSubtitleLang(t *testing.T) {
 	cases := map[string]string{
@@ -118,6 +122,29 @@ func TestLangCodeFromSubURL(t *testing.T) {
 	for in, want := range cases {
 		if got := langCodeFromSubURL(in); got != want {
 			t.Errorf("langCodeFromSubURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestDisambiguateSubtitleLangsAppendsLabelSuffix(t *testing.T) {
+	in := []core.Subtitle{
+		{URL: "u1", Lang: "en", Label: "English"},
+		{URL: "u2", Lang: "en", Label: "English Full Subtitles (Restyled By Simmsy)"},
+		{URL: "u3", Lang: "en", Label: "English CR"},
+		{URL: "u4", Lang: "en", Label: "English CR"},
+		{URL: "u5", Lang: "es", Label: "Spanish"},
+	}
+	out := disambiguateSubtitleLangs(in)
+	want := []string{
+		"en",
+		"en (Full Subtitles (Restyled By Simmsy))",
+		"en (CR)",
+		"en (CR 2)",
+		"es",
+	}
+	for i, w := range want {
+		if out[i].Lang != w {
+			t.Fatalf("track %d: got lang %q, want %q", i, out[i].Lang, w)
 		}
 	}
 }

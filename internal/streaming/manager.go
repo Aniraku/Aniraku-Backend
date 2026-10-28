@@ -738,6 +738,14 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	} else {
 		m.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("servers: no animedl download links")
 	}
+	// Same-language subtitle tracks get distinguishable lang codes before
+	// the list ships ("en", "en (Full Subtitles ...)"); applied here so
+	// every provider benefits, not just anipm.
+	for i := range allServers {
+		for j := range allServers[i].Sources {
+			allServers[i].Sources[j].Subtitles = disambiguateSubtitleLangs(allServers[i].Sources[j].Subtitles)
+		}
+	}
 	sort.SliceStable(allServers, func(i, j int) bool {
 		return serverVerdictRank(allServers[i]) > serverVerdictRank(allServers[j])
 	})

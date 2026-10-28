@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
@@ -287,4 +288,61 @@ func isASCII(s string) bool {
 		}
 	}
 	return true
+}
+
+// disambiguateSubtitleLangs makes same-language tracks distinguishable by
+// lang, not just label. When one source carries 2+ tracks resolving to the
+// same lang code ("English" + "English Full Subtitles (Restyled By
+// Simmsy)"), each duplicate's lang gets the label's remainder after the
+// language name: "en" + "en (Full Subtitles (Restyled By Simmsy))". Labels
+// that are exactly the language name keep the bare code. Still-colliding
+// suffixes get numbered ("en (CR)", "en (CR 2)").
+func disambiguateSubtitleLangs(subs []core.Subtitle) []core.Subtitle {
+	if len(subs) < 2 {
+		return subs
+	}
+	counts := make(map[string]int, len(subs))
+	for _, s := range subs {
+		counts[s.Lang]++
+	}
+	out := make([]core.Subtitle, len(subs))
+	copy(out, subs)
+	seen := make(map[string]int, len(subs))
+	for i, s := range out {
+		if s.Lang == "" || counts[s.Lang] < 2 {
+			continue
+		}
+		suffix := subtitleLabelSuffix(s.Label, s.Lang)
+		if suffix == "" {
+			continue
+		}
+		newLang := s.Lang + " (" + suffix + ")"
+		seen[newLang]++
+		if n := seen[newLang]; n > 1 {
+			newLang = s.Lang + " (" + suffix + " " + strconv.Itoa(n) + ")"
+		}
+		out[i].Lang = newLang
+	}
+	return out
+}
+
+// subtitleLabelSuffix returns the part of label that follows the language's
+// display name ("English Full Subtitles" -> "Full Subtitles"), or the whole
+// label when it does not start with the language name. Empty when the label
+// is just the language name.
+func subtitleLabelSuffix(label, lang string) string {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return ""
+	}
+	display := langDisplay(lang)
+	if display != "" && len(label) > len(display) && strings.EqualFold(label[:len(display)], display) {
+		rest := strings.TrimSpace(label[len(display):])
+		rest = strings.TrimLeft(rest, "-–—:")
+		return strings.TrimSpace(rest)
+	}
+	if display != "" && strings.EqualFold(label, display) {
+		return ""
+	}
+	return label
 }
