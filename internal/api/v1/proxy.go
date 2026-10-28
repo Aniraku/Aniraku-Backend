@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/api/middleware"
@@ -919,6 +920,24 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 		// settlar) where Cloudflare blocks IPv6 egress outright.
 		{h.proxyGoTLS4Client, true},
 	}
+
+	// Remember which transport last won for this host. Without the memo,
+	// every proxied segment re-pays the losing transports' TLS handshakes
+	// and 403 roundtrips before reaching the winner — playback crawls.
+	host := req.URL.Host
+	if entry, ok := proxyTransportMemo.Load(host); ok && time.Since(entry.(proxyTransportEntry).at) < proxyMemoTTL {
+		resp, err := entry.(proxyTransportEntry).client.Do(req)
+		if err == nil && resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusTooManyRequests {
+			return resp, nil
+		}
+		if err == nil {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+		}
+		// Winner stopped working (or errored): forget it and walk the chain.
+		proxyTransportMemo.Delete(host)
+	}
+
 	var lastErr error
 	for _, c := range chain {
 		resp, err := c.client.Do(req)
@@ -936,10 +955,22 @@ func (h *Handlers) doRequest(req *http.Request, https bool) (*http.Response, err
 			lastErr = fmt.Errorf("upstream %d on transport attempt", resp.StatusCode)
 			continue
 		}
+		proxyTransportMemo.Store(host, proxyTransportEntry{client: c.client, at: time.Now()})
 		return resp, nil
 	}
 	return nil, lastErr
 }
+
+const proxyMemoTTL = 10 * time.Minute
+
+type proxyTransportEntry struct {
+	client *http.Client
+	at     time.Time
+}
+
+// proxyTransportMemo maps upstream host -> the transport that last got a
+// clean response there. Entries expire after proxyMemoTTL or on a 403/429.
+var proxyTransportMemo sync.Map
 
 // applyProxyQueryHeaders applies the ?headers= JSON to a proxy upstream
 // request exactly as the media proxy does: filter dangerous headers, add

@@ -477,7 +477,10 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	}
 	master = resolved
 	if typ == "hls" {
-		if !probeSegmentsLenient(ctx, p.client, master, referer, anipmUserAgent) {
+		// Playlist-depth probe only: segments ride the same host/gating as
+		// the playlists (and reach players through our tcp4 proxy anyway),
+		// while the extra segment fetch just slows every /servers call.
+		if !probePlaylistsLenient(ctx, p.client, master, referer, anipmUserAgent) {
 			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
 				Msg("anipm: master blocked from this egress, dropping source")
 			return nil, nil
