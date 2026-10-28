@@ -522,7 +522,9 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 			Subtitles:    subs,
 			Verification: "proxy",
 		}},
-		Headers:     map[string]string{"Referer": referer},
+		// User-Agent must ride along: the media proxy defaults to a stale
+		// Chrome/124 that Cloudflare 403s on settlar hosts.
+		Headers:     map[string]string{"Referer": referer, "User-Agent": anipmUserAgent},
 		ServerNames: []string{anipmServerName},
 		ServerName:  anipmServerName,
 		Intro:       intro,
