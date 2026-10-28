@@ -95,6 +95,7 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 		// do the same. Streaming and proxy paths stay uncacheable.
 		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}", h.GetAnime)
 		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}/episodes", h.GetEpisodes)
+		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}/track", h.GetAnimeTrack)
 		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}/similar", h.GetSimilar)
 		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}/relations", h.GetRelations)
 		r.Post("/api/v1/stream", h.Stream)
