@@ -48,3 +48,6 @@ vipertls/
 # Stray env variants
 .env.*
 !.env.example
+
+# Nginx server configs: live on the VPS, backed up in ~/aniraku-ops-backup. Never in git.
+deploy/nginx/
