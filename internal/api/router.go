@@ -61,12 +61,15 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 		time.Second)
 
 	// The media proxy streams many small requests (playlists, segments, keys)
-	// per playback, but far fewer than the general limit allows for abuse.
-	// 10 req/s with burst 20 is comfortable for adaptive HLS while ~3x tighter
-	// than the global limiter.
+	// per playback. hls.js fetches segments in parallel (3-6) plus playlist
+	// refreshes/prewarm HEADs, so the old 10 req/s / burst 20 exhausted
+	// immediately and 429'd distant clients (high RTT => tokens refill slow)
+	// causing constant rebuffering. 60 req/s / burst 120 keeps parallel segment
+	// fetches flowing while still ~2x tighter than the global limiter.
+	// Overridable via ANIRAKU_PROXY_RATE_LIMIT / ANIRAKU_PROXY_RATE_BURST.
 	proxyRL := middleware.NewRateLimiter(
-		envInt("ANIRAKU_PROXY_RATE_LIMIT", 10),
-		envInt("ANIRAKU_PROXY_RATE_BURST", 20),
+		envInt("ANIRAKU_PROXY_RATE_LIMIT", 60),
+		envInt("ANIRAKU_PROXY_RATE_BURST", 120),
 		time.Second)
 
 	// Supabase publishes JWKS under /auth/v1, not the project root.

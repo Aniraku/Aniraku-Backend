@@ -154,7 +154,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		proxyHTTPClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext:           baseDialer.DialContext,
-				MaxIdleConnsPerHost:   10,
+				MaxIdleConnsPerHost:   60,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,
@@ -162,7 +162,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		proxyGoTLSClient: &http.Client{
 			Transport: &http.Transport{
 				DialContext:           baseDialer.DialContext,
-				MaxIdleConnsPerHost:   10,
+				MaxIdleConnsPerHost:   60,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,
@@ -175,7 +175,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					return baseDialer.DialContext(ctx, "tcp4", addr)
 				},
-				MaxIdleConnsPerHost:   10,
+				MaxIdleConnsPerHost:   60,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,

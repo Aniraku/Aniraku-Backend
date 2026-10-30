@@ -34,7 +34,7 @@ import (
 // contract as the shaping envar in proxy_throttle.go).
 const (
 	limiterEnv        = "ANIRAKU_PROXY_MAX_STREAMS"
-	limiterDefaultCap = 48
+	limiterDefaultCap = 96
 	limiterQueueHold  = 10 * time.Second
 )
 
