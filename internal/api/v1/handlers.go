@@ -116,7 +116,8 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 			}
 			return tlsConn, nil
 		},
-		MaxIdleConnsPerHost: 10,
+		MaxIdleConnsPerHost: 60,
+		IdleConnTimeout:     90 * time.Second,
 		// Bounds how long a no-timeout proxy client waits for response
 		// headers from a stalled CDN; the body itself is unbounded.
 		ResponseHeaderTimeout: 30 * time.Second,
@@ -134,7 +135,8 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			DialContext:         baseDialer.DialContext,
-			MaxIdleConnsPerHost: 10,
+			MaxIdleConnsPerHost: 60,
+			IdleConnTimeout:     90 * time.Second,
 		},
 		CheckRedirect: netguard.NoRedirects,
 	}
@@ -155,6 +157,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 			Transport: &http.Transport{
 				DialContext:           baseDialer.DialContext,
 				MaxIdleConnsPerHost:   60,
+				IdleConnTimeout:       90 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,
@@ -163,6 +166,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 			Transport: &http.Transport{
 				DialContext:           baseDialer.DialContext,
 				MaxIdleConnsPerHost:   60,
+				IdleConnTimeout:       90 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,
@@ -176,6 +180,7 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 					return baseDialer.DialContext(ctx, "tcp4", addr)
 				},
 				MaxIdleConnsPerHost:   60,
+				IdleConnTimeout:       90 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 			},
 			CheckRedirect: netguard.NoRedirects,
