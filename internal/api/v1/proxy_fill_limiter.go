@@ -29,12 +29,20 @@ import (
 // never occupy slots.
 //
 // ANIRAKU_PROXY_MAX_STREAMS overrides the cap; 0 disables the limiter
-// entirely (the pre-Oct-16 behavior). The value is read at process
-// start; changing it requires a restart (documented for operators, same
-// contract as the shaping envar in proxy_throttle.go).
+// entirely. The value is read at process start; changing it requires a
+// restart (documented for operators, same contract as the shaping envar
+// in proxy_throttle.go).
+//
+// 2026-10-31: the box grew from 836 MB to 24 GB RAM and the audience
+// target is 1000+ concurrent viewers, so the default rose 96 -> 512.
+// At ~2 MB worst-case per fill (1 MB copy buffer + connection buffers)
+// that bounds the limiter's own footprint near 1 GB — a circuit breaker
+// against the unbounded-goroutine/OOM wedge, sized far above anything
+// 1000+ legitimate viewers generate. Production never shed a single
+// fill at 96 over the previous 7 days.
 const (
 	limiterEnv        = "ANIRAKU_PROXY_MAX_STREAMS"
-	limiterDefaultCap = 96
+	limiterDefaultCap = 512
 	limiterQueueHold  = 10 * time.Second
 )
 

@@ -67,7 +67,7 @@ func testEnv(t *testing.T) (*httptest.Server, *rsa.PrivateKey, string) {
 	cfg.Logging.Level = "error"
 
 	log := zerolog.Nop()
-	r, _, _ := NewRouter(cfg, log)
+	r, _ := NewRouter(cfg, log)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 

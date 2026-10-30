@@ -32,7 +32,7 @@ func envInt(key string, def int) int {
 // only when the server config opts in.
 var http_pprof = newPprofMux()
 
-func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.RateLimiter, *middleware.RateLimiter) {
+func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.RateLimiter) {
 	r := chi.NewRouter()
 
 	r.Use(middleware.RealIP)
@@ -60,17 +60,15 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 		envInt("ANIRAKU_RATE_BURST", 60),
 		time.Second)
 
-	// The media proxy streams many small requests (playlists, segments, keys)
-	// per playback. hls.js fetches segments in parallel (3-6) plus playlist
-	// refreshes/prewarm HEADs, so the old 10 req/s / burst 20 exhausted
-	// immediately and 429'd distant clients (high RTT => tokens refill slow)
-	// causing constant rebuffering. 60 req/s / burst 120 keeps parallel segment
-	// fetches flowing while still ~2x tighter than the global limiter.
-	// Overridable via ANIRAKU_PROXY_RATE_LIMIT / ANIRAKU_PROXY_RATE_BURST.
-	proxyRL := middleware.NewRateLimiter(
-		envInt("ANIRAKU_PROXY_RATE_LIMIT", 60),
-		envInt("ANIRAKU_PROXY_RATE_BURST", 120),
-		time.Second)
+	// The media proxy has NO per-IP request rate limiter by design
+	// (2026-10-31): playback is bursty by nature (3-6 parallel segments +
+	// playlist refreshes + prewarm HEADs per viewer), 1000+ concurrent
+	// viewers are the target load, and production logs showed the limiter
+	// essentially never firing (4 x 429 in 60k requests over 7 days) while
+	// a false trip directly stalls playback with a 429. Abuse remains
+	// bounded: nginx's UA gate blocks non-app clients, the proxy fill
+	// limiter caps concurrent upstream fills server-wide, and Cloudflare
+	// absorbs floods of cacheable URLs before they reach the origin.
 
 	// Supabase publishes JWKS under /auth/v1, not the project root.
 	// The previous default (`/.well-known/jwks.json`) 404s, which made
@@ -104,9 +102,9 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 		r.With(middleware.CacheShort).Get("/api/v1/anime/{id}/relations", h.GetRelations)
 		r.Post("/api/v1/stream", h.Stream)
 		r.Get("/api/v1/servers", h.GetServers)
-		r.With(proxyRL.Middleware).Get("/api/v1/proxy", h.Proxy)
-		r.With(proxyRL.Middleware).Head("/api/v1/proxy", h.Proxy)
-		r.With(proxyRL.Middleware).Get("/api/v1/download", h.Download)
+		r.Get("/api/v1/proxy", h.Proxy)
+		r.Head("/api/v1/proxy", h.Proxy)
+		r.Get("/api/v1/download", h.Download)
 		r.Get("/ani/v1/epsrc", h.LegacyEpsrc)
 		r.Post("/api/v1/anilist", h.AniListProxy)
 	})
@@ -177,5 +175,5 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 		_, _ = w.Write([]byte(`{"error":"not found"}`))
 	})
 
-	return r, rl, proxyRL
+	return r, rl
 }

@@ -87,9 +87,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	router, rl, proxyRL := api.NewRouter(cfg, log)
+	router, rl := api.NewRouter(cfg, log)
 	defer rl.Stop()
-	defer proxyRL.Stop()
 
 	addr := cfg.Server.Addr()
 	if addr == ":" {
