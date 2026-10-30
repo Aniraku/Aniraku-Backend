@@ -681,8 +681,17 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		cacheableMediaHeaders(w, "public, max-age=31536000")
 	}
 	w.Header().Set("Content-Type", ct)
+	// Forward upstream Content-Length on full 200s so Cloudflare and clients
+	// can size the transfer (avoids chunked encoding and improves edge
+	// delivery). 206 already carries Content-Length from the Range pass-through.
+	if resp.StatusCode == http.StatusOK {
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			w.Header().Set("Content-Length", cl)
+		}
+	}
 	w.WriteHeader(resp.StatusCode)
-	if n, err := io.Copy(shapeWriter(w), resp.Body); err != nil {
+	buf := make([]byte, 1<<20)
+	if n, err := io.CopyBuffer(w, resp.Body, buf); err != nil {
 		// The status line is already sent; the client will see a truncated
 		// chunked response. Log it so upstream drops are distinguishable
 		// from nginx/app-level truncation.
@@ -724,6 +733,7 @@ func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request
 	// upstream token lifetime, so cached copies always carry valid tokens.
 	cacheableMediaHeaders(w, "public, max-age=300")
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+	w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 	w.WriteHeader(status)
 	w.Write([]byte(rewritten))
 }
@@ -824,7 +834,7 @@ func (h *Handlers) Download(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("Content-Disposition", "attachment")
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(shapeWriter(w), body)
+	io.CopyBuffer(w, body, make([]byte, 1<<20))
 }
 
 func requestPublicBaseURL(r *http.Request) string {
