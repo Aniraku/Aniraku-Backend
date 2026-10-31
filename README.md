@@ -75,8 +75,6 @@ The current router includes playback, episodes, account, sync, and admin.
 | **Catalog** | `search`, `trending`, `seasonal`, `browse`, `genres`, `schedule` | served through the backend's rate-limited AniList client (token bucket + circuit breaker) |
 | **Account** | `profiles`, `favorites`, `settings`, `notifications`, `logs`, `progress`, `ratings`, `continue-watching` | Supabase RLS via `supabaseRequest` (`apikey=anon` + `Bearer user JWT`) |
 | **Import/export** | `POST /api/v1/import/mal`/`anilist`, `export`, `sync` (`mal`/`anilist` OAuth), `SyncScore`/`SyncUpdate` | `resolveMalIDsToAniList` via `idMal_in` |
-| **Administration** | `GET /api/v1/admin/stats` | `auth.RequireAdmin` `is_admin()` RPC |
-
 All versioned routes live under `/api/v1`. The legacy `/ani/v1/epsrc` route is kept for compatibility.
 
 ## Stack
