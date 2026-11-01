@@ -148,6 +148,39 @@ func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token strin
 	}, nil
 }
 
+// DirectSeasonEpisodeCount returns the episode count of the TMDB season the
+// title refers to. AniZip-less shows otherwise stop at AniBridge's verified
+// frontier (or the last aired episode) while TMDB already lists the whole
+// current season. Returns 0 when TMDB has no match.
+func DirectSeasonEpisodeCount(ctx context.Context, client *http.Client, token, title string, knownTotal int) int {
+	title = strings.TrimSpace(title)
+	if title == "" || strings.TrimSpace(token) == "" {
+		return 0
+	}
+	if client == nil {
+		client = &http.Client{Timeout: RequestTimeout}
+	}
+	showID := resolveTmdbIDByTitle(ctx, client, token, "tv", title)
+	if showID <= 0 {
+		return 0
+	}
+	show, err := getTmdbShow(ctx, client, token, showID)
+	if err != nil {
+		return 0
+	}
+	seasons := directSeasons(show)
+	if len(seasons) == 0 {
+		return 0
+	}
+	start := pickDirectSeason(seasons, title, knownTotal)
+	for _, s := range seasons {
+		if s.Number == start {
+			return s.Episodes
+		}
+	}
+	return 0
+}
+
 // directSeasons extracts regular TMDB seasons (specials excluded) in order.
 func directSeasons(show map[string]any) []tmdbSeasonInfo {
 	raw, _ := show["seasons"].([]any)

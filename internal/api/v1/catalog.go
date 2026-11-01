@@ -282,6 +282,12 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// MOVIE entries have no episode list, keep TMDB out of their count.
+	isMovie := false
+	if f, ok := media["format"].(string); ok {
+		isMovie = strings.EqualFold(f, "MOVIE")
+	}
+
 	episodeCount := 0
 	knownTotal := 0
 	if eps, ok := media["episodes"].(float64); ok && eps > 0 {
@@ -304,6 +310,19 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 				episodeCount = 12
 			}
 		}
+	}
+
+	// AniZip has no episode map (brand-new titles) and AniBridge only covers
+	// aired/verified episodes, while TMDB already lists the whole current
+	// season. Use its length so the episode list does not stop at the
+	// verified frontier (observed: TMDB served a full 12-episode season while
+	// AniBridge had verified 1-2 and nextAiringEpisode implied 4).
+	if knownTotal == 0 && !isMovie && len(anizipData) == 0 && strings.TrimSpace(h.cfg.TMDB.ReadAccessToken) != "" && strings.TrimSpace(titleHint) != "" {
+		countCtx, countCancel := context.WithTimeout(ctx, 15*time.Second)
+		if n := tmdb.DirectSeasonEpisodeCount(countCtx, h.httpClient, h.cfg.TMDB.ReadAccessToken, titleHint, knownTotal); n > episodeCount {
+			episodeCount = n
+		}
+		countCancel()
 	}
 
 	// AniList outages (or titles with unknown counts) leave episodeCount at
@@ -361,10 +380,6 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// has no episode map at all (brand-new titles), asks TMDB directly by
 	// title and lets it win: TMDB already carries the whole season with
 	// stills while AniBridge's verified range still lags.
-	isMovie := false
-	if f, ok := media["format"].(string); ok {
-		isMovie = strings.EqualFold(f, "MOVIE")
-	}
 	resolveEpisodes := func(resolveCtx context.Context, numbers []int) map[int]*tmdb.EpisodeMetadata {
 		byNumber := map[int]*tmdb.EpisodeMetadata{}
 		if result, _ := tmdb.ResolveEpisodesWithTitle(resolveCtx, h.httpClient, token, anilistID, numbers, titleHint); result != nil {
