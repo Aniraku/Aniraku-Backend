@@ -69,6 +69,7 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.notifyEpisode(anilistID, req.Episode)
 	proxyStreamResult(r, result, req.Lang)
 	h.respondJSON(w, http.StatusOK, result)
 }
@@ -226,6 +227,9 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	}
 	if servers == nil {
 		servers = []core.Server{}
+	}
+	if hasSources(servers) {
+		h.notifyEpisode(anilistID, episode)
 	}
 	h.respondJSON(w, http.StatusOK, servers)
 }

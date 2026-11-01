@@ -60,6 +60,11 @@ type Handlers struct {
 	anilistCircuit  *circuitBreaker
 	anilistInflight sync.Map // request deduplication
 	providerHealth  sync.Map // provider -> *providerHealth
+
+	// "anime:episode" already announced by this process.
+	// shortcut: entries live for the process lifetime, bounded by the number
+	// of episodes that actually resolve a source.
+	notifiedEpisodes sync.Map
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
