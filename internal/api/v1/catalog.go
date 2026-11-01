@@ -270,8 +270,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	<-anizipDone
 	mark("list")
 
-	// Human title for the TMDB title-search fallback (unreleased/new shows
-	// where AniBridge has no tmdb_show descriptor yet).
+	// Human title for the TMDB title-search fallbacks (unreleased/new shows
+	// where AniBridge has no tmdb_show descriptor or its verified range lags).
 	titleHint := ""
 	if t, ok := media["title"].(map[string]any); ok {
 		for _, k := range []string{"english", "romaji", "userPreferred"} {
@@ -283,8 +283,10 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	episodeCount := 0
+	knownTotal := 0
 	if eps, ok := media["episodes"].(float64); ok && eps > 0 {
 		episodeCount = int(eps)
+		knownTotal = episodeCount
 	} else {
 		// Airing shows often have episodes:null and nextAiringEpisode only
 		// counts what has AIRED (1 of 12), the verified AniBridge mapping
@@ -355,6 +357,31 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 
 	token := h.cfg.TMDB.ReadAccessToken
 
+	// resolveEpisodes goes through AniBridge/Fribb first, then, when AniZip
+	// has no episode map at all (brand-new titles), asks TMDB directly by
+	// title and lets it win: TMDB already carries the whole season with
+	// stills while AniBridge's verified range still lags.
+	isMovie := false
+	if f, ok := media["format"].(string); ok {
+		isMovie = strings.EqualFold(f, "MOVIE")
+	}
+	resolveEpisodes := func(resolveCtx context.Context, numbers []int) map[int]*tmdb.EpisodeMetadata {
+		byNumber := map[int]*tmdb.EpisodeMetadata{}
+		if result, _ := tmdb.ResolveEpisodesWithTitle(resolveCtx, h.httpClient, token, anilistID, numbers, titleHint); result != nil {
+			for _, ep := range result.Episodes {
+				byNumber[ep.Number] = ep
+			}
+		}
+		if !isMovie && len(anizipData) == 0 && strings.TrimSpace(token) != "" && strings.TrimSpace(titleHint) != "" {
+			if direct, _ := tmdb.ResolveEpisodesDirect(resolveCtx, h.httpClient, token, anilistID, titleHint, numbers, knownTotal); direct != nil {
+				for _, ep := range direct.Episodes {
+					byNumber[ep.Number] = ep
+				}
+			}
+		}
+		return byNumber
+	}
+
 	// Manual fallback cover from AniList art (no network): decided before the
 	// parallel block below so only genuinely-missing covers trigger a fetch.
 	coverFallback := ""
@@ -397,12 +424,7 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		if len(episodeNumbers) > 0 {
 			fetchCtx, fetchCancel := context.WithTimeout(ctx, 50*time.Second)
 			defer fetchCancel()
-			result, _ := tmdb.ResolveEpisodesWithTitle(fetchCtx, h.httpClient, token, anilistID, episodeNumbers, titleHint)
-			if result != nil {
-				for _, ep := range result.Episodes {
-					tmdbByNumber[ep.Number] = ep
-				}
-			}
+			tmdbByNumber = resolveEpisodes(fetchCtx, episodeNumbers)
 			// Only cache non-empty results; caching an empty map poisons
 			// hentai titles for 30min when TMDB is briefly unreachable.
 			if len(tmdbByNumber) > 0 {
@@ -444,11 +466,11 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 		if len(missing) > 0 {
 			missCtx, missCancel := context.WithTimeout(ctx, 50*time.Second)
-			result, _ := tmdb.ResolveEpisodesWithTitle(missCtx, h.httpClient, token, anilistID, missing, titleHint)
+			resolved := resolveEpisodes(missCtx, missing)
 			missCancel()
-			if result != nil {
-				for _, ep := range result.Episodes {
-					tmdbByNumber[ep.Number] = ep
+			if len(resolved) > 0 {
+				for n, ep := range resolved {
+					tmdbByNumber[n] = ep
 				}
 				cachedCopy := make(map[int]*tmdb.EpisodeMetadata, len(tmdbByNumber))
 				for k, v := range tmdbByNumber {
