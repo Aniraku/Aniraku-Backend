@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
@@ -33,7 +35,7 @@ func (h *Handlers) notifyEpisode(animeID, episode int) {
 			// Allow a later resolve to retry; the recipient pre-check keeps
 			// retries idempotent.
 			h.notifiedEpisodes.Delete(key)
-			h.log.Debug().Err(err).Int("animeId", animeID).Int("episode", episode).Msg("episode notification skipped")
+			h.log.Warn().Err(err).Int("animeId", animeID).Int("episode", episode).Msg("episode notification skipped")
 		}
 	}()
 }
@@ -261,6 +263,172 @@ func hasSources(servers []core.Server) bool {
 			if strings.TrimSpace(source.URL) != "" {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// runSourceNotifier is a background loop that checks, every 5 minutes, whether
+// a source has appeared for the latest episode of every bookmarked airing
+// anime. When one appears, notifyEpisode announces it. This complements the
+// on-demand trigger in GetServers/Stream so notifications are not limited to
+// users who actually press play.
+func (h *Handlers) runSourceNotifier(ctx context.Context) {
+	if h.cfg.Supabase.URL == "" || h.cfg.Supabase.ServiceKey == "" {
+		h.log.Warn().Msg("source notifier disabled: supabase service key missing")
+		return
+	}
+	select {
+	case <-time.After(30 * time.Second):
+	case <-ctx.Done():
+		return
+	}
+	h.checkBookmarkedSources(ctx)
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			h.checkBookmarkedSources(ctx)
+		}
+	}
+}
+
+func (h *Handlers) checkBookmarkedSources(ctx context.Context) {
+	tickCtx, cancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancel()
+
+	ids, err := h.bookmarkedAnimeIDs(tickCtx)
+	if err != nil {
+		h.log.Warn().Err(err).Msg("source notifier: failed to load bookmarks")
+		return
+	}
+	if len(ids) > 500 {
+		ids = ids[:500]
+	}
+
+	var notified atomic.Int32
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for _, animeID := range ids {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(id int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			n := h.checkAnimeSources(tickCtx, id)
+			if n > 0 {
+				notified.Add(int32(n))
+			}
+		}(animeID)
+	}
+	wg.Wait()
+	h.log.Info().Int("anime", len(ids)).Int("notified", int(notified.Load())).Msg("source notifier: pass complete")
+}
+
+func (h *Handlers) bookmarkedAnimeIDs(ctx context.Context) ([]int, error) {
+	const pageSize = 1000
+	seen := map[int]struct{}{}
+	var ids []int
+	for offset := 0; offset < 100*pageSize; offset += pageSize {
+		path := fmt.Sprintf("/rest/v1/bookmarks?select=anime_id&order=anime_id&limit=%d&offset=%d", pageSize, offset)
+		resp, err := h.supabaseServiceRequest(ctx, "GET", path, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			err := fmt.Errorf("%s", supabaseErrorBody(resp))
+			resp.Body.Close()
+			return nil, err
+		}
+		var rows []struct {
+			AnimeID int `json:"anime_id"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		resp.Body.Close()
+		for _, r := range rows {
+			if r.AnimeID > 0 {
+				if _, ok := seen[r.AnimeID]; !ok {
+					seen[r.AnimeID] = struct{}{}
+					ids = append(ids, r.AnimeID)
+				}
+			}
+		}
+		if len(rows) < pageSize {
+			break
+		}
+	}
+	return ids, nil
+}
+
+func (h *Handlers) checkAnimeSources(ctx context.Context, animeID int) int {
+	media, err := h.anilistAiringMedia(ctx, animeID)
+	if err != nil || media.Status != "RELEASING" {
+		return 0
+	}
+	next := 0
+	if media.NextAiringEpisode != nil {
+		next = media.NextAiringEpisode.Episode
+	}
+	latest := media.Episodes
+	if next > 0 {
+		latest = next - 1
+	}
+
+	seen := map[int]bool{}
+	var candidates []int
+	for _, ep := range []int{latest, next} {
+		if ep > 0 && !seen[ep] {
+			seen[ep] = true
+			candidates = append(candidates, ep)
+		}
+	}
+
+	notified := 0
+	for _, ep := range candidates {
+		if !h.reanimeHasSource(ctx, animeID, ep) {
+			continue
+		}
+		h.notifyEpisode(animeID, ep)
+		notified++
+	}
+	return notified
+}
+
+func (h *Handlers) reanimeHasSource(ctx context.Context, animeID, episode int) bool {
+	reqURL := fmt.Sprintf("https://reanime.to/api/flix/%d/%d", animeID, episode)
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var body struct {
+		Success bool `json:"success"`
+		Servers []struct {
+			DataLink string `json:"dataLink"`
+		} `json:"servers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return false
+	}
+	if !body.Success {
+		return false
+	}
+	for _, s := range body.Servers {
+		if strings.TrimSpace(s.DataLink) != "" {
+			return true
 		}
 	}
 	return false

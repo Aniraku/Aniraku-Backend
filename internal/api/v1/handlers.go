@@ -232,6 +232,12 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		}
 	}()
 
+	if h.cfg.Supabase.URL != "" && h.cfg.Supabase.ServiceKey != "" {
+		go h.runSourceNotifier(context.Background())
+	} else {
+		h.log.Warn().Msg("source notifier disabled: supabase service key missing")
+	}
+
 	return h
 }
 
