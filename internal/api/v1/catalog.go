@@ -343,6 +343,16 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 	mark("count")
 
+	// Airing-or-upcoming: gates the partial-cache healing below (completed
+	// shows have stable TMDB data; airing shows gain episodes over time)
+	// and the Anisearch last-resort fetch later (Anisearch indexes released
+	// episodes only, so it can never answer an unreleased show).
+	airing := false
+	if s, ok := media["status"].(string); ok {
+		airing = strings.EqualFold(s, "RELEASING") || strings.EqualFold(s, "NOT_YET_RELEASED")
+	}
+	unreleased := airing
+
 	token := h.cfg.TMDB.ReadAccessToken
 
 	// Manual fallback cover from AniList art (no network): decided before the
@@ -378,7 +388,8 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		close(coverDone)
 	}
 	tmdbByNumber := tmdb.GetCachedEpisodes(anilistID, episodeNumbers)
-	if tmdbByNumber == nil {
+	cacheHit := tmdbByNumber != nil
+	if !cacheHit {
 		// Cache miss, fetch TMDB with a generous timeout (blocks until
 		// done), but still derived from the handler's total 45s budget so
 		// the chain can never outlive the server's 60s WriteTimeout.
@@ -414,6 +425,39 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	<-coverDone
+	// Partial cache-hit healing: GetCachedEpisodes returns a PARTIAL map
+	// (some requested numbers cached, some not) as a HIT, which pinned
+	// airing shows to whatever TMDB had at first fetch until the 30min
+	// episode TTL expired — and the refetch lagged the same way behind
+	// AniBridge's incrementally-verified ranges. For airing shows fetch
+	// exactly the missing numbers now; the resolver's 1:1 continuation
+	// covers episodes past the verified frontier and its in-memory
+	// response caches keep repeated misses cheap. The merged map goes
+	// back into the cache as a fresh copy (shared *EpisodeMetadata
+	// values are immutable after resolve, see the crash-fix note above).
+	if cacheHit && unreleased && strings.TrimSpace(token) != "" && len(tmdbByNumber) > 0 {
+		var missing []int
+		for _, n := range episodeNumbers {
+			if _, ok := tmdbByNumber[n]; !ok {
+				missing = append(missing, n)
+			}
+		}
+		if len(missing) > 0 {
+			missCtx, missCancel := context.WithTimeout(ctx, 50*time.Second)
+			result, _ := tmdb.ResolveEpisodesWithTitle(missCtx, h.httpClient, token, anilistID, missing, titleHint)
+			missCancel()
+			if result != nil {
+				for _, ep := range result.Episodes {
+					tmdbByNumber[ep.Number] = ep
+				}
+				cachedCopy := make(map[int]*tmdb.EpisodeMetadata, len(tmdbByNumber))
+				for k, v := range tmdbByNumber {
+					cachedCopy[k] = v
+				}
+				tmdb.CacheEpisodes(anilistID, cachedCopy)
+			}
+		}
+	}
 	if coverFallback == "" && strings.TrimSpace(token) != "" {
 		covCtx, covCancel := context.WithTimeout(ctx, 15*time.Second)
 		if p := tmdb.FetchTmdbFallbackPoster(covCtx, h.httpClient, token, anilistID); p != "" {
@@ -436,10 +480,6 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// stage above when available. Skipped for unreleased shows: Anisearch
 	// indexes released episodes only, so the 15s fetch would always return
 	// empty for a title whose episodes haven't aired.
-	unreleased := false
-	if s, ok := media["status"].(string); ok {
-		unreleased = strings.EqualFold(s, "RELEASING") || strings.EqualFold(s, "NOT_YET_RELEASED")
-	}
 	if episodeCount > 0 && !unreleased && anisearchEps == nil && len(anizipData) == 0 && len(tmdbByNumber) == 0 {
 		asiCtx, asiCancel := context.WithTimeout(ctx, 15*time.Second)
 		anisearchEps = tmdb.FetchAnisearchEpisodes(asiCtx, h.httpClient, anilistID)

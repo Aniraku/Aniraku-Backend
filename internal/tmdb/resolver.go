@@ -25,7 +25,12 @@ const (
 	RequestTimeout       = 30 * time.Second
 	MappingTTL           = 24 * time.Hour
 	SeasonTTL            = 24 * time.Hour
-	EpisodeTTL           = 5 * time.Minute
+	// seasonFreshTTL bounds how long a cache-bypassing season refetch
+	// (stale-season healing in ResolveEpisodesWithTitle) is reused, so a
+	// partially-aired season costs TMDB at most one call per 5 minutes
+	// instead of one per request.
+	seasonFreshTTL = 5 * time.Minute
+	EpisodeTTL     = 5 * time.Minute
 )
 
 var (
@@ -1002,6 +1007,42 @@ func selectTmdbMappingForEpisode(mappings []tmdbMapping, anilistEpisode int) *tm
 	return nil
 }
 
+// identityAlignedContinuation reports whether every range in the map is
+// identity-aligned — each source range starts at 1 and carries one constant
+// source->target offset across its whole span — and returns that offset plus
+// the largest verified source episode. Used to decide whether a mapping may
+// be extended 1:1 past its verified frontier for episodes AniBridge has not
+// verified yet. Exotic forms (multi-target comma lists, |re flags, open
+// ended ranges, mid-season starts) intentionally fail this check so only
+// the plain fresh-show shape ever gets extended.
+func identityAlignedContinuation(rangeMap map[string]string) (offset, maxEnd int, ok bool) {
+	if len(rangeMap) == 0 {
+		return 0, 0, false
+	}
+	first := true
+	for srcVal, tgtVal := range rangeMap {
+		src := parseRange(srcVal)
+		tgt := parseRange(strings.TrimSpace(strings.SplitN(tgtVal, "|", 2)[0]))
+		if src == nil || tgt == nil || src.start != 1 || src.end == nil || tgt.end == nil {
+			return 0, 0, false
+		}
+		off := tgt.start - src.start
+		if *tgt.end-*src.end != off {
+			return 0, 0, false
+		}
+		if first {
+			offset = off
+			first = false
+		} else if off != offset {
+			return 0, 0, false
+		}
+		if *src.end > maxEnd {
+			maxEnd = *src.end
+		}
+	}
+	return offset, maxEnd, true
+}
+
 func hasOpenEndedSourceRange(rangeMap map[string]string, anilistEpisode int) bool {
 	if anilistEpisode <= 0 || rangeMap == nil {
 		return false
@@ -1166,6 +1207,25 @@ func getTmdbShow(ctx context.Context, client *http.Client, token string, showID 
 		return nil, err
 	}
 	return val.(map[string]any), nil
+}
+
+// fetchTmdbSeasonFresh bypasses the 24h season read-cache (a cached season
+// payload can predate episodes TMDB has since published for an airing show)
+// but stores whatever it gets back under the short seasonFreshTTL, so repeat
+// and concurrent requests during one episode-list build reuse the fresh
+// payload instead of each paying a TMDB round trip.
+func fetchTmdbSeasonFresh(ctx context.Context, client *http.Client, token string, showID, seasonNumber int) (map[string]any, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, newResolverError("TMDB_NOT_CONFIGURED", "TMDB episode metadata is not configured.", 503)
+	}
+	u := fmt.Sprintf("%s/tv/%d/season/%d?language=en-US&include_adult=true", TMDBAPIBase, showID, seasonNumber)
+	key := cacheKey("tmdb-season", map[string]int{"showId": showID, "seasonNumber": seasonNumber})
+	m, err := requestJson(ctx, client, u, map[string]string{"Accept": "application/json", "Authorization": "Bearer " + token}, "TMDB_UNAVAILABLE", "TMDB episode metadata is unavailable.")
+	if err != nil {
+		return nil, err
+	}
+	responseCache.Store(key, cacheEntry{value: m, expiresAt: time.Now().Add(seasonFreshTTL)})
+	return m, nil
 }
 
 func getTmdbMovie(ctx context.Context, client *http.Client, token string, movieID int) (map[string]any, error) {
@@ -1367,6 +1427,64 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 	requested := map[int]*tmdbMapping{}
 	for _, n := range nums {
 		requested[n] = selectTmdbMappingForEpisode(mappings, n)
+	}
+	// Airing shows: AniBridge verifies ranges incrementally as episodes
+	// air, so the newest episodes of a season sit beyond every verified
+	// range while TMDB already carries them (observed: AniList 206814 was
+	// mapped 1-2 while TMDB served 1-4 with titles and stills). For a tv
+	// mapping whose ranges are identity-aligned (source starts at 1, one
+	// constant source->target offset) extend it 1:1 for requested numbers
+	// strictly past the verified end. Worst case the TMDB season does not
+	// have the episode yet and the number lands in Missing exactly as
+	// before the extension; once AniBridge verifies the real range, it
+	// wins. Mid-season-offset mappings (src 10-22 -> tgt 1-12) never
+	// qualify, so verified sequel semantics are untouched.
+	for _, n := range nums {
+		if requested[n] != nil {
+			continue
+		}
+		var best *tmdbMapping
+		bestEnd := 0
+		for i := range mappings {
+			m := &mappings[i]
+			if m.Type != "tv" {
+				continue
+			}
+			_, end, ok := identityAlignedContinuation(m.Ranges)
+			if !ok || n <= end {
+				continue
+			}
+			if best == nil || end > bestEnd {
+				best, bestEnd = m, end
+			}
+		}
+		if best == nil {
+			continue
+		}
+		offset, _, _ := identityAlignedContinuation(best.Ranges)
+		target := n + offset
+		if target < 1 {
+			continue
+		}
+		// Per-episode copy of the mapping (selectTmdbMappingForEpisode
+		// does the same for verified episodes): each requested number
+		// carries its own target in TmdbNumber, and the RANGES MAP ITSELF
+		// must be cloned — struct copy shares the map header, and writing
+		// the singleton into the shared map would pollute the base
+		// mapping's verified ranges, breaking identityAlignedContinuation
+		// for every later number (observed: episode 4 lost its mapping
+		// once episode 3's singleton landed in the shared map). The
+		// copies collapse back to one season fetch via the activeMap
+		// show/season dedup below.
+		ext := *best
+		ext.Ranges = make(map[string]string, len(best.Ranges)+1)
+		for rk, rv := range best.Ranges {
+			ext.Ranges[rk] = rv
+		}
+		ext.Ranges[strconv.Itoa(n)] = strconv.Itoa(target)
+		ext.TmdbNumber = &target
+		mappings = append(mappings, ext)
+		requested[n] = &mappings[len(mappings)-1]
 	}
 	// active mappings dedup
 	activeMap := map[string]tmdbMapping{}
@@ -1584,6 +1702,49 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 		contWg.Wait()
 		if firstErr != nil {
 			return nil, firstErr
+		}
+	}
+	// Stale-season healing: the 24h season read-cache can predate episodes
+	// TMDB has since published (airing shows — a season fetched the hour
+	// episode 2 aired carries no episode 3, even after the continuation
+	// extension above maps it). Numbers that mapped but found nothing in
+	// their season payload trigger ONE cache-bypassing refetch of that
+	// season, stored under a short fresh TTL so concurrent and repeat
+	// requests reuse it instead of hammering TMDB. A second miss is
+	// accepted: TMDB genuinely lacks the episode (or it has not aired).
+	staleSeasons := map[string]bool{}
+	for _, n := range nums {
+		m := requested[n]
+		if m == nil || m.Type != "tv" {
+			continue
+		}
+		if _, ok := tmdbMeta[fmt.Sprintf("tv:%d:%d:%d", m.ShowID, m.SeasonNumber, *m.TmdbNumber)]; !ok {
+			staleSeasons[fmt.Sprintf("%d:%d", m.ShowID, m.SeasonNumber)] = true
+		}
+	}
+	for key := range staleSeasons {
+		var showID, seasonNum int
+		if _, err := fmt.Sscanf(key, "%d:%d", &showID, &seasonNum); err != nil {
+			continue
+		}
+		season, err := fetchTmdbSeasonFresh(ctx, client, token, showID, seasonNum)
+		if err != nil || season == nil {
+			continue
+		}
+		eps, _ := season["episodes"].([]any)
+		for _, e := range eps {
+			entry, _ := e.(map[string]any)
+			if entry == nil {
+				continue
+			}
+			var epNum int
+			switch v := entry["episode_number"].(type) {
+			case float64:
+				epNum = int(v)
+			case int:
+				epNum = v
+			}
+			tmdbMeta[fmt.Sprintf("tv:%d:%d:%d", showID, seasonNum, epNum)] = entry
 		}
 	}
 	// build episodes
