@@ -2085,3 +2085,19 @@ func filterByQuality(sources []core.Source, quality string) []core.Source {
 	}
 	return filtered
 }
+
+// MegaVidSourceAvailable reports whether Megaplay (megavid) currently serves
+// any playable source for the episode. One provider, one upstream call
+// (AniList key, MAL key fallback internally) — the notifier's availability
+// probe deliberately skips the full multi-provider fan-out so a scheduled
+// sweep across every bookmarked show costs a couple of requests instead of
+// a dozen resolves each.
+func (m *Manager) MegaVidSourceAvailable(ctx context.Context, animeID, episode int, lang string) bool {
+	for i := range m.providers {
+		if mv, ok := m.providers[i].(*MegaVidProvider); ok {
+			res, err := mv.FindEpisodeSource(ctx, strconv.Itoa(animeID), episode, lang)
+			return err == nil && res != nil && len(res.Sources) > 0
+		}
+	}
+	return false
+}

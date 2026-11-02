@@ -270,14 +270,31 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	<-anizipDone
 	mark("list")
 
-	// Human title for the TMDB title-search fallbacks (unreleased/new shows
+	// Human titles for the TMDB title-search fallbacks (unreleased/new shows
 	// where AniBridge has no tmdb_show descriptor or its verified range lags).
+	// Every AniList title variant is a candidate, english first: TMDB
+	// frequently indexes a show under its romaji name while the english
+	// search misses, and the season markers ("Season 2", "Part 3") appear
+	// in both forms.
 	titleHint := ""
+	titleCandidates := make([]string, 0, 3)
 	if t, ok := media["title"].(map[string]any); ok {
 		for _, k := range []string{"english", "romaji", "userPreferred"} {
 			if s, _ := t[k].(string); strings.TrimSpace(s) != "" {
-				titleHint = strings.TrimSpace(s)
-				break
+				s = strings.TrimSpace(s)
+				if titleHint == "" {
+					titleHint = s
+				}
+				dup := false
+				for _, existing := range titleCandidates {
+					if strings.EqualFold(existing, s) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					titleCandidates = append(titleCandidates, s)
+				}
 			}
 		}
 	}
@@ -317,9 +334,9 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// season. Use its length so the episode list does not stop at the
 	// verified frontier (observed: TMDB served a full 12-episode season while
 	// AniBridge had verified 1-2 and nextAiringEpisode implied 4).
-	if knownTotal == 0 && !isMovie && len(anizipData) == 0 && strings.TrimSpace(h.cfg.TMDB.ReadAccessToken) != "" && strings.TrimSpace(titleHint) != "" {
+	if knownTotal == 0 && !isMovie && len(anizipData) == 0 && strings.TrimSpace(h.cfg.TMDB.ReadAccessToken) != "" && len(titleCandidates) > 0 {
 		countCtx, countCancel := context.WithTimeout(ctx, 15*time.Second)
-		if n := tmdb.DirectSeasonEpisodeCount(countCtx, h.httpClient, h.cfg.TMDB.ReadAccessToken, titleHint, knownTotal); n > episodeCount {
+		if n := tmdb.DirectSeasonEpisodeCount(countCtx, h.httpClient, h.cfg.TMDB.ReadAccessToken, titleCandidates, knownTotal); n > episodeCount {
 			episodeCount = n
 		}
 		countCancel()
@@ -382,13 +399,13 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	// stills while AniBridge's verified range still lags.
 	resolveEpisodes := func(resolveCtx context.Context, numbers []int) map[int]*tmdb.EpisodeMetadata {
 		byNumber := map[int]*tmdb.EpisodeMetadata{}
-		if result, _ := tmdb.ResolveEpisodesWithTitle(resolveCtx, h.httpClient, token, anilistID, numbers, titleHint); result != nil {
+		if result, _ := tmdb.ResolveEpisodesWithTitles(resolveCtx, h.httpClient, token, anilistID, numbers, titleCandidates); result != nil {
 			for _, ep := range result.Episodes {
 				byNumber[ep.Number] = ep
 			}
 		}
-		if !isMovie && len(anizipData) == 0 && strings.TrimSpace(token) != "" && strings.TrimSpace(titleHint) != "" {
-			if direct, _ := tmdb.ResolveEpisodesDirect(resolveCtx, h.httpClient, token, anilistID, titleHint, numbers, knownTotal); direct != nil {
+		if !isMovie && len(anizipData) == 0 && strings.TrimSpace(token) != "" && len(titleCandidates) > 0 {
+			if direct, _ := tmdb.ResolveEpisodesDirect(resolveCtx, h.httpClient, token, anilistID, titleCandidates, numbers, knownTotal); direct != nil {
 				for _, ep := range direct.Episodes {
 					byNumber[ep.Number] = ep
 				}

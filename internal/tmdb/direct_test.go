@@ -19,12 +19,24 @@ func TestPickDirectSeason(t *testing.T) {
 		{"marker wins over count", "Some Anime Season 2", 24, 2},
 	}
 	for _, tc := range cases {
-		if got := pickDirectSeason(seasons, tc.title, tc.knownTotal); got != tc.want {
+		if got := pickDirectSeason(seasons, []string{tc.title}, tc.knownTotal); got != tc.want {
 			t.Errorf("%s: pickDirectSeason(%q, %d) = %d, want %d", tc.name, tc.title, tc.knownTotal, got, tc.want)
 		}
 	}
-	if got := pickDirectSeason([]tmdbSeasonInfo{{4, "Season 4", 10}}, "Some Anime", 0); got != 4 {
+	if got := pickDirectSeason([]tmdbSeasonInfo{{4, "Season 4", 10}}, []string{"Some Anime"}, 0); got != 4 {
 		t.Errorf("single season: got %d, want 4", got)
+	}
+}
+
+// The season marker may ride on any title variant: romaji titles carry
+// "Season 2" markers just as often as english ones.
+func TestPickDirectSeasonMultiTitle(t *testing.T) {
+	seasons := []tmdbSeasonInfo{{1, "Season 1", 12}, {2, "Season 2", 12}}
+	if got := pickDirectSeason(seasons, []string{"No Marker Here", "Romaji Season 2"}, 0); got != 2 {
+		t.Errorf("romaji marker: got %d, want 2", got)
+	}
+	if got := pickDirectSeason(seasons, []string{}, 0); got != 1 {
+		t.Errorf("empty candidates: got %d, want 1", got)
 	}
 }
 

@@ -1346,13 +1346,25 @@ type ResolveResult struct {
 // ResolveEpisodes resolves episode metadata without a title hint (kept for
 // background enrichment paths).
 func ResolveEpisodes(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int) (*ResolveResult, error) {
-	return ResolveEpisodesWithTitle(ctx, client, token, anilistID, episodeNumbers, "")
+	return ResolveEpisodesWithTitles(ctx, client, token, anilistID, episodeNumbers, nil)
 }
 
-// ResolveEpisodesWithTitle resolves episode metadata. The title enables the
-// TMDB title-search fallback when AniBridge has no direct tmdb_show
-// descriptor (newly-verified shows only carry nested ranges).
+// ResolveEpisodesWithTitle resolves episode metadata with a single title
+// hint. The title enables the TMDB title-search fallback when AniBridge has
+// no direct tmdb_show descriptor (newly-verified shows only carry nested
+// ranges).
 func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int, title string) (*ResolveResult, error) {
+	if strings.TrimSpace(title) == "" {
+		return ResolveEpisodesWithTitles(ctx, client, token, anilistID, episodeNumbers, nil)
+	}
+	return ResolveEpisodesWithTitles(ctx, client, token, anilistID, episodeNumbers, []string{title})
+}
+
+// ResolveEpisodesWithTitles resolves episode metadata trying every title in
+// order (AniList english, romaji, userPreferred) for the TMDB title-search
+// fallback: TMDB frequently indexes a show under its romaji name while the
+// english search misses (or vice versa), so one title is not enough.
+func ResolveEpisodesWithTitles(ctx context.Context, client *http.Client, token string, anilistID int, episodeNumbers []int, titles []string) (*ResolveResult, error) {
 	if client == nil {
 		client = &http.Client{Timeout: RequestTimeout}
 	}
@@ -1388,10 +1400,18 @@ func ResolveEpisodesWithTitle(ctx context.Context, client *http.Client, token st
 	// first below; if that yields nothing, chain the nested ranges with a
 	// TMDB title search for the show id, no MAL/Jikan lookup involved.
 	titleFallback := func() {
-		if len(mappings) > 0 || title == "" {
+		if len(mappings) > 0 {
 			return
 		}
-		tmdbID := resolveTmdbIDByTitle(ctx, client, token, "tv", title)
+		tmdbID := 0
+		for _, candidate := range titles {
+			if strings.TrimSpace(candidate) == "" {
+				continue
+			}
+			if tmdbID = resolveTmdbIDByTitle(ctx, client, token, "tv", candidate); tmdbID > 0 {
+				break
+			}
+		}
 		if tmdbID <= 0 {
 			return
 		}

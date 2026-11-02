@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"crypto/tls"
@@ -61,10 +62,11 @@ type Handlers struct {
 	anilistInflight sync.Map // request deduplication
 	providerHealth  sync.Map // provider -> *providerHealth
 
-	// "anime:episode" already announced by this process.
-	// shortcut: entries live for the process lifetime, bounded by the number
-	// of episodes that actually resolve a source.
-	notifiedEpisodes sync.Map
+	// Notification scheduler state (airing book + bounded dedupe); see
+	// notify.go. Initialized lazily via notifier().
+	notifyState *notifierState
+	notifyOnce  sync.Once
+	sweepBusy   atomic.Bool
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {

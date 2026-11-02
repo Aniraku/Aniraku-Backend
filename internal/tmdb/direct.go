@@ -29,22 +29,31 @@ type directSlot struct {
 }
 
 // ResolveEpisodesDirect resolves episode metadata straight from TMDB by
-// human title. It serves titles AniZip has no episode map for yet, where
-// AniBridge's incrementally verified range still lags or is missing
-// entirely. TMDB stores some anime as seasons of a single show, so the
-// season the AniList title refers to is selected first and numbering stays
-// continuous across following seasons (split cours).
+// human title, trying every candidate (AniList english, romaji,
+// userPreferred) until one matches. It serves titles AniZip has no episode
+// map for yet, where AniBridge's incrementally verified range still lags or
+// is missing entirely. TMDB stores some anime as seasons of a single show,
+// so the season the AniList title refers to is selected first and numbering
+// stays continuous across following seasons (split cours).
 //
 // knownTotal is AniList's episode count (0 when unknown); it only breaks a
 // tie between several TMDB seasons of the same length when the title has no
 // season marker.
-func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token string, anilistID int, title string, episodeNumbers []int, knownTotal int) (*ResolveResult, error) {
+func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token string, anilistID int, titles []string, episodeNumbers []int, knownTotal int) (*ResolveResult, error) {
 	if client == nil {
 		client = &http.Client{Timeout: RequestTimeout}
 	}
-	title = strings.TrimSpace(title)
-	if title == "" {
-		return nil, newResolverError("INVALID_TITLE", "A title is required for direct TMDB resolution.", 400)
+	showID := 0
+	for _, title := range titles {
+		if strings.TrimSpace(title) == "" {
+			continue
+		}
+		if showID = resolveTmdbIDByTitle(ctx, client, token, "tv", title); showID > 0 {
+			break
+		}
+	}
+	if showID <= 0 {
+		return nil, newResolverError("TMDB_MEDIA_MAPPING_NOT_FOUND", "No TMDB show matches this title.", 404)
 	}
 	var nums []int
 	{ // dedupe & sort
@@ -66,10 +75,6 @@ func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token strin
 		return nil, newResolverError("TOO_MANY_EPISODES", fmt.Sprintf("Request at most %d episode numbers.", MaxEpisodeNumbers), 400)
 	}
 
-	showID := resolveTmdbIDByTitle(ctx, client, token, "tv", title)
-	if showID <= 0 {
-		return nil, newResolverError("TMDB_MEDIA_MAPPING_NOT_FOUND", "No TMDB show matches this title.", 404)
-	}
 	show, err := getTmdbShow(ctx, client, token, showID)
 	if err != nil {
 		return nil, err
@@ -78,7 +83,7 @@ func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token strin
 	if len(seasons) == 0 {
 		return nil, newResolverError("TMDB_MEDIA_MAPPING_NOT_FOUND", "TMDB show has no regular seasons.", 404)
 	}
-	start := pickDirectSeason(seasons, title, knownTotal)
+	start := pickDirectSeason(seasons, titles, knownTotal)
 	slots, needed := assignDirectSlots(seasons, start, nums)
 
 	neededSeasons := make([]int, 0, len(needed))
@@ -149,18 +154,26 @@ func ResolveEpisodesDirect(ctx context.Context, client *http.Client, token strin
 }
 
 // DirectSeasonEpisodeCount returns the episode count of the TMDB season the
-// title refers to. AniZip-less shows otherwise stop at AniBridge's verified
-// frontier (or the last aired episode) while TMDB already lists the whole
-// current season. Returns 0 when TMDB has no match.
-func DirectSeasonEpisodeCount(ctx context.Context, client *http.Client, token, title string, knownTotal int) int {
-	title = strings.TrimSpace(title)
-	if title == "" || strings.TrimSpace(token) == "" {
+// title refers to, trying every candidate title. AniZip-less shows otherwise
+// stop at AniBridge's verified frontier (or the last aired episode) while
+// TMDB already lists the whole current season. Returns 0 when TMDB has no
+// match.
+func DirectSeasonEpisodeCount(ctx context.Context, client *http.Client, token string, titles []string, knownTotal int) int {
+	if strings.TrimSpace(token) == "" {
 		return 0
 	}
 	if client == nil {
 		client = &http.Client{Timeout: RequestTimeout}
 	}
-	showID := resolveTmdbIDByTitle(ctx, client, token, "tv", title)
+	showID := 0
+	for _, title := range titles {
+		if strings.TrimSpace(title) == "" {
+			continue
+		}
+		if showID = resolveTmdbIDByTitle(ctx, client, token, "tv", title); showID > 0 {
+			break
+		}
+	}
 	if showID <= 0 {
 		return 0
 	}
@@ -172,7 +185,7 @@ func DirectSeasonEpisodeCount(ctx context.Context, client *http.Client, token, t
 	if len(seasons) == 0 {
 		return 0
 	}
-	start := pickDirectSeason(seasons, title, knownTotal)
+	start := pickDirectSeason(seasons, titles, knownTotal)
 	for _, s := range seasons {
 		if s.Number == start {
 			return s.Episodes
@@ -214,9 +227,11 @@ func directSeasons(show map[string]any) []tmdbSeasonInfo {
 }
 
 // pickDirectSeason chooses the TMDB season an AniList entry represents.
-// Explicit season markers win, then a unique episode-count match, then the
-// first regular season (most AniList entries are the show's first season).
-func pickDirectSeason(seasons []tmdbSeasonInfo, title string, knownTotal int) int {
+// Explicit season markers win (checked across every title candidate —
+// romaji and english carry the "Season 2"/"Part 3" markers equally), then a
+// unique episode-count match, then the first regular season (most AniList
+// entries are the show's first season).
+func pickDirectSeason(seasons []tmdbSeasonInfo, titles []string, knownTotal int) int {
 	if len(seasons) == 0 {
 		return 0
 	}
@@ -228,10 +243,12 @@ func pickDirectSeason(seasons []tmdbSeasonInfo, title string, knownTotal int) in
 		}
 		return false
 	}
-	for _, re := range seasonMarkers {
-		if m := re.FindStringSubmatch(title); m != nil {
-			if n, _ := strconv.Atoi(m[1]); n > 0 && has(n) {
-				return n
+	for _, title := range titles {
+		for _, re := range seasonMarkers {
+			if m := re.FindStringSubmatch(title); m != nil {
+				if n, _ := strconv.Atoi(m[1]); n > 0 && has(n) {
+					return n
+				}
 			}
 		}
 	}
