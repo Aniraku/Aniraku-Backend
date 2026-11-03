@@ -561,7 +561,13 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 	// announcing ancient episodes.
 	if entry.lastSeenNext > 0 && next > entry.lastSeenNext && now.Sub(entry.lastSeenAt) <= 48*time.Hour {
 		for ep := entry.lastSeenNext; ep < next; ep++ {
+			before := len(entry.checks)
 			addCheck(ep, entry.lastSeenAt)
+			if len(entry.checks) > before {
+				h.log.Info().Int("animeId", target).Int("episode", ep).
+					Time("airedAt", entry.lastSeenAt).
+					Msg("source notifier: aired episode detected, probe scheduled")
+			}
 		}
 	}
 	entry.lastSeenNext = next
