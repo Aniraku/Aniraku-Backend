@@ -16,79 +16,89 @@ import (
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
 )
 
-// Notification pipeline (2026-11 redesign).
+// Notification pipeline (2026-11 redesign, v2).
 //
 // Two triggers feed the same writer:
 //  1. On-demand: a user resolves sources for an episode (GetServers/Stream)
-//     and notifyEpisode announces it to every bookmarked user.
-//  2. Scheduled: an airing book tracks when each bookmarked RELEASING show's
-//     next episode airs; ~75 minutes after airtime (subs take time to land)
-//     the notifier asks MEGAPLAY ONLY whether a source exists — one provider,
-//     one upstream call — and retries every 5 minutes for up to 3 hours.
-//     Found => announce. Not found by then => stop; the on-demand trigger
-//     remains the backstop for late sources.
+//     and notifyEpisode announces it to every bookmarked user. Freshness is
+//     gated by episodeIsFresh (only the latest episode), exactly as before.
+//  2. Scheduled: an airing book tracks every bookmarked RELEASING show via
+//     AniList's nextAiringEpisode + airingSchedule. Each AIRED episode gets
+//     its own check keyed by episode number: the first Megaplay source probe
+//     happens ~75 minutes after ITS airtime, retrying every 5 minutes. If
+//     Megaplay misses, the check falls back to the full multi-provider
+//     manager resolution — an episode playable in the app is a notification,
+//     no matter which provider carries it. Checks are created for episodes
+//     aired within the last 6 hours (restart catch-up) and given up at
+//     airedAt+6h; pruned after 30h.
 //
-// The old design polled the first 500 bookmarked shows every 5 minutes and
-// gated everything on a single third-party site (reanime.to), so most
-// episodes were simply never announced. The airing book costs one AniList
-// request per bookmarked show per refresh cycle (paced well under AniList's
-// rate limit) and one Megaplay call per airing event.
+// v1 post-mortem: the first design tracked only each show's "next upcoming"
+// episode in one slot. The refresher replaced that slot as soon as AniList
+// noticed the airing (≤30 min), which is always before the +75 min check
+// came due — so the freshly aired episode was structurally never checked
+// and notifications only fired through the play trigger. Keying checks by
+// episode number with their own airtime removes that race entirely.
 
 const (
-	// notifierFirstCheckDelay is how long after airtime the first Megaplay
-	// source call happens. Subs typically land 30-120 minutes after airing;
-	// 75 minutes catches the majority on the first attempt.
+	// notifierFirstCheckDelay is how long after an episode's airtime the
+	// first Megaplay source probe happens. Subs typically land 30-120
+	// minutes after airing; 75 minutes catches the majority up front.
 	notifierFirstCheckDelay = 75 * time.Minute
-	// notifierRetryDelay is the cadence of follow-up source calls while a
-	// freshly aired episode has no Megaplay source yet.
+	// notifierRetryDelay is the cadence of follow-up probes while no
+	// source has been found yet.
 	notifierRetryDelay = 5 * time.Minute
-	// notifierGiveUpAfter bounds the retry window; past it the episode is
+	// notifierGiveUpAfter bounds probing: past airedAt+6h the episode is
 	// marked dead and only the on-demand play trigger can announce it.
-	notifierGiveUpAfter = 3 * time.Hour
-	// scheduleRefreshInterval paces AniList airing lookups: one bookmarked
-	// show per tick keeps a 10k-show book cycling in ~3.3 hours, far under
+	notifierGiveUpAfter = 6 * time.Hour
+	// scheduleAiringWindow limits catch-up: episodes aired longer ago than
+	// this never enter the book (their announcement would be stale news).
+	scheduleAiringWindow = 6 * time.Hour
+	// scheduleStaleAfter is how old a book entry's AniList data may get
+	// before the refresher re-queries it.
+	scheduleStaleAfter = 30 * time.Minute
+	// scheduleRefreshInterval paces AniList lookups: one bookmarked show
+	// per tick keeps a 10k-show book cycling in ~3.3 hours, far under
 	// AniList's rate limit, and airtimes rarely change faster.
 	scheduleRefreshInterval = 1200 * time.Millisecond
-	// scheduleStaleAfter is how old a book entry's airing data may get
-	// before the refresher re-queries AniList for it.
-	scheduleStaleAfter = 30 * time.Minute
 	// notifierSentRetention bounds the in-memory dedupe: sent keys older
 	// than this are pruned (the database notifiedUsers check is the
 	// authoritative dedupe; the map only prevents repeated upstream work).
 	notifierSentRetention = 24 * time.Hour
 )
 
-// airingSlot tracks one upcoming-or-freshly-aired episode of one bookmarked
-// show. Only RELEASING shows with a known nextAiringEpisode get a slot; the
-// on-demand trigger covers everything else.
-type airingSlot struct {
-	episode     int
-	nextAir     time.Time
-	nextAttempt time.Time // earliest next Megaplay source call
+// episodeCheck tracks the notification lifecycle of ONE aired episode.
+type episodeCheck struct {
+	airedAt     time.Time
+	nextAttempt time.Time
 	attempts    int
 	notified    bool
 	dead        bool
 }
 
+// showBook is one bookmarked show: its last AniList refresh, airing status,
+// and the per-episode checks currently in flight.
+type showBook struct {
+	refreshed time.Time
+	status    string
+	checks    map[int]*episodeCheck // keyed by aired episode number
+}
+
 // notifierState is the scheduler's bounded memory: the airing book, the
-// per-show refresh stamps, the bookmark set it must match, and the sent-key
-// dedupe (animeID:episode -> time).
+// bookmark set it must match, and the sent-key dedupe (animeID:episode).
 type notifierState struct {
-	mu        sync.Mutex
-	slots     map[int]*airingSlot
-	refreshed map[int]time.Time
-	seen      map[int]struct{}
-	sent      map[string]time.Time
-	cursor    []int // bookmark IDs awaiting their schedule refresh
+	mu    sync.Mutex
+	book  map[int]*showBook
+	seen  map[int]struct{}
+	sent  map[string]time.Time
+	cycle int // incrementing stamp for refresher fairness
 }
 
 func (h *Handlers) notifier() *notifierState {
 	h.notifyOnce.Do(func() {
 		h.notifyState = &notifierState{
-			slots:     map[int]*airingSlot{},
-			refreshed: map[int]time.Time{},
-			seen:      map[int]struct{}{},
-			sent:      map[string]time.Time{},
+			book: map[int]*showBook{},
+			seen: map[int]struct{}{},
+			sent: map[string]time.Time{},
 		}
 	})
 	return h.notifyState
@@ -114,7 +124,7 @@ func (h *Handlers) notifyEpisode(animeID, episode int) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := h.sendEpisodeNotifications(ctx, animeID, episode); err != nil {
+		if err := h.sendEpisodeNotifications(ctx, animeID, episode, false); err != nil {
 			// Allow a later resolve to retry; the recipient pre-check keeps
 			// retries idempotent.
 			st.mu.Lock()
@@ -140,17 +150,26 @@ func (st *notifierState) pruneSentLocked() {
 	}
 }
 
-func (h *Handlers) sendEpisodeNotifications(ctx context.Context, animeID, episode int) error {
+func (h *Handlers) sendEpisodeNotifications(ctx context.Context, animeID, episode int, scheduled bool) error {
 	media, err := h.anilistAiringMedia(ctx, animeID)
 	if err != nil {
 		return err
 	}
-	next := 0
-	if media.NextAiringEpisode != nil {
-		next = media.NextAiringEpisode.Episode
-	}
-	if !episodeIsFresh(media.Status, media.Episodes, next, episode) {
-		return nil
+	if scheduled {
+		// The scheduler already gated freshness by the episode's own airtime
+		// (its check would not exist otherwise); only require the show to
+		// still be airing so a finished or renamed entry never announces.
+		if media.Status != "RELEASING" {
+			return nil
+		}
+	} else {
+		next := 0
+		if media.NextAiringEpisode != nil {
+			next = media.NextAiringEpisode.Episode
+		}
+		if !episodeIsFresh(media.Status, media.Episodes, next, episode) {
+			return nil
+		}
 	}
 
 	userIDs, bookmarkedTitle, err := h.bookmarkUsers(ctx, animeID)
@@ -215,7 +234,7 @@ func (h *Handlers) sendEpisodeNotifications(ctx context.Context, animeID, episod
 		resp.Body.Close()
 	}
 	h.log.Info().Int("animeId", animeID).Int("episode", episode).Int("recipients", len(rows)).
-		Str("title", title).Msg("episode notifications sent")
+		Str("title", title).Bool("scheduled", scheduled).Msg("episode notifications sent")
 	return nil
 }
 
@@ -231,10 +250,19 @@ type airingMedia struct {
 		Romaji        string `json:"romaji"`
 		UserPreferred string `json:"userPreferred"`
 	} `json:"title"`
+	AiringSchedule struct {
+		Nodes []struct {
+			Episode  int `json:"episode"`
+			AiringAt int `json:"airingAt"`
+		} `json:"nodes"`
+	} `json:"airingSchedule"`
 }
 
 func (h *Handlers) anilistAiringMedia(ctx context.Context, animeID int) (airingMedia, error) {
-	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } } }`
+	// airingSchedule (TIME_DESC) is what makes catch-up and the
+	// slot-advance fix possible: it names each aired episode with its EXACT
+	// airtime, so a check can never be swallowed by the next airing.
+	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } airingSchedule(page: 1, perPage: 3, sort: TIME_DESC) { nodes { episode airingAt } } } }`
 	raw, err := h.anilistClient.do(ctx, query, map[string]any{"id": animeID})
 	if err != nil {
 		return airingMedia{}, err
@@ -250,10 +278,12 @@ func (h *Handlers) anilistAiringMedia(ctx context.Context, animeID int) (airingM
 	return payload.Data.Media, nil
 }
 
-// episodeIsFresh reports whether an episode is recent enough to announce.
-// Only airing shows produce new episodes: the latest aired one is
-// nextAiringEpisode-1, and nextAiringEpisode itself lets an early source for
-// the upcoming episode through without announcing older backlog.
+// episodeIsFresh reports whether an episode is recent enough to announce
+// through the ON-DEMAND trigger. Only airing shows produce new episodes:
+// the latest aired one is nextAiringEpisode-1, and nextAiringEpisode itself
+// lets an early source for the upcoming episode through without announcing
+// older backlog. Scheduled checks gate by their own airtime instead (the
+// check would not exist otherwise).
 func episodeIsFresh(status string, episodes, nextAiringEpisode, episode int) bool {
 	if status != "RELEASING" || episode <= 0 {
 		return false
@@ -372,11 +402,12 @@ func hasSources(servers []core.Server) bool {
 }
 
 // runSourceNotifier is the background scheduler. It keeps an airing book of
-// every bookmarked RELEASING show and, ~75 minutes after each episode's
-// airtime, asks Megaplay (only) whether a source exists — retrying every
-// 5 minutes for up to 3 hours — then announces to all bookmarked users.
-// This complements the on-demand trigger in GetServers/Stream so
-// notifications are not limited to users who actually press play.
+// every bookmarked RELEASING show, gives each AIRED episode its own check,
+// and ~75 minutes after that episode's airtime probes Megaplay (one call)
+// for a source — falling back to the full multi-provider resolution when
+// Megaplay misses — retrying every 5 minutes for up to 6 hours. This
+// complements the on-demand trigger in GetServers/Stream so notifications
+// are not limited to users who actually press play.
 func (h *Handlers) runSourceNotifier(ctx context.Context) {
 	if h.cfg.Supabase.URL == "" || h.cfg.Supabase.ServiceKey == "" {
 		h.log.Warn().Msg("source notifier disabled: supabase service key missing")
@@ -404,14 +435,14 @@ func (h *Handlers) runSourceNotifier(ctx context.Context) {
 		case <-refreshTicker.C:
 			h.refreshOneAiring(ctx, st)
 		case <-sweepTicker.C:
-			h.sweepDueSlots(ctx, st)
+			h.sweepDueChecks(ctx, st)
 		}
 	}
 }
 
 // refreshBookmarks pulls every bookmarked anime ID (no cap) and reconciles
-// the airing book: new bookmarks join the refresh queue, removed ones are
-// pruned. One paged Supabase scan; cheap and local.
+// the airing book: new bookmarks join as immediately-stale entries (first
+// refresh on the next tick), removed ones are pruned.
 func (h *Handlers) refreshBookmarks(ctx context.Context, st *notifierState) {
 	ctx, cancel := context.WithTimeout(ctx, 4*time.Minute)
 	defer cancel()
@@ -428,25 +459,14 @@ func (h *Handlers) refreshBookmarks(ctx context.Context, st *notifierState) {
 			continue
 		}
 		seen[id] = struct{}{}
-		if _, known := st.refreshed[id]; !known {
-			delete(st.refreshed, id) // no-op, keeps the map tidy
-		}
-		if _, has := st.slots[id]; !has {
-			if _, wasQueued := st.refreshed[id]; !wasQueued {
-				st.refreshed[id] = time.Time{} // queued, never refreshed
-			}
+		if _, known := st.book[id]; !known {
+			st.book[id] = &showBook{checks: map[int]*episodeCheck{}}
 		}
 	}
 	st.seen = seen
-	for id := range st.slots {
+	for id := range st.book {
 		if _, keep := seen[id]; !keep {
-			delete(st.slots, id)
-			delete(st.refreshed, id)
-		}
-	}
-	for id := range st.refreshed {
-		if _, keep := seen[id]; !keep {
-			delete(st.refreshed, id)
+			delete(st.book, id)
 		}
 	}
 }
@@ -458,16 +478,15 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 	st.mu.Lock()
 	var target int
 	targetAt := time.Now().Add(scheduleStaleAfter)
-	for id, at := range st.refreshed {
-		if at.Before(targetAt) {
-			target, targetAt = id, at
+	for id, entry := range st.book {
+		if entry.refreshed.Before(targetAt) {
+			target, targetAt = id, entry.refreshed
 		}
 	}
 	if target == 0 {
 		st.mu.Unlock()
 		return
 	}
-	st.refreshed[target] = time.Now()
 	st.mu.Unlock()
 
 	rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -476,107 +495,176 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 	if err != nil {
 		// Requeue: clear the stamp so the next tick retries this show.
 		st.mu.Lock()
-		st.refreshed[target] = time.Time{}
+		if entry, ok := st.book[target]; ok {
+			entry.refreshed = time.Time{}
+		}
 		st.mu.Unlock()
 		return
 	}
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	if media.Status != "RELEASING" || media.NextAiringEpisode == nil {
-		// Finished, upcoming or unknown schedule: no slot, the on-demand
-		// trigger covers it.
-		delete(st.slots, target)
-		return
+	entry, ok := st.book[target]
+	if !ok {
+		return // bookmark vanished mid-refresh
 	}
-	ep := media.NextAiringEpisode.Episode
-	air := time.Unix(int64(media.NextAiringEpisode.AiringAt), 0)
-	if ep <= 0 {
-		delete(st.slots, target)
-		return
-	}
-	slot, ok := st.slots[target]
-	if !ok || slot.episode != ep {
-		st.slots[target] = &airingSlot{
-			episode:     ep,
-			nextAir:     air,
-			nextAttempt: air.Add(notifierFirstCheckDelay),
+	entry.refreshed = time.Now()
+	entry.status = media.Status
+	now := time.Now()
+
+	addCheck := func(ep, airingAt int) {
+		if ep <= 0 {
+			return
 		}
-		return
+		at := time.Unix(int64(airingAt), 0)
+		if at.Add(scheduleAiringWindow).Before(now) {
+			return // too old to announce
+		}
+		if existing, ok := entry.checks[ep]; ok {
+			// Keep the existing lifecycle; only correct the airtime if
+			// AniList moved it.
+			if !existing.airedAt.Equal(at) && at.After(now.Add(-scheduleAiringWindow)) {
+				existing.airedAt = at
+			}
+			return
+		}
+		first := at.Add(notifierFirstCheckDelay)
+		if first.Before(now) {
+			first = now // catch-up: probe on the next sweep
+		}
+		entry.checks[ep] = &episodeCheck{airedAt: at, nextAttempt: first}
 	}
-	slot.nextAir = air
+
+	// The episode that airs next: schedule its future check now so the
+	// airtime comes from AniList, not from observing the transition.
+	if media.Status == "RELEASING" && media.NextAiringEpisode != nil && media.NextAiringEpisode.AiringAt > 0 {
+		addCheck(media.NextAiringEpisode.Episode, media.NextAiringEpisode.AiringAt)
+	}
+	// Already-aired episodes (exact airtimes): these are the checks the v1
+	// design lost to the slot advance.
+	for _, node := range media.AiringSchedule.Nodes {
+		if media.Status == "RELEASING" {
+			addCheck(node.Episode, node.AiringAt)
+		}
+	}
+	// Prune checks past their announcement window.
+	for ep, c := range entry.checks {
+		if c.airedAt.Add(scheduleAiringWindow + notifierGiveUpAfter).Before(now) {
+			delete(entry.checks, ep)
+		}
+	}
 }
 
-// sweepDueSlots checks every slot whose airtime is at least
-// notifierFirstCheckDelay old and whose retry cadence has come due: one
-// Megaplay call each. Source found -> announce; not found -> 5-minute
-// retry; window expired -> dead. Past-due slots are handled sequentially
-// here (bounded concurrency, ~40s worst case per probe), and the sweep
-// never overlaps itself.
-func (h *Handlers) sweepDueSlots(ctx context.Context, st *notifierState) {
+// sweepDueChecks probes every check whose retry cadence has come due:
+// Megaplay first (one call), and when Megaplay misses the full
+// multi-provider resolution — the same availability signal a user's play
+// produces. Source found -> announce; not found -> 5-minute retry;
+// airedAt+6h -> give up. Probes run sequentially and the sweep never
+// overlaps itself.
+func (h *Handlers) sweepDueChecks(ctx context.Context, st *notifierState) {
 	if !h.sweepBusy.CompareAndSwap(false, true) {
 		return
 	}
 	defer h.sweepBusy.Store(false)
 
-	type due struct {
+	type dueCheck struct {
 		id      int
 		episode int
 	}
 	st.mu.Lock()
 	now := time.Now()
-	var dueSlots []due
-	for id, slot := range st.slots {
-		if slot.dead || slot.notified || now.Before(slot.nextAttempt) {
+	var due []dueCheck
+	for id, entry := range st.book {
+		if entry.status != "RELEASING" {
 			continue
 		}
-		dueSlots = append(dueSlots, due{id: id, episode: slot.episode})
+		for ep, c := range entry.checks {
+			if c.dead || c.notified || now.Before(c.nextAttempt) {
+				continue
+			}
+			due = append(due, dueCheck{id: id, episode: ep})
+		}
 	}
-	for _, d := range dueSlots {
-		if slot, ok := st.slots[d.id]; ok {
-			slot.nextAttempt = now.Add(notifierRetryDelay)
-			slot.attempts++
+	for _, d := range due {
+		if c, ok := st.book[d.id].checks[d.episode]; ok {
+			c.nextAttempt = now.Add(notifierRetryDelay)
+			c.attempts++
 		}
 	}
 	st.mu.Unlock()
+	if len(due) == 0 {
+		return
+	}
 
-	for _, d := range dueSlots {
+	attempted, found, gaveUp := 0, 0, 0
+	for _, d := range due {
 		if ctx.Err() != nil {
 			return
 		}
 		st.mu.Lock()
-		slot, ok := st.slots[d.id]
-		if !ok || slot.episode != d.episode {
+		entry, ok := st.book[d.id]
+		if !ok {
 			st.mu.Unlock()
 			continue
 		}
-		if slot.attempts > int(notifierGiveUpAfter/notifierRetryDelay) {
-			slot.dead = true
+		c, ok := entry.checks[d.episode]
+		if !ok || c.dead || c.notified {
 			st.mu.Unlock()
-			h.log.Info().Int("animeId", d.id).Int("episode", d.episode).
-				Msg("source notifier: gave up on episode window")
+			continue
+		}
+		if c.airedAt.Add(notifierGiveUpAfter).Before(time.Now()) {
+			c.dead = true
+			gaveUp++
+			st.mu.Unlock()
 			continue
 		}
 		st.mu.Unlock()
 
+		// Probe 1: Megaplay only — one upstream call.
 		pctx, cancel := context.WithTimeout(ctx, 40*time.Second)
-		found := h.stream.MegaVidSourceAvailable(pctx, d.id, d.episode, "sub")
+		hasSource := h.stream.MegaVidSourceAvailable(pctx, d.id, d.episode, "sub")
 		cancel()
+		// Probe 2: the real multi-provider resolution — the same signal a
+		// user's play produces. Megaplay misses plenty of episodes other
+		// providers carry, and "available in the app" is what the
+		// notification means.
+		if !hasSource {
+			fctx, fcancel := context.WithTimeout(ctx, 45*time.Second)
+			servers := h.stream.FindAllServers(fctx, d.id, d.episode, "sub", nil)
+			hasSource = hasSources(servers)
+			fcancel()
+		}
+		attempted++
 
 		st.mu.Lock()
-		slot, ok = st.slots[d.id]
-		if !ok || slot.episode != d.episode {
+		entry, ok = st.book[d.id]
+		if !ok {
 			st.mu.Unlock()
 			continue
 		}
-		if found {
-			slot.notified = true
+		c, ok = entry.checks[d.episode]
+		if !ok {
 			st.mu.Unlock()
-			h.notifyEpisode(d.id, d.episode)
+			continue
+		}
+		if hasSource {
+			c.notified = true
+			st.mu.Unlock()
+			found++
+			go func() {
+				sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer scancel()
+				if err := h.sendEpisodeNotifications(sctx, d.id, d.episode, true); err != nil {
+					h.log.Warn().Err(err).Int("animeId", d.id).Int("episode", d.episode).
+						Msg("scheduled episode notification failed")
+				}
+			}()
 			continue
 		}
 		st.mu.Unlock()
 	}
+	h.log.Info().Int("attempted", attempted).Int("found", found).Int("gaveUp", gaveUp).
+		Msg("source notifier: sweep complete")
 }
 
 // bookmarkedAnimeIDs pages through every bookmarked anime ID.
