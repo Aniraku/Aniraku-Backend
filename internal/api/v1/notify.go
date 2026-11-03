@@ -42,8 +42,9 @@ import (
 const (
 	// notifierFirstCheckDelay is how long after an episode's airtime the
 	// first Megaplay source probe happens. Subs typically land 30-120
-	// minutes after airing; 75 minutes catches the majority up front.
-	notifierFirstCheckDelay = 75 * time.Minute
+	// minutes after airing; 60 minutes catches most episodes on the first
+	// attempt and the 5-minute retries sweep up the rest.
+	notifierFirstCheckDelay = 60 * time.Minute
 	// notifierRetryDelay is the cadence of follow-up probes while no
 	// source has been found yet.
 	notifierRetryDelay = 5 * time.Minute
