@@ -23,7 +23,7 @@ import (
 //     and notifyEpisode announces it to every bookmarked user. Freshness is
 //     gated by episodeIsFresh (only the latest episode), exactly as before.
 //  2. Scheduled: an airing book tracks every bookmarked RELEASING show via
-//     AniList's nextAiringEpisode + airingSchedule. Each AIRED episode gets
+//     AniList's nextAiringEpisode. Each AIRED episode gets
 //     its own check keyed by episode number: the first Megaplay source probe
 //     happens ~75 minutes after ITS airtime, retrying every 5 minutes. If
 //     Megaplay misses, the check falls back to the full multi-provider
@@ -76,11 +76,15 @@ type episodeCheck struct {
 }
 
 // showBook is one bookmarked show: its last AniList refresh, airing status,
-// and the per-episode checks currently in flight.
+// the nextAiringEpisode transition state (lastSeenNext is the episode we
+// last observed as "next" — when it advances, that episode has aired within
+// the observation window), and the per-episode checks in flight.
 type showBook struct {
-	refreshed time.Time
-	status    string
-	checks    map[int]*episodeCheck // keyed by aired episode number
+	refreshed    time.Time
+	status       string
+	lastSeenNext int
+	lastSeenAt   time.Time
+	checks       map[int]*episodeCheck // keyed by episode number
 }
 
 // notifierState is the scheduler's bounded memory: the airing book, the
@@ -250,23 +254,16 @@ type airingMedia struct {
 		Romaji        string `json:"romaji"`
 		UserPreferred string `json:"userPreferred"`
 	} `json:"title"`
-	AiringSchedule struct {
-		Edges []struct {
-			Node struct {
-				Episode  int `json:"episode"`
-				AiringAt int `json:"airingAt"`
-			} `json:"node"`
-		} `json:"edges"`
-	} `json:"airingSchedule"`
 }
 
 func (h *Handlers) anilistAiringMedia(ctx context.Context, animeID int) (airingMedia, error) {
-	// airingSchedule (TIME_DESC) is what makes catch-up and the
-	// slot-advance fix possible: it names each aired episode with its EXACT
-	// airtime, so a check can never be swallowed by the next airing.
-	// Parsed via edges{node} — the self-hosted mirror (graphql.aniraku.tech)
-	// only shapes connections as edges, and official AniList supports both.
-	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } airingSchedule(page: 1, perPage: 3, sort: TIME_DESC) { edges { node { episode airingAt } } } } }`
+	// nextAiringEpisode drives everything: its episode + airingAt schedule
+	// the future check, and its ADVANCEMENT between refreshes is the proof
+	// that the previously-observed episode aired (transition detection).
+	// airingSchedule was tried and dropped: the self-hosted mirror ignores
+	// the sort argument and always pages ascending from episode 1, so the
+	// most recent airing is unreachable through it.
+	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } } }`
 	raw, err := h.anilistClient.do(ctx, query, map[string]any{"id": animeID})
 	if err != nil {
 		return airingMedia{}, err
@@ -516,11 +513,10 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 	entry.status = media.Status
 	now := time.Now()
 
-	addCheck := func(ep, airingAt int) {
+	addCheck := func(ep int, at time.Time) {
 		if ep <= 0 {
 			return
 		}
-		at := time.Unix(int64(airingAt), 0)
 		if at.Add(scheduleAiringWindow).Before(now) {
 			return // too old to announce
 		}
@@ -539,18 +535,38 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 		entry.checks[ep] = &episodeCheck{airedAt: at, nextAttempt: first}
 	}
 
-	// The episode that airs next: schedule its future check now so the
-	// airtime comes from AniList, not from observing the transition.
-	if media.Status == "RELEASING" && media.NextAiringEpisode != nil && media.NextAiringEpisode.AiringAt > 0 {
-		addCheck(media.NextAiringEpisode.Episode, media.NextAiringEpisode.AiringAt)
+	// RELEASING only: every branch below exists to announce episodes.
+	if media.Status != "RELEASING" || media.NextAiringEpisode == nil {
+		return
 	}
-	// Already-aired episodes (exact airtimes): these are the checks the v1
-	// design lost to the slot advance.
-	for _, edge := range media.AiringSchedule.Edges {
-		if media.Status == "RELEASING" {
-			addCheck(edge.Node.Episode, edge.Node.AiringAt)
+	next := media.NextAiringEpisode.Episode
+	air := time.Unix(int64(media.NextAiringEpisode.AiringAt), 0)
+	if next <= 0 {
+		return
+	}
+
+	// The upcoming episode: schedule its check at ITS airtime + 75 minutes,
+	// straight from AniList (no observation lag).
+	if air.After(now) {
+		addCheck(next, air)
+	} else {
+		addCheck(next, now)
+	}
+
+	// Transition detection: we last observed episode `lastSeenNext` as the
+	// upcoming one at `lastSeenAt`; AniList now names a LATER episode, so
+	// the observed one (and anything between) aired inside that window.
+	// This is the check the v1 slot-advance bug lost. AiredAt is bounded by
+	// the observation window, so late restarts (>48h) skip instead of
+	// announcing ancient episodes.
+	if entry.lastSeenNext > 0 && next > entry.lastSeenNext && now.Sub(entry.lastSeenAt) <= 48*time.Hour {
+		for ep := entry.lastSeenNext; ep < next; ep++ {
+			addCheck(ep, entry.lastSeenAt)
 		}
 	}
+	entry.lastSeenNext = next
+	entry.lastSeenAt = now
+
 	// Prune checks past their announcement window.
 	for ep, c := range entry.checks {
 		if c.airedAt.Add(scheduleAiringWindow + notifierGiveUpAfter).Before(now) {
