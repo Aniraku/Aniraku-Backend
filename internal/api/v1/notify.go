@@ -251,10 +251,12 @@ type airingMedia struct {
 		UserPreferred string `json:"userPreferred"`
 	} `json:"title"`
 	AiringSchedule struct {
-		Nodes []struct {
-			Episode  int `json:"episode"`
-			AiringAt int `json:"airingAt"`
-		} `json:"nodes"`
+		Edges []struct {
+			Node struct {
+				Episode  int `json:"episode"`
+				AiringAt int `json:"airingAt"`
+			} `json:"node"`
+		} `json:"edges"`
 	} `json:"airingSchedule"`
 }
 
@@ -262,7 +264,9 @@ func (h *Handlers) anilistAiringMedia(ctx context.Context, animeID int) (airingM
 	// airingSchedule (TIME_DESC) is what makes catch-up and the
 	// slot-advance fix possible: it names each aired episode with its EXACT
 	// airtime, so a check can never be swallowed by the next airing.
-	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } airingSchedule(page: 1, perPage: 3, sort: TIME_DESC) { nodes { episode airingAt } } } }`
+	// Parsed via edges{node} — the self-hosted mirror (graphql.aniraku.tech)
+	// only shapes connections as edges, and official AniList supports both.
+	query := `query ($id: Int) { Media(id: $id, type: ANIME) { status episodes nextAiringEpisode { episode airingAt } title { english romaji userPreferred } airingSchedule(page: 1, perPage: 3, sort: TIME_DESC) { edges { node { episode airingAt } } } } }`
 	raw, err := h.anilistClient.do(ctx, query, map[string]any{"id": animeID})
 	if err != nil {
 		return airingMedia{}, err
@@ -542,9 +546,9 @@ func (h *Handlers) refreshOneAiring(ctx context.Context, st *notifierState) {
 	}
 	// Already-aired episodes (exact airtimes): these are the checks the v1
 	// design lost to the slot advance.
-	for _, node := range media.AiringSchedule.Nodes {
+	for _, edge := range media.AiringSchedule.Edges {
 		if media.Status == "RELEASING" {
-			addCheck(node.Episode, node.AiringAt)
+			addCheck(edge.Node.Episode, edge.Node.AiringAt)
 		}
 	}
 	// Prune checks past their announcement window.
