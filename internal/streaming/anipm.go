@@ -74,11 +74,11 @@ type anipmSeriesEntry struct {
 	bootSource string // playback-bootstrap path segment: the series' source
 	bootID     int    // bootstrap series id (settlar id, else the series id)
 	settlarID  int
-	malID     int
-	anilistID string
-	current   bool
-	episodes  []anipmEpisode
-	fetched   time.Time
+	malID      int
+	anilistID  string
+	current    bool
+	episodes   []anipmEpisode
+	fetched    time.Time
 }
 
 type anipmEpisode struct {
