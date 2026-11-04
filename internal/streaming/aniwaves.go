@@ -84,6 +84,7 @@ func aniwavesCuteName(upstream string, index int) string {
 type AniWavesProvider struct {
 	log        zerolog.Logger
 	client     *http.Client
+	outage     outageBreaker
 	base       string
 	anilistURL string
 	learnHost  func(host string)
@@ -119,6 +120,7 @@ func NewAniWavesProvider(log zerolog.Logger, base, anilistURL string) *AniWavesP
 		anilistURL = core.AnilistGraphQLEndpoint()
 	}
 	return &AniWavesProvider{
+		outage:     newOutageBreaker("aniwaves", log, 6*time.Second),
 		log:        log,
 		client:     &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport()},
 		base:       strings.TrimRight(base, "/"),
@@ -1200,6 +1202,9 @@ func (p *AniWavesProvider) storeShow(id int, s *aniwavesShow) {
 // FindEpisodeSource resolves one episode for exactly the requested lang
 // (strict per-lang: no dub server when the listing carries no dub).
 func (p *AniWavesProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+	if p.outage.paused() {
+		return nil, nil
+	}
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
 		return nil, fmt.Errorf("aniwaves: bad anilist id %q", anilistID)

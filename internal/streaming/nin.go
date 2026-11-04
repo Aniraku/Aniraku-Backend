@@ -51,6 +51,7 @@ const ninServerName = "NiN"
 // provider switch): Supaplay's API answers 502 for them.
 type NiNProvider struct {
 	client   *http.Client
+	outage   outageBreaker
 	log      zerolog.Logger
 	supaBase string
 	// learnHost vouches verified hosts for the media-proxy CDN allowlist
@@ -65,6 +66,7 @@ func NewNiNProvider(log zerolog.Logger) *NiNProvider {
 		base = "https://supaplay.fun"
 	}
 	return &NiNProvider{
+		outage: newOutageBreaker("nin", log, 6*time.Second),
 		client: &http.Client{
 			Timeout:   45 * time.Second,
 			Transport: netguard.NewTransport(),
@@ -158,6 +160,9 @@ type ninCacheResponse struct {
 // runs on every request. Returns nil (no error) when the episode simply
 // does not exist on either path.
 func (p *NiNProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
+	if p.outage.paused() {
+		return nil, nil
+	}
 	if lang != "dub" {
 		lang = "sub"
 	}

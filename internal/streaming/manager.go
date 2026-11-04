@@ -936,7 +936,9 @@ func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episo
 		if !ok {
 			continue
 		}
+		started := time.Now()
 		sr, err := nn.FindEpisodeSource(ctx, anilistID, episode, lang)
+		nn.outage.noteResolve(time.Since(started))
 		if err != nil {
 			m.log.Warn().Err(err).Str("provider", "nin").Str("anilistId", anilistID).
 				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
@@ -1507,7 +1509,9 @@ func (m *Manager) collectAniWavesServers(ctx context.Context, anilistID string, 
 		if !ok {
 			continue
 		}
+		started := time.Now()
 		sr, err := aw.FindEpisodeSource(ctx, anilistID, episode, lang)
+		aw.outage.noteResolve(time.Since(started))
 		if err != nil {
 			m.log.Warn().Err(err).Str("provider", "aniwaves").Str("anilistId", anilistID).
 				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
