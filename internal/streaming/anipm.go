@@ -81,6 +81,9 @@ type anipmEpisode struct {
 	sourceNumber string
 	hasSub       bool
 	hasDub       bool
+	beta         bool // episode lives only on the beta embed
+	betaSub      bool // the sub track comes from the beta embed
+	betaDub      bool // the dub track comes from the beta embed
 }
 
 // anipmTransport was replaced by newChromeTLSClient (2026-11-04): ani.pm's
@@ -189,6 +192,9 @@ type anipmSeriesJSON struct {
 		SourceNumber any  `json:"sourceNumber"`
 		HasSub       bool `json:"sub"`
 		HasDub       bool `json:"dub"`
+		Beta         bool `json:"beta"`
+		BetaSub      bool `json:"betaSub"`
+		BetaDub      bool `json:"betaDub"`
 	} `json:"episodes"`
 }
 
@@ -228,6 +234,9 @@ func (p *AniPMProvider) resolveSeries(ctx context.Context, id int) (*anipmSeries
 				sourceNumber: anipmSourceNumber(e.SourceNumber, e.Number),
 				hasSub:       e.HasSub,
 				hasDub:       e.HasDub,
+				beta:         e.Beta,
+				betaSub:      e.BetaSub,
+				betaDub:      e.BetaDub,
 			})
 		}
 		if len(entry.episodes) > 0 {
@@ -278,6 +287,9 @@ type anipmCurrentSeries struct {
 		SourceNumber any  `json:"sourceNumber"`
 		HasSub       bool `json:"sub"`
 		HasDub       bool `json:"dub"`
+		Beta         bool `json:"beta"`
+		BetaSub      bool `json:"betaSub"`
+		BetaDub      bool `json:"betaDub"`
 	} `json:"episodes"`
 }
 
@@ -327,6 +339,7 @@ func (p *AniPMProvider) resolveCurrentSeries(ctx context.Context, id int) (*anip
 		entry.episodes = append(entry.episodes, anipmEpisode{
 			number: episode.Number, sourceNumber: anipmSourceNumber(episode.SourceNumber, episode.Number),
 			hasSub: episode.HasSub, hasDub: episode.HasDub,
+			beta: episode.Beta, betaSub: episode.BetaSub, betaDub: episode.BetaDub,
 		})
 	}
 	if len(entry.episodes) == 0 {
@@ -347,6 +360,9 @@ type anipmBootstrap struct {
 	// either its own settlar selection (same session chain as core) or a
 	// direct source/embed URL.
 	BackupEmbed anipmBackupEmbed `json:"backupEmbed"`
+	// BetaEmbed appears on the lean (core=0) bootstrap for episodes the
+	// site flags beta/betaSub/betaDub — the beta server's own offer.
+	BetaEmbed anipmBackupEmbed `json:"betaEmbed"`
 }
 
 // anipmBackupEmbed is one backup server offer from the bootstrap.
@@ -402,14 +418,24 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	if ep == nil {
 		return nil, fmt.Errorf("anipm: episode %d not listed", episode)
 	}
-	if langKey == "sub" && !ep.hasSub || langKey == "dub" && !ep.hasDub {
+	betaServes := ep.beta || (langKey == "sub" && ep.betaSub) || (langKey == "dub" && ep.betaDub)
+	coreHasLang := (langKey == "sub" && ep.hasSub) || (langKey == "dub" && ep.hasDub)
+	if !coreHasLang && !betaServes {
 		p.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).Msg("anipm: episode flag missing lang")
 		return nil, nil
 	}
+	// Beta-flagged-for-this-lang episodes skip the core bootstrap: the site
+	// nulls their core version (episode.betaSub/betaDub/beta) and serves
+	// them through the lean (core=0) bootstrap + beta embed, named Nama.
+	useBeta := betaServes && !coreHasLang
 	referer := fmt.Sprintf("%s/anime/", p.base)
 	var boot anipmBootstrap
-	bootURL := fmt.Sprintf("%s/api/anime/playback-bootstrap/settlar/%d?ep=%s&lang=%s&backup=1",
-		p.base, series.settlarID, url.QueryEscape(ep.sourceNumber), langKey)
+	bootExtra := "&backup=1"
+	if useBeta {
+		bootExtra = "&core=0"
+	}
+	bootURL := fmt.Sprintf("%s/api/anime/playback-bootstrap/settlar/%d?ep=%s&lang=%s%s",
+		p.base, series.settlarID, url.QueryEscape(ep.sourceNumber), langKey, bootExtra)
 	if err := p.getJSON(ctx, bootURL, referer, &boot); err != nil {
 		if isUpstreamGated(err) {
 			p.log.Debug().Err(err).Str("anilistId", anilistID).Int("episode", episode).Msg("anipm: bootstrap gated")
@@ -512,7 +538,11 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		Subtitles:    subs,
 		Verification: "proxy",
 	}}
-	names := []string{anipmServerName}
+	serverName := anipmServerName
+	if useBeta {
+		serverName = anipmBetaName
+	}
+	names := []string{serverName}
 
 	// Daifuku (the site's backup server): resolve the backup embed through
 	// the same session chain when the bootstrap offers one. Best-effort —
@@ -529,7 +559,7 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		// Chrome/124 that Cloudflare 403s on settlar hosts.
 		Headers:     map[string]string{"Referer": referer, "User-Agent": anipmUserAgent},
 		ServerNames: names,
-		ServerName:  names[len(names)-1],
+		ServerName:  serverName,
 		Intro:       intro,
 		Outro:       outro,
 	}
