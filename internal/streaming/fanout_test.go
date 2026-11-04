@@ -59,12 +59,12 @@ func TestFindAllServersCompletes(t *testing.T) {
 	}
 	found := false
 	for _, s := range servers {
-		if s.Name == "Sunny" && s.Provider == "animegg" {
+		if s.Name == "Taiyaki" && s.Provider == "animegg" {
 			found = true
 		}
 	}
 	if !found {
-		t.Fatalf("Sunny missing from servers: %+v", servers)
+		t.Fatalf("Taiyaki missing from servers: %+v", servers)
 	}
 }
 

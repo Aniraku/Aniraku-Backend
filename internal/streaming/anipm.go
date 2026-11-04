@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -16,7 +15,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
-	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // AniPMProvider resolves direct HLS streams through ani.pm (AniList-keyed
@@ -46,7 +44,10 @@ const (
 	anipmDefaultBase = "https://ani.pm"
 	anipmEmbedBase   = "https://embed.settlar.io"
 	anipmReferer     = "https://ani.pm/"
-	anipmServerName  = "Yui"
+	// Server names (sweets theme): Mochi = the soft-sub settlar embed,
+	// Daifuku = the backup embed (a filled mochi — the backup of Mochi).
+	anipmServerName = "Mochi"
+	anipmBackupName = "Daifuku"
 	// Chrome 131: embed.settlar.io's Cloudflare 403s the older shared
 	// browserUA (Chrome 124); a current UA passes.
 	anipmUserAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -82,34 +83,9 @@ type anipmEpisode struct {
 	hasDub       bool
 }
 
-// anipmTransport builds the provider HTTP transport: same guardrails as
-// netguard.NewTransport but dialing tcp4 only (VPS IPv6 egress is
-// Cloudflare-blocked).
-func anipmTransport() *http.Transport {
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "udp", "8.8.8.8:53")
-		},
-	}
-	dialer := &net.Dialer{
-		Timeout:  10 * time.Second,
-		Resolver: resolver,
-		Control:  netguard.Control,
-	}
-	return &http.Transport{
-		// Force tcp4: the VPS IPv6 egress is Cloudflare-blocked (1106).
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp4", addr)
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   4,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   15 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-}
+// anipmTransport was replaced by newChromeTLSClient (2026-11-04): ani.pm's
+// Cloudflare began rejecting the stock Go TLS fingerprint with error 1106
+// on every request; the Chrome-fingerprinted uTLS handshake answers 200.
 
 func NewAniPMProvider(log zerolog.Logger, base, embedBase string) *AniPMProvider {
 	if strings.TrimSpace(base) == "" {
@@ -120,7 +96,7 @@ func NewAniPMProvider(log zerolog.Logger, base, embedBase string) *AniPMProvider
 	}
 	return &AniPMProvider{
 		log:        log,
-		client:     &http.Client{Timeout: 45 * time.Second, Transport: anipmTransport()},
+		client:     newChromeTLSClient(45 * time.Second),
 		base:       strings.TrimRight(base, "/"),
 		embedBase:  strings.TrimRight(embedBase, "/"),
 		anilistURL: core.AnilistGraphQLEndpoint(),
@@ -365,6 +341,21 @@ type anipmBootstrap struct {
 		Dub bool `json:"dub"`
 	} `json:"availability"`
 	Selection string `json:"settlarSelection"`
+	// BackupEmbed is the site's second server (the site UI fetches the same
+	// bootstrap with backup=1 and renders core + backupEmbed as separate
+	// tabs). Shape for the available case is lenient-parsed: it carries
+	// either its own settlar selection (same session chain as core) or a
+	// direct source/embed URL.
+	BackupEmbed anipmBackupEmbed `json:"backupEmbed"`
+}
+
+// anipmBackupEmbed is one backup server offer from the bootstrap.
+type anipmBackupEmbed struct {
+	Available bool   `json:"available"`
+	Source    string `json:"source"`
+	Kind      string `json:"kind"`
+	Selection string `json:"selection"`
+	EmbedURL  string `json:"embedUrl"`
 }
 
 type anipmSession struct {
@@ -514,23 +505,90 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	p.log.Info().Int("animeId", id).Int("episode", episode).
 		Str("lang", langKey).Int("subs", len(subs)).Msg("anipm resolved")
 	intro, outro := p.fetchSkip(ctx, series.malID, id, episode, langKey)
+	sources := []core.Source{{
+		URL:          master,
+		Type:         typ,
+		Quality:      "auto",
+		Subtitles:    subs,
+		Verification: "proxy",
+	}}
+	names := []string{anipmServerName}
+
+	// Daifuku (the site's backup server): resolve the backup embed through
+	// the same session chain when the bootstrap offers one. Best-effort —
+	// most episodes have no backup, and a failed backup never costs the
+	// core Mochi source.
+	if backup, ok := p.resolveBackupSource(ctx, boot.BackupEmbed, referer); ok {
+		sources = append(sources, backup)
+		names = append(names, anipmBackupName)
+	}
+
 	sr := &SourceResult{
-		Sources: []core.Source{{
-			URL:          master,
-			Type:         typ,
-			Quality:      "auto",
-			Subtitles:    subs,
-			Verification: "proxy",
-		}},
+		Sources: sources,
 		// User-Agent must ride along: the media proxy defaults to a stale
 		// Chrome/124 that Cloudflare 403s on settlar hosts.
 		Headers:     map[string]string{"Referer": referer, "User-Agent": anipmUserAgent},
-		ServerNames: []string{anipmServerName},
-		ServerName:  anipmServerName,
+		ServerNames: names,
+		ServerName:  names[len(names)-1],
 		Intro:       intro,
 		Outro:       outro,
 	}
 	return sr, nil
+}
+
+// resolveBackupSource turns the bootstrap's backupEmbed into a second
+// playable source (the site's Daifuku tab). Lenient by design: returns
+// ok=false for the common unavailable case.
+func (p *AniPMProvider) resolveBackupSource(ctx context.Context, backup anipmBackupEmbed, referer string) (core.Source, bool) {
+	if !backup.Available {
+		return core.Source{}, false
+	}
+	master := strings.TrimSpace(backup.Source)
+	if master == "" && backup.Selection != "" {
+		// Same settlar session chain as the core embed, just with the
+		// backup's own selection token.
+		var sess anipmSession
+		sessURL := p.base + "/api/anime/settlar/session?selection=" + url.QueryEscape(backup.Selection) + "&provider=anipm&telemetry=0"
+		if err := p.getJSON(ctx, sessURL, referer, &sess); err != nil {
+			return core.Source{}, false
+		}
+		token := ""
+		if i := strings.Index(sess.EmbedURL, "?t="); i >= 0 {
+			token = sess.EmbedURL[i+3:]
+		}
+		if token == "" {
+			return core.Source{}, false
+		}
+		var es anipmEmbedSession
+		if err := p.getJSON(ctx, p.embedBase+"/api/embed/session?t="+url.QueryEscape(token), referer, &es); err != nil {
+			return core.Source{}, false
+		}
+		master = strings.TrimSpace(es.Source)
+	}
+	if master == "" && strings.TrimSpace(backup.EmbedURL) != "" {
+		master = strings.TrimSpace(backup.EmbedURL)
+	}
+	if master == "" {
+		return core.Source{}, false
+	}
+	typ := "hls"
+	if strings.EqualFold(backup.Kind, "mp4") || regexpMatchMP4(master) {
+		typ = "mp4"
+	}
+	resolved, ok := p.resolveFinalSource(ctx, master, referer, typ)
+	if !ok {
+		return core.Source{}, false
+	}
+	if typ == "hls" && !probePlaylistsLenient(ctx, p.client, resolved, referer, anipmUserAgent) {
+		return core.Source{}, false
+	}
+	p.learnURLHost(resolved)
+	return core.Source{
+		URL:          resolved,
+		Type:         typ,
+		Quality:      "auto",
+		Verification: "proxy",
+	}, true
 }
 
 // resolveFinalSource follows the source URL once before it reaches the media

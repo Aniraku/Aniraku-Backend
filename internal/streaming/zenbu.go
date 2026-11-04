@@ -47,6 +47,15 @@ const (
 	zenbuIndexDefault = "https://megadown.zen-bu.cc"
 	zenbuSiteDefault  = "https://zen-bu.cc"
 
+	// zenbuCDNReferer: the zenbu CDN edges (the rotating worker domains:
+	// *.mistyhorizon.space, *.shadowharbor.space, *.twilightharbor.space,
+	// *.mysubsplay.com, *.lostproject.club, *.silentvoyage.space) began
+	// requiring Megaplay's own player referer on 2026-11-03 — measured
+	// live: zen-bu.cc referer, empty referer or a browser UA alone all 403
+	// in ~40ms, while Referer: https://megaplay.buzz/ answers 200. The
+	// zen-bu.cc site itself still answers 200 without it.
+	zenbuCDNReferer = "https://megaplay.buzz/"
+
 	zenbuPrimaryProvider = "shorekeeper"
 	zenbuMirrorProvider  = "encore"
 	zenbuSubProxyDefault = "roccia"
@@ -203,7 +212,9 @@ func (p *ZenbuProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 
 	out := &SourceResult{
 		Headers: map[string]string{
-			"Referer":    p.site + "/",
+			// The CDN edges reject the site's own referer now; they want
+			// Megaplay's player (see zenbuCDNReferer).
+			"Referer":    zenbuCDNReferer,
 			"User-Agent": browserUA,
 		},
 	}
@@ -220,7 +231,7 @@ func (p *ZenbuProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 		go func() {
 			defer probeWG.Done()
 			for job := range jobs {
-				kept[job.index] = probeSegmentsLenient(ctx, p.client, job.url, p.site+"/", browserUA)
+				kept[job.index] = probeSegmentsLenient(ctx, p.client, job.url, zenbuCDNReferer, browserUA)
 			}
 		}()
 	}

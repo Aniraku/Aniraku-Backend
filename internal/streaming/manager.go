@@ -277,22 +277,30 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	// "Sunny", the explicit request sends "Sunny"): normalize them to the
 	// family before anything else so both forms resolve identically.
 	switch strings.ToLower(provider) {
-	case "animegg", "sunny", "yolky", "eggy":
+	case "animegg", "sunny", "yolky", "eggy", "taiyaki":
 		provider = "animegg"
-	case "anv", "mikan", "nashi", "bana":
+	case "anv", "mikan", "nashi", "bana", "senbei":
 		provider = "anv"
-	case "anixo", "kohaku":
+	case "anixo", "kohaku", "kompeito":
 		provider = "anixo"
-	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
+	case "aniwaves", "nami", "purin", "pudding", "custard", "flan", "coral", "pearl", "wavy", "bubbles", "shelly":
 		provider = "aniwaves"
-	case "zenbu", "zen-bu":
+	case "zenbu", "zen-bu", "zenzai":
 		provider = "zenbu"
-	case "megavid", "vidy":
+	case "megavid", "vidy", "dorayaki":
 		provider = "megavid"
 	case "mkissa":
 		provider = "mkissa"
-	case "novuscloud", "novus":
+	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		provider = "novuscloud"
+	case "anikoto", "ichigo", "anko":
+		provider = "anikoto"
+	case "zoko", "zokoanime", "dango":
+		provider = "zoko"
+	case "nin", "supaplay", "ramune":
+		provider = "nin"
+	case "anipm", "yui", "mochi", "daifuku":
+		provider = "anipm"
 	}
 	// Hentai titles are served by Zoko (MAL-keyed) + FlixCloud:
 	// explicit requests for anikoto/animex are
@@ -303,7 +311,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "animex", "yuki", "neko", "zuna", "sora", "nin", "supaplay", "animegg", "aniwaves", "megavid", "zenbu", "anv", "mikan", "nashi", "bana", "anixo", "kohaku", "mkissa", "novuscloud":
+		case "anikoto", "ichigo", "anko", "animex", "yuki", "neko", "zuna", "sora", "nin", "ramune", "supaplay", "animegg", "taiyaki", "aniwaves", "purin", "megavid", "dorayaki", "zenbu", "zenzai", "anv", "mikan", "senbei", "nashi", "bana", "anixo", "kohaku", "kompeito", "mkissa", "novuscloud", "matcha", "azuki", "kinako", "kuri":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -329,7 +337,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("animex: no sources for this episode")
-	case "zoko", "zokoanime":
+	case "zoko", "zokoanime", "dango":
 		// Frontend sends "zoko"; accept "zokoanime" as an alias. Backend
 		// hits ZokoAnime (/stream/ani/{anilistId}/{ep}/{sub|dub}).
 		if zokoPaused {
@@ -352,7 +360,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("flixcloud: no sources for this episode")
-	case "nin", "supaplay":
+	case "nin", "supaplay", "ramune":
 		// Supaplay (anistream's embed lineup), SFW titles only: the
 		// hentai reject above short-circuits adult titles before any
 		// upstream call (Supaplay's API 502s them).
@@ -375,7 +383,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("kaa: no sources for this episode")
-	case "animegg", "sunny", "yolky", "eggy":
+	case "animegg", "sunny", "yolky", "eggy", "taiyaki":
 		// Family plus cute aliases (normalization above already maps
 		// them; the aliases here cover direct switch hits).
 		result, err := m.tryAnimeGG(ctx, animeID, episode, lang, quality)
@@ -386,7 +394,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("animegg: no sources for this episode")
-	case "aniwaves", "nami", "coral", "pearl", "wavy", "bubbles", "shelly":
+	case "aniwaves", "nami", "purin", "pudding", "custard", "flan", "coral", "pearl", "wavy", "bubbles", "shelly":
 		result, err := m.tryAniWaves(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -395,7 +403,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("aniwaves: no sources for this episode")
-	case "megavid", "vidy":
+	case "megavid", "vidy", "dorayaki":
 		result, err := m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -404,7 +412,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("megavid: no sources for this episode")
-	case "zenbu", "zen-bu":
+	case "zenbu", "zen-bu", "zenzai":
 		result, err := m.tryZenbu(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -413,7 +421,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("zenbu: no sources for this episode")
-	case "anv", "mikan", "nashi", "bana":
+	case "anv", "mikan", "nashi", "bana", "senbei":
 		result, err := m.tryAnv(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -422,7 +430,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anv: no sources for this episode")
-	case "anixo", "kohaku":
+	case "anixo", "kohaku", "kompeito":
 		result, err := m.tryAnixo(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -431,10 +439,19 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anixo: no sources for this episode")
+	case "anipm", "mochi", "daifuku":
+		result, err := m.tryAniPM(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("anipm: no sources for this episode")
 	case "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
 	// case "mkissa": disabled: NEED_CAPTCHA from VPS egress, slows /stream fallback
-	case "novuscloud", "novus":
+	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		result, err := m.tryNovuscloud(ctx, animeID, episode, lang, quality)
 		if err != nil {
 			return nil, err
@@ -765,9 +782,43 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	return result
 }
 
+// cuteServerNames maps the internal display names onto the sweets theme
+// (2026-11-04 operator rename). Already-sweet names (Momo = peach, Yuzu =
+// citron, Hana = flower, Mikan = tangerine) keep their name; the rest got
+// Japanese sweets with a matching vibe. Old names remain valid as provider
+// aliases in GetSourcesForProviderWithSlug so app preferences survive.
+var cuteServerNames = map[string]string{
+	"Niko":   "Ichigo", // strawberry
+	"Nico":   "Anko",   // red bean
+	"Zoko":   "Dango",  // sweet dumpling
+	"NiN":    "Ramune", // marble soda
+	"Nami":   "Purin",  // caramel pudding
+	"Yui":    "Mochi",  // rice cake
+	"Vidy":   "Dorayaki",
+	"Sunny":  "Taiyaki",
+	"Nova":   "Matcha",
+	"Nebula": "Azuki",
+	"Stella": "Kinako",
+	"Lyra":   "Kuri", // chestnut
+	"Kohaku": "Kompeito",
+	"Nuri":   "Manju",
+	"Kaa":    "Kashi", // 菓子, sweets
+	"Zenbu":  "Zenzai",
+	"Yuta":   "Yokan",
+	"Syota":  "Monaka",
+	"Mike":   "Mikan",
+}
+
+func cuteServerName(name string) string {
+	if v, ok := cuteServerNames[name]; ok && v != "" {
+		return v
+	}
+	return name
+}
+
 // appendNamedServers maps a provider's source list onto display names
-// (Niko/Momo, Yuta/Syota/Mike, ...). When there are more sources than names,
-// extras collide on the last name, on a collision the source with the
+// (Ichigo/Anko, Yokan/Monaka/Mikan, ...). When there are more sources than
+// names, extras collide on the last name, on a collision the source with the
 // richer subtitle track list wins, the other is dropped, so a display name
 // never appears twice in the server list.
 func appendNamedServers(out []core.Server, serverNames []string, provider, lang string, sr *SourceResult) []core.Server {
@@ -777,13 +828,14 @@ func appendNamedServers(out []core.Server, serverNames []string, provider, lang 
 		if i < len(serverNames) {
 			name = serverNames[i]
 		}
-		// A result may name its own sources (Anikoto: Niko for the
-		// AniList-keyed stream, Momo for the MAL-keyed one), that wins
+		// A result may name its own sources (Anikoto: Ichigo for the
+		// AniList-keyed stream, Anko for the MAL-keyed one), that wins
 		// over positional naming so each key keeps its slot even when
 		// the other key is missing.
 		if len(sr.ServerNames) == len(sr.Sources) && sr.ServerNames[i] != "" {
 			name = sr.ServerNames[i]
 		}
+		name = cuteServerName(name)
 		if idx, ok := nameIndex[name]; ok {
 			if len(src.Subtitles) > len(out[idx].Sources[0].Subtitles) {
 				out[idx].Sources = []core.Source{src}
@@ -1907,6 +1959,28 @@ func (m *Manager) collectAniPMServers(ctx context.Context, anilistID string, epi
 		out = appendNamedServers(out, []string{anipmServerName}, "anipm", lang, sr)
 	}
 	return out
+}
+
+// tryAniPM resolves one episode through the AniPM provider (Mochi + Daifuku
+// sources) for explicit provider requests. Mirrors tryZoko: provider owns
+// probing/verification, the manager applies the quality filter.
+func (m *Manager) tryAniPM(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
+	for _, prov := range m.providers {
+		apm, ok := prov.(*AniPMProvider)
+		if !ok {
+			continue
+		}
+		m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying anipm")
+		source, err := apm.FindEpisodeSource(ctx, strconv.Itoa(animeID), episode, lang)
+		if err != nil {
+			return nil, fmt.Errorf("anipm failed: %w", err)
+		}
+		if source == nil || len(source.Sources) == 0 {
+			return nil, nil
+		}
+		return m.applyQualityFilter(source, quality), nil
+	}
+	return nil, fmt.Errorf("anipm provider not configured")
 }
 
 func (m *Manager) collectAnixoServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {

@@ -28,7 +28,7 @@ func TestCustomServerNamesRemainStable(t *testing.T) {
 	}
 }
 
-// A result may name its own sources (Anikoto: Niko for the AniList-keyed
+// A result may name its own sources (Anikoto: Ichigo for the AniList-keyed
 // stream, Momo for the MAL-keyed one). Those win over positional naming so
 // each key keeps its slot even when the other key is missing; results
 // without slot names behave exactly as before.
@@ -48,13 +48,13 @@ func TestAppendNamedServersPrefersSlotNames(t *testing.T) {
 		return got
 	}
 
-	// Both slots: positional fallback would also give Niko/Momo here.
+	// Both slots: positional fallback would also give Ichigo/Momo here.
 	sr := &SourceResult{
 		Sources:     mkSources("http://x/a.m3u8", "http://x/b.m3u8"),
 		ServerNames: []string{"Niko", "Momo"},
 	}
-	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 2 || got[0] != "Niko" || got[1] != "Momo" {
-		t.Fatalf("both slots = %v, want [Niko Momo]", got)
+	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 2 || got[0] != "Ichigo" || got[1] != "Momo" {
+		t.Fatalf("both slots = %v, want [Ichigo Momo]", got)
 	}
 
 	// MAL-only: single source keeps the Momo slot instead of sliding
@@ -69,13 +69,13 @@ func TestAppendNamedServersPrefersSlotNames(t *testing.T) {
 
 	// No slot names: legacy positional behavior unchanged.
 	sr = &SourceResult{Sources: mkSources("http://x/a.m3u8", "http://x/b.m3u8")}
-	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 2 || got[0] != "Niko" || got[1] != "Momo" {
-		t.Fatalf("unnamed = %v, want [Niko Momo]", got)
+	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 2 || got[0] != "Ichigo" || got[1] != "Momo" {
+		t.Fatalf("unnamed = %v, want [Ichigo Momo]", got)
 	}
 
 	// Length mismatch: ignored, positional behavior unchanged.
 	sr = &SourceResult{Sources: mkSources("http://x/a.m3u8"), ServerNames: []string{"Niko", "Momo"}}
-	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 1 || got[0] != "Niko" {
-		t.Fatalf("mismatched = %v, want [Niko]", got)
+	if got := names(appendNamedServers(nil, anikotoServers[:], "anikoto", "sub", sr)); len(got) != 1 || got[0] != "Ichigo" {
+		t.Fatalf("mismatched = %v, want [Ichigo]", got)
 	}
 }

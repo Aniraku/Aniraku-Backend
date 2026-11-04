@@ -1035,6 +1035,15 @@ func applyProxyQueryHeaders(req *http.Request, headersJSON string) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	}
+	// The zenbu CDN family (rotating worker domains) locked its edges to
+	// Megaplay's player referer on 2026-11-03: zen-bu.cc or empty referer
+	// 403 in ~40ms, megaplay.buzz answers 200 (measured live). Cached
+	// playlists embed the old zen-bu.cc headers in the url= param, so the
+	// override happens here at fetch time, not just in the provider.
+	if strings.Contains(strings.ToLower(req.Header.Get("Referer")), "zen-bu.cc") {
+		req.Header.Set("Referer", "https://megaplay.buzz/")
+		req.Header.Set("Origin", "https://megaplay.buzz")
+	}
 }
 
 func (h *Handlers) rewriteHLSPlaylist(content, baseURL, headersJSON, proxyBase, al string) string {
