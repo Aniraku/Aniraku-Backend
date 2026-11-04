@@ -3,6 +3,7 @@ package streaming
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -92,7 +93,22 @@ type NovuscloudProvider struct {
 
 	mu       sync.Mutex
 	resolved map[novuscloudResolveKey]*novuscloudResolvedEntry
+
+	// Outage breaker (same ladder as animegg): while novuscloud.buzz hangs,
+	// every /servers call used to wait the full collector budget for its
+	// timeouts (1251 hung GETs in 2h on 2026-11-04). After a hang strike
+	// the provider pauses fail-fast; a healthy resolve lifts the pause
+	// instantly.
+	outageMu      sync.Mutex
+	outageUntil   time.Time
+	outageStrikes int
 }
+
+const (
+	novusOutageProbeMin = 7 * time.Second // mirror budget is 8s; a resolve this slow hung
+	novusOutageBase     = 10 * time.Minute
+	novusOutageMax      = 60 * time.Minute
+)
 
 func NewNovuscloudProvider(log zerolog.Logger, site, mirror, server string) *NovuscloudProvider {
 	if strings.TrimSpace(site) == "" {
@@ -153,13 +169,25 @@ func (p *NovuscloudProvider) FindEpisodeSource(ctx context.Context, anilistID st
 	if lang != "dub" {
 		lang = "sub"
 	}
+	if p.pausedOutage() {
+		return nil, nil
+	}
 
 	// Per-mirror timeout so a slow or blocked mirror doesn't drag down the
 	// whole fan-out. 8s is enough for embed + API + probe.
+	started := time.Now()
 	mirrorCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 
 	sr, err := p.resolveMirror(mirrorCtx, id, episode, lang)
+	// Hang classification: a resolve that ran to the mirror deadline (or
+	// any deadline-exceeded error) is a network hang; fast 404s and parse
+	// failures are the server ANSWERING (healthy network, missing content).
+	if sick := err != nil && (time.Since(started) >= novusOutageProbeMin || errors.Is(err, context.DeadlineExceeded)); sick {
+		p.noteOutageHealth(false)
+	} else {
+		p.noteOutageHealth(true)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +195,36 @@ func (p *NovuscloudProvider) FindEpisodeSource(ctx context.Context, anilistID st
 		return nil, nil
 	}
 	return sr, nil
+}
+
+// pausedOutage reports whether the network path is inside a pause window.
+func (p *NovuscloudProvider) pausedOutage() bool {
+	p.outageMu.Lock()
+	defer p.outageMu.Unlock()
+	return time.Now().Before(p.outageUntil)
+}
+
+// noteOutageHealth records one resolve outcome: healthy clears the pause
+// instantly, a hang opens/extends it (doubling ladder, 10min base).
+func (p *NovuscloudProvider) noteOutageHealth(healthy bool) {
+	p.outageMu.Lock()
+	defer p.outageMu.Unlock()
+	if healthy {
+		if p.outageStrikes > 0 {
+			p.log.Info().Str("server", p.server).Msg("novuscloud: outage pause lifted (mirror healthy again)")
+		}
+		p.outageStrikes = 0
+		p.outageUntil = time.Time{}
+		return
+	}
+	p.outageStrikes++
+	d := novusOutageBase << (p.outageStrikes - 1)
+	if d > novusOutageMax || d <= 0 {
+		d = novusOutageMax
+	}
+	p.outageUntil = time.Now().Add(d)
+	p.log.Warn().Str("server", p.server).Int("strike", p.outageStrikes).
+		Dur("pause", d).Msg("novuscloud: mirror hung, outage pause opened")
 }
 
 // resolveMirror fetches the embed page, extracts the getSources token, calls

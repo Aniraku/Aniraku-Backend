@@ -19,7 +19,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
-	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 const (
@@ -215,12 +214,13 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 	}
 
 	jar, _ := cookiejar.New(nil)
+	// Chrome-fingerprinted uTLS client: the plyr API answers the stock Go
+	// TLS fingerprint with HTTP 429 "fingerprint source limit" on every
+	// sub-provider (measured 2026-11-04), while the browser hello passes.
+	c := newChromeTLSClient(45 * time.Second)
+	c.Jar = jar
 	return &AnimeXProvider{
-		client: &http.Client{
-			Timeout:   45 * time.Second,
-			Transport: netguard.NewTransport(),
-			Jar:       jar,
-		},
+		client:     c,
 		log:        log,
 		apiBase:    strings.TrimRight(apiBase, "/"),
 		sessionTTL: 5 * time.Minute,
