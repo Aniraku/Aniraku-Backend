@@ -71,7 +71,9 @@ type AniPMProvider struct {
 }
 
 type anipmSeriesEntry struct {
-	settlarID int
+	bootSource string // playback-bootstrap path segment: the series' source
+	bootID     int    // bootstrap series id (settlar id, else the series id)
+	settlarID  int
 	malID     int
 	anilistID string
 	current   bool
@@ -188,8 +190,10 @@ func (p *AniPMProvider) getJSON(ctx context.Context, rawURL, referer string, out
 }
 
 type anipmSeriesJSON struct {
-	SettlarID int `json:"settlarId"`
-	MalID     int `json:"malId"`
+	ID        int    `json:"id"`
+	Source    string `json:"source"`
+	SettlarID int    `json:"settlarId"`
+	MalID     int    `json:"malId"`
 	Episodes  []struct {
 		Number       int  `json:"number"`
 		SourceNumber any  `json:"sourceNumber"`
@@ -226,8 +230,16 @@ func (p *AniPMProvider) resolveSeries(ctx context.Context, id int) (*anipmSeries
 	var sj anipmSeriesJSON
 	if err := p.getJSON(ctx, fmt.Sprintf("%s/api/anime/ani/%d?phase=core&routes=e4", p.base, id), p.base+"/", &sj); err != nil {
 		p.log.Debug().Err(err).Int("anilistId", id).Msg("anipm: legacy route unavailable, trying current route")
-	} else if sj.SettlarID > 0 && len(sj.Episodes) > 0 {
-		entry := &anipmSeriesEntry{settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
+	} else if (sj.SettlarID > 0 || sj.ID > 0) && len(sj.Episodes) > 0 {
+		// Route-based shows carry no settlar id: the bootstrap rides the
+		// series' own source segment + id instead (2026-11-05, HxH 11061).
+		entry := &anipmSeriesEntry{bootSource: sj.Source, bootID: sj.SettlarID, settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
+		if entry.bootSource == "" {
+			entry.bootSource = "settlar"
+		}
+		if entry.bootID <= 0 {
+			entry.bootID = sj.ID
+		}
 		for _, e := range sj.Episodes {
 			if e.Number < 1 {
 				continue
@@ -284,6 +296,7 @@ type anipmCurrentSeries struct {
 	ID        int    `json:"id"`
 	RouteID   string `json:"routeId"`
 	AniListID string `json:"anilistId"`
+	Source    string `json:"source"`
 	MalID     int    `json:"malId"`
 	Episodes  []struct {
 		Number       int  `json:"number"`
@@ -331,8 +344,13 @@ func (p *AniPMProvider) resolveCurrentSeries(ctx context.Context, id int) (*anip
 	if series.ID <= 0 {
 		series.ID = match.ID
 	}
+	bootSource := series.Source
+	if bootSource == "" {
+		bootSource = "settlar"
+	}
+	bootID := series.ID // current-route series id (anilist-keyed shows: == anilist id)
 	entry := &anipmSeriesEntry{
-		settlarID: series.ID, malID: series.MalID, anilistID: strconv.Itoa(id), current: true,
+		bootSource: bootSource, bootID: bootID, settlarID: series.ID, malID: series.MalID, anilistID: strconv.Itoa(id), current: true,
 		fetched: time.Now(),
 	}
 	for _, episode := range series.Episodes {
@@ -437,8 +455,8 @@ func (p *AniPMProvider) FindEpisodeSource(ctx context.Context, anilistID string,
 	if useBeta {
 		bootExtra = "&core=0"
 	}
-	bootURL := fmt.Sprintf("%s/api/anime/playback-bootstrap/settlar/%d?ep=%s&lang=%s%s",
-		p.base, series.settlarID, url.QueryEscape(ep.sourceNumber), langKey, bootExtra)
+	bootURL := fmt.Sprintf("%s/api/anime/playback-bootstrap/%s/%d?ep=%s&lang=%s%s",
+		p.base, series.bootSource, series.bootID, url.QueryEscape(ep.sourceNumber), langKey, bootExtra)
 	if err := p.getJSON(ctx, bootURL, referer, &boot); err != nil {
 		if isUpstreamGated(err) {
 			p.log.Debug().Err(err).Str("anilistId", anilistID).Int("episode", episode).Msg("anipm: bootstrap gated")
