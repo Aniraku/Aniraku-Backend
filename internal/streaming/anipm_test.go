@@ -110,8 +110,8 @@ func TestAniPMResolve(t *testing.T) {
 	if src.Type != "hls" || src.Quality != "auto" || src.Verification != "proxy" {
 		t.Errorf("meta = type %q quality %q verification %q", src.Type, src.Quality, src.Verification)
 	}
-	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "Mochi" {
-		t.Errorf("ServerNames = %v, want [Mochi]", sr.ServerNames)
+	if len(sr.ServerNames) != 1 || sr.ServerNames[0] != "Warabi" {
+		t.Errorf("ServerNames = %v, want [Warabi]", sr.ServerNames)
 	}
 	if len(src.Subtitles) != 1 || src.Subtitles[0].Lang != "en" {
 		t.Errorf("subtitles = %+v, want 1 English track", src.Subtitles)

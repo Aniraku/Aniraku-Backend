@@ -44,9 +44,9 @@ const (
 	anipmDefaultBase = "https://ani.pm"
 	anipmEmbedBase   = "https://embed.settlar.io"
 	anipmReferer     = "https://ani.pm/"
-	// Server names (sweets theme): Mochi = the soft-sub settlar embed,
-	// Daifuku = the backup embed (a filled mochi — the backup of Mochi).
-	anipmServerName = "Mochi"
+	// Server names (sweets theme): Warabi = the soft-sub settlar embed
+	// (warabimochi), Daifuku = the backup embed (a filled mochi).
+	anipmServerName = "Warabi"
 	anipmBackupName = "Daifuku"
 	// Chrome 131: embed.settlar.io's Cloudflare 403s the older shared
 	// browserUA (Chrome 124); a current UA passes.

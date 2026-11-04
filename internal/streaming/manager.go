@@ -788,13 +788,12 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 // Japanese sweets with a matching vibe. Old names remain valid as provider
 // aliases in GetSourcesForProviderWithSlug so app preferences survive.
 var cuteServerNames = map[string]string{
-	"Niko":   "Ichigo", // strawberry
-	"Nico":   "Anko",   // red bean
-	"Zoko":   "Dango",  // sweet dumpling
-	"NiN":    "Ramune", // marble soda
-	"Nami":   "Purin",  // caramel pudding
-	"Yui":    "Mochi",  // rice cake
-	"Vidy":   "Dorayaki",
+	"Niko": "Ichigo", // strawberry
+	"Nico": "Anko",   // red bean
+	"Zoko": "Dango",  // sweet dumpling
+	"NiN":  "Ramune", // marble soda
+	"Nami": "Purin",  // caramel pudding
+	"Yui":  "Mochi", "Vidy": "Dorayaki",
 	"Sunny":  "Taiyaki",
 	"Nova":   "Matcha",
 	"Nebula": "Azuki",
