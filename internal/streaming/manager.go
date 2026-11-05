@@ -169,7 +169,9 @@ type SourceResult struct {
 // episode, any show, served the same 3.7-second preroll ad instead of the
 // episode. Zenime removed: arms API unreliable. OGFLix removed:
 // api.anizen.tr challenged every request and every resolved edge was blocked
-// , pure fan-out latency for nothing.)
+// , pure fan-out latency for nothing.) AniPM (ani.pm, AniList-keyed direct
+// HLS) rides last in the /stream chain as the automatic backup server; its
+// Warabi/Daifuku/Nama servers also ride the /servers fan-out.
 //
 // NOTE (operator): kaa.lt decrypted stream URLs are dual-language, one
 // resolved URL serves both sub (ja-JP) and dub (en-US). A future kaa.lt
@@ -466,7 +468,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	var lastErr error
 	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
 	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
-	// sixth, AniWaves HLS seventh, MegaVid eighth, Zenbu edges ninth.
+	// sixth, AniWaves HLS seventh, MegaVid eighth, Zenbu edges ninth,
+	// AnV tenth, Anixo eleventh, AniPM (ani.pm, AniList-keyed direct HLS)
+	// last — the automatic backup server.
 	// Hentai titles only ever reach Zoko (MAL-keyed for hentai, when
 	// unpaused) and FlixCloud (Reanime embeds, covers hentai).
 	var candidates []func() (*core.StreamResult, error)
@@ -506,6 +510,8 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryAnv(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAnixo(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryAniPM(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {

@@ -6,6 +6,18 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-05 animex: VPS egress cycles the fingerprint 429
+  (fingerprint source limit) once per cooldown window since the Chrome-uTLS
+  client (commit 930a4bc): window expires → 3-4 racing sub-provider pokes →
+  fresh 429 → window reopens, hour after hour. Fix: /stream resolves
+  sub-providers lazily (first success in plyr order — one sources-API call
+  per request instead of the full 4-6 fan-out) and consecutive throttle
+  cycles double the window 30s→1m (cap 2m); a healthy 200 resets the
+  ladder. /servers keeps the full parallel fan-out.
+- 2026-11-05 anipm: ani.pm verified working from the VPS egress but was
+  not part of the automatic /stream chain (only reachable by explicit
+  provider=request). It now rides last in the /stream candidates, after
+  Anixo; Daifuku stays the site's own second embed slot.
 - 2026-10-26 zenbu: zen-bu.cc index verified end-to-end from the VPS
   egress; megadown JSON, Worker-edge masters, child playlists and segment
   bytes all 200. shorekeeper 2 sub + 2 dub, encore 4 + 4, roccia and

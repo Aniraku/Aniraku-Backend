@@ -14,7 +14,7 @@ Chi router ── RealIP → CleanPath → RequestID → Recover → Logging →
    ├── proxy.go         uTLS media proxy · HLS rewrite · downloads
    ├── anilist_client.go token bucket · circuit breaker · stale cache · dedup
    ├── account.go       progress · favorites · settings · notifications · sync I/O
-   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → NiN → kaa → AnimeGG → AniWaves → MegaVid → Zenbu → Mkissa (+ AnV, Anixo)
+   └── streaming/       Anikoto → AnimeX → Zoko → FlixCloud → kaa → AnimeGG → AniWaves → MegaVid → Zenbu → AnV → Anixo → AniPM
 ```
 
 ## Code layout (`internal/api/v1`)

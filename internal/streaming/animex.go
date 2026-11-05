@@ -25,7 +25,6 @@ const (
 	animexXORKey   = "10b06cdc1ca48c9fb0b94af97cc040cf"
 	animexCDNBase  = "https://cdnx.aniwatchtv.site"
 	animexPlayerUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-	animexPlyrBase = "https://plyr.animex.one"
 	// animexStaleTTL bounds serving last-good sub-provider results when a
 	// fresh resolve fails (timeout, API 404 flaps, challenge storms,
 	// rotated blocked edges): the URLs involved are stable for hours, so a
@@ -37,6 +36,14 @@ const (
 	// unbounded growth over a multi-year process lifetime.
 	maxAnimeXStaleEntries = 2000
 )
+
+// var so tests can point the plyr page at an httptest server instead of
+// https://plyr.animex.one.
+var animexPlyrBase = "https://plyr.animex.one"
+
+// animexCooldownCap bounds the escalated fingerprint throttle window in
+// setCooldown: consecutive post-window 429 cycles grow 30s→1m→2m.
+const animexCooldownCap = 2 * time.Minute
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
 // Generous on purpose: a slow Animex sub-provider regularly needs 30-35s, and
@@ -176,9 +183,12 @@ type AnimeXProvider struct {
 
 	// Fingerprint-wide 429 cooldown: the limit is per our fingerprint, so
 	// one throttled sub-provider means all of them are. Fresh attempts
-	// hold until this time; stale results serve meanwhile.
-	limitMu    sync.Mutex
-	limitUntil time.Time
+	// hold until this time; stale results serve meanwhile. limitStreak
+	// counts consecutive throttle cycles (window expired, still 429) and
+	// escalates the next window; a healthy answer resets it.
+	limitMu     sync.Mutex
+	limitUntil  time.Time
+	limitStreak int
 }
 
 // animexStaleEntry is one sub-provider's last good result.
@@ -297,7 +307,7 @@ func (p *AnimeXProvider) invalidateSession() {
 // NOT the numeric AniList ID. The plyr page is fetched to extract the correct
 // slug from the embedded SvelteKit data.
 func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
-	results, lastErr := p.resolveAllProviders(ctx, anilistID, episode, lang)
+	results, lastErr := p.resolveFirstProvider(ctx, anilistID, episode, lang)
 	for _, r := range results {
 		if r != nil && len(r.Sources) > 0 {
 			return r, nil
@@ -319,8 +329,8 @@ func (p *AnimeXProvider) FindAllEpisodeSources(ctx context.Context, anilistID st
 	return p.resolveAllProviders(ctx, anilistID, episode, lang)
 }
 
-// resolveAllProviders is the shared resolver behind FindEpisodeSource and
-// FindAllEpisodeSources.
+// resolveAllProviders is the parallel resolver behind FindAllEpisodeSources
+// (the /servers fan-out resolves every sub-provider).
 //
 // The plyr page gives the authoritative per-language provider list, episodes
 // that only exist on a provider missing from our static list (e.g. loli) are
@@ -334,12 +344,44 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 	if lang != "dub" {
 		lang = "sub"
 	}
+	slug, providers := p.preparePlyr(ctx, anilistID, episode, lang)
+	// Known-bad sub-providers (loli / Anzu) are excluded no matter what
+	// plyr lists.
+	providers = filterBlockedProviders(providers)
+	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Strs("providers", providers).Msg("animex: resolved plyr data")
 
-	// Fetch the plyr page (slug + provider list) and establish the
-	// Cloudflare clearance session concurrently, independent requests
-	// (the jar is goroutine-safe), saving ~300-600ms off every call.
-	// One short-backoff retry on the plyr page: it intermittently serves
-	// the Cloudflare challenge.
+	results := make([]*SourceResult, len(providers))
+	errs := make([]error, len(providers))
+	var refreshOnce sync.Once
+	sem := make(chan struct{}, 3) // bounded concurrency
+	var wg sync.WaitGroup
+	for i, providerID := range providers {
+		wg.Add(1)
+		go func(i int, providerID string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			results[i], errs[i] = p.resolveProviderCached(ctx, slug, anilistID, episode, lang, providerID, &refreshOnce)
+		}(i, providerID)
+	}
+	wg.Wait()
+
+	var lastErr error
+	for _, e := range errs {
+		if e != nil {
+			lastErr = errors.Join(lastErr, e)
+		}
+	}
+	return results, lastErr
+}
+
+// preparePlyr fetches the plyr page (slug + provider list) and establishes
+// the Cloudflare clearance session concurrently, independent requests (the
+// jar is goroutine-safe), saving ~300-600ms off every call. One short-backoff
+// retry on the plyr page: it intermittently serves the Cloudflare challenge.
+// On total failure the anilistId rides as slug with the static provider list,
+// the fallback path lists every core slot anyway.
+func (p *AnimeXProvider) preparePlyr(ctx context.Context, anilistID string, episode int, lang string) (string, []string) {
 	type plyrRes struct {
 		slug      string
 		providers []string
@@ -370,91 +412,102 @@ func (p *AnimeXProvider) resolveAllProviders(ctx context.Context, anilistID stri
 	case <-ctx.Done():
 		pr = plyrRes{err: ctx.Err()}
 	}
-	slug, providers, err := pr.slug, pr.providers, pr.err
-	if err != nil {
-		p.log.Debug().Err(err).Msg("animex: failed to read plyr page, using anilistId and static providers")
-		slug = anilistID
-		providers = animexProviders
+	if pr.err == nil {
+		return pr.slug, pr.providers
 	}
-	// The plyr list is authoritative, but known-bad sub-providers (loli /
-	// Anzu) are excluded no matter what it lists.
+	p.log.Debug().Err(pr.err).Msg("animex: failed to read plyr page, using anilistId and static providers")
+	return anilistID, animexProviders
+}
+
+// resolveProviderCached is the shared per-sub-provider policy behind the
+// parallel fan-out and the sequential first-hit path: one Cloudflare-
+// challenge refresh retry per resolve wave, one immediate retry on fast
+// failures, and stale serving (last good result, animexStaleTTL) after a
+// failed fresh resolve so a working server never flickers out.
+func (p *AnimeXProvider) resolveProviderCached(ctx context.Context, slug, anilistID string, episode int, lang, providerID string, refreshOnce *sync.Once) (*SourceResult, error) {
+	attempt := func() (*SourceResult, error) {
+		// Fingerprint throttled: skip the fresh attempt entirely and drop
+		// through to stale serving below. Hitting a throttled API anyway
+		// only extends the throttle.
+		if p.coolingDown() {
+			return nil, &animexRateLimitError{status: http.StatusTooManyRequests}
+		}
+		res, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
+		if err != nil {
+			var challenge *animexChallengeError
+			if errors.As(err, &challenge) {
+				refreshOnce.Do(func() {
+					p.log.Info().Msg("animex: cloudflare challenge, refreshing session")
+					p.invalidateSession()
+					if sessErr := p.ensureSession(ctx); sessErr != nil {
+						p.log.Debug().Err(sessErr).Msg("animex: session refresh failed")
+					}
+				})
+				res, err = p.resolveProvider(ctx, slug, episode, lang, providerID)
+			}
+		}
+		return res, err
+	}
+	start := time.Now()
+	res, err := attempt()
+	// Fast failure (not a hang): likely a transient edge flap, one
+	// immediate retry converts most into hits. Slow failures are left
+	// alone to avoid piling retries onto hangs, and legitimate empties
+	// (no error) are never retried.
+	if shouldRetryProvider(err, time.Since(start)) {
+		if res2, err2 := attempt(); err2 == nil && res2 != nil && len(res2.Sources) > 0 {
+			res, err = res2, nil
+		}
+	}
+	staleKey := animexStaleKey(anilistID, episode, lang, providerID)
+	if res != nil && len(res.Sources) > 0 {
+		p.storeStale(staleKey, res)
+	} else if err != nil {
+		// Fresh resolve failed: serve the last good result while it is
+		// fresh (URLs are stable for hours) instead of flickering a
+		// working server out of the list. Expired entries refuse
+		// themselves inside loadStale.
+		if stale := p.loadStale(staleKey); stale != nil {
+			p.log.Info().Str("provider", providerID).Msg("animex: serving stale result after failure")
+			res, err = stale, nil
+		}
+	}
+	if err != nil {
+		p.log.Info().Err(err).Str("provider", providerID).Msg("animex: provider failed")
+	}
+	return res, err
+}
+
+// resolveFirstProvider is the sequential twin of resolveAllProviders for the
+// /stream fast path: sub-providers resolve one at a time in plyr priority
+// order and the loop stops at the first success. The player path only ever
+// reads the top slot, but a full parallel resolve spent 4-6 sources-API
+// calls (plus probes) per request — the fingerprint's source budget was
+// burned several times faster than needed and the 429 source limit made
+// "animex does not work" the hourly norm. One good API call per /stream
+// request keeps animex inside the budget.
+func (p *AnimeXProvider) resolveFirstProvider(ctx context.Context, anilistID string, episode int, lang string) ([]*SourceResult, error) {
+	if lang != "dub" {
+		lang = "sub"
+	}
+	slug, providers := p.preparePlyr(ctx, anilistID, episode, lang)
+	// Known-bad sub-providers (loli / Anzu) are excluded no matter what
+	// plyr lists.
 	providers = filterBlockedProviders(providers)
 	p.log.Debug().Str("anilistId", anilistID).Str("slug", slug).Strs("providers", providers).Msg("animex: resolved plyr data")
 
-	results := make([]*SourceResult, len(providers))
-	errs := make([]error, len(providers))
 	var refreshOnce sync.Once
-	sem := make(chan struct{}, 3) // bounded concurrency
-	var wg sync.WaitGroup
-	for i, providerID := range providers {
-		wg.Add(1)
-		go func(i int, providerID string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			attempt := func() (*SourceResult, error) {
-				// Fingerprint throttled: skip the fresh attempt entirely
-				// and drop through to stale serving below. Hitting a
-				// throttled API anyway only extends the throttle.
-				if p.coolingDown() {
-					return nil, &animexRateLimitError{status: http.StatusTooManyRequests}
-				}
-				res, err := p.resolveProvider(ctx, slug, episode, lang, providerID)
-				if err != nil {
-					var challenge *animexChallengeError
-					if errors.As(err, &challenge) {
-						refreshOnce.Do(func() {
-							p.log.Info().Msg("animex: cloudflare challenge, refreshing session")
-							p.invalidateSession()
-							if sessErr := p.ensureSession(ctx); sessErr != nil {
-								p.log.Debug().Err(sessErr).Msg("animex: session refresh failed")
-							}
-						})
-						res, err = p.resolveProvider(ctx, slug, episode, lang, providerID)
-					}
-				}
-				return res, err
-			}
-			start := time.Now()
-			res, err := attempt()
-			// Fast failure (not a hang): likely a transient edge flap,
-			// one immediate retry converts most into hits. Slow failures
-			// are left alone to avoid piling retries onto hangs, and
-			// legitimate empties (no error) are never retried.
-			if shouldRetryProvider(err, time.Since(start)) {
-				if res2, err2 := attempt(); err2 == nil && res2 != nil && len(res2.Sources) > 0 {
-					res, err = res2, nil
-				}
-			}
-			staleKey := animexStaleKey(anilistID, episode, lang, providerID)
-			if res != nil && len(res.Sources) > 0 {
-				p.storeStale(staleKey, res)
-			} else if err != nil {
-				// Fresh resolve failed: serve the last good result while
-				// it is fresh (URLs are stable for hours) instead of
-				// flickering a working server out of the list. Expired
-				// entries refuse themselves inside loadStale.
-				if stale := p.loadStale(staleKey); stale != nil {
-					p.log.Info().Str("provider", providerID).Msg("animex: serving stale result after failure")
-					res, err = stale, nil
-				}
-			}
-			if err != nil {
-				p.log.Info().Err(err).Str("provider", providerID).Msg("animex: provider failed")
-			}
-			results[i], errs[i] = res, err
-		}(i, providerID)
-	}
-	wg.Wait()
-
 	var lastErr error
-	for _, e := range errs {
-		if e != nil {
-			lastErr = errors.Join(lastErr, e)
+	for _, providerID := range providers {
+		res, err := p.resolveProviderCached(ctx, slug, anilistID, episode, lang, providerID, &refreshOnce)
+		if res != nil && len(res.Sources) > 0 {
+			return []*SourceResult{res}, nil
+		}
+		if err != nil {
+			lastErr = err
 		}
 	}
-	return results, lastErr
+	return nil, lastErr
 }
 
 // animexStaleKey identifies one cached sub-provider result.
@@ -590,14 +643,44 @@ func (p *AnimeXProvider) coolingDown() bool {
 
 // setCooldown opens a fingerprint-wide cooldown after a 429 so concurrent
 // sub-providers stop piling fresh requests onto a throttled API. Later
-// (longer) windows win; windows never shrink.
+// (longer) windows win; windows never shrink. A 429 inside an already-open
+// window is the same throttle episode (the fan-out's racing pokes land
+// within the same second); only a 429 after the window expired means the
+// fingerprint's source budget was still not refilled, and those consecutive
+// cycles double the window (30s→1m→2m cap) until a healthy answer resets
+// the ladder.
 func (p *AnimeXProvider) setCooldown(d time.Duration) {
-	until := time.Now().Add(d)
 	p.limitMu.Lock()
 	defer p.limitMu.Unlock()
+	now := time.Now()
+	if !now.Before(p.limitUntil) {
+		p.limitStreak++
+	}
+	shift := p.limitStreak - 1
+	if shift > 2 {
+		shift = 2
+	}
+	if shift > 0 {
+		d *= time.Duration(1) << shift
+	}
+	if d > animexCooldownCap {
+		d = animexCooldownCap
+	}
+	until := now.Add(d)
 	if until.After(p.limitUntil) {
 		p.limitUntil = until
 	}
+}
+
+// resetThrottle clears the escalation ladder and any open window. Only a
+// successful resolve calls this, and successes can only happen after the
+// window expired (in-window attempts are skipped), so in production this
+// is a pure ladder reset; tests and future callers get a full clear.
+func (p *AnimeXProvider) resetThrottle() {
+	p.limitMu.Lock()
+	defer p.limitMu.Unlock()
+	p.limitStreak = 0
+	p.limitUntil = time.Time{}
 }
 
 // fetchPlyrData fetches the AnimeX plyr page once and extracts BOTH the show
@@ -812,6 +895,9 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	if got.err != nil {
 		return nil, got.err
 	}
+	// A 200 means the fingerprint's source budget answers again: the
+	// cooldown escalation ladder restarts here, at the only success path.
+	p.resetThrottle()
 	apiResp := got.resp
 
 	if len(apiResp.Sources) == 0 {

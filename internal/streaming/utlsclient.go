@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -12,6 +13,24 @@ import (
 
 	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
+
+// helloRotation spreads our connections across real-browser ClientHellos:
+// rate limiters (ani.pm / plyr "fingerprint source limit") bucket by TLS
+// fingerprint, so one fingerprint carries one budget and N fingerprints
+// carry N. Each new TCP connection takes the next hello.
+var helloRotation = []utls.ClientHelloID{
+	utls.HelloChrome_Auto,
+	utls.HelloFirefox_Auto,
+	utls.HelloSafari_Auto,
+	utls.HelloEdge_Auto,
+	utls.HelloIOS_14,
+}
+
+var helloCursor atomic.Uint32
+
+func nextHelloID() utls.ClientHelloID {
+	return helloRotation[helloCursor.Add(1)%uint32(len(helloRotation))]
+}
 
 // newChromeTLSClient builds an HTTP/2 client whose TLS handshake presents
 // Chrome's real ClientHello (uTLS HelloChrome_Auto, default ALPN h2+http/1.1
@@ -44,7 +63,7 @@ func newChromeTLSClient(timeout time.Duration) *http.Client {
 				raw.Close()
 				return nil, err
 			}
-			tlsConn := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloChrome_Auto)
+			tlsConn := utls.UClient(raw, &utls.Config{ServerName: host}, nextHelloID())
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				raw.Close()
 				return nil, err

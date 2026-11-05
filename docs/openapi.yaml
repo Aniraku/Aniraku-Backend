@@ -144,7 +144,7 @@ paths:
       tags: [playback]
       summary: Resolve playback sources for an episode
       description: |
-        Provider fallback chain (Anikoto → AnimeX → Zoko → OGFLix → FlixCloud)
+        Provider fallback chain (Anikoto → AnimeX → Zoko → FlixCloud → kaa → AnimeGG → AniWaves → MegaVid → Zenbu → AnV → Anixo → AniPM)
         or a specific provider when `provider` is set. HLS sources are
         rewritten to point at `/api/v1/proxy`; subtitles are returned raw.
       security: []
