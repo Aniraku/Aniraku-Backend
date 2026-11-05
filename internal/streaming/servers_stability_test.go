@@ -158,12 +158,19 @@ func TestServerStabilityCriticalProviderOutlivesNormalFallback(t *testing.T) {
 	cache.stabilizeProvider(normalKey, []core.Server{stabilityTestServer("animex", "Mochi")}, true, now)
 	cache.stabilizeProvider(criticalKey, []core.Server{stabilityTestServer("kaa", "Nico")}, true, now)
 
-	afterNormalTTL := now.Add(providerLastGoodTTL + time.Second)
-	if got, reused := cache.stabilizeProvider(normalKey, nil, true, afterNormalTTL); reused || len(got) != 0 {
-		t.Fatalf("normal provider survived past its fallback TTL: reused=%v got=%+v", reused, got)
+	// Unified persistence (2026-11-05): every provider's last-good list
+	// survives outages/rate-limit windows at the same 2h TTL — animex must
+	// stay listed through its 15m 429 cooldowns, nin/novuscloud through
+	// their hangs.
+	if got, reused := cache.stabilizeProvider(normalKey, nil, true, now.Add(time.Hour)); !reused || len(got) != 1 {
+		t.Fatalf("normal provider dropped before the unified TTL: reused=%v got=%+v", reused, got)
 	}
-	if got, reused := cache.stabilizeProvider(criticalKey, nil, true, afterNormalTTL); !reused || len(got) != 1 {
-		t.Fatalf("critical provider was dropped at the normal TTL: reused=%v got=%+v", reused, got)
+	afterAllTTL := now.Add(providerLastGoodTTL + time.Second)
+	if got, reused := cache.stabilizeProvider(normalKey, nil, true, afterAllTTL); reused || len(got) != 0 {
+		t.Fatalf("normal provider survived past the unified TTL: reused=%v got=%+v", reused, got)
+	}
+	if got, reused := cache.stabilizeProvider(criticalKey, nil, true, afterAllTTL); reused || len(got) != 0 {
+		t.Fatalf("critical provider survived past the unified TTL: reused=%v got=%+v", reused, got)
 	}
 }
 

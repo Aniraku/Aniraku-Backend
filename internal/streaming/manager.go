@@ -300,7 +300,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	case "zoko", "zokoanime", "dango":
 		provider = "zoko"
 	case "nin", "supaplay", "ramune":
-		provider = "nin"
+		provider = "supaplay"
 	case "anipm", "yui", "mochi", "daifuku":
 		provider = "anipm"
 	}
@@ -313,7 +313,7 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "ichigo", "anko", "animex", "yuki", "neko", "zuna", "sora", "nin", "ramune", "supaplay", "animegg", "taiyaki", "aniwaves", "purin", "megavid", "dorayaki", "zenbu", "zenzai", "anv", "mikan", "senbei", "nashi", "bana", "anixo", "kohaku", "kompeito", "mkissa", "novuscloud", "matcha", "azuki", "kinako", "kuri":
+		case "anikoto", "ichigo", "anko", "animex", "yuki", "neko", "zuna", "sora", "supaplay", "ramune", "animegg", "taiyaki", "aniwaves", "purin", "megavid", "dorayaki", "zenbu", "zenzai", "anv", "mikan", "senbei", "nashi", "bana", "anixo", "kohaku", "kompeito", "mkissa", "novuscloud", "matcha", "azuki", "kinako", "kuri":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -669,7 +669,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		{"animex", &axServers, m.collectAnimeXServers, !hentai},
 		{"zoko", &zkServers, m.collectZokoServers, !zokoPaused},
 		{"flixcloud", &fcServers, m.collectFlixServers, true},
-		{"nin", &nnServers, m.collectNiNServers, !hentai},
+		{"supaplay", &nnServers, m.collectNiNServers, !hentai},
 		{"kaa", &kaServers, m.collectKaaServers, !hentai},
 		{"animegg", &agServers, m.collectAnimeGGServers, !hentai},
 		{"aniwaves", &awServers, m.collectAniWavesServers, !hentai},
@@ -944,15 +944,15 @@ func (m *Manager) collectNiNServers(ctx context.Context, anilistID string, episo
 		}
 		sr, err := nn.FindEpisodeSource(ctx, anilistID, episode, lang)
 		if err != nil {
-			m.log.Warn().Err(err).Str("provider", "nin").Str("anilistId", anilistID).
+			m.log.Warn().Err(err).Str("provider", "supaplay").Str("anilistId", anilistID).
 				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
 			continue
 		}
 		if sr == nil || len(sr.Sources) == 0 {
 			continue // blocked relay or missing episode (logged inside nin.go)
 		}
-		sr = m.withDubSubtitles(ctx, "nin", lang, anilistID, episode, sr)
-		out = appendNamedServers(out, []string{ninServerName}, "nin", lang, sr)
+		sr = m.withDubSubtitles(ctx, "supaplay", lang, anilistID, episode, sr)
+		out = appendNamedServers(out, []string{ninServerName}, "supaplay", lang, sr)
 	}
 	return out
 }
@@ -1278,7 +1278,7 @@ func (m *Manager) tryNiN(ctx context.Context, animeID int, episode int, lang, qu
 	if source == nil || len(source.Sources) == 0 {
 		return nil, nil
 	}
-	source = m.withDubSubtitles(ctx, "nin", lang, anilistID, episode, source)
+	source = m.withDubSubtitles(ctx, "supaplay", lang, anilistID, episode, source)
 
 	return m.applyQualityFilter(source, quality), nil
 }

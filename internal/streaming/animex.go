@@ -30,7 +30,7 @@ const (
 	// rotated blocked edges): the URLs involved are stable for hours, so a
 	// minutes-old entry plays fine and keeps the server listed instead of
 	// flickering it in and out.
-	animexStaleTTL = 10 * time.Minute
+	animexStaleTTL = 6 * time.Hour
 	// maxAnimeXStaleEntries caps the stale-result cache: one entry per
 	// title/episode/lang/sub-provider stays tiny, the cap only stops
 	// unbounded growth over a multi-year process lifetime.

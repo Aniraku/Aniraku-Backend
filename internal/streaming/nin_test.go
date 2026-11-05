@@ -113,8 +113,8 @@ func TestNiNZ6Resolve(t *testing.T) {
 	if src.Type != "hls" || src.Quality != "auto" || src.Verification != "proxy" {
 		t.Errorf("source meta = type %q quality %q verification %q", src.Type, src.Quality, src.Verification)
 	}
-	if got, want := sr.ServerNames, []string{"NiN"}; len(got) != 1 || got[0] != want[0] {
-		t.Errorf("ServerNames = %v, want [NiN]", got)
+	if got, want := sr.ServerNames, []string{"Supaplay"}; len(got) != 1 || got[0] != want[0] {
+		t.Errorf("ServerNames = %v, want [Supaplay]", got)
 	}
 	if ref := sr.Headers["Referer"]; ref != f.server.URL+"/" {
 		t.Errorf("Referer = %q, want %q", ref, f.server.URL+"/")
@@ -180,7 +180,7 @@ func TestMergeNiNSubtitles(t *testing.T) {
 	zokoSubs := []core.Subtitle{{URL: "https://zoko.example/en.vtt", Lang: "en", Label: "English"}}
 	// Fresh per case: the merge writes into the NiN sources in place.
 	nn := func() []core.Server {
-		return []core.Server{mkNinServer("NiN", "nin", nil)}
+		return []core.Server{mkNinServer("Supaplay", "nin", nil)}
 	}
 
 	// Priority: Niko wins when present.

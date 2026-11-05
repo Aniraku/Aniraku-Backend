@@ -18,7 +18,7 @@ import (
 )
 
 // ninServerName is the display slot for the Supaplay source.
-const ninServerName = "NiN"
+const ninServerName = "Supaplay"
 
 // NiNProvider resolves Supaplay (supaplay.fun), one of the embed providers
 // anistream.one injects into its watch page, to direct HLS sources.
@@ -66,7 +66,7 @@ func NewNiNProvider(log zerolog.Logger) *NiNProvider {
 		base = "https://supaplay.fun"
 	}
 	return &NiNProvider{
-		outage: newOutageBreaker("nin", log, 6*time.Second),
+		outage: newOutageBreaker("supaplay", log, 6*time.Second),
 		client: &http.Client{
 			Timeout:   45 * time.Second,
 			Transport: netguard.NewTransport(),

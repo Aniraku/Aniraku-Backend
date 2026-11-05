@@ -10,10 +10,14 @@ import (
 const (
 	serverListStabilityTTL  = 90 * time.Second
 	incompleteServerListTTL = 5 * time.Second
-	providerLastGoodTTL     = 10 * time.Minute
-	criticalLastGoodTTL     = 2 * time.Hour
-	maxServerListSnapshots  = 256
-	maxProviderSnapshots    = 2048
+	// providerLastGoodTTL raised to match the critical tier (2026-11-05):
+	// every provider's last-good list must survive provider-side outages
+	// and rate-limit windows (animex 15m cooldown, novuscloud/nin/aniwaves
+	// hangs) so server lists persist instead of flickering out.
+	providerLastGoodTTL    = 2 * time.Hour
+	criticalLastGoodTTL    = 2 * time.Hour
+	maxServerListSnapshots = 256
+	maxProviderSnapshots   = 2048
 )
 
 type serverRequestKey struct {
