@@ -33,8 +33,8 @@ func TestParseRateLimit(t *testing.T) {
 	if got := parseRateLimit([]byte(`{}`)); got != 30*time.Second {
 		t.Errorf("empty body should fall back to 30s, got %v", got)
 	}
-	if got := parseRateLimit([]byte(`{"retry_after":3600}`)); got != 2*time.Minute {
-		t.Errorf("absurd cooldown must cap at 2m, got %v", got)
+	if got := parseRateLimit([]byte(`{"retry_after":3600}`)); got != 15*time.Minute {
+		t.Errorf("absurd cooldown must cap at 15m, got %v", got)
 	}
 }
 

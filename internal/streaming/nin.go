@@ -161,12 +161,14 @@ type ninCacheResponse struct {
 // does not exist on either path.
 func (p *NiNProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	if p.outage.paused() {
-		return nil, nil
+		return nil, nil // paused short-circuits are NOT health signals
 	}
 	if lang != "dub" {
 		lang = "sub"
 	}
+	started := time.Now()
 	data, err := p.fetchEpisodeAnyPath(ctx, anilistID, episode, lang)
+	p.outage.noteResolve(time.Since(started))
 	if err != nil {
 		return nil, err
 	}

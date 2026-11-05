@@ -42,8 +42,8 @@ const (
 var animexPlyrBase = "https://plyr.animex.one"
 
 // animexCooldownCap bounds the escalated fingerprint throttle window in
-// setCooldown: consecutive post-window 429 cycles grow 30s→1m→2m.
-const animexCooldownCap = 2 * time.Minute
+// setCooldown: consecutive post-window 429 cycles grow 30s→1m→2m→5m→15m.
+const animexCooldownCap = 15 * time.Minute
 
 // animexProviderTimeout bounds one sub-provider resolve (API + probe).
 // Generous on purpose: a slow Animex sub-provider regularly needs 30-35s, and
@@ -619,7 +619,7 @@ func shouldRetryProvider(err error, elapsed time.Duration) bool {
 // hostile header can never silence the provider for long.
 func parseRateLimit(body []byte) time.Duration {
 	const fallback = 30 * time.Second
-	const maxCooldown = 2 * time.Minute
+	const maxCooldown = 15 * time.Minute
 	var v struct {
 		RetryAfter float64 `json:"retry_after"`
 	}
@@ -672,15 +672,26 @@ func (p *AnimeXProvider) setCooldown(d time.Duration) {
 	}
 }
 
-// resetThrottle clears the escalation ladder and any open window. Only a
-// successful resolve calls this, and successes can only happen after the
-// window expired (in-window attempts are skipped), so in production this
-// is a pure ladder reset; tests and future callers get a full clear.
+// resetThrottle clears the escalation ladder and any open window.
 func (p *AnimeXProvider) resetThrottle() {
 	p.limitMu.Lock()
 	defer p.limitMu.Unlock()
 	p.limitStreak = 0
 	p.limitUntil = time.Time{}
+}
+
+// decayThrottle unwinds the escalation ladder one step per healthy 200.
+// Interleaved successes (some sub-providers 200 while others 429 in the
+// same fan-out) must not reset the ladder to its 30s base mid-storm.
+func (p *AnimeXProvider) decayThrottle() {
+	p.limitMu.Lock()
+	defer p.limitMu.Unlock()
+	if p.limitStreak > 0 {
+		p.limitStreak--
+	}
+	if p.limitStreak == 0 {
+		p.limitUntil = time.Time{}
+	}
 }
 
 // fetchPlyrData fetches the AnimeX plyr page once and extracts BOTH the show
@@ -895,9 +906,14 @@ func (p *AnimeXProvider) resolveProvider(ctx context.Context, anilistID string, 
 	if got.err != nil {
 		return nil, got.err
 	}
-	// A 200 means the fingerprint's source budget answers again: the
-	// cooldown escalation ladder restarts here, at the only success path.
-	p.resetThrottle()
+	// A 200 means the fingerprint's source budget answered for THIS
+	// sub-provider — but 4-6 sub-providers resolve in parallel and the
+	// others may still be 429ing, so a full ladder reset here (the old
+	// behavior) let interleaved successes pin the cooldown at its 30s
+	// base while the storm continued (49k 429s / 12h). Decay one step
+	// per success instead: sustained health unwinds the ladder within a
+	// few resolves, an ongoing storm keeps it escalated.
+	p.decayThrottle()
 	apiResp := got.resp
 
 	if len(apiResp.Sources) == 0 {

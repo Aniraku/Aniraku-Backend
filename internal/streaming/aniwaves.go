@@ -1203,8 +1203,10 @@ func (p *AniWavesProvider) storeShow(id int, s *aniwavesShow) {
 // (strict per-lang: no dub server when the listing carries no dub).
 func (p *AniWavesProvider) FindEpisodeSource(ctx context.Context, anilistID string, episode int, lang string) (*SourceResult, error) {
 	if p.outage.paused() {
-		return nil, nil
+		return nil, nil // paused short-circuits are NOT health signals
 	}
+	started := time.Now()
+	defer func() { p.outage.noteResolve(time.Since(started)) }()
 	id, err := strconv.Atoi(strings.TrimSpace(anilistID))
 	if err != nil || id <= 0 {
 		return nil, fmt.Errorf("aniwaves: bad anilist id %q", anilistID)
