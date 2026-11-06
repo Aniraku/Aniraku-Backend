@@ -271,7 +271,90 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 	}
 	pv.loadStaleSnapshot()
 	go pv.staleSnapshotSaver()
+	go pv.staleRefresher()
 	return pv
+}
+
+// staleRefresher re-resolves watched-episode entries before their 6h stale
+// window expires, so a fingerprint-budget gap between fresh successes
+// never flickers animex out of a server list. One plyr page per (show,
+// episode, lang) group, at most two groups per 5-minute tick, skipped
+// entirely while the fingerprint cooldown is open (the run would just
+// 429). Successful re-resolves re-store fresh + stale automatically via
+// resolveProviderCached.
+func (p *AnimeXProvider) staleRefresher() {
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		if p.coolingDown() {
+			continue
+		}
+		now := time.Now()
+		type refreshGroup struct {
+			anilistID string
+			episode   int
+			lang      string
+			providers []string
+		}
+		groups := map[string]*refreshGroup{}
+		p.staleMu.Lock()
+		for key, e := range p.stale {
+			if now.Sub(e.fetchedAt) < animexStaleTTL-90*time.Minute {
+				continue // only entries approaching expiry
+			}
+			parts := strings.SplitN(key, "/", 4)
+			if len(parts) != 4 {
+				continue
+			}
+			ep, err := strconv.Atoi(parts[1])
+			if err != nil || ep <= 0 {
+				continue
+			}
+			gk := parts[0] + "/" + parts[1] + "/" + parts[2]
+			g, ok := groups[gk]
+			if !ok {
+				g = &refreshGroup{anilistID: parts[0], episode: ep, lang: parts[2]}
+				groups[gk] = g
+			}
+			g.providers = append(g.providers, parts[3])
+		}
+		p.staleMu.Unlock()
+
+		done := 0
+		for _, g := range groups {
+			if done >= 2 {
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			slug, listed := p.preparePlyr(ctx, g.anilistID, g.episode, g.lang)
+			cancel()
+			var once sync.Once
+			resolvedAny := false
+			for _, pid := range g.providers {
+				stillListed := false
+				for _, l := range listed {
+					if l == pid {
+						stillListed = true
+						break
+					}
+				}
+				if !stillListed {
+					continue // plyr no longer lists this sub-provider
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+				res, rerr := p.resolveProviderCached(ctx, slug, g.anilistID, g.episode, g.lang, pid, &once)
+				cancel()
+				if rerr == nil && res != nil && len(res.Sources) > 0 {
+					resolvedAny = true
+				}
+			}
+			if resolvedAny {
+				done++
+				p.log.Info().Str("anilistId", g.anilistID).Int("episode", g.episode).
+					Str("lang", g.lang).Msg("animex: stale entry refreshed before expiry")
+			}
+		}
+	}
 }
 
 // loadStaleSnapshot restores the on-disk stale store (written every
