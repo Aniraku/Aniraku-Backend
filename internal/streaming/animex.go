@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"context"
+	"os"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -36,6 +37,14 @@ const (
 	// without this cache every poll re-fetched 4-6 sub-providers and the
 	// fingerprint budget never recovered (429 storm, 2026-11-04/05).
 	animexFreshTTL = 3 * time.Minute
+	// animexSnapshotPath: the stale store is snapshotted to disk so a
+	// restart restores known-good sources instantly instead of re-resolving
+	// into a still-hot fingerprint budget (restarts wiped the in-memory
+	// store and animex vanished until the budget refilled). /var/tmp
+	// survives reboots; entries older than animexStaleTTL are dropped on
+	// load, so a stale snapshot can never resurrect dead sources.
+	animexSnapshotPath = "/var/tmp/animex-stale-snapshot.json"
+	animexSnapshotEvery = 60 * time.Second
 	// maxAnimeXStaleEntries caps the stale-result cache: one entry per
 	// title/episode/lang/sub-provider stays tiny, the cap only stops
 	// unbounded growth over a multi-year process lifetime.
@@ -208,6 +217,18 @@ type animexStaleEntry struct {
 	fetchedAt time.Time
 }
 
+// animexSnapshotJSON is the on-disk shape of the stale store: sources are
+// plain structs and round-trip losslessly.
+type animexSnapshotJSON struct {
+	SavedAt time.Time                                 `json:"savedAt"`
+	Entries map[string]animexSnapshotEntry            `json:"entries"`
+}
+
+type animexSnapshotEntry struct {
+	Result    *SourceResult `json:"result"`
+	FetchedAt time.Time     `json:"fetchedAt"`
+}
+
 // animexSession holds a Cloudflare clearance session for the AnimeX API.
 type animexSession struct {
 	cookies   []*http.Cookie
@@ -240,7 +261,7 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 	// sub-provider (measured 2026-11-04), while the browser hello passes.
 	c := newChromeTLSClient(45 * time.Second)
 	c.Jar = jar
-	return &AnimeXProvider{
+	pv := &AnimeXProvider{
 		client:     c,
 		log:        log,
 		apiBase:    strings.TrimRight(apiBase, "/"),
@@ -248,6 +269,63 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 		stale:      make(map[string]*animexStaleEntry),
 		fresh:      make(map[string]animexFreshEntry),
 	}
+	pv.loadStaleSnapshot()
+	go pv.staleSnapshotSaver()
+	return pv
+}
+
+// loadStaleSnapshot restores the on-disk stale store (written every
+// minute) so a restart re-lists known-good animex servers instantly
+// instead of re-resolving into a still-hot fingerprint budget. Entries
+// older than animexStaleTTL never load, so a stale snapshot cannot
+// resurrect dead sources.
+func (p *AnimeXProvider) loadStaleSnapshot() {
+	raw, err := os.ReadFile(animexSnapshotPath)
+	if err != nil {
+		return
+	}
+	var snap animexSnapshotJSON
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return
+	}
+	now := time.Now()
+	p.staleMu.Lock()
+	defer p.staleMu.Unlock()
+	for k, e := range snap.Entries {
+		if e.Result == nil || now.Sub(e.FetchedAt) >= animexStaleTTL {
+			continue
+		}
+		p.stale[k] = &animexStaleEntry{res: e.Result, fetchedAt: e.FetchedAt}
+	}
+	p.log.Info().Int("entries", len(p.stale)).Msg("animex: stale snapshot restored")
+}
+
+// staleSnapshotSaver persists the stale store once a minute for the
+// process lifetime (the provider lives as long as the server).
+func (p *AnimeXProvider) staleSnapshotSaver() {
+	ticker := time.NewTicker(animexSnapshotEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.saveStaleSnapshot()
+	}
+}
+
+func (p *AnimeXProvider) saveStaleSnapshot() {
+	p.staleMu.Lock()
+	snap := animexSnapshotJSON{SavedAt: time.Now(), Entries: make(map[string]animexSnapshotEntry, len(p.stale))}
+	for k, e := range p.stale {
+		snap.Entries[k] = animexSnapshotEntry{Result: e.res, FetchedAt: e.fetchedAt}
+	}
+	p.staleMu.Unlock()
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	tmp := animexSnapshotPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, animexSnapshotPath)
 }
 
 func (p *AnimeXProvider) Name() string { return "animex" }
