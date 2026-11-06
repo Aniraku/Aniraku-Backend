@@ -337,8 +337,47 @@ func (p *AnimeXProvider) FindEpisodeSource(ctx context.Context, anilistID string
 // Referer/User-Agent headers, so callers must map results to servers (one
 // server per result) rather than merging sources under a single header set.
 // Results are ordered by plyr priority. Used by the /servers fan-out.
+// A show-level fresh cache wraps the whole resolve: when the previous
+// pass still has minutes left, the plyr page + session + every
+// sub-provider resolve are skipped entirely (continuous /servers polling
+// otherwise re-runs the whole chain each minute and the fingerprint
+// budget never recovers).
 func (p *AnimeXProvider) FindAllEpisodeSources(ctx context.Context, anilistID string, episode int, lang string) ([]*SourceResult, error) {
-	return p.resolveAllProviders(ctx, anilistID, episode, lang)
+	allKey := animexStaleKey(anilistID, episode, lang, "ALL")
+	if fresh := p.loadFreshAll(allKey); fresh != nil {
+		return fresh, nil
+	}
+	results, err := p.resolveAllProviders(ctx, anilistID, episode, lang)
+	if err == nil && len(results) > 0 {
+		p.storeFreshAll(allKey, results)
+	}
+	return results, err
+}
+
+// loadFreshAll/storeFreshAll wrap the show-level fresh cache: the stored
+// slice is shallow-copied on the way out (callers only read).
+func (p *AnimeXProvider) loadFreshAll(key string) []*SourceResult {
+	p.freshMu.Lock()
+	defer p.freshMu.Unlock()
+	e, ok := p.fresh[key]
+	if !ok || time.Since(e.fetched) >= animexFreshTTL {
+		return nil
+	}
+	out := make([]*SourceResult, 0, len(e.results))
+	out = append(out, e.results...)
+	return out
+}
+
+func (p *AnimeXProvider) storeFreshAll(key string, results []*SourceResult) {
+	p.freshMu.Lock()
+	defer p.freshMu.Unlock()
+	if len(p.fresh) >= maxAnimeXStaleEntries {
+		for k := range p.fresh {
+			delete(p.fresh, k)
+			break
+		}
+	}
+	p.fresh[key] = animexFreshEntry{results: results, fetched: time.Now()}
 }
 
 // resolveAllProviders is the parallel resolver behind FindAllEpisodeSources
@@ -538,6 +577,7 @@ func animexStaleKey(anilistID string, episode int, lang, providerID string) stri
 // theirs, and future readers must never observe a mutated entry).
 type animexFreshEntry struct {
 	result  *SourceResult
+	results []*SourceResult
 	fetched time.Time
 }
 
