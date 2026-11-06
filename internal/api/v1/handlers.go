@@ -63,10 +63,15 @@ type Handlers struct {
 	providerHealth  sync.Map // provider -> *providerHealth
 
 	// Notification scheduler state (airing book + bounded dedupe); see
-	// notify.go. Initialized lazily via notifier().
+	// notify.go. Initialized lazively via notifier().
 	notifyState *notifierState
 	notifyOnce  sync.Once
 	sweepBusy   atomic.Bool
+
+	// Episodes response cache (see catalog.go episodesCacheGet).
+	episodesOnce  sync.Once
+	episodesMu    sync.Mutex
+	episodesCache map[int]episodesCacheEntry
 }
 
 func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {

@@ -208,6 +208,62 @@ func suffixTitle(t *anilist.Title, suffix string) {
 	}
 }
 
+type episodesCacheEntry struct {
+	body    []byte
+	fetched time.Time
+}
+
+const episodesCacheTTL = 90 * time.Second
+
+// episodesCacheGet/store keep the fully-rendered episodes response for a
+// short window: the app polls /episodes continuously and the cold chain
+// regularly lands in AniList's rate-limit retry window. The cached bytes
+// are the exact response the cold path rendered - zero quality loss.
+func (h *Handlers) episodesCacheInit() {
+	h.episodesOnce.Do(func() {
+		h.episodesCache = make(map[int]episodesCacheEntry)
+	})
+}
+
+func (h *Handlers) episodesCacheGet(id int) ([]byte, bool) {
+	h.episodesCacheInit()
+	h.episodesMu.Lock()
+	defer h.episodesMu.Unlock()
+	e, ok := h.episodesCache[id]
+	if !ok || time.Since(e.fetched) >= episodesCacheTTL {
+		return nil, false
+	}
+	return e.body, true
+}
+
+func (h *Handlers) episodesCacheStore(id int, body []byte) {
+	h.episodesCacheInit()
+	h.episodesMu.Lock()
+	defer h.episodesMu.Unlock()
+	if len(h.episodesCache) >= 1000 {
+		// Simple bounds: drop expired entries, then the oldest if full.
+		now := time.Now()
+		for k, e := range h.episodesCache {
+			if now.Sub(e.fetched) >= episodesCacheTTL {
+				delete(h.episodesCache, k)
+			}
+		}
+		if len(h.episodesCache) >= 1000 {
+			var oldestK int
+			var oldestT time.Time
+			first := true
+			for k, e := range h.episodesCache {
+				if first || e.fetched.Before(oldestT) {
+					oldestK, oldestT = k, e.fetched
+					first = false
+				}
+			}
+			delete(h.episodesCache, oldestK)
+		}
+	}
+	h.episodesCache[id] = episodesCacheEntry{body: body, fetched: time.Now()}
+}
+
 func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	idStr := chi.URLParam(r, "id")
 	id, err := strconv.Atoi(idStr)
@@ -217,6 +273,17 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 	}
 
 	anilistID := id
+
+	// Episodes response cache: the app polls /episodes continuously and the
+	// cold chain (AniZip + AniList + TMDB resolve) regularly lands in
+	// AniList's rate-limit retry window (6-10s). Episode lists change only
+	// when episodes air, so the fully-rendered response is served from a
+	// short-lived cache - byte-identical JSON, zero quality loss.
+	if body, ok := h.episodesCacheGet(anilistID); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(body)
+		return
+	}
 
 	// Hard total budget for every upstream stage below. The stages run
 	// serially (AniZip + AniList + count fallbacks + TMDB resolve + cover),
@@ -609,7 +676,14 @@ func (h *Handlers) GetEpisodes(w http.ResponseWriter, r *http.Request) {
 			Msg("episodes: slow response")
 	}
 
-	h.respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
+	body, err := json.Marshal(map[string]any{"episodes": episodes})
+	if err != nil {
+		h.respondJSON(w, http.StatusOK, map[string]any{"episodes": episodes})
+		return
+	}
+	h.episodesCacheStore(anilistID, body)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(body)
 }
 
 func (h *Handlers) GetSchedule(w http.ResponseWriter, r *http.Request) {
