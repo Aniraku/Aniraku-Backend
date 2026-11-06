@@ -30,7 +30,12 @@ const (
 	// rotated blocked edges): the URLs involved are stable for hours, so a
 	// minutes-old entry plays fine and keeps the server listed instead of
 	// flickering it in and out.
-	animexStaleTTL = 6 * time.Hour
+	// animexStaleTTL 12h: megavid/krussdomi source URLs are long-lived;
+	// nexabloom's tokenized URL may die late in the window, in which case
+	// the player falls to the other animex servers. 12h keeps animex
+	// listed continuously across the API's per-IP budget windows (the
+	// fingerprint cooldown caps at 15m but the budget refills hourly).
+	animexStaleTTL = 12 * time.Hour
 	// animexFreshTTL: how long a fresh sub-provider result is re-served
 	// before the API is asked again. The app polls /servers continuously;
 	// without this cache every poll re-fetched 4-6 sub-providers and the

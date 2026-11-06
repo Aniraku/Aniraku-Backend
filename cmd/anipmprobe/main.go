@@ -21,10 +21,19 @@ func main() {
 	if len(os.Args) > 2 {
 		ep, _ = strconv.Atoi(os.Args[2])
 	}
-	p := streaming.NewAniPMProvider(zerolog.Nop(), "", "")
+	provider := os.Args[3]
+	var sr *streaming.SourceResult
+	var err error
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	sr, err := p.FindEpisodeSource(ctx, fmt.Sprintf("%d", id), ep, "sub")
+	switch provider {
+	case "animex":
+		apx := streaming.NewAnimeXProvider(zerolog.Nop(), "")
+		sr, err = apx.FindEpisodeSource(ctx, fmt.Sprintf("%d", id), ep, "sub")
+	case "anipm":
+		apm := streaming.NewAniPMProvider(zerolog.Nop(), "", "")
+		sr, err = apm.FindEpisodeSource(ctx, fmt.Sprintf("%d", id), ep, "sub")
+	}
 	if err != nil {
 		fmt.Println("ERR:", err)
 		os.Exit(1)
@@ -38,6 +47,10 @@ func main() {
 		if i < len(sr.ServerNames) {
 			name = sr.ServerNames[i]
 		}
-		fmt.Printf("OK server=%s type=%s\n", name, s.Type)
+		u := s.URL
+		if len(u) > 55 {
+			u = u[:55]
+		}
+		fmt.Printf("OK server=%s type=%s url=%s\n", name, s.Type, u)
 	}
 }
