@@ -31,6 +31,11 @@ const (
 	// minutes-old entry plays fine and keeps the server listed instead of
 	// flickering it in and out.
 	animexStaleTTL = 6 * time.Hour
+	// animexFreshTTL: how long a fresh sub-provider result is re-served
+	// before the API is asked again. The app polls /servers continuously;
+	// without this cache every poll re-fetched 4-6 sub-providers and the
+	// fingerprint budget never recovered (429 storm, 2026-11-04/05).
+	animexFreshTTL = 3 * time.Minute
 	// maxAnimeXStaleEntries caps the stale-result cache: one entry per
 	// title/episode/lang/sub-provider stays tiny, the cap only stops
 	// unbounded growth over a multi-year process lifetime.
@@ -181,6 +186,12 @@ type AnimeXProvider struct {
 	staleMu sync.Mutex
 	stale   map[string]*animexStaleEntry
 
+	// Fresh-result cache (see animexFreshTTL): serves repeated /servers
+	// polls WITHOUT touching the plyr API, which is what keeps the
+	// fingerprint budget from exhausting under continuous polling.
+	freshMu sync.Mutex
+	fresh   map[string]animexFreshEntry
+
 	// Fingerprint-wide 429 cooldown: the limit is per our fingerprint, so
 	// one throttled sub-provider means all of them are. Fresh attempts
 	// hold until this time; stale results serve meanwhile. limitStreak
@@ -235,6 +246,7 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 		apiBase:    strings.TrimRight(apiBase, "/"),
 		sessionTTL: 5 * time.Minute,
 		stale:      make(map[string]*animexStaleEntry),
+		fresh:      make(map[string]animexFreshEntry),
 	}
 }
 
@@ -425,6 +437,10 @@ func (p *AnimeXProvider) preparePlyr(ctx context.Context, anilistID string, epis
 // failures, and stale serving (last good result, animexStaleTTL) after a
 // failed fresh resolve so a working server never flickers out.
 func (p *AnimeXProvider) resolveProviderCached(ctx context.Context, slug, anilistID string, episode int, lang, providerID string, refreshOnce *sync.Once) (*SourceResult, error) {
+	staleKey := animexStaleKey(anilistID, episode, lang, providerID)
+	if fresh := p.loadFresh(staleKey); fresh != nil {
+		return fresh, nil
+	}
 	attempt := func() (*SourceResult, error) {
 		// Fingerprint throttled: skip the fresh attempt entirely and drop
 		// through to stale serving below. Hitting a throttled API anyway
@@ -459,10 +475,13 @@ func (p *AnimeXProvider) resolveProviderCached(ctx context.Context, slug, anilis
 			res, err = res2, nil
 		}
 	}
-	staleKey := animexStaleKey(anilistID, episode, lang, providerID)
 	if res != nil && len(res.Sources) > 0 {
+		p.storeFresh(staleKey, res)
 		p.storeStale(staleKey, res)
 	} else if err != nil {
+		p.freshMu.Lock()
+		delete(p.fresh, staleKey)
+		p.freshMu.Unlock()
 		// Fresh resolve failed: serve the last good result while it is
 		// fresh (URLs are stable for hours) instead of flickering a
 		// working server out of the list. Expired entries refuse
@@ -517,6 +536,35 @@ func animexStaleKey(anilistID string, episode int, lang, providerID string) stri
 
 // storeStale remembers a good result (deep-copied, callers keep using
 // theirs, and future readers must never observe a mutated entry).
+type animexFreshEntry struct {
+	result  *SourceResult
+	fetched time.Time
+}
+
+// loadFresh returns a still-fresh result for the key, if one exists.
+func (p *AnimeXProvider) loadFresh(key string) *SourceResult {
+	p.freshMu.Lock()
+	defer p.freshMu.Unlock()
+	e, ok := p.fresh[key]
+	if !ok || time.Since(e.fetched) >= animexFreshTTL {
+		return nil
+	}
+	return e.result
+}
+
+// storeFresh remembers a good result for the fresh TTL.
+func (p *AnimeXProvider) storeFresh(key string, sr *SourceResult) {
+	p.freshMu.Lock()
+	defer p.freshMu.Unlock()
+	if len(p.fresh) >= maxAnimeXStaleEntries {
+		for k := range p.fresh {
+			delete(p.fresh, k)
+			break
+		}
+	}
+	p.fresh[key] = animexFreshEntry{result: sr, fetched: time.Now()}
+}
+
 func (p *AnimeXProvider) storeStale(key string, sr *SourceResult) {
 	p.staleMu.Lock()
 	defer p.staleMu.Unlock()

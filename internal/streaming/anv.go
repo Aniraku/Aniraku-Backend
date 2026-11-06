@@ -17,7 +17,6 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Aniraku/Aniraku-Backend/internal/core"
-	"github.com/Aniraku/Aniraku-Backend/internal/netguard"
 )
 
 // AnV (anv.to) resolves direct HLS through the site's own first-party edge.
@@ -119,8 +118,16 @@ func (j *anvJar) sessionCookie(host string) (string, bool) {
 
 func NewAnvProvider(log zerolog.Logger) *AnvProvider {
 	return &AnvProvider{
-		log:    log,
-		client: &http.Client{Timeout: 45 * time.Second, Transport: netguard.NewTransport(), Jar: newAnvJar()},
+		log: log,
+		// Chrome-fingerprinted uTLS client: the anv API rate-limits by TLS
+		// fingerprint ("api/episode returned status 429", 2036 hits / 6h on
+		// 2026-11-05); the browser hello passes where the stock Go hello
+		// gets throttled.
+		client: func() *http.Client {
+			c := newChromeTLSClient(45 * time.Second)
+			c.Jar = newAnvJar()
+			return c
+		}(),
 	}
 }
 
