@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -273,8 +274,64 @@ func NewAnimeXProvider(log zerolog.Logger, apiBase string) *AnimeXProvider {
 		stale:      make(map[string]*animexStaleEntry),
 		fresh:      make(map[string]animexFreshEntry),
 	}
+	pv.loadStaleSnapshot()
+	go pv.staleSnapshotSaver()
 	go pv.staleRefresher()
 	return pv
+}
+
+// loadStaleSnapshot restores the on-disk stale store (written every
+// minute) so a restart re-lists known-good animex servers instantly
+// instead of re-resolving into a still-hot fingerprint budget. Entries
+// older than animexStaleTTL never load, so a stale snapshot cannot
+// resurrect dead sources.
+func (p *AnimeXProvider) loadStaleSnapshot() {
+	raw, err := os.ReadFile(animexSnapshotPath)
+	if err != nil {
+		return
+	}
+	var snap animexSnapshotJSON
+	if err := json.Unmarshal(raw, &snap); err != nil {
+		return
+	}
+	now := time.Now()
+	p.staleMu.Lock()
+	defer p.staleMu.Unlock()
+	for k, e := range snap.Entries {
+		if e.Result == nil || now.Sub(e.FetchedAt) >= animexStaleTTL {
+			continue
+		}
+		p.stale[k] = &animexStaleEntry{res: e.Result, fetchedAt: e.FetchedAt}
+	}
+	p.log.Info().Int("entries", len(p.stale)).Msg("animex: stale snapshot restored")
+}
+
+// staleSnapshotSaver persists the stale store once a minute for the
+// process lifetime (the provider lives as long as the server).
+func (p *AnimeXProvider) staleSnapshotSaver() {
+	ticker := time.NewTicker(animexSnapshotEvery)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.saveStaleSnapshot()
+	}
+}
+
+func (p *AnimeXProvider) saveStaleSnapshot() {
+	p.staleMu.Lock()
+	snap := animexSnapshotJSON{SavedAt: time.Now(), Entries: make(map[string]animexSnapshotEntry, len(p.stale))}
+	for k, e := range p.stale {
+		snap.Entries[k] = animexSnapshotEntry{Result: e.res, FetchedAt: e.fetchedAt}
+	}
+	p.staleMu.Unlock()
+	raw, err := json.Marshal(snap)
+	if err != nil {
+		return
+	}
+	tmp := animexSnapshotPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return
+	}
+	_ = os.Rename(tmp, animexSnapshotPath)
 }
 
 // staleRefresher re-resolves watched-episode entries before their 6h stale
