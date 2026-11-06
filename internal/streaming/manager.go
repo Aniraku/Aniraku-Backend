@@ -397,14 +397,9 @@ func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int
 		}
 		return nil, fmt.Errorf("animegg: no sources for this episode")
 	case "aniwaves", "nami", "purin", "pudding", "custard", "flan", "coral", "pearl", "wavy", "bubbles", "shelly":
-		result, err := m.tryAniWaves(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("aniwaves: no sources for this episode")
+		// Disabled (2026-11-05, operator): the aniwaves edges hung to the
+		// collector budget and the operator dropped the provider.
+		return nil, fmt.Errorf("aniwaves is temporarily unavailable")
 	case "megavid", "vidy", "dorayaki":
 		result, err := m.tryMegaVid(ctx, animeID, episode, lang, quality)
 		if err != nil {
@@ -673,7 +668,8 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		{"supaplay", &nnServers, m.collectNiNServers, !hentai},
 		{"kaa", &kaServers, m.collectKaaServers, !hentai},
 		{"animegg", &agServers, m.collectAnimeGGServers, !hentai},
-		{"aniwaves", &awServers, m.collectAniWavesServers, !hentai},
+		// {"aniwaves", &awServers, m.collectAniWavesServers, !hentai}, // disabled (2026-11-05, operator): its edges hang to the collector budget (12s stalls, breaker strikes 6-9) and the operator dropped it from the lineup
+
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
 		// {"mkissa", &mkServers, m.collectMkissaServers, !hentai}, // disabled: NEED_CAPTCHA from VPS egress, slows fan-out
