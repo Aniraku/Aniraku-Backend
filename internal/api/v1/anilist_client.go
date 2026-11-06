@@ -60,14 +60,15 @@ func (tb *tokenBucket) wait(ctx context.Context) error {
 
 // anilistClient provides retry logic, caching, and rate limiting for AniList API calls
 type anilistClient struct {
-	h          *Handlers
-	client     *http.Client
-	endpoint   string
-	cache      sync.Map
-	cacheTTL   time.Duration
-	maxRetries int
-	baseDelay  time.Duration
-	limiter    *tokenBucket
+	h           *Handlers
+	client      *http.Client
+	endpoint    string
+	cache       sync.Map
+	cacheTTL    time.Duration
+	maxRetries  int
+	baseDelay   time.Duration
+	limiter     *tokenBucket
+	localMirror bool // self-hosted bridge: no client-side pacing or long 429 waits
 }
 
 type anilistCacheEntry struct {
@@ -106,7 +107,8 @@ func newAnilistClient(h *Handlers) *anilistClient {
 		// slowness from a fast page load. A page load fires ~10-15
 		// parallel queries; the burst absorbs that, the refill keeps us
 		// under the ceiling.
-		limiter: newTokenBucket(8, 0.4),
+		limiter:     newTokenBucket(8, 0.4),
+		localMirror: !strings.Contains(endpoint, "graphql.anilist.co"),
 	}
 }
 
@@ -327,8 +329,14 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 
 	body, _ := json.Marshal(map[string]any{"query": query, "variables": variables})
 
-	if err := c.limiter.wait(ctx); err != nil {
-		return nil, err
+	// The self-hosted bridge (graphql.aniraku.tech) answers from its local
+	// mirror DB - pacing the client to official-AniList's 30/min only
+	// queued requests into AniList's 60s retry windows (6-10s episode
+	// stalls). Official-endpoint callers keep the bucket.
+	if !c.localMirror {
+		if err := c.limiter.wait(ctx); err != nil {
+			return nil, err
+		}
 	}
 
 	var lastErr error
@@ -377,6 +385,9 @@ func (c *anilistClient) do(ctx context.Context, query string, variables map[stri
 				wait := parseRetryAfter(resp.Header.Get("Retry-After"))
 				if wait <= 0 {
 					wait = 60 * time.Second
+				}
+				if c.localMirror && wait > 3*time.Second {
+					wait = 3 * time.Second
 				}
 				c.h.log.Warn().Dur("wait", wait).Msg("AniList rate limited, honoring retry window")
 				select {
