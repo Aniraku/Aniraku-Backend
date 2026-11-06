@@ -2,7 +2,6 @@ package streaming
 
 import (
 	"context"
-	"os"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,6 +10,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -43,7 +43,7 @@ const (
 	// store and animex vanished until the budget refilled). /var/tmp
 	// survives reboots; entries older than animexStaleTTL are dropped on
 	// load, so a stale snapshot can never resurrect dead sources.
-	animexSnapshotPath = "/var/tmp/animex-stale-snapshot.json"
+	animexSnapshotPath  = "/var/tmp/animex-stale-snapshot.json"
 	animexSnapshotEvery = 60 * time.Second
 	// maxAnimeXStaleEntries caps the stale-result cache: one entry per
 	// title/episode/lang/sub-provider stays tiny, the cap only stops
@@ -220,8 +220,8 @@ type animexStaleEntry struct {
 // animexSnapshotJSON is the on-disk shape of the stale store: sources are
 // plain structs and round-trip losslessly.
 type animexSnapshotJSON struct {
-	SavedAt time.Time                                 `json:"savedAt"`
-	Entries map[string]animexSnapshotEntry            `json:"entries"`
+	SavedAt time.Time                      `json:"savedAt"`
+	Entries map[string]animexSnapshotEntry `json:"entries"`
 }
 
 type animexSnapshotEntry struct {
