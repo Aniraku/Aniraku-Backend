@@ -543,15 +543,15 @@ func containsHentai(genres []string) bool {
 
 // collectorBudget: wall-clock ceiling for every fan-out collector (each
 // provider plus the downloads fetch). Cold /servers latency is its
-// slowest collector; the budget is 6s (was 12s, 2026-11-05): the timing
+// slowest collector; the budget is 4s (was 12s, 2026-11-05): the timing
 // distribution over 40 fan-outs showed four providers hanging to the old
 // 12s ceiling (anixo max 10.8s, megavid/aniwaves/animegg 12s) while every
-// fast collector finishes in under 3s. The budget never strands finished
-// work: inner ops inherit this deadline, so a cut collector returns what
-// it already gathered, and cut providers keep serving their 2h last-good
-// stability lists - a slow provider costs at most 6s of tail instead of
-// 12. Var so tests can shrink it.
-var collectorBudget = 6 * time.Second
+// fast collector finishes in under 3s, and even the first 6s ceiling left
+// a 6.4s wall-clock tail. The budget never strands finished work: inner
+// ops inherit this deadline, so a cut collector returns what it already
+// gathered, and cut providers keep serving their 2h last-good stability
+// lists - a hang costs at most 4s of tail. Var so tests can shrink it.
+var collectorBudget = 4 * time.Second
 
 const serverFanOutLifetime = 15 * time.Second
 
