@@ -233,13 +233,22 @@ func (p *AniPMProvider) resolveSeries(ctx context.Context, id int) (*anipmSeries
 	} else if (sj.SettlarID > 0 || sj.ID > 0) && len(sj.Episodes) > 0 {
 		// Route-based shows carry no settlar id: the bootstrap rides the
 		// series' own source segment + id instead (2026-11-05, HxH 11061).
-		entry := &anipmSeriesEntry{bootSource: sj.Source, bootID: sj.SettlarID, settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
-		if entry.bootSource == "" {
-			entry.bootSource = "settlar"
+		// Bootstrap pairing follows the site: source "anilist" pairs with
+		// the ANILIST id (the lookup key), "settlar" with the settlar id.
+		// Pairing settlar ids with the anilist segment 404s (observed:
+		// Frieren 154587, settlarId 6351, bootstrap/anilist/6351 -> 404).
+		bootSource := sj.Source
+		if bootSource == "" {
+			bootSource = "settlar"
 		}
-		if entry.bootID <= 0 {
-			entry.bootID = sj.ID
+		bootID := id
+		if bootSource == "settlar" && sj.SettlarID > 0 {
+			bootID = sj.SettlarID
 		}
+		if bootID <= 0 {
+			bootID = sj.ID
+		}
+		entry := &anipmSeriesEntry{bootSource: bootSource, bootID: bootID, settlarID: sj.SettlarID, malID: sj.MalID, anilistID: strconv.Itoa(id), fetched: time.Now()}
 		for _, e := range sj.Episodes {
 			if e.Number < 1 {
 				continue
@@ -348,7 +357,13 @@ func (p *AniPMProvider) resolveCurrentSeries(ctx context.Context, id int) (*anip
 	if bootSource == "" {
 		bootSource = "settlar"
 	}
-	bootID := series.ID // current-route series id (anilist-keyed shows: == anilist id)
+	bootID := id
+	if bootSource == "settlar" && series.ID > 0 {
+		bootID = series.ID
+	}
+	if bootID <= 0 {
+		bootID = series.ID
+	}
 	entry := &anipmSeriesEntry{
 		bootSource: bootSource, bootID: bootID, settlarID: series.ID, malID: series.MalID, anilistID: strconv.Itoa(id), current: true,
 		fetched: time.Now(),
