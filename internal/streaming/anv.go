@@ -64,22 +64,6 @@ type AnvProvider struct {
 	log    zerolog.Logger
 	client *http.Client // fixed cookie-jarred client; jar churn is done by name inside anvJar
 
-	// Last-good results (6h): the anv API rate-limits per IP, so when a
-	// fresh resolve 429s the last good anv server is served instead of
-	// flickering out of the list.
-	lastGoodMu sync.Mutex
-	lastGood   map[anvLastGoodKey]anvLastGoodEntry
-}
-
-type anvLastGoodKey struct {
-	anilistID string
-	episode   int
-	lang      string
-}
-
-type anvLastGoodEntry struct {
-	result *SourceResult
-	stored time.Time
 }
 
 // anvJar is a tiny cookie jar whose cookies can be dropped by name without
@@ -145,7 +129,6 @@ func NewAnvProvider(log zerolog.Logger) *AnvProvider {
 			c.Jar = newAnvJar()
 			return c
 		}(),
-		lastGood: make(map[anvLastGoodKey]anvLastGoodEntry),
 	}
 }
 
@@ -260,7 +243,6 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 	}
 
 	anilistIDInt, _ := strconv.Atoi(anilistID)
-	lgKey := anvLastGoodKey{anilistID: anilistID, episode: episode, lang: langKey}
 	body, _ := json.Marshal(map[string]any{"anilistId": anilistIDInt, "episode": episode})
 	sig := anvBase + "/api/episode"
 	var data anvEpisodeResponse
@@ -272,17 +254,6 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 		postErr = p.postJSON(ctx, sig, body, &data)
 	}
 	if postErr != nil {
-		// Rate-limited or unreachable: serve the last good anv server for
-		// this episode instead of flickering out of the list. Entries
-		// older than 6h expire - tokenized URLs must not resurrect.
-		p.lastGoodMu.Lock()
-		e, ok := p.lastGood[lgKey]
-		p.lastGoodMu.Unlock()
-		if ok && time.Since(e.stored) < 6*time.Hour {
-			p.log.Info().Str("anilistId", anilistID).Int("episode", episode).
-				Msg("anv: serving last good result after failure")
-			return e.result, nil
-		}
 		return nil, postErr
 	}
 	if data.Status != "ready" {
@@ -388,13 +359,6 @@ func (p *AnvProvider) FindEpisodeSource(ctx context.Context, anilistID string, e
 
 	p.log.Info().Str("anilistId", anilistID).Int("episode", episode).Str("lang", langKey).
 		Int("streams", len(sources)).Msg("anv: resolved")
-	p.lastGoodMu.Lock()
-	p.lastGood[lgKey] = anvLastGoodEntry{result: &SourceResult{
-		Sources:    sources,
-		Headers:    map[string]string{},
-		ServerName: names[0],
-	}, stored: time.Now()}
-	p.lastGoodMu.Unlock()
 	return &SourceResult{
 		Sources: sources,
 		Headers: map[string]string{
