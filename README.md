@@ -21,12 +21,12 @@ Go service layer for the Aniraku web and Android clients.
 Aniraku is open source. Voluntary support helps fund **hosting, releases, and open-source development** and never changes access to API or app features.
 > [!IMPORTANT]
 > This branch uses a **publicly hosted Anilist offline database** for metadata Helping with **no rate limits**.
-> - **Ok the rest-api Web-GUI is being disabled to make the server lightweight for streaming and episode routes**.Enjoy
+> - **Ok the rest-api Web-GUI is being disabled to keep the service lightweight for playback coordination and episode routes**. Enjoy
 > - **Anilist Mirror Graphql With Same Anilist Endpoint:** [Mirror](https://graphql.aniraku.tech)
 > - **GitHub Repository:** [Shoislam0311/anilist-offline-db](https://github.com/Shoislam0311/anilist-offline-db)
 
 > [!CAUTION]
->If it has saved you time, a small donation keeps it up. And the library keeps growing. **Missing an anime?** Email [`sho.islam0311@proton.me`](mailto:sho.islam0311@proton.me) and it'll get added.
+>If it has saved you time, a small donation keeps it up. And the library keeps growing. Feature requests and metadata corrections go through the [issue tracker](https://github.com/Aniraku/Aniraku-Backend/issues).
 
 <p align="center">
   <a href="https://patreon.com/ShoIslam"><img src="https://img.shields.io/badge/Support_on_Patreon-FF4D4D?style=for-the-badge&logo=patreon&logoColor=white" alt="Support on Patreon" /></a>
