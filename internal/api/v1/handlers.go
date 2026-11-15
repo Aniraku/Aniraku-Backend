@@ -2,6 +2,7 @@ package v1
 
 import (
 	"context"
+	"os"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -203,6 +204,12 @@ func NewHandlers(cfg *config.Config, log zerolog.Logger) *Handlers {
 		browseCacheTTL: 5 * time.Minute, // 5 min cache for browse/trending
 	}
 	h.anilistClient = newAnilistClient(h)
+	// Opaque media links: when PROXY_LINK_KEY is set (32-byte hex), /servers
+	// and /stream mint /proxy?k= tokens sealing raw URLs + scraper cookies;
+	// the proxy resolves them server-side. Unset = legacy raw-URL responses.
+	if !proxyLinkInit(os.Getenv("PROXY_LINK_KEY")) {
+		h.log.Warn().Msg("PROXY_LINK_KEY invalid or unset, opaque links disabled")
+	}
 	h.anilistCircuit = newCircuitBreaker()
 
 	// AnikotoTV resolves directly from megaplay.buzz (AniList/MAL-keyed);
