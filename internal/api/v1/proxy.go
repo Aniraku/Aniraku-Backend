@@ -342,6 +342,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 			h.respondError(w, http.StatusNotFound, "expired or invalid media link")
 			return
 		}
+		h.log.Info().Str("kroute_resolved", rawURL).Msg("proxy: opaque link resolved")
 		q := r.URL.Query()
 		q.Del("k")
 		q.Set("url", rawURL)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -55,7 +56,34 @@ func proxyLinkCipher() (cipher.AEAD, error) {
 
 // mintProxyLink seals a raw upstream URL + its provider headers into an
 // opaque, expiring token. Returns the full /api/v1/proxy?k= URL path.
+//
+// Collectors return sources already pointing at the LOCAL proxy
+// (http://127.0.0.1:43211/api/v1/proxy?url=<raw>&headers=<json>) — the
+// nested self-proxy is unwrapped first so the token seals the RAW upstream
+// URL + headers. Sealing the nested loopback URL instead makes every
+// k-link 403 at the allowlist (proxy target 127.0.0.1).
 func mintProxyLink(rawURL string, headers map[string]string) (string, error) {
+	if u, err := url.Parse(rawURL); err == nil && u.Query().Get("url") != "" {
+		// Nested self-proxy: unwrap the inner url= and merge the inner
+		// headers= (the provider session cookies/headers the collector
+		// already embedded) over the caller-supplied ones.
+		if inner, ierr := url.QueryUnescape(u.Query().Get("url")); ierr == nil {
+			rawURL = inner
+		}
+		if hj := u.Query().Get("headers"); hj != "" {
+			var innerHeaders map[string]string
+			if jerr := json.Unmarshal([]byte(hj), &innerHeaders); jerr == nil {
+				merged := map[string]string{}
+				for k, v := range headers {
+					merged[k] = v
+				}
+				for k, v := range innerHeaders {
+					merged[k] = v
+				}
+				headers = merged
+			}
+		}
+	}
 	aead, err := proxyLinkCipher()
 	if err != nil {
 		return "", err
