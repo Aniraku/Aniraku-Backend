@@ -231,7 +231,7 @@ func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
 	if hasSources(servers) {
 		h.notifyEpisode(anilistID, episode)
 	}
-	h.respondJSON(w, http.StatusOK, servers)
+	h.respondJSON(w, http.StatusOK, h.mintSourcesForClient(servers))
 }
 
 // blockedProxyPorts are well-known non-HTTP service ports the media proxy
