@@ -42,6 +42,9 @@ func NewRouter(cfg *config.Config, log zerolog.Logger) (*chi.Mux, *middleware.Ra
 	r.Use(middleware.Logging(log))
 	r.Use(middleware.SecurityHeaders)
 	r.Use(middleware.CORS)
+	// Edge hardening: internal-token gate (default off; activates with
+	// ANIRAKU_INTERNAL_ENFORCE=1 + ANIRAKU_INTERNAL_TOKEN on this box).
+	r.Use(middleware.InternalToken)
 
 	// Compression applies only to the JSON API response bodies (attached per
 	// group below). The media proxy/streaming paths are never routed through
