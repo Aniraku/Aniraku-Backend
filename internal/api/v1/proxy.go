@@ -172,7 +172,7 @@ func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxyStreamResult(r, result, lang)
-	h.respondJSON(w, http.StatusOK, result)
+	h.respondJSON(w, http.StatusOK, h.mintStreamSources(result))
 }
 
 func (h *Handlers) GetServers(w http.ResponseWriter, r *http.Request) {
@@ -258,6 +258,60 @@ func isSubtitleURL(pathLower string) bool {
 	return false
 }
 
+// mintSourcesForClient swaps every source URL (and the server's header set)
+// for an opaque /proxy?k= link when PROXY_LINK_KEY is configured. The raw
+// provider URLs and the scraper-session cookies/headers never reach the
+// client: they are sealed inside the token, and the visible "headers"
+// fields are dropped. Without the key the responses pass through unchanged
+// (legacy raw-URL behavior, app compatibility).
+func (h *Handlers) mintSourcesForClient(servers []core.Server) []core.Server {
+	if len(proxyLinkKeyBytes) != 32 {
+		return servers
+	}
+	out := make([]core.Server, 0, len(servers))
+	for _, srv := range servers {
+		srcs := make([]core.Source, 0, len(srv.Sources))
+		for _, src := range srv.Sources {
+			if src.URL == "" {
+				continue
+			}
+			if link, err := mintProxyLink(src.URL, srv.Headers); err == nil {
+				src.URL = link
+			}
+			srcs = append(srcs, src)
+		}
+		if len(srcs) == 0 {
+			continue
+		}
+		srv.Sources = srcs
+		srv.Headers = nil // scraper-session headers are sealed in the links
+		out = append(out, srv)
+	}
+	return out
+}
+
+// mintStreamSources seals a StreamResult's sources the same way.
+func (h *Handlers) mintStreamSources(result *core.StreamResult) *core.StreamResult {
+	if len(proxyLinkKeyBytes) != 32 || result == nil {
+		return result
+	}
+	srcs := make([]core.Source, 0, len(result.Sources))
+	for _, src := range result.Sources {
+		if src.URL == "" {
+			continue
+		}
+		if link, err := mintProxyLink(src.URL, result.Headers); err == nil {
+			src.URL = link
+			srcs = append(srcs, src)
+		}
+	}
+	if len(srcs) > 0 {
+		result.Sources = srcs
+		result.Headers = nil // sealed in the links
+	}
+	return result
+}
+
 func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: nothing here is stored. Cacheable branches below (playlists,
 	// segments, subtitles, keys) overwrite this with explicit public
 	// directives; errors and rejections keep no-store. Only allowlisted
@@ -276,6 +330,27 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		// safe and keeps playback working from any origin without letting
 		// untrusted sites read credentialed responses.
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+	}
+
+	// Opaque-link route (PROXY_LINK_KEY): the client holds /proxy?k=<token>
+	// instead of raw provider URLs + scraper cookies. Resolves server-side
+	// into the raw URL + sealed headers, then flows through the normal
+	// path below. Legacy ?url= + headers= keep working (app compatibility).
+	if kToken := r.URL.Query().Get("k"); kToken != "" {
+		rawURL, sealedHeaders, err := resolveProxyLink(kToken)
+		if err != nil {
+			h.respondError(w, http.StatusNotFound, "expired or invalid media link")
+			return
+		}
+		q := r.URL.Query()
+		q.Del("k")
+		q.Set("url", rawURL)
+		if len(sealedHeaders) > 0 {
+			if hj, jerr := json.Marshal(sealedHeaders); jerr == nil {
+				q.Set("headers", string(hj))
+			}
+		}
+		r.URL.RawQuery = q.Encode()
 	}
 
 	targetURL := r.URL.Query().Get("url")

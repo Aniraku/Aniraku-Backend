@@ -1,8 +1,6 @@
 module github.com/Aniraku/Aniraku-Backend
 
-go 1.26.0
-
-toolchain go1.26.10
+go 1.27.4
 
 require (
 	github.com/go-chi/chi/v5 v5.4.0
