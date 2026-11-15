@@ -28,11 +28,11 @@ import (
 //     exempt from the gate (browser traffic from the site's own pages)
 //   - Health endpoints stay open for uptime monitors.
 type internalTokenGate struct {
-	once        sync.Once
-	token       string
-	enforce     bool
-	uaPrefixes  []string
-	origins     []string
+	once       sync.Once
+	token      string
+	enforce    bool
+	uaPrefixes []string
+	origins    []string
 }
 
 var internalGate internalTokenGate
