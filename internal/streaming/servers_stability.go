@@ -32,7 +32,11 @@ const (
 	// every provider's last-good list must survive provider-side outages
 	// and rate-limit windows (animex 15m cooldown, novuscloud/nin/aniwaves
 	// hangs) so server lists persist instead of flickering out.
-	providerLastGoodTTL    = 2 * time.Hour
+	providerLastGoodTTL = 2 * time.Hour
+	// flixcloud last-good stays short: its masters embed a JWT minted per
+	// token window, so long snapshots outlive the playback rights they
+	// cached. Expiry is ALSO checked exactly per entry (below).
+	flixcloudLastGoodTTL   = 30 * time.Minute
 	criticalLastGoodTTL    = 2 * time.Hour
 	maxServerListSnapshots = 256
 	maxProviderSnapshots   = 2048
@@ -327,7 +331,13 @@ func (c *serverStabilityCache) stabilizeProvider(key providerRequestKey, fresh [
 	if len(fresh) > 0 {
 		retained := false
 		if previous, ok := c.providers[key]; ok && now.Sub(previous.storedAt) <= providerSnapshotTTL(key.provider) {
-			fresh, retained = mergeProviderServers(fresh, previous.servers), true
+			// Never merge token-bound entries whose JWTs have lapsed: the
+			// merged snapshot would keep serving dead master URLs.
+			if key.provider == "flixcloud" && flixcloudServersExpired(previous.servers, now) {
+				delete(c.providers, key)
+			} else {
+				fresh, retained = mergeProviderServers(fresh, previous.servers), true
+			}
 		}
 		if len(c.providers) >= maxProviderSnapshots {
 			removeOldestProviderSnapshot(c.providers)
@@ -343,6 +353,10 @@ func (c *serverStabilityCache) stabilizeProvider(key providerRequestKey, fresh [
 		return fresh, false
 	}
 	if now.Sub(entry.storedAt) > providerSnapshotTTL(key.provider) {
+		delete(c.providers, key)
+		return fresh, false
+	}
+	if key.provider == "flixcloud" && flixcloudServersExpired(entry.servers, now) {
 		delete(c.providers, key)
 		return fresh, false
 	}
@@ -372,7 +386,39 @@ func providerSnapshotTTL(provider string) time.Duration {
 	if provider == "kaa" || provider == "zenbu" {
 		return criticalLastGoodTTL
 	}
+	// FlixCloud masters carry an IP-bound JWT whose expiry flixcloud mints
+	// per token window; a 2h last-good snapshot can easily outlive it, so
+	// the snapshot TTL stays well under the shortest window. (Expired JWTs
+	// are also detected exactly, see flixcloudServersExpired.)
+	if provider == "flixcloud" {
+		return flixcloudLastGoodTTL
+	}
 	return providerLastGoodTTL
+}
+
+// flixcloudServersExpired reports whether every source of the given
+// flixcloud servers rides a JWT that has already lapsed (2min safety
+// margin). Signature-free masters carry no expiry and never count as
+// expired; the check only fires when ALL jwt-bound sources are dead, so a
+// mixed set stays usable.
+func flixcloudServersExpired(servers []core.Server, now time.Time) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	anyJWT := false
+	for _, s := range servers {
+		for _, src := range s.Sources {
+			exp, bounded := flixcloudJWTExpiry(src.URL)
+			if !bounded {
+				continue
+			}
+			anyJWT = true
+			if now.Before(exp.Add(-2 * time.Minute)) {
+				return false
+			}
+		}
+	}
+	return anyJWT
 }
 
 func hasProvider(servers []core.Server, provider string) bool {

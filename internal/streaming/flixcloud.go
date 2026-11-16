@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strconv"
@@ -486,22 +487,59 @@ func (p *FlixCloudProvider) cachedResolve(embedURL string) *flixcloudResolve {
 	return &r
 }
 
-func (p *FlixCloudProvider) storeResolve(embedURL string, r flixcloudResolve) {
+func (p *FlixCloudProvider) storeResolve(embedURL string, r flixcloudResolve, ttl time.Duration) {
 	p.resolvedMu.Lock()
 	defer p.resolvedMu.Unlock()
 	// Bound the map: embed URLs rotate per episode, old entries are dead.
 	if len(p.resolved) > 512 {
 		p.resolved = map[string]flixcloudResolve{}
 	}
-	r.expiresAt = time.Now().Add(flixcloudResolveTTL)
+	r.expiresAt = time.Now().Add(ttl)
 	p.resolved[embedURL] = r
+}
+
+// flixcloudJWTExpiry reads the exp claim out of the IP-bound JWT that rides
+// in the master URL's token= query. The JWT is opaque to us (HMAC-signed,
+// not ours to verify) but its payload is readable, and its expiry governs
+// how long the resolved master stays playable — flixcloud's own backend
+// re-mints per token, so a fresh resolve always yields a fresh window.
+// Signature-free masters (no token param) have no known expiry.
+func flixcloudJWTExpiry(masterURL string) (time.Time, bool) {
+	u, err := url.Parse(masterURL)
+	if err != nil {
+		return time.Time{}, false
+	}
+	tok := u.Query().Get("token")
+	if tok == "" {
+		return time.Time{}, false
+	}
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
 }
 
 // resolveDirect resolves one embed URL to a direct master playlist URL,
 // retrying once on a fresh page when the single-use token was already gone.
 func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) (string, []core.Subtitle, error) {
-	if cached := p.cachedResolve(embedURL); cached != nil {
-		return cached.url, cached.subs, nil
+	// Token-bound playback must not ride stale caches: an explicit refresh
+	// always re-resolves so a fresh single-use token (and a fresh JWT
+	// window) is minted instead of reusing the previous one.
+	if !IsRefresh(ctx) {
+		if cached := p.cachedResolve(embedURL); cached != nil {
+			return cached.url, cached.subs, nil
+		}
 	}
 	master, subs, err := p.flixcloudResolveEmbed(ctx, embedURL)
 	if err != nil {
@@ -514,7 +552,18 @@ func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) 
 			return "", nil, err
 		}
 	}
-	p.storeResolve(embedURL, flixcloudResolve{url: master, subs: subs})
+	// The master's JWT is the real lifetime: cache only until 15 minutes
+	// before it lapses, never the fixed TTL past it. Refresh requests still
+	// store (bounded the same way) so the next plain request is fast.
+	ttl := flixcloudResolveTTL
+	if exp, bounded := flixcloudJWTExpiry(master); bounded {
+		if safe := time.Until(exp) - 15*time.Minute; safe < ttl {
+			ttl = safe
+		}
+	}
+	if ttl > 0 {
+		p.storeResolve(embedURL, flixcloudResolve{url: master, subs: subs}, ttl)
+	}
 	return master, subs, nil
 }
 

@@ -147,3 +147,24 @@ func TestDecodeFlixcloudPlaylistKeyGenerations(t *testing.T) {
 		t.Fatalf("decode broke after storing a stale key: got %q", got[:40])
 	}
 }
+
+// The resolved master's JWT payload decides the resolve-cache lifetime:
+// exp must be read without verifying the (foreign) signature, and
+// signature-free masters must report "no known expiry".
+func TestFlixcloudJWTExpiry(t *testing.T) {
+	mk := func(payload string) string {
+		return "https://fetch9.flixcloud.cc/_v7/x/master.m3u8?token=" +
+			base64.RawURLEncoding.EncodeToString([]byte("head")) + "." +
+			base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
+	}
+	exp, ok := flixcloudJWTExpiry(mk(`{"video_id":"x","client_ip":"a","exp":1794870340,"iat":1794848740}`))
+	if !ok || exp.Unix() != 1794870340 {
+		t.Fatalf("exp parse: got %v ok=%v", exp, ok)
+	}
+	if _, ok := flixcloudJWTExpiry("https://fetch8.flixcloud.cc/_v8/AbV/master.m3u8"); ok {
+		t.Fatal("signature-free master must have no expiry")
+	}
+	if _, ok := flixcloudJWTExpiry(mk(`{"noexp":true}`)); ok {
+		t.Fatal("missing exp must be reported as unbounded")
+	}
+}

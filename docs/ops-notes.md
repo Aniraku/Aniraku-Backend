@@ -6,6 +6,18 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-16 flixcloud (again, same day): the master URLs embed an
+  IP-bound JWT whose window flixcloud mints per token — observed iat
+  7.5h stale inside a "fresh" resolve, expiring mid-flight, which took
+  Yokan/Monaka down while Mikan (a fresher cached generation) kept
+  playing. Resolve cache now expires at min(45min, exp-15min) read
+  straight from the JWT payload, refresh=true bypasses it entirely
+  (token-bound playback must never ride a stale token), and the
+  stability snapshot for flixcloud is 30min with exact expired-JWT
+  eviction on both the merge and fallback paths. Verified: fresh
+  resolve mints a 6h window (iat=now), all three servers green
+  end-to-end (master, both audio renditions, key.bin, segments to
+  valid TS).
 ## Provider checks
 
 - 2026-11-16 flixcloud: embed playback replaced with the reverse-engineered
