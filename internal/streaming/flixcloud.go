@@ -632,13 +632,30 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 // --- playlist obfuscation key -------------------------------------------
 
 // flixcloudPKFallback is the playlist XOR key observed in every sampled
-// module (baked into the wasm data section, static across pages). The
-// resolver refreshes flixcloudPK from live modules; the fallback covers
-// proxy playlist fetches that happen before any fresh resolve.
+// module (baked into the wasm data section, static across pages).
+//
+// It lives in a SET, not a single value: flixcloud rebuilds rotate the key,
+// and their Cloudflare edge caches page renders and playlist bodies of
+// DIFFERENT generations side by side (a resolve can land on a page whose
+// module embeds last week's key while the playlist it names is encrypted
+// with the current one). A single runtime value overwritten per resolve
+// made every decode after such a resolve fail until restart — the wrapped
+// body was then served raw and the player died. The set holds every key
+// seen (static fallback permanent, resolve-derived entries LRU-capped);
+// decode tries each until the plaintext magic appears.
+const flixcloudPKFallbackHex = "ad84671c539a5e919ae6932f604f2a16d26c93d5545e90f76518561453c2e744"
+
 var (
-	flixcloudPKMu sync.RWMutex
-	flixcloudPK   = mustHex("ad84671c539a5e919ae6932f604f2a16d26c93d5545e90f76518561453c2e744")
+	flixcloudPKMu       sync.RWMutex
+	flixcloudPKOrder    []string
+	flixcloudPKSet      = map[string][]byte{}
+	flixcloudPKFallback = mustHex(flixcloudPKFallbackHex)
 )
+
+func init() {
+	flixcloudPKSet[flixcloudPKFallbackHex] = flixcloudPKFallback
+	flixcloudPKOrder = append(flixcloudPKOrder, flixcloudPKFallbackHex)
+}
 
 func mustHex(s string) []byte {
 	b, err := hex.DecodeString(s)
@@ -648,13 +665,48 @@ func mustHex(s string) []byte {
 	return b
 }
 
+// flixcloudStorePlaylistKey adds a resolve-derived key to the candidate set.
 func flixcloudStorePlaylistKey(pk []byte) {
 	if len(pk) != 32 {
 		return
 	}
+	id := hex.EncodeToString(pk)
 	flixcloudPKMu.Lock()
-	flixcloudPK = pk
-	flixcloudPKMu.Unlock()
+	defer flixcloudPKMu.Unlock()
+	if _, ok := flixcloudPKSet[id]; ok {
+		return
+	}
+	// Bound the set: drop the OLDEST non-fallback entry first.
+	for len(flixcloudPKOrder) >= 8 {
+		oldest := flixcloudPKOrder[0]
+		flixcloudPKOrder = flixcloudPKOrder[1:]
+		if oldest != flixcloudPKFallbackHex {
+			delete(flixcloudPKSet, oldest)
+			break
+		}
+	}
+	// Fallback stays first so the common path needs one try.
+	idx := 1
+	if len(flixcloudPKOrder) < idx {
+		idx = len(flixcloudPKOrder)
+	}
+	flixcloudPKOrder = append(flixcloudPKOrder, "")
+	copy(flixcloudPKOrder[idx+1:], flixcloudPKOrder[idx:])
+	flixcloudPKOrder[idx] = id
+	flixcloudPKSet[id] = pk
+}
+
+// flixcloudPKSnapshot returns the current candidates, fallback first.
+func flixcloudPKSnapshot() [][]byte {
+	flixcloudPKMu.RLock()
+	defer flixcloudPKMu.RUnlock()
+	out := make([][]byte, 0, len(flixcloudPKOrder))
+	for _, id := range flixcloudPKOrder {
+		if pk, ok := flixcloudPKSet[id]; ok {
+			out = append(out, pk)
+		}
+	}
+	return out
 }
 
 // DecodeFlixcloudPlaylist unwraps the base64(XOR(plaintext, pk)) wrapper
@@ -671,19 +723,15 @@ func DecodeFlixcloudPlaylist(body []byte) []byte {
 	if err != nil || len(decoded) < 32 {
 		return body
 	}
-	flixcloudPKMu.RLock()
-	pk := flixcloudPK
-	flixcloudPKMu.RUnlock()
-	if len(pk) != 32 {
-		return body
+	for _, pk := range flixcloudPKSnapshot() {
+		out := make([]byte, len(decoded))
+		copy(out, decoded)
+		for i := range out {
+			out[i] ^= pk[i%len(pk)]
+		}
+		if strings.HasPrefix(string(out[:8]), "#EXTM3U") {
+			return out
+		}
 	}
-	out := make([]byte, len(decoded))
-	copy(out, decoded)
-	for i := range out {
-		out[i] ^= pk[i%len(pk)]
-	}
-	if !strings.HasPrefix(string(out[:8]), "#EXTM3U") {
-		return body
-	}
-	return out
+	return body
 }

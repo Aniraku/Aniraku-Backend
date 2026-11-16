@@ -103,7 +103,7 @@ func TestFlixcloudFieldNames(t *testing.T) {
 // The playlist wrapper round-trips: encode = b64(XOR(plain, pk)).
 func TestDecodeFlixcloudPlaylist(t *testing.T) {
 	flixcloudPKMu.RLock()
-	pk := flixcloudPK
+	pk := flixcloudPKFallback
 	flixcloudPKMu.RUnlock()
 
 	plain := "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:6\nseg-0.png\n"
@@ -123,5 +123,27 @@ func TestDecodeFlixcloudPlaylist(t *testing.T) {
 	// Garbage returns as-is (proxy classification handles rejection).
 	if got := DecodeFlixcloudPlaylist([]byte("not base64!!!")); string(got) != "not base64!!!" {
 		t.Fatalf("garbage passthrough mismatch: %q", got)
+	}
+}
+
+// A resolve landing on a cached page of a DIFFERENT build embeds a stale
+// key; storing it must never break decodes of the other generation's
+// playlists (the fallback always stays in the candidate set).
+func TestDecodeFlixcloudPlaylistKeyGenerations(t *testing.T) {
+	flixcloudPKMu.RLock()
+	fallback := flixcloudPKFallback
+	flixcloudPKMu.RUnlock()
+
+	plain := "#EXTM3U\n#EXT-X-VERSION:3\nseg-0.png\n"
+	wrapped := make([]byte, len(plain))
+	for i := 0; i < len(plain); i++ {
+		wrapped[i] = plain[i] ^ fallback[i%len(fallback)]
+	}
+	enc := []byte(base64.StdEncoding.EncodeToString(wrapped))
+
+	// Simulate a resolve that saw a different build's key.
+	flixcloudStorePlaylistKey([]byte("stale-key-from-an-older-build-xxxxxx"))
+	if got := DecodeFlixcloudPlaylist(enc); string(got) != plain {
+		t.Fatalf("decode broke after storing a stale key: got %q", got[:40])
 	}
 }

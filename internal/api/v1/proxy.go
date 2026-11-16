@@ -474,6 +474,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Reached only after the SSRF/allowlist gates above, so the cache can
 	// never answer a request the proxy would not have fetched itself.
 	if cachedBody, ok := streaming.VODCacheGet(decodedURL); ok {
+		// Defensive: cache entries written before the flixcloud unwrap (or by
+		// any path that stored raw) could still be wrapped; the decode is
+		// idempotent for plaintext, so apply it unconditionally here.
+		cachedBody = streaming.DecodeFlixcloudPlaylist(cachedBody)
 		if r.Method == http.MethodHead {
 			// No Content-Length: the GET representation is the REWRITTEN
 			// playlist whose length differs from these raw bytes,

@@ -195,13 +195,29 @@ func normalizeOriginReferer(referer string) string {
 // path still stores into the same cache.
 func fetchPlaylistCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
 	if body, ok := VODCacheGet(rawURL); ok && int64(len(body)) <= limit {
-		return body, true
+		return unwrapFlixcloudBody(rawURL, body), true
 	}
 	body, ok := fetchURLCapped(ctx, client, rawURL, referer, ua, limit, timeout)
 	if ok {
+		body = unwrapFlixcloudBody(rawURL, body)
 		VODCacheSet(rawURL, body)
 	}
 	return body, ok
+}
+
+// unwrapFlixcloudBody strips the base64(XOR(_, pk)) wrapper flixcloud puts
+// around every m3u8 body BEFORE the probe parses it or the VOD cache stores
+// it. Cached-raw wrapped bodies made every downstream consumer (probe
+// segment extraction, the proxy's cache-hit playlist serve) see base64
+// noise instead of #EXTM3U, which blacked out flixcloud playback entirely.
+// Idempotent: plaintext bodies pass through unchanged, so this is safe to
+// apply at every consumption point.
+func unwrapFlixcloudBody(rawURL string, body []byte) []byte {
+	u, err := url.Parse(rawURL)
+	if err != nil || !strings.HasSuffix(strings.ToLower(u.Hostname()), "flixcloud.cc") {
+		return body
+	}
+	return DecodeFlixcloudPlaylist(body)
 }
 
 func fetchURLCapped(ctx context.Context, client *http.Client, rawURL, referer, ua string, limit int64, timeout time.Duration) ([]byte, bool) {
