@@ -30,6 +30,7 @@ import (
 type internalTokenGate struct {
 	once       sync.Once
 	token      string
+	tokens     map[string]struct{}
 	enforce    bool
 	uaPrefixes []string
 	origins    []string
@@ -39,8 +40,19 @@ var internalGate internalTokenGate
 
 func (g *internalTokenGate) init() {
 	g.token = strings.TrimSpace(os.Getenv("ANIRAKU_INTERNAL_TOKEN"))
+	// The Cloudflare Pages function presents the secret as
+	// x-aniraku-internal sourced from ITS OWN env var name
+	// (BACKEND_INTERNAL_TOKEN) — accept both spellings so the deployment
+	// pairing works no matter which side named the variable.
+	g.tokens = map[string]struct{}{}
+	if g.token != "" {
+		g.tokens[g.token] = struct{}{}
+	}
+	if alt := strings.TrimSpace(os.Getenv("BACKEND_INTERNAL_TOKEN")); alt != "" {
+		g.tokens[alt] = struct{}{}
+	}
 	e := strings.ToLower(strings.TrimSpace(os.Getenv("ANIRAKU_INTERNAL_ENFORCE")))
-	g.enforce = g.token != "" && (e == "1" || e == "true")
+	g.enforce = len(g.tokens) > 0 && (e == "1" || e == "true")
 	g.uaPrefixes = splitList(os.Getenv("ANIRAKU_TRUSTED_UA_PREFIXES"))
 	g.origins = splitList(os.Getenv("ANIRAKU_TRUSTED_ORIGINS"))
 }
@@ -107,9 +119,11 @@ func InternalToken(next http.Handler) http.Handler {
 		if token == "" {
 			token = r.Header.Get("X-Aniraku-Internal")
 		}
-		if token == g.token && g.token != "" {
-			next.ServeHTTP(w, r)
-			return
+		if token != "" {
+			if _, ok := g.tokens[token]; ok {
+				next.ServeHTTP(w, r)
+				return
+			}
 		}
 		if g.trustedOrigin(r) {
 			next.ServeHTTP(w, r)
