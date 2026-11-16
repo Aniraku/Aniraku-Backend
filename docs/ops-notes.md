@@ -6,6 +6,22 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-16 flixcloud (app path): the box-side chain was green but the
+  APP still failed because the Pages function's serveK fetched sealed
+  masters from Cloudflare's own IPs — the JWT client_ip check 403'd the
+  edge, and where the edge answered from cache the body was the undecoded
+  base64(XOR) wrapper. serveK now routes flixcloud-sealed tokens and
+  backend-host child URIs through the backend (internal header attached);
+  the shield then wraps everything as usual. Verified with the REAL
+  function code driven against the REAL backend (Node harness, no CF in
+  the loop): shielded /servers with zero upstream-host leaks, master ->
+  variant -> key(16B) -> segment(1.3MB) -> styled .ass subtitle, all
+  same-origin tokens. ALSO found: the Pages function's token env name
+  (BACKEND_INTERNAL_TOKEN) and the gate's (ANIRAKU_INTERNAL_TOKEN) held
+  different values in production — the gate now accepts either, so the
+  token check is actually live instead of riding the UA exemption.
+  /servers consistency re-verified after all changes: 3 identical runs,
+  17 servers / 10 providers each, cold titles included.
 - 2026-11-16 flixcloud (again, same day): the master URLs embed an
   IP-bound JWT whose window flixcloud mints per token — observed iat
   7.5h stale inside a "fresh" resolve, expiring mid-flight, which took
