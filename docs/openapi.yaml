@@ -146,7 +146,10 @@ paths:
       description: |
         Provider fallback chain (Anikoto → AnimeX → Zoko → FlixCloud → kaa → AnimeGG → AniWaves → MegaVid → Zenbu → AnV → Anixo → AniPM)
         or a specific provider when `provider` is set. HLS sources are
-        rewritten to point at `/api/v1/proxy`; subtitles are returned raw.
+        rewritten to point at `/api/v1/proxy`; subtitle tracks are wrapped
+        the same way (url= + headers=, or an opaque `k=` link when
+        PROXY_LINK_KEY is set) so the proxy fetches them with the provider's
+        sealed UA/Referer.
       security: []
       requestBody:
         required: true
@@ -834,7 +837,13 @@ components:
     Subtitle:
       type: object
       properties:
-        url: { type: string }
+        url:
+          type: string
+          description: |
+            Backend proxy link (same shape as Source.url): `/api/v1/proxy?url=<raw>&headers=<json>`,
+            or an opaque `/api/v1/proxy?k=<token>` when PROXY_LINK_KEY is set.
+            Clients must use it as-is — re-wrapping produces a proxy-of-proxy
+            URL the backend rejects with 403.
         lang: { type: string }
         label: { type: string }
 

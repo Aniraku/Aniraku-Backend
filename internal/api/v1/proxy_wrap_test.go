@@ -2,6 +2,7 @@ package v1
 
 import (
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -35,13 +36,47 @@ func TestProxySourcesNoCrossRequestPoison(t *testing.T) {
 	if !strings.HasPrefix(sub[0].URL, "https://api.aniraku.tech/api/v1/proxy?") || !strings.Contains(sub[0].URL, "al=sub") {
 		t.Fatalf("sub wrap = %q, want prod base + al=sub", sub[0].URL)
 	}
-	if len(sub[0].Subtitles) != 1 || sub[0].Subtitles[0].URL != "https://cdn.example/subs/en.vtt" {
-		t.Fatalf("subtitles must stay raw: %+v", sub[0].Subtitles)
+	// Subtitles ride the same proxy as the video (url= + headers=), so the
+	// client fetches them with the provider's sealed UA/Referer instead of
+	// a bare CDN URL the CDN answers with 403.
+	subURL := sub[0].Subtitles[0].URL
+	if !strings.HasPrefix(subURL, "https://api.aniraku.tech/api/v1/proxy?url=") ||
+		!strings.Contains(subURL, url.QueryEscape("https://cdn.example/subs/en.vtt")) ||
+		!strings.Contains(subURL, "headers=") {
+		t.Fatalf("subtitle not proxied: %q", subURL)
+	}
+	// The provider's cached track slice must stay raw (shallow copy would
+	// have written the proxy URL into it).
+	if srcs[0].Subtitles[0].URL != "https://cdn.example/subs/en.vtt" {
+		t.Fatalf("input subtitle mutated: %q", srcs[0].Subtitles[0].URL)
 	}
 	// Wrapping the same input again must not double-wrap.
 	again := proxySources(prod, sub, headers, "sub")
 	if strings.Count(again[0].URL, "/api/v1/proxy?") != 1 {
 		t.Fatalf("double wrap: %q", again[0].URL)
+	}
+	if strings.Count(again[0].Subtitles[0].URL, "/api/v1/proxy?") != 1 {
+		t.Fatalf("subtitle double wrap: %q", again[0].Subtitles[0].URL)
+	}
+}
+
+// Relative and non-http subtitle URLs cannot be fetched upstream, and a
+// nested proxy URL must not be wrapped again: both pass through untouched
+// instead of producing a proxy link that 400s or loops back to 127.0.0.1.
+func TestProxySourcesSubtitlePassthrough(t *testing.T) {
+	req := httptest.NewRequest("GET", "https://api.aniraku.tech/api/v1/servers?lang=sub", nil)
+	srcs := []core.Source{{
+		URL: "https://hls.krussdomi.com/master.m3u8", Type: "hls",
+		Subtitles: []core.Subtitle{
+			{URL: "/subs/relative.vtt", Lang: "en"},
+			{URL: "https://api.aniraku.tech/api/v1/proxy?url=https%3A%2F%2Fcdn.example%2Fen.vtt", Lang: "en"},
+		},
+	}}
+	got := proxySources(req, srcs, nil, "sub")
+	for i, sub := range got[0].Subtitles {
+		if sub.URL != srcs[0].Subtitles[i].URL {
+			t.Fatalf("subtitle %d rewritten: %q", i, sub.URL)
+		}
 	}
 }
 

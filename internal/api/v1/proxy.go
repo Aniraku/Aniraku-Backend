@@ -104,20 +104,31 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	wantAl := lang == "sub" || lang == "dub"
 	for i := range out {
 		source := &out[i]
+		// Subtitle tracks ride the same proxy as the video. Their CDNs
+		// answer 403 without the provider's UA/Referer/cookies, and those
+		// headers only exist server-side, so a raw subtitle URL cannot be
+		// fetched by the client on most providers.
+		// Deep copy first: out is a shallow copy, so writing through the
+		// Subtitles slice would bake this request's proxyBase into the
+		// provider's cached result (the bug pinned for source URLs by
+		// TestProxySourcesNoCrossRequestPoison).
+		if len(source.Subtitles) > 0 {
+			subs := make([]core.Subtitle, len(source.Subtitles))
+			copy(subs, source.Subtitles)
+			for j := range subs {
+				subs[j].URL = proxyMediaURL(proxyBase, subs[j].URL, headersParam)
+			}
+			source.Subtitles = subs
+		}
 		st := strings.ToLower(source.Type)
-		if (st != "hls" && st != "mp4") || source.URL == "" || strings.Contains(source.URL, "/api/v1/proxy?") {
+		if (st != "hls" && st != "mp4") || source.URL == "" {
 			continue
 		}
 		alParam := ""
 		if wantAl && isKaaHLSSource(source.URL) {
 			alParam = "&al=" + lang
 		}
-		source.URL = fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s%s", proxyBase, url.QueryEscape(source.URL), headersParam, alParam)
-		// Subtitle URLs are delivered RAW: the web client wraps them with its
-		// own proxied() helper (which attaches headers + cache nonce). Wrapping
-		// them here too produced double-encoded URLs that 403 at the gate.
-		// Subtitle hosts are still vouched for the allowlist by the provider
-		// (learnURLHost), so the proxy accepts them.
+		source.URL = proxyMediaURL(proxyBase, source.URL, headersParam) + alParam
 	}
 	// The input slice is never mutated: provider resolve caches share their
 	// SourceResult backing arrays across requests, and wrapping in place
@@ -125,6 +136,20 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 	// (observed: local 127.0.0.1 links and al=dub served on production sub
 	// requests). Callers use the returned copy.
 	return out
+}
+
+// proxyMediaURL wraps one upstream media URL (video, playlist, subtitle)
+// into a backend proxy link in the url= + headers= form the client already
+// understands. Already-proxied URLs and anything not absolute http(s) come
+// back untouched: re-wrapping a self-proxy URL would make the proxy fetch
+// itself (127.0.0.1 → 403 at the allowlist), and a relative URL is not
+// fetchable upstream at all.
+func proxyMediaURL(proxyBase, rawURL, headersParam string) string {
+	if rawURL == "" || strings.Contains(rawURL, "/api/v1/proxy?") ||
+		(!strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://")) {
+		return rawURL
+	}
+	return fmt.Sprintf("%s/api/v1/proxy?url=%s&headers=%s", proxyBase, url.QueryEscape(rawURL), headersParam)
 }
 
 // isKaaHLSSource reports whether an upstream URL is a krussdomi/kaa HLS
@@ -278,6 +303,20 @@ func (h *Handlers) mintSourcesForClient(servers []core.Server) []core.Server {
 			if link, err := mintProxyLink(src.URL, srv.Headers); err == nil {
 				src.URL = link
 			}
+			// Subtitle tracks get their own opaque link: a raw URL here
+			// would bypass the proxy and lose the sealed UA/Referer the
+			// CDN requires. Deep copy, src shares the Subtitles backing
+			// array with the cached server result.
+			if len(src.Subtitles) > 0 {
+				subs := make([]core.Subtitle, len(src.Subtitles))
+				copy(subs, src.Subtitles)
+				for j := range subs {
+					if link, err := mintProxyLink(subs[j].URL, srv.Headers); err == nil {
+						subs[j].URL = link
+					}
+				}
+				src.Subtitles = subs
+			}
 			srcs = append(srcs, src)
 		}
 		if len(srcs) == 0 {
@@ -302,8 +341,18 @@ func (h *Handlers) mintStreamSources(result *core.StreamResult) *core.StreamResu
 		}
 		if link, err := mintProxyLink(src.URL, result.Headers); err == nil {
 			src.URL = link
-			srcs = append(srcs, src)
 		}
+		if len(src.Subtitles) > 0 {
+			subs := make([]core.Subtitle, len(src.Subtitles))
+			copy(subs, src.Subtitles)
+			for j := range subs {
+				if link, err := mintProxyLink(subs[j].URL, result.Headers); err == nil {
+					subs[j].URL = link
+				}
+			}
+			src.Subtitles = subs
+		}
+		srcs = append(srcs, src)
 	}
 	if len(srcs) > 0 {
 		result.Sources = srcs
