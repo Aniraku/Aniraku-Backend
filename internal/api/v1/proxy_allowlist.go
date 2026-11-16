@@ -21,9 +21,14 @@ var defaultCDNSuffixes = []string{
 	// Miruro-family HLS CDNs (observed live + referenced in code)
 	"akirax.buzz", "shiora.site", "anidb.app", "uwucdn.com", "owocdn.com",
 	"kwik.cx", "ninstream.com", "ninstream.co",
-	// FlixCloud embed CDN
+	// FlixCloud embed CDN. Direct HLS masters live on the site's fetch
+	// hosts (fetch{8,9,10,...}.flixcloud.cc — the number rotates, so the
+	// bare domain entry covers them via suffix matching), and the
+	// vault-N.{vividcdn,spectralcdn,rundowncdn,atomic4cdn}.top families
+	// carry segments/key material/subtitles. Both the vault number and the
+	// domain rotate per episode, so the bare families are listed.
 	"flixcloud.cc", "flixcloud.com",
-	"fetch8.flixcloud.cc", "fetch9.flixcloud.cc", "fetch10.flixcloud.cc", "vault-95.atomic4cdn.top",
+	"atomic4cdn.top", "vividcdn.top", "spectralcdn.top", "rundowncdn.top",
 	// Direct mp4 mirrors
 	"animegg.org",
 	// AnimeGG mp4 file host (302 target of /play/ URLs)

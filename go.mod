@@ -8,6 +8,8 @@ require (
 	github.com/refraction-networking/utls v1.8.2
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/viper v1.19.0
+	github.com/tetratelabs/wazero v1.12.0
+	golang.org/x/crypto v0.57.0
 	golang.org/x/net v0.60.0
 )
 
@@ -32,7 +34,6 @@ require (
 	github.com/stretchr/testify v1.11.1 // indirect
 	github.com/subosito/gotenv v1.6.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

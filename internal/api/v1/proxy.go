@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -71,7 +70,7 @@ func (h *Handlers) Stream(w http.ResponseWriter, r *http.Request) {
 
 	h.notifyEpisode(anilistID, req.Episode)
 	proxyStreamResult(r, result, req.Lang)
-	h.respondJSON(w, http.StatusOK, result)
+	h.respondJSON(w, http.StatusOK, h.mintStreamSources(result))
 }
 
 // proxyStreamResult makes the API response safe for browsers. Providers return
@@ -502,21 +501,13 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		}
 	}
 
-	// FlixCloud's m3u8 JWT is bound to the IP that hit the decrypt endpoint
-	// (the `client_ip` claim), and the CDN validates the actual TCP source IP
-	// of every request. It does not honor X-Forwarded-For, X-Real-IP, or
-	// CF-Connecting-IP for this check. The previous code sent the local proxy
-	// peer (often 127.0.0.1) in those headers, which could not fix an IP
-	// mismatch and could make the request misleading to diagnose.
-	if host := strings.ToLower(parsed.Hostname()); host == "fetch8.flixcloud.cc" || strings.HasSuffix(host, ".flixcloud.cc") {
-		if clientIP, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-			h.log.Debug().
-				Str("proxy_url", decodedURL).
-				Str("r_remote_addr", r.RemoteAddr).
-				Str("jwt_client_ip_guess", clientIP).
-				Msg("flixcloud proxy: IP-bound JWT; verify Go egress IP matches the client_ip claim")
-		}
-	}
+	// FlixCloud: segments (vault-N.vividcdn.top etc.) answer 403 to
+	// headerless fetches, and the sealed Referer from the k-token already
+	// rides on every rewritten child URI, so nothing extra is set here. The
+	// m3u8 bodies on the fetch hosts are additionally wrapped in
+	// base64(XOR(_, pk)); that decode happens right before classification.
+	// The old IP-bound JWT flow (client_ip claim validated against the TCP
+	// source) is gone — direct masters carry no signature at all now.
 
 	// Forward the client's Range header for media/segment requests so the
 	// video element can seek through the proxy. Without it every seek turns
@@ -689,6 +680,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		if err != nil {
 			h.respondError(w, http.StatusBadGateway, "failed to read HLS playlist")
 			return
+		}
+		// FlixCloud wraps every m3u8 body in base64(XOR(plaintext, pk)) where
+		// pk is baked into the embed page's wasm data section. Unwrap BEFORE
+		// classification — the wrapped body is base64 text, not #EXTM3U, and
+		// would be rejected as garbage. DecodeFlixcloudPlaylist passes
+		// already-plaintext bodies through, so this is a no-op for anything
+		// else the CDN serves.
+		if strings.HasSuffix(strings.ToLower(parsed.Hostname()), "flixcloud.cc") {
+			body = streaming.DecodeFlixcloudPlaylist(body)
 		}
 		switch classifyPlaylistResponse(resp.StatusCode, resp.Header.Get("Content-Range"), body) {
 		case playlistReject:

@@ -6,6 +6,24 @@ inside source comments.
 
 ## Provider checks
 
+## Provider checks
+
+- 2026-11-16 flixcloud: embed playback replaced with the reverse-engineered
+  direct chain (flixcloud.go + flixcloud_wasmrun.go). Verified live on the
+  box: all three reanime embeds (v=1/2/3 → fetch9/fetch8/fetch11 masters)
+  resolve to direct HLS, master + child playlists unwrap (b64+XOR) and
+  rewrite, key.bin serves 16 raw bytes, vault-N.rundowncdn.top segments
+  carry the sealed Referer and AES-128-decrypt to valid TS, and the
+  island's styled English .ass subs ride the proxy as source subtitles.
+  Tokens behind /api/m3u8/ are single-use (410 invalid_or_used_token on
+  reuse) and the two v1/v3 masters carry an IP-bound JWT (client_ip claim,
+  ~6h expiry) — valid only because every fetch egresses from this box.
+  The wasm mix module randomizes both structure and constants per page
+  render, so it is executed (wazero) rather than reimplemented; the
+  playlist XOR key is baked into the module's data section and refreshed
+  from every resolve. POST /api/v1/stream now mints k-links like /servers
+  (it previously leaked url=+headers= on the cached path).
+
 - 2026-11-05 animex: VPS egress cycles the fingerprint 429
   (fingerprint source limit) once per cooldown window since the Chrome-uTLS
   client (commit 930a4bc): window expires → 3-4 racing sub-provider pokes →
