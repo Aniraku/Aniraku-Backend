@@ -84,8 +84,15 @@ func mintProxyLink(rawURL string, headers map[string]string) (string, error) {
 	if u, err := url.Parse(rawURL); err == nil && u.Query().Get("url") != "" {
 		// Nested self-proxy: unwrap the inner url= and merge the inner
 		// headers= (the provider session cookies/headers the collector
-		// already embedded) over the caller-supplied ones.
+		// already embedded) over the caller-supplied ones. The al= audio
+		// strip context rides on the OUTER URL — proxySources appends it
+		// after wrapping — and MUST survive the unwrap onto the sealed
+		// inner URL, or sub/dub selections lose their audio-strip context
+		// and both play the default rendition.
 		if inner, ierr := url.QueryUnescape(u.Query().Get("url")); ierr == nil {
+			if al := u.Query().Get("al"); al != "" {
+				inner = withAudioLang(inner, al)
+			}
 			rawURL = inner
 		}
 		if hj := u.Query().Get("headers"); hj != "" {

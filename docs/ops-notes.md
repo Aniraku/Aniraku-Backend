@@ -6,6 +6,18 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
+  and dub entries (one dual-audio master carrying jpn "Native" + eng
+  "English" renditions) — the languages differ by the al=sub/dub strip,
+  which flixcloud URLs never received (proxySources gated the strip on
+  isKaaHLSSource, and the k-link mint dropped al during the nested
+  unwrap). Fix: wantsAudioStrip covers flixcloud hosts, withAudioLang
+  appends al at mint time, mintProxyLink preserves it across the unwrap,
+  and the k-route promotes the sealed al to the request query so
+  stripAudioRenditions sees it. Verified live: SUB master serves jpn
+  only, DUB master serves eng only, variant playlists strip too.
+  Subtitle chain re-verified through the exact browser flow (Range head
+  fetch -> [Script Info] detect -> Artplayer ass type).
 - 2026-11-17 flixcloud (final piece): the direct-browser flow
   (VITE_PLAYBACK_HOST_B64 -> api.aniraku.tech) served the RAW wrapped
   bodies for all three masters — logUnwrappedFlixcloud caught the decode

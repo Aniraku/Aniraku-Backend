@@ -124,7 +124,7 @@ func proxySources(r *http.Request, sources []core.Source, headers map[string]str
 			continue
 		}
 		alParam := ""
-		if wantAl && isKaaHLSSource(source.URL) {
+		if wantAl && wantsAudioStrip(source.URL) {
 			alParam = "&al=" + lang
 		}
 		source.URL = proxyMediaURL(proxyBase, source.URL, headersParam) + alParam
@@ -163,6 +163,41 @@ func isKaaHLSSource(rawURL string) bool {
 	}
 	host := strings.ToLower(u.Hostname())
 	return strings.Contains(host, "krussdomi") || strings.Contains(host, "kaa")
+}
+
+// isFlixcloudSource reports flixcloud HLS masters: every one is dual-audio
+// (jpn "Native" + eng "English" EXT-X-MEDIA renditions), so they qualify
+// for the al=sub/dub strip exactly like kaa.
+func isFlixcloudSource(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(strings.ToLower(u.Hostname()), "flixcloud.cc")
+}
+
+// wantsAudioStrip reports whether this source's master carries dual audio
+// the al=sub/dub strip should act on.
+func wantsAudioStrip(rawURL string) bool {
+	return isKaaHLSSource(rawURL) || isFlixcloudSource(rawURL)
+}
+
+// withAudioLang appends al=<lang> to a master URL so the proxy's rewrite
+// strips the wrong audio rendition. Used by the k-link mint, whose sealed
+// URL is the ONLY thing the proxy sees — without this the strip context is
+// lost and sub/dub selections play identical (default jpn) audio.
+func withAudioLang(rawURL, lang string) string {
+	if lang != "sub" && lang != "dub" {
+		return rawURL
+	}
+	if !wantsAudioStrip(rawURL) {
+		return rawURL
+	}
+	sep := "?"
+	if strings.Contains(rawURL, "?") {
+		sep = "&"
+	}
+	return rawURL + sep + "al=" + lang
 }
 
 func (h *Handlers) LegacyEpsrc(w http.ResponseWriter, r *http.Request) {
@@ -394,6 +429,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		q := r.URL.Query()
 		q.Del("k")
 		q.Set("url", rawURL)
+		// Promote the audio-strip context: the mint seals al= INSIDE the
+		// master URL (withAudioLang at mint time), but the rewrite reads it
+		// from the REQUEST query — without promotion a sealed al never
+		// reaches stripAudioRenditions and sub/dub play identical audio.
+		if sealedURL, sErr := url.Parse(rawURL); sErr == nil {
+			if alv := sealedURL.Query().Get("al"); alv != "" && q.Get("al") == "" {
+				q.Set("al", alv)
+			}
+		}
 		if len(sealedHeaders) > 0 {
 			if hj, jerr := json.Marshal(sealedHeaders); jerr == nil {
 				q.Set("headers", string(hj))
