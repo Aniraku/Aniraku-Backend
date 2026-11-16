@@ -308,13 +308,20 @@ func disambiguateSubtitleLangs(subs []core.Subtitle) []core.Subtitle {
 	out := make([]core.Subtitle, len(subs))
 	copy(out, subs)
 	seen := make(map[string]int, len(subs))
+	plain := make(map[string]int, len(subs))
 	for i, s := range out {
 		if s.Lang == "" || counts[s.Lang] < 2 {
 			continue
 		}
 		suffix := subtitleLabelSuffix(s.Label, s.Lang)
 		if suffix == "" {
-			continue
+			// Nothing distinguishes this track ("English" twice): number the
+			// label AND the lang. A bare duplicate lang is what makes
+			// clients that dedupe by lang keep only the first track, so the
+			// second file silently disappears.
+			plain[s.Lang]++
+			suffix = strconv.Itoa(plain[s.Lang])
+			out[i].Label = langDisplay(s.Lang) + " (" + suffix + ")"
 		}
 		newLang := s.Lang + " (" + suffix + ")"
 		seen[newLang]++

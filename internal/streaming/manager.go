@@ -274,7 +274,22 @@ const zokoPaused = false
 // GetSourcesForProviderWithSlug is the frontend-aware streaming entry point.
 // slug is accepted for API compatibility; the Anikoto resolver maps AniList
 // IDs itself, so the slug is unused today.
+//
+// Every return path goes through disambiguateStreamSubtitles: a /stream
+// response must label duplicate same-language tracks ("English (1)",
+// "English (2)") just like the /servers merge does, or a client that dedupes
+// by lang keeps only the first file.
 func (m *Manager) GetSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
+	result, err := m.getSourcesForProviderWithSlug(ctx, episode, provider, lang, quality, animeID, slug)
+	if result != nil {
+		for i := range result.Sources {
+			result.Sources[i].Subtitles = disambiguateSubtitleLangs(result.Sources[i].Subtitles)
+		}
+	}
+	return result, err
+}
+
+func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int, provider, lang, quality string, animeID int, slug string) (*core.StreamResult, error) {
 	// Cute server names double as provider aliases (the server list shows
 	// "Sunny", the explicit request sends "Sunny"): normalize them to the
 	// family before anything else so both forms resolve identically.

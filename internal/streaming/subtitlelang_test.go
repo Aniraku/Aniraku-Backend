@@ -136,7 +136,7 @@ func TestDisambiguateSubtitleLangsAppendsLabelSuffix(t *testing.T) {
 	}
 	out := disambiguateSubtitleLangs(in)
 	want := []string{
-		"en",
+		"en (1)",
 		"en (Full Subtitles (Restyled By Simmsy))",
 		"en (CR)",
 		"en (CR 2)",
@@ -146,5 +146,33 @@ func TestDisambiguateSubtitleLangsAppendsLabelSuffix(t *testing.T) {
 		if out[i].Lang != w {
 			t.Fatalf("track %d: got lang %q, want %q", i, out[i].Lang, w)
 		}
+	}
+	if out[0].Label != "English (1)" {
+		t.Fatalf("plain duplicate label = %q, want %q", out[0].Label, "English (1)")
+	}
+	// A label that already carries text keeps it untouched.
+	if out[1].Label != "English Full Subtitles (Restyled By Simmsy)" {
+		t.Fatalf("named duplicate label = %q", out[1].Label)
+	}
+}
+
+// Two indistinguishable tracks ("English" twice) are what clients collapse
+// to one entry: both lang and label must carry a suffix, or the second file
+// is unreachable.
+func TestDisambiguateSubtitleLangsNumbersIdenticalEnglish(t *testing.T) {
+	out := disambiguateSubtitleLangs([]core.Subtitle{
+		{URL: "u1", Lang: "en", Label: "English"},
+		{URL: "u2", Lang: "en", Label: "English"},
+	})
+	if out[0].Lang != "en (1)" || out[1].Lang != "en (2)" {
+		t.Fatalf("langs = %q, %q; want en (1), en (2)", out[0].Lang, out[1].Lang)
+	}
+	if out[0].Label != "English (1)" || out[1].Label != "English (2)" {
+		t.Fatalf("labels = %q, %q; want English (1), English (2)", out[0].Label, out[1].Label)
+	}
+	// A lone track keeps its plain code, and an empty lang stays empty.
+	single := disambiguateSubtitleLangs([]core.Subtitle{{URL: "u", Lang: "en", Label: "English"}})
+	if single[0].Lang != "en" || single[0].Label != "English" {
+		t.Fatalf("single track rewritten: %+v", single[0])
 	}
 }
