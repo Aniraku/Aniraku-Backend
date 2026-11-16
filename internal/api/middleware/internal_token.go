@@ -100,7 +100,14 @@ func InternalToken(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Header.Get("X-Internal-Token") == g.token && g.token != "" {
+		// The Pages function sends the secret as `x-aniraku-internal`; the
+		// original contract was `X-Internal-Token`. Accept both so either
+		// side can be rolled without breaking the site's proxied traffic.
+		token := r.Header.Get("X-Internal-Token")
+		if token == "" {
+			token = r.Header.Get("X-Aniraku-Internal")
+		}
+		if token == g.token && g.token != "" {
 			next.ServeHTTP(w, r)
 			return
 		}

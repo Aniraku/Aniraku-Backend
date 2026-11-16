@@ -66,3 +66,17 @@ func TestInternalTokenGate(t *testing.T) {
 		})
 	}
 }
+
+// The Pages function sends the shared secret as `x-aniraku-internal` (see
+// functions/api/v1/[[path]].js forwarded()); the gate must accept that header
+// too, or enabling enforcement 403s every request the site proxies.
+func TestInternalTokenGateAcceptsPagesHeader(t *testing.T) {
+	h := gateFor(t, "secret1", "1", "aniraku.anime.app,okhttp,dalvik", "aniraku.tech")
+	req := newReq("totally-unknown-client/1.0")
+	req.Header.Set("X-Aniraku-Internal", "secret1")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("x-aniraku-internal: got %d, want 200", rec.Code)
+	}
+}
