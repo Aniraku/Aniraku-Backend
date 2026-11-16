@@ -86,6 +86,16 @@ func VODCacheGet(exactURL string) ([]byte, bool) {
 	return cp, true
 }
 
+// VODCacheDrop removes a single cached playlist body — used when a cached
+// entry turns out to be undecodable (wrapped in a key generation the key
+// set no longer covers), so the next request takes the fresh-fetch path
+// with its bust+refresh retry instead of serving garbage forever.
+func VODCacheDrop(exactURL string) {
+	vodCacheMu.Lock()
+	defer vodCacheMu.Unlock()
+	delete(vodCache, exactURL)
+}
+
 // VODCacheSet stores a raw playlist body under exactURL when it passes the
 // static-playlist gate. Oversized bodies and live playlists are dropped.
 func VODCacheSet(exactURL string, body []byte) {

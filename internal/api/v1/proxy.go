@@ -474,23 +474,33 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// Reached only after the SSRF/allowlist gates above, so the cache can
 	// never answer a request the proxy would not have fetched itself.
 	if cachedBody, ok := streaming.VODCacheGet(decodedURL); ok {
-		// Defensive: cache entries written before the flixcloud unwrap (or by
-		// any path that stored raw) could still be wrapped; the decode is
+		// Defensive: cache entries written by paths that stored raw could
+		// still carry the flixcloud base64(XOR) wrapper; the decode is
 		// idempotent for plaintext, so apply it unconditionally here.
 		cachedBody = streaming.DecodeFlixcloudPlaylist(cachedBody)
-		if r.Method == http.MethodHead {
-			// No Content-Length: the GET representation is the REWRITTEN
-			// playlist whose length differs from these raw bytes,
-			// reporting the raw length lies to download managers.
-			w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
-			w.WriteHeader(http.StatusOK)
+		if strings.Contains(strings.ToLower(parsed.Hostname()), "flixcloud.cc") &&
+			!looksLikeM3u8Bytes(cachedBody) && len(cachedBody) > 32 {
+			// The cached entry itself is undecodable (wrapped in a key
+			// generation the key set does not cover) — drop it and fall
+			// through to a fresh fetch, whose flixcloud branch carries the
+			// bust+refresh retry. Serving this entry raw would feed the
+			// player base64 noise forever.
+			streaming.VODCacheDrop(decodedURL)
+		} else {
+			if r.Method == http.MethodHead {
+				// No Content-Length: the GET representation is the REWRITTEN
+				// playlist whose length differs from these raw bytes,
+				// reporting the raw length lies to download managers.
+				w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			h.serveRewrittenPlaylist(w, r, cachedBody, decodedURL, headersJSON, al, http.StatusOK)
 			return
 		}
-		h.serveRewrittenPlaylist(w, r, cachedBody, decodedURL, headersJSON, al, http.StatusOK)
-		return
 	}
 
-	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header
+	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header	// AnimeX CDN proxy: decode the /uwu/ token to extract the Referer header
 	// that the CDN requires. The token format is base64url(xor(url\0referer\0ua, key)).
 	if strings.Contains(decodedURL, "cdnx.aniwatchtv.site/uwu/") {
 		_, ref, ua := streaming.DecodeAnimeXProxyURL(decodedURL)
@@ -693,6 +703,36 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		// else the CDN serves.
 		if strings.HasSuffix(strings.ToLower(parsed.Hostname()), "flixcloud.cc") {
 			body = streaming.DecodeFlixcloudPlaylist(body)
+			if !looksLikeM3u8Bytes(body) && len(body) > 32 {
+				// Every known key failed on THESE bytes: Cloudflare's edge
+				// serves mixed key-generations of the encrypted playlist
+				// (older cache nodes hold copies wrapped by a previous
+				// flixcloud build). Bust the CDN cache, refetch once, refresh
+				// the key set from a live page, and decode again.
+				busted := decodedURL
+				if idx := strings.IndexByte(busted, '?'); idx >= 0 {
+					busted += "&fcb=" + strconv.FormatInt(time.Now().UnixNano(), 36)
+				} else {
+					busted += "?fcb=" + strconv.FormatInt(time.Now().UnixNano(), 36)
+				}
+				req2 := req.Clone(r.Context())
+				req2.URL, _ = url.Parse(busted)
+				streaming.FlixcloudRefreshKeys(r.Context())
+				if resp2, err2 := h.doRequest(req2, parsed.Scheme == "https"); err2 == nil {
+					body2, err2 := io.ReadAll(io.LimitReader(resp2.Body, hlsMaxRead))
+					resp2.Body.Close()
+					if err2 == nil {
+						body2 = streaming.DecodeFlixcloudPlaylist(body2)
+						if looksLikeM3u8Bytes(body2) {
+							body = body2
+							logUnwrappedFlixcloud(h, busted, "refetch-ok", body)
+						} else {
+							logUnwrappedFlixcloud(h, busted, "refetch-still-wrapped", body2)
+						}
+					}
+				}
+			}
+			logUnwrappedFlixcloud(h, decodedURL, "fresh", body)
 		}
 		switch classifyPlaylistResponse(resp.StatusCode, resp.Header.Get("Content-Range"), body) {
 		case playlistReject:
@@ -844,6 +884,23 @@ func cacheableMediaHeaders(w http.ResponseWriter, cacheControl string) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Del("Access-Control-Allow-Credentials")
 	w.Header().Del("Vary")
+}
+
+func looksLikeM3u8Bytes(body []byte) bool {
+	return strings.HasPrefix(strings.TrimSpace(string(body)), "#EXTM3U")
+}
+
+// logUnwrappedFlixcloud warns ONLY when a flixcloud body still looks wrapped
+// after decoding — the single signal that the XOR key set no longer covers
+// what the CDN is serving (key rotation the fallback didn't capture). Healthy
+// decodes stay silent so the journal stays clean.
+func logUnwrappedFlixcloud(h *Handlers, decodedURL, via string, body []byte) {
+	t := strings.TrimSpace(string(body))
+	if strings.HasPrefix(t, "#EXTM3U") || len(body) < 32 {
+		return
+	}
+	h.log.Warn().Str("via", via).Str("proxy_url", decodedURL).Int("bytes", len(body)).
+		Msg("flixcloud playlist still wrapped after decode - key set stale?")
 }
 
 // serveRewrittenPlaylist answers a playlist request from raw upstream bytes:

@@ -56,6 +56,11 @@ type FlixCloudProvider struct {
 	reanimeBase string
 	flixBase    string
 
+	// lastEmbedURL is the most recent live embed page (for the key
+	// refresher); lastEmbedMu guards both it and the refresher installation.
+	lastEmbedMu  sync.Mutex
+	lastEmbedURL string
+
 	// resolved caches direct master URLs per embed URL. The master URL has
 	// no signature and its CDN copy is cached, so one decrypt serves many
 	// sessions; the /api/m3u8 token behind it is single-use, which is why
@@ -530,6 +535,34 @@ func flixcloudJWTExpiry(masterURL string) (time.Time, bool) {
 	return time.Unix(claims.Exp, 0), true
 }
 
+// FlixcloudKeyRefresher is the decode-failure self-heal hook: installed by
+// the provider on its first resolve, it re-fetches a recent embed page,
+// derives the CURRENT playlist key from that page's wasm data section, and
+// adds it to the candidate set.
+var FlixcloudKeyRefresher func(ctx context.Context) bool
+
+var (
+	flixcloudRefreshMu      sync.Mutex
+	flixcloudRefreshLastTry time.Time
+)
+
+// FlixcloudRefreshKeys invokes the refresher, throttled to one attempt per
+// 20s so a burst of failing requests cannot hammer the embed page.
+func FlixcloudRefreshKeys(ctx context.Context) bool {
+	flixcloudRefreshMu.Lock()
+	if time.Since(flixcloudRefreshLastTry) < 20*time.Second {
+		flixcloudRefreshMu.Unlock()
+		return false
+	}
+	flixcloudRefreshLastTry = time.Now()
+	fn := FlixcloudKeyRefresher
+	flixcloudRefreshMu.Unlock()
+	if fn == nil {
+		return false
+	}
+	return fn(ctx)
+}
+
 // resolveDirect resolves one embed URL to a direct master playlist URL,
 // retrying once on a fresh page when the single-use token was already gone.
 func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) (string, []core.Subtitle, error) {
@@ -565,6 +598,42 @@ func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) 
 		p.storeResolve(embedURL, flixcloudResolve{url: master, subs: subs}, ttl)
 	}
 	return master, subs, nil
+}
+
+// rememberEmbed records a live embed URL for the key refresher (bounded,
+// latest wins — any current page yields the current global playlist key).
+func (p *FlixCloudProvider) rememberEmbed(ctx context.Context, embedURL string) {
+	p.lastEmbedMu.Lock()
+	p.lastEmbedURL = embedURL
+	p.lastEmbedMu.Unlock()
+	if FlixcloudKeyRefresher == nil {
+		FlixcloudKeyRefresher = func(ctx context.Context) bool {
+			p.lastEmbedMu.Lock()
+			url := p.lastEmbedURL
+			p.lastEmbedMu.Unlock()
+			if url == "" {
+				return false
+			}
+			page, err := p.flixcloudPage(ctx, url, p.reanimeBase)
+			if err != nil {
+				return false
+			}
+			wasm, err := base64.StdEncoding.DecodeString(page.wasmB64)
+			if err != nil {
+				return false
+			}
+			mod, err := flixcloudInstantiate(wasm)
+			if err != nil {
+				return false
+			}
+			pk, err := flixcloudPlaylistKey(mod)
+			if err != nil {
+				return false
+			}
+			flixcloudStorePlaylistKey(pk)
+			return true
+		}
+	}
 }
 
 // FindEpisodeSource resolves every distinct flixcloud embed the Reanime
@@ -613,6 +682,10 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 			continue
 		}
 		seen[embedURL] = true
+		// Remember one live embed URL: the decode-failure refresher needs
+		// ANY current page's wasm to recover the playlist key after a
+		// flixcloud key rotation.
+		p.rememberEmbed(ctx, embedURL)
 		name := "FlixCloud"
 		if len(entries) < len(serverNames) {
 			name = serverNames[len(entries)]

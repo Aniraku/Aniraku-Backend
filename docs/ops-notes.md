@@ -6,6 +6,23 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-17 flixcloud (final piece): the direct-browser flow
+  (VITE_PLAYBACK_HOST_B64 -> api.aniraku.tech) served the RAW wrapped
+  bodies for all three masters — logUnwrappedFlixcloud caught the decode
+  failing while the bytes decoded fine via curl minutes later: Cloudflare
+  edge nodes hold MIXED key-generations of the encrypted playlists, and a
+  fetch can land on a copy wrapped by a key the candidate set does not
+  hold. The proxy now busts the CDN cache (fcb= param) and refetches once
+  on decode failure, refreshes the key set from a live embed page
+  (FlixcloudRefreshKeys, throttled 20s, provider remembers its last embed
+  URL), retries the decode, and drops undecodable VOD-cache entries so
+  they never serve again. Verified live: 24/24 rounds across all three
+  servers, master/variant/key/segment/subtitle green through
+  api.aniraku.tech with browser Origin. The zone's "API Accessing" WAF
+  rule was ALSO blocking the function's backend subrequests (empty UA);
+  serveKViaBackend now sends Aniraku-PagesFunction/1.0 and the rule needs
+  Origin/UA exemptions for the site's own playback (user-side dashboard
+  change, expression provided).
 - 2026-11-16 flixcloud (app path): the box-side chain was green but the
   APP still failed because the Pages function's serveK fetched sealed
   masters from Cloudflare's own IPs — the JWT client_ip check 403'd the
