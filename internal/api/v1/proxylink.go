@@ -1,6 +1,7 @@
 package v1
 
 import (
+	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
@@ -11,24 +12,35 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // Opaque proxy links: the backend replaces raw provider URLs (and their
-// scraper-session headers) with self-contained AES-GCM tokens. The client
-// only ever sees /api/v1/proxy?k=<token>; the proxy decrypts the token
-// server-side and fetches upstream with the sealed headers. Tokens expire
-// (6h) so leaked links die with the session that minted them.
+// scraper-session headers) with self-contained tokens. The client only ever
+// sees /api/v1/proxy?k=<token>; the proxy decrypts the token server-side and
+// fetches upstream with the sealed headers. Tokens expire (6h) so leaked
+// links die with the session that minted them.
 //
 // The key is PROXY_LINK_KEY (32-byte hex) — shared with the Cloudflare
-// Pages media shield, which mints/resolves the same token shape, so
-// backend-minted links pass through the Pages shield untouched.
+// Pages media shield, which mints and resolves the SAME token shape
+// (shared/mediaShield.js), so backend-minted links pass through the Pages
+// shield untouched and Pages-minted links resolve here.
+//
+// The wire format is byte-for-byte the JS one, and it is not negotiable:
+//
+//	token = base64url( iv(12) || AES-256-GCM ciphertext || tag(16) )
+//	plain = {"u": <url>, "h": <headers?>, "e": <expiry unix ms>}
+//
+// This side used to seal with ChaCha20-Poly1305. WebCrypto has no
+// ChaCha20-Poly1305, so the Pages shield could never open those tokens: the
+// moment it started intercepting ?k= (instead of forwarding it), every
+// backend-minted source and subtitle link 404'd at the edge, and tokens
+// minted by the shield 404'd here. AES-GCM is the only cipher both runtimes
+// share, so both sides now use it.
 
 type proxyLinkPayload struct {
 	URL     string            `json:"u"`
 	Headers map[string]string `json:"h,omitempty"`
-	Exp     int64             `json:"e"`
+	Exp     int64             `json:"e"` // unix milliseconds, as in mediaShield.js
 }
 
 const proxyLinkTTL = 6 * time.Hour
@@ -48,10 +60,16 @@ func proxyLinkInit(keyHex string) bool {
 }
 
 func proxyLinkCipher() (cipher.AEAD, error) {
-	if len(proxyLinkKeyBytes) != chacha20poly1305.KeySize {
+	if len(proxyLinkKeyBytes) != 32 {
 		return nil, errors.New("proxy link key not configured")
 	}
-	return chacha20poly1305.New(proxyLinkKeyBytes)
+	block, err := aes.NewCipher(proxyLinkKeyBytes)
+	if err != nil {
+		return nil, fmt.Errorf("proxy link: %w", err)
+	}
+	// NewGCM: 12-byte nonce, 16-byte tag appended to the ciphertext — the
+	// exact layout bytesToB64url/openK expect on the JS side.
+	return cipher.NewGCM(block)
 }
 
 // mintProxyLink seals a raw upstream URL + its provider headers into an
@@ -91,7 +109,7 @@ func mintProxyLink(rawURL string, headers map[string]string) (string, error) {
 	payload, err := json.Marshal(proxyLinkPayload{
 		URL:     rawURL,
 		Headers: headers,
-		Exp:     time.Now().Add(proxyLinkTTL).Unix(),
+		Exp:     time.Now().Add(proxyLinkTTL).UnixMilli(),
 	})
 	if err != nil {
 		return "", err
@@ -114,6 +132,9 @@ func resolveProxyLink(token string) (string, map[string]string, error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("proxy link: bad encoding: %w", err)
 	}
+	if len(sealed) < aead.NonceSize() {
+		return "", nil, errors.New("proxy link: truncated")
+	}
 	plain, err := aead.Open(nil, sealed[:aead.NonceSize()], sealed[aead.NonceSize():], nil)
 	if err != nil {
 		return "", nil, fmt.Errorf("proxy link: %w", err)
@@ -122,7 +143,7 @@ func resolveProxyLink(token string) (string, map[string]string, error) {
 	if err := json.Unmarshal(plain, &payload); err != nil {
 		return "", nil, fmt.Errorf("proxy link: %w", err)
 	}
-	if payload.Exp > 0 && time.Now().Unix() > payload.Exp {
+	if payload.Exp > 0 && time.Now().UnixMilli() > payload.Exp {
 		return "", nil, errors.New("proxy link expired")
 	}
 	if payload.URL == "" {
