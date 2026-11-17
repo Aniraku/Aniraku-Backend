@@ -517,7 +517,15 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// proxyBase, the al strip and the rn nonce are never shared across hits.
 	// Reached only after the SSRF/allowlist gates above, so the cache can
 	// never answer a request the proxy would not have fetched itself.
-	if cachedBody, ok := streaming.VODCacheGet(decodedURL); ok {
+	cachedBody, vok := streaming.VODCacheGet(decodedURL)
+	if vok && isFlixcloudSource(decodedURL) {
+		// Token-bound: the master URL carries a single-use IP-bound JWT and
+		// every body is wrapped in a key generation that rotates per page
+		// render, so a stored copy can outlive its token or arrive wrapped
+		// with a key this page no longer yields. Go upstream every time.
+		vok = false
+	}
+	if vok {
 		// Defensive: cache entries written by paths that stored raw could
 		// still carry the flixcloud base64(XOR) wrapper; the decode is
 		// idempotent for plaintext, so apply it unconditionally here.
@@ -596,7 +604,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	}
 	isKey := strings.HasSuffix(strings.ToLower(parsed.Path), ".key")
 
-	if isKey {
+	if isKey && !isFlixcloudSource(decodedURL) {
 		if cached, ok := h.keyCache.Load(cacheKeyURL); ok {
 			if entry, ok := cached.(keyCacheEntry); ok && time.Since(entry.fetchedAt) < 5*time.Minute {
 				w.Header().Set("Content-Type", "application/octet-stream")
@@ -696,7 +704,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// never learn anything: this code is only reachable once the allowlist
 	// gate above has already passed.
 
-	if isKey && resp.StatusCode == http.StatusOK {
+	if isKey && !isFlixcloudSource(decodedURL) && resp.StatusCode == http.StatusOK {
 		// Emergency memory guard: the key read is capped so a
 		// misrouted or hostile .key URL cannot be slurped into RAM in
 		// full. Real keys are 16 bytes; anything at or beyond the cap
@@ -809,7 +817,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 			}
 			// Keep the RAW pre-rewrite body for the short VOD window: the next
 			// request for this URL (any lang, any proxyBase) rewrites it fresh.
-			streaming.VODCacheSet(decodedURL, body)
+			if !isFlixcloudSource(decodedURL) {
+				streaming.VODCacheSet(decodedURL, body)
+			}
 			h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, http.StatusOK)
 			return
 		}
@@ -824,7 +834,9 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 			if isPlaylistBody(peek) {
 				if rest, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20)); rerr == nil {
 					body := append(peek, rest...)
-					streaming.VODCacheSet(decodedURL, body)
+					if !isFlixcloudSource(decodedURL) {
+						streaming.VODCacheSet(decodedURL, body)
+					}
 					h.serveRewrittenPlaylist(w, r, body, decodedURL, headersJSON, al, resp.StatusCode)
 					return
 				}
@@ -892,7 +904,11 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// full 200s get immutable; 206 ranges are cached per-range without it,
 	// and errors (404/5xx) keep the no-store default. Keys keep their own
 	// max-age=300 branch above.
-	if resp.StatusCode == http.StatusOK {
+	if isFlixcloudSource(decodedURL) {
+		// Token-bound bytes: a shared edge holding these past the JWT window
+		// serves a dead master to every viewer that shares the cache key.
+		w.Header().Set("Cache-Control", "private, no-store")
+	} else if resp.StatusCode == http.StatusOK {
 		cacheableMediaHeaders(w, "public, max-age=31536000, immutable")
 	} else if resp.StatusCode == http.StatusPartialContent {
 		cacheableMediaHeaders(w, "public, max-age=31536000")
@@ -965,7 +981,11 @@ func (h *Handlers) serveRewrittenPlaylist(w http.ResponseWriter, r *http.Request
 	// Playlists are tiny but re-fetched constantly (hls.js polling, quality
 	// switches, prewarm HEADs). 300s of edge is still far below the 3-4h
 	// upstream token lifetime, so cached copies always carry valid tokens.
-	cacheableMediaHeaders(w, "public, max-age=300")
+	cacheControl := "public, max-age=300"
+	if isFlixcloudSource(decodedURL) {
+		cacheControl = "private, no-store"
+	}
+	cacheableMediaHeaders(w, cacheControl)
 	w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
 	w.Header().Set("Content-Length", strconv.Itoa(len(rewritten)))
 	w.WriteHeader(status)
