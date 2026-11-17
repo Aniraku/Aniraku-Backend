@@ -798,14 +798,26 @@ func flixcloudStorePlaylistKey(pk []byte) {
 	if _, ok := flixcloudPKSet[id]; ok {
 		return
 	}
-	// Bound the set: drop the OLDEST non-fallback entry first.
+	// Bound the set: drop the OLDEST non-fallback entry. The static fallback
+	// is the key every sampled module embeds and must stay in the order
+	// forever — the old loop dropped index 0 unconditionally, so once eight
+	// distinct resolve-derived keys had accumulated the fallback vanished
+	// from the order and every body wrapped with the current generation
+	// failed to decode while the same bytes decoded fine in a fresh process.
+	// That is the "plays right after a restart, dead minutes later" failure.
 	for len(flixcloudPKOrder) >= 8 {
-		oldest := flixcloudPKOrder[0]
-		flixcloudPKOrder = flixcloudPKOrder[1:]
-		if oldest != flixcloudPKFallbackHex {
-			delete(flixcloudPKSet, oldest)
-			break
+		drop := -1
+		for i, id := range flixcloudPKOrder {
+			if id != flixcloudPKFallbackHex {
+				drop = i
+				break
+			}
 		}
+		if drop < 0 {
+			break // only the fallback left, nothing evictable
+		}
+		delete(flixcloudPKSet, flixcloudPKOrder[drop])
+		flixcloudPKOrder = append(flixcloudPKOrder[:drop], flixcloudPKOrder[drop+1:]...)
 	}
 	// Fallback stays first so the common path needs one try.
 	idx := 1
