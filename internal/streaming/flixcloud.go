@@ -720,8 +720,16 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 	var sources []core.Source
 	for i, res := range results {
 		if res.err != nil {
+			// Graceful degradation. The direct chain is reverse-engineered:
+			// an upstream page-obfuscation change, a wasm key rotation we
+			// cannot decode or an already-consumed single-use token breaks
+			// it, and dropping the entry left the title with no FlixCloud
+			// server at all. Ship the embed page instead — the iframe
+			// player still works, which is exactly what FlixCloud served
+			// before direct playback landed.
 			p.log.Warn().Err(res.err).Str("anilistId", providerID).Int("episode", episode).
-				Str("embed", entries[i].url).Msg("flixcloud: direct resolve failed")
+				Str("embed", entries[i].url).Msg("flixcloud: direct resolve failed, falling back to embed")
+			sources = append(sources, flixcloudEmbedFallback(entries[i].url))
 			continue
 		}
 		p.log.Info().
@@ -749,6 +757,18 @@ func (p *FlixCloudProvider) FindEpisodeSource(ctx context.Context, providerID st
 			"User-Agent": browserUA,
 		},
 	}, nil
+}
+
+// flixcloudEmbedFallback is the degraded source shape for a server whose
+// direct chain could not be resolved: the embed page URL, played by the
+// frontend's iframe player.
+func flixcloudEmbedFallback(embedURL string) core.Source {
+	return core.Source{
+		URL:          embedURL,
+		Type:         "embed",
+		Quality:      "auto",
+		Verification: "embed",
+	}
 }
 
 // --- playlist obfuscation key -------------------------------------------
