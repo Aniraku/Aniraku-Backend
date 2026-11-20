@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	mkissaBuildID = "180"
+	mkissaBuildID = "190"
 	mkissaLane    = "k7"
 
 	mkissaSlugTTL           = 24 * time.Hour

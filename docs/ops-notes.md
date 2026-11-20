@@ -26,11 +26,23 @@ inside source comments.
   episode/source query hash is fragment-assembled in the obfuscated
   tables (not yet recovered; browse hashes captured). The collector
   fails fast (~150-300ms bootstrap 404) so the fan-out cost is small.
-  Remaining to finish mkissa: capture the watch-page episode/source
-  query hash (headless SPA hangs pre-player) + the exact PBKDF2/AES-GCM
-  byte derivation, then update mkissa.go (structure intact, constants +
-  GET form + partB scheme to swap). RE artifacts in /tmp/fx/mk
-  (deobfuscators, captures, decoded functions).
+  Remaining to finish mkissa: (1) the episode/source query hash is
+  fragment-assembled in the obfuscated tables — the watch-page SPA hang
+  and the fragment deobfuscation both need more work; (2) the x-aa-boot
+  derivation is byte-verified (the VM token = the browser token =
+  4a8beabb...) but the PBKDF2/AES-GCM byte parameters live inside the
+  globalThis["UUeyEG"] crypto bridge (a custom JS crypto implementation,
+  NOT WebCrypto — the bridge's own PBKDF2 with bridge-internal
+  constants). A PBKDF2 sweep 1..100k with the modeled inputs found no
+  match — the bridge's internal config holds the real params.
+  mkissa.go's structure is correct for the flow (bootstrap → episode →
+  sources) but the crypto needs the bridge's internal constants.
+  RE artifacts preserved: /tmp/fx/mk (deobfuscators deob.js/deob2.js/
+  deob3.js/deobfn2.cjs, captures mkissa_capture*.json, VM runners
+  vmrun5b.mjs (WORKING — produces the verified token), mkissa_token.mjs,
+  decoded functions bootfn.js, chunk tree chunks/). The "API Accessing"
+  WAF rule on the zone blocks empty-UA requests to api.aniraku.tech —
+  the Pages function now sends Aniraku-PagesFunction/1.0 UA (bffb4ce).
   Sweep result: PBKDF2-SHA256 does NOT match the recovered key
   (177d58d7...) for iterations 1..100000 with password=mask(raw or hex)
   and salt="rEVwtVi:<epoch>" — the derive call takes an algo STRING
