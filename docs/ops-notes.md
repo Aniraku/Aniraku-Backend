@@ -31,6 +31,14 @@ inside source comments.
   byte derivation, then update mkissa.go (structure intact, constants +
   GET form + partB scheme to swap). RE artifacts in /tmp/fx/mk
   (deobfuscators, captures, decoded functions).
+  Sweep result: PBKDF2-SHA256 does NOT match the recovered key
+  (177d58d7...) for iterations 1..100000 with password=mask(raw or hex)
+  and salt="rEVwtVi:<epoch>" — the derive call takes an algo STRING
+  ("cbhC") that indexes a config table inside the globalThis["UUeyEG"]
+  crypto bridge, so the real password/salt/iterations live in that
+  bridge config. Next RE step: wrap the bridge methods in the chunk VM
+  (vmrun5b.mjs runs the chunk fully) and log the bridge config — not a
+  brute-force job.
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
   and dub entries (one dual-audio master carrying jpn "Native" + eng
   "English" renditions) — the languages differ by the al=sub/dub strip,
