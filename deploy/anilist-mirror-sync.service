@@ -3,4 +3,9 @@ Description=Sync local AniList shard base to the latest GitHub release (sha-veri
 
 [Service]
 Type=oneshot
+# The script resolves ~/mirror-sync and ~/mirror-data with expanduser("~"),
+# so without this it runs as root and syncs into /root instead of the
+# directory nginx serves.
+User=shoislam
+Group=shoislam
 ExecStart=/usr/bin/python3 /home/shoislam/bin/mirror-sync.py
