@@ -454,8 +454,8 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 			return result, nil
 		}
 		return nil, fmt.Errorf("anipm: no sources for this episode")
-	case "heave", "animeheaven":
-		return nil, fmt.Errorf("provider %q removed", provider)
+	case "heave", "animeheaven", "mkissa", "chuu", "mua", "kissy", "smooch", "peck", "xoxo", "umi":
+		return nil, fmt.Errorf("provider %q removed", "mkissa")
 	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		result, err := m.tryNovuscloud(ctx, animeID, episode, lang, quality)
 		if err != nil {
