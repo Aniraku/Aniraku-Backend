@@ -23,7 +23,7 @@ fallback order and the `/servers` merge order.
 | `aniwaves` | Nami (Vidplay), Coral (MyCloud), Pearl (DatSaV/savedly), Wavy/Bubbles/Shelly (fallback) | echovideo multi-rendition HLS masters + top savedly mp4 |
 | `megavid` | Vidy | megavid.buzz JSON API (AnimeX-codec files + `/vid/` gateway), language-verified |
 | `zenbu` | Yuzu, Ume (shorekeeper), Ringo, Budo, Kaki, Kuri (encore), Biwa, Ichijiku (roccia), Melon, Suika (carlotta) | zen-bu.cc stream index (`megadown.zen-bu.cc/episodes/<anilistId>/<ep>?provider=<id>`): one `audio`-tagged HLS master per entry on Cloudflare Worker edges, every published URL probed master → child → segment; roccia/carlotta are sub-only, dub entries come only from shorekeeper/encore; label-less sprite tracks are dropped |
-| `mkissa` | Chuu (default), Mua (uv-mp4), Kissy (mp4), Smooch (ss-hls), Peck (sl-mp4), Xoxo (ok), Umi (uni) | mkissa.to secured GraphQL: bootstrap lane key + aaReq, AES-GCM decrypted direct m3u8/mp4, strict per-lang, hentai-gated |
+| `mkissa` | — | removed (2026-11-21, operator) |
 
 Removed providers return a `removed` error naming them explicitly
 (`miruro`, `zenime`, `tryembed`, `heave`, `tensho`, …): never

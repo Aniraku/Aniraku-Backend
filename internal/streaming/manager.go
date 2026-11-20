@@ -115,9 +115,6 @@ func (m *Manager) SetHostLearner(fn func(host string)) {
 		if zb, ok := p.(*ZenbuProvider); ok {
 			zb.SetHostLearner(fn)
 		}
-		if mk, ok := p.(*MkissaProvider); ok {
-			mk.SetHostLearner(fn)
-		}
 	}
 }
 
@@ -192,7 +189,6 @@ func NewManager(log zerolog.Logger) *Manager {
 			NewAniWavesProvider(log, "", ""),
 			NewMegaVidProvider(log, ""),
 			NewZenbuProvider(log, "", ""),
-			NewMkissaProvider(log),
 			NewNovuscloudProvider(log, "", "hd-1", "Nova"),
 			NewNovuscloudProvider(log, "", "hd-2", "Nebula"),
 			NewNovuscloudProvider(log, "", "hd-3", "Stella"),
@@ -306,8 +302,6 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 		provider = "zenbu"
 	case "megavid", "vidy", "dorayaki":
 		provider = "megavid"
-	case "mkissa":
-		provider = "mkissa"
 	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		provider = "novuscloud"
 	case "anikoto", "ichigo", "anko":
@@ -328,7 +322,7 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 	hentai := m.isHentaiTitle(ctx, animeID)
 	if hentai {
 		switch provider {
-		case "anikoto", "ichigo", "anko", "animex", "yuki", "neko", "zuna", "sora", "supaplay", "ramune", "animegg", "taiyaki", "aniwaves", "purin", "megavid", "dorayaki", "zenbu", "zenzai", "anv", "mikan", "senbei", "nashi", "bana", "anixo", "kohaku", "kompeito", "mkissa", "novuscloud", "matcha", "azuki", "kinako", "kuri":
+		case "anikoto", "ichigo", "anko", "animex", "yuki", "neko", "zuna", "sora", "supaplay", "ramune", "animegg", "taiyaki", "aniwaves", "purin", "megavid", "dorayaki", "zenbu", "zenzai", "anv", "mikan", "senbei", "nashi", "bana", "anixo", "kohaku", "kompeito", "novuscloud", "matcha", "azuki", "kinako", "kuri":
 			return nil, fmt.Errorf("provider %q is not available for this title", provider)
 		}
 	}
@@ -462,15 +456,6 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 		return nil, fmt.Errorf("anipm: no sources for this episode")
 	case "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
-	case "mkissa", "chuu", "mua", "kissy", "smooch", "peck", "xoxo", "umi":
-		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
-		if err != nil {
-			return nil, err
-		}
-		if result != nil && len(result.Sources) > 0 {
-			return result, nil
-		}
-		return nil, fmt.Errorf("mkissa: no sources for this episode")
 	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		result, err := m.tryNovuscloud(ctx, animeID, episode, lang, quality)
 		if err != nil {
@@ -537,8 +522,6 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryAnixo(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAniPM(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
-			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -654,7 +637,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		stability.finishFlight(flightKey, flight, result)
 	}()
 
-	var mkServers, akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers []core.Server
+	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers []core.Server
 	var wg sync.WaitGroup
 
 	fanStart := time.Now()
@@ -705,14 +688,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
-		// mkissa re-enabled (2026-11-21): the boot-token crypto is
-		// byte-verified against the browser (rEVwtVi: HMAC chain) and the
-		// episode query resolves live. NEED_CAPTCHA is only the per-IP
-		// anti-abuse window; the provider throttles itself and, when
-		// MKISSA_CAPSOLVER_KEY / MKISSA_2CAPTCHA_KEY /
-		// MKISSA_TURNSTILE_TOKEN_FILE is set, retries through the
-		// Turnstile path like the site client does.
-		{"mkissa", &mkServers, m.collectMkissaServers, !hentai},
+		// mkissa removed (2026-11-21, operator): deleted from the lineup.
 		{"novuscloud", &nvServers, m.collectNovuscloudServers, !hentai},
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
@@ -779,7 +755,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 	// the main server), then direct, embeds and the newest providers last;
 	// playback-verdict ranking below reorders by health.
 	allServers := fcServers
-	for _, pool := range [][]core.Server{akServers, axServers, zkServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers, mkServers} {
+	for _, pool := range [][]core.Server{akServers, axServers, zkServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL external download links removed (2026-11-20, operator).
@@ -1727,15 +1703,6 @@ func (m *Manager) getZenbuProvider() *ZenbuProvider {
 	return nil
 }
 
-func (m *Manager) getMkissaProvider() *MkissaProvider {
-	for _, p := range m.providers {
-		if mk, ok := p.(*MkissaProvider); ok {
-			return mk
-		}
-	}
-	return nil
-}
-
 func (m *Manager) getNovuscloudProvider() *NovuscloudProvider {
 	for _, p := range m.providers {
 		if nv, ok := p.(*NovuscloudProvider); ok {
@@ -1745,25 +1712,6 @@ func (m *Manager) getNovuscloudProvider() *NovuscloudProvider {
 	return nil
 }
 
-func (m *Manager) tryMkissa(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
-	mk := m.getMkissaProvider()
-	if mk == nil {
-		return nil, fmt.Errorf("mkissa provider not configured")
-	}
-
-	m.log.Info().Int("animeId", animeID).Int("episode", episode).Str("lang", lang).Msg("trying mkissa")
-
-	anilistID := fmt.Sprintf("%d", animeID)
-	source, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
-	if err != nil {
-		return nil, fmt.Errorf("mkissa failed: %w", err)
-	}
-	if source == nil || len(source.Sources) == 0 {
-		return nil, nil
-	}
-
-	return m.applyQualityFilter(source, quality), nil
-}
 
 // tryNovuscloud resolves NovusCloud direct m3u8/mp4 sources.
 func (m *Manager) tryNovuscloud(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
@@ -1889,27 +1837,6 @@ func (m *Manager) collectZenbuServers(ctx context.Context, anilistID string, epi
 	return out
 }
 
-// collectMkissaServers maps Mkissa direct sources to their cute server names.
-func (m *Manager) collectMkissaServers(ctx context.Context, anilistID string, episode int, lang string) []core.Server {
-	var out []core.Server
-	for _, prov := range m.providers {
-		mk, ok := prov.(*MkissaProvider)
-		if !ok {
-			continue
-		}
-		sr, err := mk.FindEpisodeSource(ctx, anilistID, episode, lang)
-		if err != nil {
-			m.log.Warn().Err(err).Str("provider", "mkissa").Str("anilistId", anilistID).
-				Int("episode", episode).Str("lang", lang).Msg("servers: provider failed")
-			continue
-		}
-		if sr == nil || len(sr.Sources) == 0 {
-			continue
-		}
-		out = appendNamedServers(out, []string{"Chuu"}, "mkissa", lang, sr)
-	}
-	return out
-}
 
 // collectNovuscloudServers maps NovusCloud mirror sources to their cute
 // server names (Novus-hd1, Novus-hd2, Novus-hd3, Novus-hd4). FindEpisodeSource

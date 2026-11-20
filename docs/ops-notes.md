@@ -13,85 +13,14 @@ inside source comments.
   > ...  with Yokan/Monaka at positions 0-1. The AnimeDL/animeheaven
   external download source is REMOVED (fetch + attach + file gone;
   animedl_downloads.go deleted); zoko's own download link remains.
-- 2026-11-21 mkissa SOLVED and re-enabled in the fan-out (byte-verified
-  crypto, live full chain on henix-arm: AniList 21 ep1 sub → direct mp4).
-  The earlier "Turnstile is the fundamental blocker" conclusion was WRONG:
-  NEED_CAPTCHA is mkissa's generic anti-abuse reply to invalid client
-  crypto (and to a per-IP request budget), NOT a mandatory captcha. The
-  real bug: the Go boot token never matched the browser (different HMAC
-  chain), so bootstrap 403'd / the aaReq laneKey was wrong. The corrected
-  protocol, extracted from the crypto chunk (B3DA467b.js — byte-identical
-  between the Nov 20 and Nov 21 site builds, buildId still 190):
-
-  Config (the client's obfuscated `_l()` — dumped at runtime):
-    saltMul=179 saltAdd=115 fragMul=58 fragAdd=158 bootPrefix="rEVwtVi:"
-    join="~" parts=[host,lane,buildId,group,epoch] envXor=32
-  Fragments (vm array in the chunk, 4×8 bytes):
-    J0mP4l4MHpw= rojHZpjcsso= RQPF6Dz59/E= UGdxCsEP9Cw=
-  Mask (hy(buildId)):
-    salt[l]     = (buildId.charCodeAt(l%len)||0) ^ ((l*179+115)&255)
-    mask[i*8+j] = part[i][j] ^ salt[i*8+j] ^ ((i*58 + j*158)&255)
-    (tT() is false in prod → no oT() final transform)
-  Boot token (pT):
-    bootKey = HMAC-SHA256(mask, "rEVwtVi:"+buildId)
-    msg     = "mkissa.to~k7~190~mkissa~<epoch>"   (host~lane~buildId~group~epoch)
-    x-aa-boot = hex(HMAC-SHA256(bootKey, msg))
-    Byte-verified: buildId 190, epoch 2968 → 4a8beabb… = the browser's.
-  Lane key (RT→LT):
-    laneKey[i] = partB[i] ^ mask[i]   (plain XOR, 32 bytes)
-  aaReq (FT):
-    payload = {v:1, ts:floor(ms/300000)*300000, epoch, buildId, qh:hash, k:"k7"}
-    iv      = sha256("epoch:buildId:qh:ts:lane")[:12]
-    aaReq   = b64(0x01 || iv || AES-256-GCM(laneKey, iv, json(payload)))
-  Episode response (BT/UT):
-    tobeparsed b64 → v byte 1, iv = raw[1:13], ct||tag = raw[13:],
-    AES-256-GCM open with the SAME laneKey → JSON {episode:{sourceUrls}}
-  Episode query: POST /api {variables:{showId,translationType,episodeString},
-  extensions:{persistedQuery:{version:1,sha256Hash:670bbf38…}, k:"k7",
-  aaReq}} — hash 670bbf38 IS the episode hash (earlier note wrong), headers
-  x-build-id + Referer/Origin mkissa.to. No captcha field needed normally.
-
-  Source kinds (lowercased sourceName; the client uses sourceName directly
-  and skips "unkonw"/"Wp-*"): Default (prio 8.5, hex-sealed "--…" URL →
-  mkissaDecodeHex → /apivtwo/clock?id=… on allanime.day, HLS links), Yt-mp4
-  (prio 7.9, type "player", direct mp4 on tools.fast4speed.rsvp with an
-  Authorization query param, no extension), Ss-Hls (streamsb embed), Mp4
-  (mp4upload embed, extracted), Ok (ok.ru embed, ondemandHls extracted),
-  Sl-mp4 (streamlare, extracted), Uv-mp4 (hex-sealed clock), Fm-Hls/Sw/Vg
-  (iframe-only embeds — the client plays them in an iframe and never
-  extracts; we drop them when extraction yields nothing).
-
-  NEED_CAPTCHA handling: when the per-IP budget trips, the client renders a
-  Turnstile (siteKey 0x4AAAAAADXpHZ1lTeqKwhch, provider "turnstile1") in a
-  "Security Check" modal and retries the POST with
-  extensions.captcha={token,provider}. Provider support: on NEED_CAPTCHA the
-  episode POST is retried once with that extension, token from
-  MKISSA_CAPSOLVER_KEY (CapSolver AntiTurnstileTaskProxyLess) /
-  MKISSA_2CAPTCHA_KEY (2Captcha TurnstileTaskProxyless) /
-  MKISSA_TURNSTILE_TOKEN_FILE (manual paste; mtime rotates it). No solver
-  configured → the provider falls back to its throttle breaker (2 strikes →
-  10 min). The budget is temporary: full chains resolved without any token
-  before/after the probe burst tripped it. Local headed-Chromium note: the
-  widget modal opens and window.turnstile loads, but the render never fires
-  under CDP automation (silent anti-bot), so local token stealing is not a
-  viable fallback.
-  RE artifacts: /tmp/fx/mk — trace_hy.mjs (mask trace),
-  probe_pT_internals.mjs (pT chain), dump_cfg.mjs (_l() config),
-  mkissa_captcha_probe_test.go (live POST probe), steal_turnstile.mjs /
-  diag*.mjs (browser diagnostics), hy_full.js.
-
-  Deployed (30400b9, arm64, aniraku-api restarted): fan-out includes
-  mkissa (collectorMs shows it), lineup verified Yokan > Monaka > … >
-  Warabi with mkissa servers (Chuu/Umi/Smooch/Peck/Xoxo/Kissy) joining
-  as the budget allows. Deployment-day caveat: the VPS datacenter IP
-  tripped the per-IP episode budget during RE probing and the penalty
-  ran 45+ min (residential IP cooled in ~20), while search/show
-  resolution kept working — only the episode POST is budget-gated. If
-  the penalty recurs on henix-arm, set one of MKISSA_CAPSOLVER_KEY /
-  MKISSA_2CAPTCHA_KEY / MKISSA_TURNSTILE_TOKEN_FILE in
-  ~/Aniraku-Backend/.env and restart; the provider then rides the
-  Turnstile retry like the site client does.
-
+- 2026-11-21 mkissa REMOVED (operator decision): provider files deleted
+  (mkissa.go/mkissa_test.go/mkissa_turnstile.go/captcha probe), fan-out
+  entry, /stream aliases and collect hook all gone; allowlist additions
+  for it (ok.ru, mycdn.me, allanime.day) reverted. History note: the
+  boot-token crypto was byte-verified and the episode query resolved
+  live from a residential IP, but the VPS datacenter IP sat in a long
+  NEED_CAPTCHA penalty window, so it never worked reliably where it
+  mattered. Full RE notes preserved in git history (30400b9..8aef332).
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
   and dub entries (one dual-audio master carrying jpn "Native" + eng
   "English" renditions) — the languages differ by the al=sub/dub strip,
