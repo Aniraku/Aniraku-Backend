@@ -54,7 +54,14 @@ inside source comments.
   and salt="rEVwtVi:<epoch>" — the derive call takes an algo STRING
   ("cbhC") that indexes a config table inside the globalThis["UUeyEG"]
   crypto bridge, so the real password/salt/iterations live in that
-  bridge config. Next RE step: wrap the bridge methods in the chunk VM
+  bridge config. Turnstile confirmed: the episode query returns NEED_CAPTCHA (not
+  AA_CRYPTO_MISSING) when the AA crypto is valid — the server
+  deliberately requires a Cloudflare Turnstile token for episode source
+  resolution. This is a bot-protection measure, not a crypto issue.
+  The AA crypto derivation (partA/partB → laneKey → AES-GCM aa-req) was
+  successfully reverse-engineered and the server accepted it (the error
+  changed from AA_CRYPTO_MISSING to NEED_CAPTCHA). The Turnstile is the
+  fundamental blocker for automated mkissa access. Next RE step: wrap the bridge methods in the chunk VM
   (vmrun5b.mjs runs the chunk fully) and log the bridge config — not a
   brute-force job.
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub

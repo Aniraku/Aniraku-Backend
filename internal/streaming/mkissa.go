@@ -672,6 +672,7 @@ func (p *MkissaProvider) doJSON(ctx context.Context, payload any, out any) error
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("mkissa: search POST -> HTTP %d", resp.StatusCode)
 	}
+	// body may contain NEED_CAPTCHA in errors even with 200 — checked by caller
 	rb, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
 		return err
