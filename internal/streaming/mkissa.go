@@ -52,10 +52,11 @@ var mkissaAPIGap = 4 * time.Second
 
 // The client's obfuscated crypto config (_l()) — byte-verified against the
 // browser's x-aa-boot token (4a8beabb… for buildId 190, epoch 2968):
-//   salt[l]  = (buildId.charCodeAt(l%len)||0) ^ ((l*saltMul + saltAdd)&255)
-//   mask[i*8+j] = part[i][j] ^ salt[i*8+j] ^ ((i*fragMul + j*fragAdd)&255)
-//   bootKey  = HMAC-SHA256(mask, bootPrefix+buildId)
-//   bootToken= hex(HMAC-SHA256(bootKey, host~lane~buildId~group~epoch))
+//
+//	salt[l]  = (buildId.charCodeAt(l%len)||0) ^ ((l*saltMul + saltAdd)&255)
+//	mask[i*8+j] = part[i][j] ^ salt[i*8+j] ^ ((i*fragMul + j*fragAdd)&255)
+//	bootKey  = HMAC-SHA256(mask, bootPrefix+buildId)
+//	bootToken= hex(HMAC-SHA256(bootKey, host~lane~buildId~group~epoch))
 var mkissaMaskParts = []string{
 	"J0mP4l4MHpw=",
 	"rojHZpjcsso=",

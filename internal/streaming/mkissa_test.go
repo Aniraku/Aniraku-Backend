@@ -1,12 +1,12 @@
 package streaming
 
 import (
-	"encoding/hex"
 	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"

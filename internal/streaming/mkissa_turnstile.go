@@ -188,7 +188,7 @@ func (s *mkissaPollSolver) solve(ctx context.Context) (string, error) {
 			return "", err
 		}
 		var rr struct {
-			Status  string `json:"status"`
+			Status   string `json:"status"`
 			Solution struct {
 				Token string `json:"token"`
 			} `json:"solution"`
