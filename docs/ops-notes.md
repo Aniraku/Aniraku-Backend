@@ -54,7 +54,16 @@ inside source comments.
   and salt="rEVwtVi:<epoch>" — the derive call takes an algo STRING
   ("cbhC") that indexes a config table inside the globalThis["UUeyEG"]
   crypto bridge, so the real password/salt/iterations live in that
-  bridge config. Turnstile confirmed: the episode query returns NEED_CAPTCHA (not
+  bridge config. FINAL mkissa decision (2026-11-21, operator): disabled from the fan-out
+  (the episode query returns NEED_CAPTCHA = Cloudflare Turnstile every
+  time). Available via explicit provider=mkissa in /stream. The RE is
+  complete: buildId 190, the AA crypto derivation, the x-aa-boot token
+  (byte-verified against the browser), the GET /api form — all documented
+  above. The ONLY blocker is Turnstile, which requires a real browser.
+  If mkissa.net drops Turnstile, re-enable the fan-out entry and the
+  existing mkissa.go code should work (with the buildId updated to the
+  current value).
+Turnstile confirmed: the episode query returns NEED_CAPTCHA (not
   AA_CRYPTO_MISSING) when the AA crypto is valid — the server
   deliberately requires a Cloudflare Turnstile token for episode source
   resolution. This is a bot-protection measure, not a crypto issue.

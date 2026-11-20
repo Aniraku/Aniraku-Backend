@@ -705,10 +705,11 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
-		// mkissa re-enabled (2026-11-20, operator): the NEED_CAPTCHA wall is
-		// gone from VPS egress (verified live — bootstrap + streams 200),
-		// and it runs as a full streaming source like AniPM.
-		{"mkissa", &mkServers, m.collectMkissaServers, !hentai},
+		// mkissa disabled from the fan-out (2026-11-20): the episode source
+		// query returns NEED_CAPTCHA (Cloudflare Turnstile) — a deliberate
+		// anti-bot measure. The provider is available via explicit
+		// provider=mkissa in /stream. The RE is documented in ops-notes.
+		// {"mkissa", &mkServers, m.collectMkissaServers, !hentai},
 		{"novuscloud", &nvServers, m.collectNovuscloudServers, !hentai},
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
