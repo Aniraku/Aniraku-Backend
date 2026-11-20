@@ -462,7 +462,15 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 		return nil, fmt.Errorf("anipm: no sources for this episode")
 	case "heave", "animeheaven":
 		return nil, fmt.Errorf("provider %q removed", provider)
-	// case "mkissa": disabled: NEED_CAPTCHA from VPS egress, slows /stream fallback
+	case "mkissa", "chuu", "mua", "kissy", "smooch", "peck", "xoxo", "umi":
+		result, err := m.tryMkissa(ctx, animeID, episode, lang, quality)
+		if err != nil {
+			return nil, err
+		}
+		if result != nil && len(result.Sources) > 0 {
+			return result, nil
+		}
+		return nil, fmt.Errorf("mkissa: no sources for this episode")
 	case "novuscloud", "novus", "matcha", "azuki", "kinako", "kuri":
 		result, err := m.tryNovuscloud(ctx, animeID, episode, lang, quality)
 		if err != nil {
@@ -485,18 +493,25 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 	// unpaused) and FlixCloud (Reanime embeds, covers hentai).
 	var candidates []func() (*core.StreamResult, error)
 	if hentai {
-		candidates = []func() (*core.StreamResult, error){}
+		// FlixCloud first (2026-11-20, operator): the main server covers
+		// hentai titles directly via Reanime.
+		candidates = []func() (*core.StreamResult, error){
+			func() (*core.StreamResult, error) {
+				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
+			},
+		}
 		if !zokoPaused {
 			candidates = append(candidates,
 				func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) })
 		}
-		candidates = append(candidates,
+	} else {
+		// FlixCloud first (2026-11-20, operator): the main server — its
+		// masters lead the automatic fallback chain before every other
+		// provider.
+		candidates = []func() (*core.StreamResult, error){
 			func() (*core.StreamResult, error) {
 				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 			},
-		)
-	} else {
-		candidates = []func() (*core.StreamResult, error){
 			func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
 			func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
 		}
@@ -522,6 +537,8 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 			return m.tryAnixo(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAniPM(ctx, animeID, episode, lang, quality)
+		}, func() (*core.StreamResult, error) {
+			return m.tryMkissa(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -637,8 +654,7 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		stability.finishFlight(flightKey, flight, result)
 	}()
 
-	var akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers []core.Server
-	var adlLinks []core.DownloadLink
+	var mkServers, akServers, axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers []core.Server
 	var wg sync.WaitGroup
 
 	fanStart := time.Now()
@@ -676,10 +692,12 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		enabled bool
 	}
 	entries := []fanOutEntry{
+		// FlixCloud first (2026-11-20, operator): the main server — its
+		// Yokan/Monaka/Mikan slots lead both the server list and playback.
+		{"flixcloud", &fcServers, m.collectFlixServers, true},
 		{"anikoto", &akServers, m.collectAnikotoServers, !hentai},
 		{"animex", &axServers, m.collectAnimeXServers, !hentai},
 		{"zoko", &zkServers, m.collectZokoServers, !zokoPaused},
-		{"flixcloud", &fcServers, m.collectFlixServers, true},
 		{"supaplay", &nnServers, m.collectNiNServers, !hentai},
 		{"kaa", &kaServers, m.collectKaaServers, !hentai},
 		{"animegg", &agServers, m.collectAnimeGGServers, !hentai},
@@ -687,7 +705,10 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 
 		{"megavid", &mvServers, m.collectMegaVidServers, !hentai},
 		{"zenbu", &zbServers, m.collectZenbuServers, !hentai},
-		// {"mkissa", &mkServers, m.collectMkissaServers, !hentai}, // disabled: NEED_CAPTCHA from VPS egress, slows fan-out
+		// mkissa re-enabled (2026-11-20, operator): the NEED_CAPTCHA wall is
+		// gone from VPS egress (verified live — bootstrap + streams 200),
+		// and it runs as a full streaming source like AniPM.
+		{"mkissa", &mkServers, m.collectMkissaServers, !hentai},
 		{"novuscloud", &nvServers, m.collectNovuscloudServers, !hentai},
 		{"anv", &avServers, m.collectAnvServers, !hentai},
 		{"anixo", &axoServers, m.collectAnixoServers, !hentai},
@@ -721,20 +742,11 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		}()
 	}
 
-	// AnimeDL downloads run alongside the providers, never after them: a
-	// slow provider must not starve the download fetch of context budget,
-	// and the response waits for it like any other collector.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		start := time.Now()
-		actx, cancel := context.WithTimeout(ctx, collectorBudget)
-		adlLinks = fetchAnimeDlDownloads(actx, m.httpClient, anilistID, episode, lang)
-		cancel()
-		dmu.Lock()
-		collectorMs["animedlDownloads"] = time.Since(start).Milliseconds()
-		dmu.Unlock()
-	}()
+	// External download links (AnimeDL/animeheaven) removed (2026-11-20,
+	// operator): the third-party download source is gone from responses.
+
+	// Fan-out barrier: every provider collector above runs on the WaitGroup;
+	// the merge below reads their slots only after all of them land.
 	wg.Wait()
 
 	// Merged downloads for Zoko: Zoko's own link plus the already-fetched
@@ -759,20 +771,14 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		providerFallbacks++
 	}
 
-	// Provider merge order is fixed (direct first, embeds and the newest
-	// providers last); playback-verdict ranking below reorders by health.
-	allServers := akServers
-	for _, pool := range [][]core.Server{axServers, zkServers, fcServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers} {
+	// Provider merge order is fixed: FlixCloud first (2026-11-20, operator —
+	// the main server), then direct, embeds and the newest providers last;
+	// playback-verdict ranking below reorders by health.
+	allServers := fcServers
+	for _, pool := range [][]core.Server{akServers, axServers, zkServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers, mkServers} {
 		allServers = append(allServers, pool...)
 	}
-	// AnimeDL download links (fetched in parallel above): attach to every
-	// server except FlixCloud's, "all sources without the FlixCloud"; the
-	// embed player takes no file links, other providers' links stay first.
-	if len(adlLinks) > 0 {
-		allServers = attachDownloadLinks(allServers, adlLinks)
-	} else {
-		m.log.Debug().Str("anilistId", anilistID).Int("episode", episode).Str("lang", lang).Msg("servers: no animedl download links")
-	}
+	// AnimeDL external download links removed (2026-11-20, operator).
 	// Same-language subtitle tracks get distinguishable lang codes before
 	// the list ships ("en", "en (Full Subtitles ...)"); applied here so
 	// every provider benefits, not just anipm.
@@ -1063,6 +1069,11 @@ func mergeDownloadLinks(primary, fallback []core.DownloadLink) []core.DownloadLi
 // serverVerdictRank maps a server's best per-source verification tag to a
 // comparable rank (proxy > direct > embed > dead).
 func serverVerdictRank(s core.Server) int {
+	// FlixCloud is the operator's main server (2026-11-20): its slots lead
+	// the site's server list regardless of the playback verdict.
+	if s.Provider == "flixcloud" {
+		return 4
+	}
 	best := 0
 	for _, src := range s.Sources {
 		switch src.Verification {

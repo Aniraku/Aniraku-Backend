@@ -6,6 +6,31 @@ inside source comments.
 
 ## Provider checks
 
+- 2026-11-20 lineup (operator): FlixCloud is the MAIN server — fan-out
+  entry first, merge first, /stream fallback first (also first for
+  hentai), and serverVerdictRank tier 4 so the verdict sort cannot bury
+  it. Verified live: provider order flixcloud > anikoto > animex > zoko
+  > ...  with Yokan/Monaka at positions 0-1. The AnimeDL/animeheaven
+  external download source is REMOVED (fetch + attach + file gone;
+  animedl_downloads.go deleted); zoko's own download link remains.
+- 2026-11-20 mkissa re-enabled (fan-out + /stream + explicit provider,
+  cute names Chuu/Mua/Kissy/...): the old NEED_CAPTCHA wall is
+  intermittent now — one explicit /stream returned sources, then
+  bootstrap started 404ing. Root cause mapped by RE (obscura CDP capture
+  + chunk RE): the client shipped a NEW protocol — buildId 190 (was 180),
+  lane k7 unchanged, bootstrap response now {epoch, partB, k} (server
+  partB replaces the local 4-part mask; local partA = "Xot36i3lK3" via
+  xT()), x-aa-boot = fT(AES-GCM({buildId, group, host, epoch, lane},
+  key = PBKDF2(partA, "0x"+epoch salt))), /api moved from POST to
+  GET /api?variables=...&extensions={persistedQuery:{sha256Hash}} — the
+  episode/source query hash is fragment-assembled in the obfuscated
+  tables (not yet recovered; browse hashes captured). The collector
+  fails fast (~150-300ms bootstrap 404) so the fan-out cost is small.
+  Remaining to finish mkissa: capture the watch-page episode/source
+  query hash (headless SPA hangs pre-player) + the exact PBKDF2/AES-GCM
+  byte derivation, then update mkissa.go (structure intact, constants +
+  GET form + partB scheme to swap). RE artifacts in /tmp/fx/mk
+  (deobfuscators, captures, decoded functions).
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
   and dub entries (one dual-audio master carrying jpn "Native" + eng
   "English" renditions) — the languages differ by the al=sub/dub strip,
