@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"encoding/hex"
 	"bytes"
 	"context"
 	"crypto/aes"
@@ -187,5 +188,40 @@ func TestMkissaCryptoRoundTrip(t *testing.T) {
 	}
 	if !bytes.Contains(pt, []byte("hello")) {
 		t.Fatal("decrypted missing")
+	}
+}
+
+// Byte-verified against the real browser: buildId 190, epoch 2968 produced
+// x-aa-boot 4a8beabb… (captured from mkissa.to on 2026-11-21) and the
+// bootstrap accepted it (HTTP 200 + partB).
+func TestMkissaBootTokenMatchesBrowser(t *testing.T) {
+	mask := mkissaDeriveMask("190", mkissaMaskParts)
+	want := "65c85a8520d83eafafdff966cc3f5187ab774d238f60338ff4fc0ae7d941ca35"
+	if got := hex.EncodeToString(mask); got != want {
+		t.Fatalf("mask mismatch:\n got %s\nwant %s", got, want)
+	}
+	tok := mkissaBootToken(mask, "190", 2968)
+	if tok != "4a8beabb9f230cd4fb9aa972242a403eccfc0c7f3e6d274b083c30e198c9d5b3" {
+		t.Fatalf("boot token mismatch:\n got %s\nwant 4a8beabb9f230cd4fb9aa972242a403eccfc0c7f3e6d274b083c30e198c9d5b3", tok)
+	}
+}
+
+// Live full chain: AniList match → bootstrap → aaReq → episode POST →
+// decrypt → embed extraction → source probing. Skipped unless MKISSA_LIVE=1.
+func TestLiveMkissaFullChain(t *testing.T) {
+	if os.Getenv("MKISSA_LIVE") != "1" {
+		t.Skip("MKISSA_LIVE=1 required")
+	}
+	log := zerolog.New(os.Stderr).With().Timestamp().Logger()
+	p := NewMkissaProvider(log)
+	sr, err := p.FindEpisodeSource(context.Background(), "21", 1, "sub")
+	if err != nil {
+		t.Fatalf("FindEpisodeSource: %v", err)
+	}
+	if sr == nil || len(sr.Sources) == 0 {
+		t.Fatal("no sources resolved")
+	}
+	for i, s := range sr.Sources {
+		t.Logf("server %q: %s (%s)", sr.ServerNames[i], s.URL, s.Type)
 	}
 }

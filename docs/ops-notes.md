@@ -13,66 +13,73 @@ inside source comments.
   > ...  with Yokan/Monaka at positions 0-1. The AnimeDL/animeheaven
   external download source is REMOVED (fetch + attach + file gone;
   animedl_downloads.go deleted); zoko's own download link remains.
-- 2026-11-20 mkissa re-enabled (fan-out + /stream + explicit provider,
-  cute names Chuu/Mua/Kissy/...): the old NEED_CAPTCHA wall is
-  intermittent now — one explicit /stream returned sources, then
-  bootstrap started 404ing. Root cause mapped by RE (obscura CDP capture
-  + chunk RE): the client shipped a NEW protocol — buildId 190 (was 180),
-  lane k7 unchanged, bootstrap response now {epoch, partB, k} (server
-  partB replaces the local 4-part mask; local partA = "Xot36i3lK3" via
-  xT()), x-aa-boot = fT(AES-GCM({buildId, group, host, epoch, lane},
-  key = PBKDF2(partA, "0x"+epoch salt))), /api moved from POST to
-  GET /api?variables=...&extensions={persistedQuery:{sha256Hash}} — the
-  episode/source query hash is fragment-assembled in the obfuscated
-  tables (not yet recovered; browse hashes captured). The collector
-  fails fast (~150-300ms bootstrap 404) so the fan-out cost is small.
-  Remaining to finish mkissa: (1) the episode/source query hash is
-  fragment-assembled in the obfuscated tables — the watch-page SPA hang
-  and the fragment deobfuscation both need more work; (2) the x-aa-boot
-  derivation is byte-verified (the VM token = the browser token =
-  4a8beabb...) but the PBKDF2/AES-GCM byte parameters live inside the
-  globalThis["UUeyEG"] crypto bridge (a custom JS crypto implementation,
-  NOT WebCrypto — the bridge's own PBKDF2 with bridge-internal
-  constants). A PBKDF2 sweep 1..100k with the modeled inputs found no
-  match — the bridge's internal config holds the real params.
-  mkissa.go's structure is correct for the flow (bootstrap → episode →
-  sources) but the crypto needs the bridge's internal constants.
-  Episode query note: the c4cc2a47 hash ({"format":"anime","id":...})
-  returns community recommendation data, NOT episode listings. The actual
-  episode/source query hash was not captured (the watch page needs the
-  AA crypto header which requires the bridge crypto). The AA_CRYPTO_MISSING
-  error on the OLD hash (670bbf38...) confirms the server still registers
-  the old persisted query but requires the AA crypto header.
-  RE artifacts preserved: /tmp/fx/mk (deobfuscators deob.js/deob2.js/
-  deob3.js/deobfn2.cjs, captures mkissa_capture*.json, VM runners
-  vmrun5b.mjs (WORKING — produces the verified token), mkissa_token.mjs,
-  decoded functions bootfn.js, chunk tree chunks/). The "API Accessing"
-  WAF rule on the zone blocks empty-UA requests to api.aniraku.tech —
-  the Pages function now sends Aniraku-PagesFunction/1.0 UA (bffb4ce).
-  Sweep result: PBKDF2-SHA256 does NOT match the recovered key
-  (177d58d7...) for iterations 1..100000 with password=mask(raw or hex)
-  and salt="rEVwtVi:<epoch>" — the derive call takes an algo STRING
-  ("cbhC") that indexes a config table inside the globalThis["UUeyEG"]
-  crypto bridge, so the real password/salt/iterations live in that
-  bridge config. FINAL mkissa decision (2026-11-21, operator): disabled from the fan-out
-  (the episode query returns NEED_CAPTCHA = Cloudflare Turnstile every
-  time). Available via explicit provider=mkissa in /stream. The RE is
-  complete: buildId 190, the AA crypto derivation, the x-aa-boot token
-  (byte-verified against the browser), the GET /api form — all documented
-  above. The ONLY blocker is Turnstile, which requires a real browser.
-  If mkissa.net drops Turnstile, re-enable the fan-out entry and the
-  existing mkissa.go code should work (with the buildId updated to the
-  current value).
-Turnstile confirmed: the episode query returns NEED_CAPTCHA (not
-  AA_CRYPTO_MISSING) when the AA crypto is valid — the server
-  deliberately requires a Cloudflare Turnstile token for episode source
-  resolution. This is a bot-protection measure, not a crypto issue.
-  The AA crypto derivation (partA/partB → laneKey → AES-GCM aa-req) was
-  successfully reverse-engineered and the server accepted it (the error
-  changed from AA_CRYPTO_MISSING to NEED_CAPTCHA). The Turnstile is the
-  fundamental blocker for automated mkissa access. Next RE step: wrap the bridge methods in the chunk VM
-  (vmrun5b.mjs runs the chunk fully) and log the bridge config — not a
-  brute-force job.
+- 2026-11-21 mkissa SOLVED and re-enabled in the fan-out (byte-verified
+  crypto, live full chain on henix-arm: AniList 21 ep1 sub → direct mp4).
+  The earlier "Turnstile is the fundamental blocker" conclusion was WRONG:
+  NEED_CAPTCHA is mkissa's generic anti-abuse reply to invalid client
+  crypto (and to a per-IP request budget), NOT a mandatory captcha. The
+  real bug: the Go boot token never matched the browser (different HMAC
+  chain), so bootstrap 403'd / the aaReq laneKey was wrong. The corrected
+  protocol, extracted from the crypto chunk (B3DA467b.js — byte-identical
+  between the Nov 20 and Nov 21 site builds, buildId still 190):
+
+  Config (the client's obfuscated `_l()` — dumped at runtime):
+    saltMul=179 saltAdd=115 fragMul=58 fragAdd=158 bootPrefix="rEVwtVi:"
+    join="~" parts=[host,lane,buildId,group,epoch] envXor=32
+  Fragments (vm array in the chunk, 4×8 bytes):
+    J0mP4l4MHpw= rojHZpjcsso= RQPF6Dz59/E= UGdxCsEP9Cw=
+  Mask (hy(buildId)):
+    salt[l]     = (buildId.charCodeAt(l%len)||0) ^ ((l*179+115)&255)
+    mask[i*8+j] = part[i][j] ^ salt[i*8+j] ^ ((i*58 + j*158)&255)
+    (tT() is false in prod → no oT() final transform)
+  Boot token (pT):
+    bootKey = HMAC-SHA256(mask, "rEVwtVi:"+buildId)
+    msg     = "mkissa.to~k7~190~mkissa~<epoch>"   (host~lane~buildId~group~epoch)
+    x-aa-boot = hex(HMAC-SHA256(bootKey, msg))
+    Byte-verified: buildId 190, epoch 2968 → 4a8beabb… = the browser's.
+  Lane key (RT→LT):
+    laneKey[i] = partB[i] ^ mask[i]   (plain XOR, 32 bytes)
+  aaReq (FT):
+    payload = {v:1, ts:floor(ms/300000)*300000, epoch, buildId, qh:hash, k:"k7"}
+    iv      = sha256("epoch:buildId:qh:ts:lane")[:12]
+    aaReq   = b64(0x01 || iv || AES-256-GCM(laneKey, iv, json(payload)))
+  Episode response (BT/UT):
+    tobeparsed b64 → v byte 1, iv = raw[1:13], ct||tag = raw[13:],
+    AES-256-GCM open with the SAME laneKey → JSON {episode:{sourceUrls}}
+  Episode query: POST /api {variables:{showId,translationType,episodeString},
+  extensions:{persistedQuery:{version:1,sha256Hash:670bbf38…}, k:"k7",
+  aaReq}} — hash 670bbf38 IS the episode hash (earlier note wrong), headers
+  x-build-id + Referer/Origin mkissa.to. No captcha field needed normally.
+
+  Source kinds (lowercased sourceName; the client uses sourceName directly
+  and skips "unkonw"/"Wp-*"): Default (prio 8.5, hex-sealed "--…" URL →
+  mkissaDecodeHex → /apivtwo/clock?id=… on allanime.day, HLS links), Yt-mp4
+  (prio 7.9, type "player", direct mp4 on tools.fast4speed.rsvp with an
+  Authorization query param, no extension), Ss-Hls (streamsb embed), Mp4
+  (mp4upload embed, extracted), Ok (ok.ru embed, ondemandHls extracted),
+  Sl-mp4 (streamlare, extracted), Uv-mp4 (hex-sealed clock), Fm-Hls/Sw/Vg
+  (iframe-only embeds — the client plays them in an iframe and never
+  extracts; we drop them when extraction yields nothing).
+
+  NEED_CAPTCHA handling: when the per-IP budget trips, the client renders a
+  Turnstile (siteKey 0x4AAAAAADXpHZ1lTeqKwhch, provider "turnstile1") in a
+  "Security Check" modal and retries the POST with
+  extensions.captcha={token,provider}. Provider support: on NEED_CAPTCHA the
+  episode POST is retried once with that extension, token from
+  MKISSA_CAPSOLVER_KEY (CapSolver AntiTurnstileTaskProxyLess) /
+  MKISSA_2CAPTCHA_KEY (2Captcha TurnstileTaskProxyless) /
+  MKISSA_TURNSTILE_TOKEN_FILE (manual paste; mtime rotates it). No solver
+  configured → the provider falls back to its throttle breaker (2 strikes →
+  10 min). The budget is temporary: full chains resolved without any token
+  before/after the probe burst tripped it. Local headed-Chromium note: the
+  widget modal opens and window.turnstile loads, but the render never fires
+  under CDP automation (silent anti-bot), so local token stealing is not a
+  viable fallback.
+  RE artifacts: /tmp/fx/mk — trace_hy.mjs (mask trace),
+  probe_pT_internals.mjs (pT chain), dump_cfg.mjs (_l() config),
+  mkissa_captcha_probe_test.go (live POST probe), steal_turnstile.mjs /
+  diag*.mjs (browser diagnostics), hy_full.js.
+
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
   and dub entries (one dual-audio master carrying jpn "Native" + eng
   "English" renditions) — the languages differ by the al=sub/dub strip,

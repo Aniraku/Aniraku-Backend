@@ -50,22 +50,47 @@ const (
 // throttle bucket. Var so tests can disable it.
 var mkissaAPIGap = 4 * time.Second
 
+// The client's obfuscated crypto config (_l()) — byte-verified against the
+// browser's x-aa-boot token (4a8beabb… for buildId 190, epoch 2968):
+//   salt[l]  = (buildId.charCodeAt(l%len)||0) ^ ((l*saltMul + saltAdd)&255)
+//   mask[i*8+j] = part[i][j] ^ salt[i*8+j] ^ ((i*fragMul + j*fragAdd)&255)
+//   bootKey  = HMAC-SHA256(mask, bootPrefix+buildId)
+//   bootToken= hex(HMAC-SHA256(bootKey, host~lane~buildId~group~epoch))
 var mkissaMaskParts = []string{
-	"AFEIqKvfcWk=",
-	"SPqwGgteqB4=",
-	"s/WpUzSxn8I=",
-	"R7bCnc9cO5A=",
+	"J0mP4l4MHpw=",
+	"rojHZpjcsso=",
+	"RQPF6Dz59/E=",
+	"UGdxCsEP9Cw=",
 }
 
-// mkissaServerNames maps source kinds to stable cute server names.
+const (
+	mkissaSaltMul = 179
+	mkissaSaltAdd = 115
+	mkissaFragMul = 58
+	mkissaFragAdd = 158
+	mkissaBootPre = "rEVwtVi:"
+	mkissaKeyJoin = "~"
+	mkissaKeyGrp  = "mkissa"
+	mkissaHost    = "mkissa.to"
+)
+
+// mkissaServerNames maps source kinds (lowercased sourceName, as the client
+// uses sourceName directly for its own server tabs) to stable cute server
+// names. The client skips kinds "unkonw" and "Wp-*"; so do we. Kinds seen in
+// the wild: Default (hex-sealed clock link, prio 8.5), Yt-mp4 (direct player
+// URL, prio 7.9), Ss-Hls (streamsb), Mp4 (mp4upload), Ok (ok.ru), Sl-mp4
+// (streamlare), Uv-mp4 (hex-sealed), Fm-Hls/Sw/Vg (iframe-only embeds).
 var mkissaServerNames = map[string]string{
 	"default": "Chuu",
-	"uv-mp4":  "Mua",
-	"mp4":     "Kissy",
+	"yt-mp4":  "Umi",
 	"ss-hls":  "Smooch",
+	"uv-mp4":  "Mua",
 	"sl-mp4":  "Peck",
 	"ok":      "Xoxo",
-	"uni":     "Umi",
+	"mp4":     "Kissy",
+	"fm-hls":  "Bee",
+	"sw":      "Nia",
+	"vg":      "Pip",
 }
 
 type mkissaSlugEntry struct {
@@ -102,6 +127,7 @@ type mkissaSource struct {
 	SourceURL    string  `json:"sourceUrl"`
 	ExtractedURL string  `json:"extractedUrl"`
 	Type         string  `json:"type"`
+	Stype        string  `json:"stype"`
 	Priority     float64 `json:"priority"`
 }
 
@@ -166,6 +192,15 @@ type MkissaProvider struct {
 	throttleMu          sync.Mutex
 	consecutiveThrottle int
 	blockedUntil        time.Time
+
+	// Turnstile solver, built lazily on the first NEED_CAPTCHA so an
+	// unsolved deployment pays nothing.
+	turnMu     sync.Mutex
+	turnSolver mkissaSolver
+
+	turnTokMu sync.Mutex
+	turnTok   string
+	turnTokAt time.Time
 }
 
 type mkissaLaneCache struct {
@@ -302,43 +337,78 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 			"aaReq":          aaReq,
 		},
 	}
-	b, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase, bytes.NewReader(b))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", mkissaReferer)
-	req.Header.Set("Origin", mkissaOrigin)
-	req.Header.Set("User-Agent", browserUA)
-	req.Header.Set("x-build-id", mkissaBuildID)
-	p.acquireAPI(ctx)
-	resp, err := p.client.Do(req)
-	p.releaseAPI()
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	rb, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("mkissa: episode POST -> HTTP %d", resp.StatusCode)
-	}
-	var parsed struct {
+	// episodePost runs the secured episode query; when the server answers
+	// NEED_CAPTCHA (per-IP budget exhausted) it is retried once through the
+	// Turnstile path, exactly like the site client's withCaptchaRetry.
+	episodePost := func(payload map[string]any) (struct {
 		Data struct {
 			Tobeparsed string `json:"tobeparsed"`
 		} `json:"data"`
 		Errors []struct {
 			Message string `json:"message"`
 		} `json:"errors"`
+	}, error) {
+		var parsed struct {
+			Data struct {
+				Tobeparsed string `json:"tobeparsed"`
+			} `json:"data"`
+			Errors []struct {
+				Message string `json:"message"`
+			} `json:"errors"`
+		}
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return parsed, err
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.apiBase, bytes.NewReader(b))
+		if err != nil {
+			return parsed, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Referer", mkissaReferer)
+		req.Header.Set("Origin", mkissaOrigin)
+		req.Header.Set("User-Agent", browserUA)
+		req.Header.Set("x-build-id", mkissaBuildID)
+		p.acquireAPI(ctx)
+		resp, err := p.client.Do(req)
+		p.releaseAPI()
+		if err != nil {
+			return parsed, err
+		}
+		defer resp.Body.Close()
+		rb, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			return parsed, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return parsed, fmt.Errorf("mkissa: episode POST -> HTTP %d", resp.StatusCode)
+		}
+		if err := json.Unmarshal(rb, &parsed); err != nil {
+			return parsed, fmt.Errorf("mkissa: episode decode: %w", err)
+		}
+		return parsed, nil
 	}
-	if err := json.Unmarshal(rb, &parsed); err != nil {
-		return nil, fmt.Errorf("mkissa: episode decode: %w", err)
+	parsed, postErr := episodePost(body)
+	if postErr == nil && len(parsed.Errors) > 0 && strings.Contains(strings.Join(errMsgs(parsed.Errors), "|"), "NEED_CAPTCHA") {
+		if rb2, rerr := p.mkissaCaptchaRetry(ctx, body); rerr == nil {
+			var retry struct {
+				Data struct {
+					Tobeparsed string `json:"tobeparsed"`
+				} `json:"data"`
+				Errors []struct {
+					Message string `json:"message"`
+				} `json:"errors"`
+			}
+			if json.Unmarshal(rb2, &retry) == nil && len(retry.Errors) == 0 {
+				parsed = retry
+				postErr = nil
+			}
+		} else {
+			p.log.Debug().Err(rerr).Msg("mkissa: captcha retry unavailable")
+		}
+	}
+	if postErr != nil {
+		return nil, postErr
 	}
 	if len(parsed.Errors) > 0 {
 		msgs := make([]string, 0, len(parsed.Errors))
@@ -369,17 +439,27 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 		name string
 		url  string
 		typ  string
+		prio float64
 	}
 	var cands []mkissaCandidate
 	for _, s := range dec.sources() {
 		kind := strings.ToLower(strings.TrimSpace(s.kind()))
+		// Mirror the client's own skip list: unknown ("unkonw" typo is the
+		// server's) and WordPress-packaged sources are never playable.
+		if kind == "" || kind == "unkonw" || strings.HasPrefix(kind, "wp-") {
+			continue
+		}
 		name, ok := mkissaServerNames[kind]
 		if !ok {
 			p.log.Debug().Str("kind", s.kind()).Msg("mkissa: unnamed source kind skipped")
 			continue
 		}
 		u := strings.TrimSpace(s.directURL())
-		if u == "" {
+		// Hex-sealed URLs ("--…", kinds Default/Uv-mp4) decode to
+		// /apivtwo/clock links that extractMkissaSource resolves via the
+		// allanime.day clock JSON — route them through it instead of
+		// treating the raw hex as the playback URL.
+		if u == "" || strings.HasPrefix(u, "--") {
 			u = strings.TrimSpace(p.extractMkissaSource(ctx, s))
 		}
 		if u == "" {
@@ -392,11 +472,18 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 			typ = "hls"
 		case strings.Contains(lu, ".mp4"):
 			typ = "mp4"
+		case s.Type == "player":
+			// The site's own player URLs (kind Yt-mp4) are direct mp4
+			// streams carrying an Authorization query param, no extension.
+			typ = "mp4"
 		default:
 			continue // not a direct stream URL
 		}
-		cands = append(cands, mkissaCandidate{name: name, url: u, typ: typ})
+		cands = append(cands, mkissaCandidate{name: name, url: u, typ: typ, prio: s.Priority})
 	}
+	// Highest upstream priority first so the direct player source outranks
+	// the extracted embeds.
+	sort.SliceStable(cands, func(i, j int) bool { return cands[i].prio > cands[j].prio })
 
 	kept := make([]bool, len(cands))
 	var wg sync.WaitGroup
@@ -435,6 +522,17 @@ func (p *MkissaProvider) FindEpisodeSource(ctx context.Context, anilistID string
 	}
 	p.storeResolved(showID, episode, langKey, sr)
 	return sr, nil
+}
+
+// errMsgs flattens GraphQL error messages for log/error lines.
+func errMsgs(errs []struct {
+	Message string `json:"message"`
+}) []string {
+	out := make([]string, 0, len(errs))
+	for _, e := range errs {
+		out = append(out, e.Message)
+	}
+	return out
 }
 
 func (p *MkissaProvider) getLane(ctx context.Context) (mkissaBootstrap, []byte, error) {
@@ -902,7 +1000,7 @@ func mkissaDeriveSalt(buildID string) []byte {
 		if len(buildID) > 0 {
 			c = buildID[i%len(buildID)]
 		}
-		out[i] = c ^ byte((i*12+227)&255)
+		out[i] = c ^ byte((i*mkissaSaltMul+mkissaSaltAdd)&255)
 	}
 	return out
 }
@@ -928,7 +1026,7 @@ func mkissaDeriveMask(buildID string, parts []string) []byte {
 			if offset+j < len(salt) {
 				sv = salt[offset+j]
 			}
-			out[offset+j] = pv ^ sv ^ byte((j*32+i*217)&255)
+			out[offset+j] = pv ^ sv ^ byte((i*mkissaFragMul+j*mkissaFragAdd)&255)
 		}
 	}
 	return out
@@ -944,8 +1042,15 @@ func mkissaEpoch(now time.Time) int64 {
 }
 
 func mkissaBootToken(mask []byte, buildID string, epoch int64) string {
-	bootKey := mkissaHMACSHA256(mask, []byte("NmmeXF:"+buildID))
-	msg := mkissaLane + "+" + buildID + "+" + "mkissa.to" + "+" + "mkissa" + "+" + strconv.FormatInt(epoch, 10)
+	bootKey := mkissaHMACSHA256(mask, []byte(mkissaBootPre+buildID))
+	// Message order is the client config's parts list: host~lane~buildId~group~epoch.
+	msg := strings.Join([]string{
+		mkissaHost,
+		mkissaLane,
+		buildID,
+		mkissaKeyGrp,
+		strconv.FormatInt(epoch, 10),
+	}, mkissaKeyJoin)
 	return hex.EncodeToString(mkissaHMACSHA256(bootKey, []byte(msg)))
 }
 

@@ -62,6 +62,11 @@ var defaultCDNSuffixes = []string{
 	"vidtub.akirax.buzz", "vidtub.shiora.site", "hls.anidb.app",
 	"vidcloud.net", "vidstreaming.io", "streamtape.net",
 	"rapidvideo.com", "mp4upload.com", "vidhide.net",
+	// Mkissa Ok server: ok.ru embed extracts to ondemandHls on ok.ru/mycdn.me
+	"ok.ru", "mycdn.me", "odcdn.mycdn.me",
+	// Mkissa Default/Uv-mp4 servers: hex-sealed /apivtwo/clock links resolve
+	// to HLS on allanime.day (same AllAnime plumbing)
+	"allanime.day",
 	// New CDN hosts
 	"norami.top", "fetch.nexabloom.top",
 	// ZokoAnime embed CDN (referer-gated)
