@@ -80,6 +80,18 @@ inside source comments.
   mkissa_captcha_probe_test.go (live POST probe), steal_turnstile.mjs /
   diag*.mjs (browser diagnostics), hy_full.js.
 
+  Deployed (30400b9, arm64, aniraku-api restarted): fan-out includes
+  mkissa (collectorMs shows it), lineup verified Yokan > Monaka > … >
+  Warabi with mkissa servers (Chuu/Umi/Smooch/Peck/Xoxo/Kissy) joining
+  as the budget allows. Deployment-day caveat: the VPS datacenter IP
+  tripped the per-IP episode budget during RE probing and the penalty
+  ran 45+ min (residential IP cooled in ~20), while search/show
+  resolution kept working — only the episode POST is budget-gated. If
+  the penalty recurs on henix-arm, set one of MKISSA_CAPSOLVER_KEY /
+  MKISSA_2CAPTCHA_KEY / MKISSA_TURNSTILE_TOKEN_FILE in
+  ~/Aniraku-Backend/.env and restart; the provider then rides the
+  Turnstile retry like the site client does.
+
 - 2026-11-17 flixcloud sub/dub: reanime hands the SAME dataLink for sub
   and dub entries (one dual-audio master carrying jpn "Native" + eng
   "English" renditions) — the languages differ by the al=sub/dub strip,
