@@ -1712,7 +1712,6 @@ func (m *Manager) getNovuscloudProvider() *NovuscloudProvider {
 	return nil
 }
 
-
 // tryNovuscloud resolves NovusCloud direct m3u8/mp4 sources.
 func (m *Manager) tryNovuscloud(ctx context.Context, animeID int, episode int, lang, quality string) (*core.StreamResult, error) {
 	nv := m.getNovuscloudProvider()
@@ -1836,7 +1835,6 @@ func (m *Manager) collectZenbuServers(ctx context.Context, anilistID string, epi
 	}
 	return out
 }
-
 
 // collectNovuscloudServers maps NovusCloud mirror sources to their cute
 // server names (Novus-hd1, Novus-hd2, Novus-hd3, Novus-hd4). FindEpisodeSource
