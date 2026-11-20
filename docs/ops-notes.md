@@ -37,6 +37,12 @@ inside source comments.
   match — the bridge's internal config holds the real params.
   mkissa.go's structure is correct for the flow (bootstrap → episode →
   sources) but the crypto needs the bridge's internal constants.
+  Episode query note: the c4cc2a47 hash ({"format":"anime","id":...})
+  returns community recommendation data, NOT episode listings. The actual
+  episode/source query hash was not captured (the watch page needs the
+  AA crypto header which requires the bridge crypto). The AA_CRYPTO_MISSING
+  error on the OLD hash (670bbf38...) confirms the server still registers
+  the old persisted query but requires the AA crypto header.
   RE artifacts preserved: /tmp/fx/mk (deobfuscators deob.js/deob2.js/
   deob3.js/deobfn2.cjs, captures mkissa_capture*.json, VM runners
   vmrun5b.mjs (WORKING — produces the verified token), mkissa_token.mjs,
