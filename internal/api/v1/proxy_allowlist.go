@@ -28,6 +28,10 @@ var defaultCDNSuffixes = []string{
 	// carry segments/key material/subtitles. Both the vault number and the
 	// domain rotate per episode, so the bare families are listed.
 	"flixcloud.cc", "flixcloud.com",
+	// FlixCloud subtitle CDN (fetchN.subtites4you.com rotate; the domain
+	// typo "subtites" is theirs) — the .ass/.vtt files referenced from the
+	// embed data island live here, not on the video CDNs.
+	"subtites4you.com",
 	"atomic4cdn.top", "vividcdn.top", "spectralcdn.top", "rundowncdn.top",
 	// Direct mp4 mirrors
 	"animegg.org",
