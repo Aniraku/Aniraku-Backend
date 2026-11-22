@@ -194,3 +194,23 @@ inside source comments.
 - 2026-10-21 episode embeds key on ani/mal per-episode values that
   already embed the episode ("185874/9"): /embed/ani/185874/9/sub, not
   /embed/ani/<ep-less>/sub, which 404s.
+- 2026-11-22 automated proxy allowlist (operator): provider CDN/subtitle
+  rotation no longer needs an allowlist edit. The dynamic learner now
+  vouches hosts from four points: (1) mintProxyLink — every URL sealed
+  into a k-link (source, subtitle, nested unwrap) is provider-resolved
+  by definition, its host is learned at mint time; (2) the k-route —
+  resolving a self-minted token re-vouches its host (covers links minted
+  by an earlier process); (3) the legacy handout (seal disabled) —
+  /servers and /stream learn source AND subtitle hosts they expose; (4)
+  playlist rewrite — children of a trusted playlist (unchanged, existing).
+  Learned entries: exact-host match only (never suffix), nuisance/private
+  hosts rejected, 500-entry LRU cap, TTL raised 24h→7d so learned hosts
+  outlive edge-cached playlists. Persistence default fixed from
+  /app/data/dynamic_cdn.json (never existed on the VPS — learning was
+  silently volatile across restarts) to data/dynamic_cdn.json relative to
+  the service working directory; ANIRAKU_DYNAMIC_CDN_FILE still overrides.
+  Tests: TestMintProxyLinkLearnsHost, TestResolveProxyLinkLearnsHost,
+  TestLegacyHandoutLearnsSubtitleHosts. Root incident: flixcloud subtitle
+  rotation to fetchN.subtites4you.com 403'd ("proxy target not allowed")
+  until manually allowlisted; the static subtites4you.com entry stays as
+  the baseline while learning handles the next rotation automatically.

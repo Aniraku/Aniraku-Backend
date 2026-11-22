@@ -188,8 +188,12 @@ var (
 	dynamicCDNMu       sync.RWMutex
 	// Max dynamic entries to prevent unbounded growth
 	maxDynamicEntries = 500
-	// TTL for dynamic entries (24 hours)
-	dynamicEntryTTL = 24 * time.Hour
+	// TTL for dynamic entries. A week, not a day: learned hosts must
+	// outlive edge-cached playlists (Cloudflare serves repeat views from
+	// cache for hours/days, and a cached master still names child hosts
+	// whose fresh resolve may not happen for days for a rarely-watched
+	// episode). Re-learned on every fresh mint/resolve anyway.
+	dynamicEntryTTL = 7 * 24 * time.Hour
 )
 
 func proxyCDNSuffixes() []string {
@@ -273,12 +277,16 @@ func dynamicEntryLive(host string) bool {
 // dynamicCDNFilePath is where learned hosts persist so container restarts
 // and redeploys don't wipe the dynamic allowlist (a wipe turns every
 // in-flight edge-cached playlist into 403s until each upstream is
-// re-fetched). Overridable for tests via ANIRAKU_DYNAMIC_CDN_FILE.
+// re-fetched). The default is RELATIVE to the service working directory
+// (the VPS layout is ~/Aniraku-Backend with a data/ dir next to .env —
+// the old /app/data/ absolute default never existed there, so learning
+// was silently volatile across every restart). Overridable for tests via
+// ANIRAKU_DYNAMIC_CDN_FILE.
 func dynamicCDNFilePath() string {
 	if p := strings.TrimSpace(os.Getenv("ANIRAKU_DYNAMIC_CDN_FILE")); p != "" {
 		return p
 	}
-	return "/app/data/dynamic_cdn.json"
+	return filepath.Join("data", "dynamic_cdn.json")
 }
 
 var dynamicCDNLoadOnce sync.Once

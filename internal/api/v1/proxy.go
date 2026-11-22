@@ -324,6 +324,22 @@ func isSubtitleURL(pathLower string) bool {
 // fields are dropped. Without the key the responses pass through unchanged
 // (legacy raw-URL behavior, app compatibility).
 func (h *Handlers) mintSourcesForClient(servers []core.Server) []core.Server {
+	// Learn every host in the response FIRST — sealed or not, these are
+	// provider-resolved playback targets and the proxy gate must accept
+	// them even when the upstream rotated to an unlisted CDN (subtitle
+	// hosts rotate too and the source learner only sees stream URLs).
+	for _, srv := range servers {
+		for _, src := range srv.Sources {
+			if u, err := url.Parse(src.URL); err == nil {
+				LearnHostFromPlaylist(u.Hostname())
+			}
+			for _, sub := range src.Subtitles {
+				if u, err := url.Parse(sub.URL); err == nil {
+					LearnHostFromPlaylist(u.Hostname())
+				}
+			}
+		}
+	}
 	if len(proxyLinkKeyBytes) != 32 {
 		return servers
 	}
@@ -365,6 +381,20 @@ func (h *Handlers) mintSourcesForClient(servers []core.Server) []core.Server {
 
 // mintStreamSources seals a StreamResult's sources the same way.
 func (h *Handlers) mintStreamSources(result *core.StreamResult) *core.StreamResult {
+	// Same first-learn as mintSourcesForClient: vouch every provider
+	// handout (sources + subtitles) before any seal decision.
+	if result != nil {
+		for _, src := range result.Sources {
+			if u, err := url.Parse(src.URL); err == nil {
+				LearnHostFromPlaylist(u.Hostname())
+			}
+			for _, sub := range src.Subtitles {
+				if u, err := url.Parse(sub.URL); err == nil {
+					LearnHostFromPlaylist(u.Hostname())
+				}
+			}
+		}
+	}
 	if len(proxyLinkKeyBytes) != 32 || result == nil {
 		return result
 	}
@@ -424,6 +454,14 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		if err != nil {
 			h.respondError(w, http.StatusNotFound, "expired or invalid media link")
 			return
+		}
+		// Self-minted token: vouch the host even when the static allowlist
+		// never saw it (e.g. minted by a previous process whose learned
+		// file was lost, or a legacy client replaying an old k-link).
+		// Same trust tier as the mint-time learn — the token only exists
+		// because one of our providers resolved this URL for playback.
+		if pu, perr := url.Parse(rawURL); perr == nil {
+			LearnHostFromPlaylist(pu.Hostname())
 		}
 		h.log.Info().Str("kroute_resolved", rawURL).Msg("proxy: opaque link resolved")
 		q := r.URL.Query()

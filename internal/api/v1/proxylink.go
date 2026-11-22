@@ -113,6 +113,15 @@ func mintProxyLink(rawURL string, headers map[string]string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// A sealed URL is by definition one of OUR provider-resolved playback
+	// targets (source, subtitle, nested unwrap) — vouch its host into the
+	// dynamic allowlist right here so the proxy gate accepts it even when
+	// the upstream rotates to a CDN the static list has never seen. This
+	// is the automated-learning anchor: every host the providers hand out
+	// for playback passes through mintProxyLink exactly once per mint.
+	if u, perr := url.Parse(rawURL); perr == nil {
+		LearnHostFromPlaylist(u.Hostname())
+	}
 	payload, err := json.Marshal(proxyLinkPayload{
 		URL:     rawURL,
 		Headers: headers,
