@@ -247,8 +247,8 @@ func (m *Manager) isHentaiTitle(ctx context.Context, animeID int) bool {
 	return isHentai
 }
 
-// GetSources resolves sources using the default provider order (anikoto,
-// zoko, then flixcloud).
+// GetSources resolves sources using the default provider order (AniPM,
+// Kaa, FlixCloud, MegaPlay, AnV, AnimeX, then the rest).
 func (m *Manager) GetSources(ctx context.Context, title string, episode int, lang, quality string) (*core.StreamResult, error) {
 	return m.GetSourcesForProvider(ctx, episode, "", lang, quality, 0)
 }
@@ -469,13 +469,13 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 		return nil, fmt.Errorf("provider %q removed - use anikoto, zoko or flixcloud", provider)
 	}
 	var lastErr error
-	// Anikoto direct first, AnimeX (plyr API) second, Zoko third (skipped
-	// while paused), FlixCloud embed fourth, kaa.lt fifth, AnimeGG mp4
-	// sixth, AniWaves HLS seventh, MegaVid eighth, Zenbu edges ninth,
-	// AnV tenth, Anixo eleventh, AniPM (ani.pm, AniList-keyed direct HLS)
-	// last — the automatic backup server.
-	// Hentai titles only ever reach Zoko (MAL-keyed for hentai, when
-	// unpaused) and FlixCloud (Reanime embeds, covers hentai).
+	// Automatic fallback order (2026-11-24, operator): AniPM first, then
+	// Kaa, FlixCloud, MegaPlay (megavid), AnV, AnimeX, then the remaining
+	// providers in their existing order. The first provider that returns
+	// sources wins; every later entry is only a backup.
+	// Hentai titles only ever reach FlixCloud (Reanime embeds, covers
+	// hentai) and Zoko (MAL-keyed, when unpaused); the gated providers
+	// above are rejected before any upstream call.
 	var candidates []func() (*core.StreamResult, error)
 	if hentai {
 		// FlixCloud first (2026-11-20, operator): the main server covers
@@ -490,38 +490,45 @@ func (m *Manager) getSourcesForProviderWithSlug(ctx context.Context, episode int
 				func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) })
 		}
 	} else {
-		// FlixCloud first (2026-11-20, operator): the main server — its
-		// masters lead the automatic fallback chain before every other
-		// provider.
+		// Playback priority (2026-11-24, operator): AniPM, Kaa, FlixCloud,
+		// MegaPlay, AnV, AnimeX, then the rest.
 		candidates = []func() (*core.StreamResult, error){
+			func() (*core.StreamResult, error) {
+				return m.tryAniPM(ctx, animeID, episode, lang, quality)
+			},
+			func() (*core.StreamResult, error) {
+				return m.tryKaa(ctx, animeID, episode, lang, quality)
+			},
 			func() (*core.StreamResult, error) {
 				return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
 			},
-			func() (*core.StreamResult, error) { return m.tryAnikoto(ctx, animeID, episode, lang, quality) },
-			func() (*core.StreamResult, error) { return m.tryAnimeX(ctx, animeID, episode, lang, quality) },
+			func() (*core.StreamResult, error) {
+				return m.tryMegaVid(ctx, animeID, episode, lang, quality)
+			},
+			func() (*core.StreamResult, error) {
+				return m.tryAnv(ctx, animeID, episode, lang, quality)
+			},
+			func() (*core.StreamResult, error) {
+				return m.tryAnimeX(ctx, animeID, episode, lang, quality)
+			},
+			func() (*core.StreamResult, error) {
+				return m.tryAnikoto(ctx, animeID, episode, lang, quality)
+			},
 		}
 		if !zokoPaused {
 			candidates = append(candidates,
 				func() (*core.StreamResult, error) { return m.tryZoko(ctx, animeID, episode, lang, quality) })
 		}
 		candidates = append(candidates, func() (*core.StreamResult, error) {
-			return m.tryFlixCloudWithSlug(ctx, animeID, episode, lang, quality, slug)
-		}, func() (*core.StreamResult, error) {
-			return m.tryKaa(ctx, animeID, episode, lang, quality)
+			return m.tryNiN(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAnimeGG(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
-			return m.tryAniWaves(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
-			return m.tryMegaVid(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
 			return m.tryZenbu(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
-			return m.tryAnv(ctx, animeID, episode, lang, quality)
+			return m.tryNovuscloud(ctx, animeID, episode, lang, quality)
 		}, func() (*core.StreamResult, error) {
 			return m.tryAnixo(ctx, animeID, episode, lang, quality)
-		}, func() (*core.StreamResult, error) {
-			return m.tryAniPM(ctx, animeID, episode, lang, quality)
 		})
 	}
 	for _, try := range candidates {
@@ -751,11 +758,13 @@ func (m *Manager) FindAllServers(ctx context.Context, animeID int, episode int, 
 		providerFallbacks++
 	}
 
-	// Provider merge order is fixed: FlixCloud first (2026-11-20, operator —
-	// the main server), then direct, embeds and the newest providers last;
-	// playback-verdict ranking below reorders by health.
-	allServers := fcServers
-	for _, pool := range [][]core.Server{akServers, axServers, zkServers, nnServers, kaServers, agServers, awServers, mvServers, zbServers, nvServers, avServers, axoServers, pmServers} {
+	// Provider merge order is fixed (2026-11-24, operator): AniPM, Kaa,
+	// FlixCloud, MegaPlay, AnV, AnimeX, then the remaining providers in
+	// their existing order. serverVerdictRank below applies the same
+	// priority as the primary sort key, so this order is what the player
+	// sees even when verdicts differ.
+	allServers := pmServers
+	for _, pool := range [][]core.Server{kaServers, fcServers, mvServers, avServers, axServers, akServers, zkServers, nnServers, agServers, awServers, zbServers, nvServers, axoServers} {
 		allServers = append(allServers, pool...)
 	}
 	// AnimeDL external download links removed (2026-11-20, operator).
@@ -1048,12 +1057,30 @@ func mergeDownloadLinks(primary, fallback []core.DownloadLink) []core.DownloadLi
 
 // serverVerdictRank maps a server's best per-source verification tag to a
 // comparable rank (proxy > direct > embed > dead).
+// providerPlayOrder is the operator's playback priority (2026-11-24):
+// AniPM, Kaa, FlixCloud, MegaPlay (megavid), AnV, AnimeX, then every other
+// provider. It is the PRIMARY sort key; the playback verdict only breaks
+// ties inside one provider, so a healthy provider can never be demoted
+// below a lower-priority one.
+var providerPlayOrder = map[string]int{
+	"anipm":     60,
+	"kaa":       50,
+	"flixcloud": 40,
+	"megavid":   30,
+	"anv":       20,
+	"animex":    10,
+}
+
 func serverVerdictRank(s core.Server) int {
-	// FlixCloud is the operator's main server (2026-11-20): its slots lead
-	// the site's server list regardless of the playback verdict.
-	if s.Provider == "flixcloud" {
-		return 4
+	if base, ok := providerPlayOrder[s.Provider]; ok {
+		return base*10 + playbackVerdictRank(s)
 	}
+	return playbackVerdictRank(s)
+}
+
+// playbackVerdictRank ranks a server by how it can reach a player:
+// proxy > direct > embed > dead.
+func playbackVerdictRank(s core.Server) int {
 	best := 0
 	for _, src := range s.Sources {
 		switch src.Verification {
