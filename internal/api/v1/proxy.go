@@ -567,7 +567,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		// Defensive: cache entries written by paths that stored raw could
 		// still carry the flixcloud base64(XOR) wrapper; the decode is
 		// idempotent for plaintext, so apply it unconditionally here.
-		cachedBody = streaming.DecodeFlixcloudPlaylist(cachedBody)
+		cachedBody = streaming.DecodeFlixcloudPlaylistForURL(decodedURL, cachedBody)
 		if strings.Contains(strings.ToLower(parsed.Hostname()), "flixcloud.cc") &&
 			!looksLikeM3u8Bytes(cachedBody) && len(cachedBody) > 32 {
 			// The cached entry itself is undecodable (wrapped in a key
@@ -610,8 +610,10 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 	// rides on every rewritten child URI, so nothing extra is set here. The
 	// m3u8 bodies on the fetch hosts are additionally wrapped in
 	// base64(XOR(_, pk)); that decode happens right before classification.
-	// The old IP-bound JWT flow (client_ip claim validated against the TCP
-	// source) is gone — direct masters carry no signature at all now.
+	// Direct masters DO carry an IP-bound JWT in their token= query (6h
+	// window, client_ip claim); the resolve cache is bounded by its exp and
+	// proxy links are capped to it in mintProxyLink, so a cached link can
+	// never outlive the token it wraps.
 
 	// Forward the client's Range header for media/segment requests so the
 	// video element can seek through the proxy. Without it every seek turns
@@ -786,13 +788,14 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 			return
 		}
 		// FlixCloud wraps every m3u8 body in base64(XOR(plaintext, pk)) where
-		// pk is baked into the embed page's wasm data section. Unwrap BEFORE
-		// classification — the wrapped body is base64 text, not #EXTM3U, and
-		// would be rejected as garbage. DecodeFlixcloudPlaylist passes
-		// already-plaintext bodies through, so this is a no-op for anything
-		// else the CDN serves.
+		// pk is minted per embed-page render. Unwrap BEFORE classification —
+		// the wrapped body is base64 text, not #EXTM3U, and would be rejected
+		// as garbage. The URL-aware decoder uses the key bound to this URL's
+		// family, then the candidate set, then recovers the key from the
+		// playlist's known opening, so a generation this process never
+		// resolved still decodes. Plaintext bodies pass through unchanged.
 		if strings.HasSuffix(strings.ToLower(parsed.Hostname()), "flixcloud.cc") {
-			body = streaming.DecodeFlixcloudPlaylist(body)
+			body = streaming.DecodeFlixcloudPlaylistForURL(decodedURL, body)
 			if !looksLikeM3u8Bytes(body) && len(body) > 32 {
 				// Every known key failed on THESE bytes: Cloudflare's edge
 				// serves mixed key-generations of the encrypted playlist
@@ -812,7 +815,7 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 					body2, err2 := io.ReadAll(io.LimitReader(resp2.Body, hlsMaxRead))
 					resp2.Body.Close()
 					if err2 == nil {
-						body2 = streaming.DecodeFlixcloudPlaylist(body2)
+						body2 = streaming.DecodeFlixcloudPlaylistForURL(decodedURL, body2)
 						if looksLikeM3u8Bytes(body2) {
 							body = body2
 							logUnwrappedFlixcloud(h, busted, "refetch-ok", body)

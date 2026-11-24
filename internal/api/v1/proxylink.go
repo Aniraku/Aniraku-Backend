@@ -12,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/Aniraku/Aniraku-Backend/internal/streaming"
 )
 
 // Opaque proxy links: the backend replaces raw provider URLs (and their
@@ -122,10 +124,24 @@ func mintProxyLink(rawURL string, headers map[string]string) (string, error) {
 	if u, perr := url.Parse(rawURL); perr == nil {
 		LearnHostFromPlaylist(u.Hostname())
 	}
+	expiry := time.Now().Add(proxyLinkTTL)
+	// Never seal a link that outlives the upstream media token: a master
+	// whose JWT expires in 10 minutes must not hand the player a 6-hour
+	// k-link that answers 403 from the CDN half an hour later. Expire 30s
+	// early for clock skew; if the token is already inside that margin,
+	// keep the link valid just long enough for the in-flight request.
+	if tokenExp, ok := streaming.MediaURLExpiry(rawURL); ok {
+		if safe := time.Until(tokenExp) - 30*time.Second; safe < time.Until(expiry) {
+			if safe < time.Second {
+				safe = time.Second
+			}
+			expiry = time.Now().Add(safe)
+		}
+	}
 	payload, err := json.Marshal(proxyLinkPayload{
 		URL:     rawURL,
 		Headers: headers,
-		Exp:     time.Now().Add(proxyLinkTTL).UnixMilli(),
+		Exp:     expiry.UnixMilli(),
 	})
 	if err != nil {
 		return "", err

@@ -1,6 +1,7 @@
 package streaming
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -397,9 +398,13 @@ func (p *FlixCloudProvider) decryptEmbed(ctx context.Context, page *flixcloudPag
 	if err != nil {
 		return "", nil, fmt.Errorf("wasm instantiate: %w", err)
 	}
-	// Same instance also yields the static playlist XOR key; keep it fresh
-	// for the proxy's DecodeFlixcloudPlaylist.
+	// Same instance also yields this render's playlist XOR key. The key is
+	// per embed-page render (NOT a global build constant), so it is bound to
+	// the master URL below: the proxy decodes that URL's body with exactly
+	// this key even after the global candidate set has evicted it.
+	var playlistKey []byte
 	if pk, err := flixcloudPlaylistKey(mod); err == nil {
+		playlistKey = pk
 		flixcloudStorePlaylistKey(pk)
 	}
 
@@ -445,6 +450,9 @@ func (p *FlixCloudProvider) decryptEmbed(ctx context.Context, page *flixcloudPag
 	}
 	if !strings.Contains(url, "://") {
 		return "", nil, fmt.Errorf("decrypted blob is not a URL (%d bytes)", len(plain))
+	}
+	if len(playlistKey) == 32 {
+		flixcloudBindURLKey(url, playlistKey)
 	}
 	return url, page.subs, nil
 }
@@ -501,6 +509,13 @@ func (p *FlixCloudProvider) storeResolve(embedURL string, r flixcloudResolve, tt
 	}
 	r.expiresAt = time.Now().Add(ttl)
 	p.resolved[embedURL] = r
+}
+
+// MediaURLExpiry reports the exp claim of a token= JWT riding on a media
+// URL, when present. The proxy-link layer uses it to avoid sealing a link
+// that outlives the upstream token it wraps.
+func MediaURLExpiry(rawURL string) (time.Time, bool) {
+	return flixcloudJWTExpiry(rawURL)
 }
 
 // flixcloudJWTExpiry reads the exp claim out of the IP-bound JWT that rides
@@ -773,26 +788,41 @@ func flixcloudEmbedFallback(embedURL string) core.Source {
 
 // --- playlist obfuscation key -------------------------------------------
 
-// flixcloudPKFallback is the playlist XOR key observed in every sampled
-// module (baked into the wasm data section, static across pages).
+// flixcloudPKFallback is the playlist XOR key observed in the original
+// sampled modules. It is no longer trusted as a global constant: the key is
+// minted PER EMBED-PAGE RENDER (two titles resolved seconds apart carried
+// 20ee… and 8286…), so a process that resolves many episodes accumulates
+// generations quickly. The fallback stays first in the candidate set because
+// older CDN cache nodes still serve bodies wrapped with it.
 //
-// It lives in a SET, not a single value: flixcloud rebuilds rotate the key,
-// and their Cloudflare edge caches page renders and playlist bodies of
-// DIFFERENT generations side by side (a resolve can land on a page whose
-// module embeds last week's key while the playlist it names is encrypted
-// with the current one). A single runtime value overwritten per resolve
-// made every decode after such a resolve fail until restart — the wrapped
-// body was then served raw and the player died. The set holds every key
-// seen (static fallback permanent, resolve-derived entries LRU-capped);
-// decode tries each until the plaintext magic appears.
+// The authoritative path is flixcloudURLKeys: every resolve binds its page's
+// key to the master URL (and to every child playlist named by that master),
+// so a decode never depends on what the global set happens to hold. Bodies
+// whose URL binding is missing are still recoverable: flixcloudPlaylistOpenings
+// are the stable plaintext openings of flixcloud playlists, and XORing the
+// first 32 ciphertext bytes with one of them yields the full 32-byte key.
 const flixcloudPKFallbackHex = "ad84671c539a5e919ae6932f604f2a16d26c93d5545e90f76518561453c2e744"
+
+// flixcloudPKSetCap bounds the global generation cache. Per-page keys rotate
+// constantly, so this is only a fast path for recently seen generations; the
+// URL binding map and known-plaintext recovery cover everything else.
+const flixcloudPKSetCap = 32
 
 var (
 	flixcloudPKMu       sync.RWMutex
 	flixcloudPKOrder    []string
 	flixcloudPKSet      = map[string][]byte{}
 	flixcloudPKFallback = mustHex(flixcloudPKFallbackHex)
+
+	// flixcloudURLKeys maps a query-stripped playlist URL to the key that
+	// wraps its body. It is bounded FIFO: playlist URLs are unique per
+	// render, so LRU bookkeeping buys nothing.
+	flixcloudURLMu    sync.Mutex
+	flixcloudURLKeys  = map[string][]byte{}
+	flixcloudURLOrder []string
 )
+
+const flixcloudURLKeyCap = 4096
 
 func init() {
 	flixcloudPKSet[flixcloudPKFallbackHex] = flixcloudPKFallback
@@ -807,6 +837,24 @@ func mustHex(s string) []byte {
 	return b
 }
 
+// flixcloudPlaylistOpenings are the plaintext openings every flixcloud
+// playlist generation has used. Each is at least 32 bytes, so the first 32
+// ciphertext bytes XOR opening[:32] recover all 32 key bytes; the rest of the
+// opening and the whole-body text check reject wrong candidates.
+var flixcloudPlaylistOpenings = [][]byte{
+	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA:TYPE=AUDIO"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MEDIA:TYPE=AUDIO"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-KEY:METHOD=AES-128"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-STREAM-INF"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD"),
+	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-PLAYLIST-TYPE:VOD"),
+	[]byte("#EXTM3U\n#EXT-X-TARGETDURATION:4\n"),
+	[]byte("#EXTM3U\n#EXT-X-TARGETDURATION:6\n"),
+	[]byte("#EXTM3U\n#EXT-X-TARGETDURATION:10"),
+}
+
 // flixcloudStorePlaylistKey adds a resolve-derived key to the candidate set.
 func flixcloudStorePlaylistKey(pk []byte) {
 	if len(pk) != 32 {
@@ -818,14 +866,12 @@ func flixcloudStorePlaylistKey(pk []byte) {
 	if _, ok := flixcloudPKSet[id]; ok {
 		return
 	}
-	// Bound the set: drop the OLDEST non-fallback entry. The static fallback
-	// is the key every sampled module embeds and must stay in the order
-	// forever — the old loop dropped index 0 unconditionally, so once eight
-	// distinct resolve-derived keys had accumulated the fallback vanished
-	// from the order and every body wrapped with the current generation
-	// failed to decode while the same bytes decoded fine in a fresh process.
-	// That is the "plays right after a restart, dead minutes later" failure.
-	for len(flixcloudPKOrder) >= 8 {
+	// Bound the set: drop the OLDEST non-fallback entry. The fallback must
+	// stay in the order forever — the old loop dropped index 0
+	// unconditionally, so once enough distinct keys had accumulated the
+	// fallback vanished and every body wrapped with it failed to decode
+	// while the same bytes decoded fine in a fresh process.
+	for len(flixcloudPKOrder) >= flixcloudPKSetCap {
 		drop := -1
 		for i, id := range flixcloudPKOrder {
 			if id != flixcloudPKFallbackHex {
@@ -863,29 +909,196 @@ func flixcloudPKSnapshot() [][]byte {
 	return out
 }
 
+// flixcloudURLKeyID normalizes a playlist URL for key lookup: the token
+// query rotates per resolve while the path (and its body key) stays fixed.
+func flixcloudURLKeyID(rawURL string) string {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return strings.TrimSpace(rawURL)
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
+}
+
+// flixcloudBindURLKey records the key that wraps rawURL's body.
+func flixcloudBindURLKey(rawURL string, pk []byte) {
+	if len(pk) != 32 || rawURL == "" {
+		return
+	}
+	id := flixcloudURLKeyID(rawURL)
+	key := append([]byte(nil), pk...)
+	flixcloudURLMu.Lock()
+	defer flixcloudURLMu.Unlock()
+	if _, ok := flixcloudURLKeys[id]; ok {
+		flixcloudURLKeys[id] = key
+		return
+	}
+	for len(flixcloudURLOrder) >= flixcloudURLKeyCap {
+		drop := flixcloudURLOrder[0]
+		flixcloudURLOrder = flixcloudURLOrder[1:]
+		delete(flixcloudURLKeys, drop)
+	}
+	flixcloudURLOrder = append(flixcloudURLOrder, id)
+	flixcloudURLKeys[id] = key
+}
+
+// flixcloudURLKey returns the bound key for rawURL, or nil.
+func flixcloudURLKey(rawURL string) []byte {
+	id := flixcloudURLKeyID(rawURL)
+	flixcloudURLMu.Lock()
+	defer flixcloudURLMu.Unlock()
+	if pk, ok := flixcloudURLKeys[id]; ok {
+		return append([]byte(nil), pk...)
+	}
+	return nil
+}
+
+// flixcloudXORDecode applies the repeating 32-byte key.
+func flixcloudXORDecode(decoded, pk []byte) []byte {
+	out := make([]byte, len(decoded))
+	for i := range decoded {
+		out[i] = decoded[i] ^ pk[i%len(pk)]
+	}
+	return out
+}
+
+// flixcloudLooksPlain accepts a decoded body only when it is an HLS playlist
+// and the whole body is text. A wrong key leaves high-bit noise even when
+// the forced 32-byte opening happens to match.
+func flixcloudLooksPlain(out []byte) bool {
+	if !bytes.HasPrefix(out, []byte("#EXTM3U")) || !bytes.Contains(out, []byte("#EXT-X-")) {
+		return false
+	}
+	text := 0
+	for _, b := range out {
+		if b == '\n' || b == '\r' || b == '\t' || (b >= 0x20 && b < 0x7f) {
+			text++
+		}
+	}
+	return text*100 >= len(out)*97
+}
+
+// flixcloudBase64Body decodes the wrapper. Both padded and unpadded standard
+// base64 have been observed across CDN generations.
+func flixcloudBase64Body(body []byte) ([]byte, bool) {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return nil, false
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(trimmed); err == nil && len(decoded) >= 32 {
+		return decoded, true
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(trimmed); err == nil && len(decoded) >= 32 {
+		return decoded, true
+	}
+	return nil, false
+}
+
+// flixcloudDecode tries, in order: the URL-bound key, every recently seen
+// generation, then key recovery from the playlist's known opening. It
+// returns the plaintext and the key that produced it.
+func flixcloudDecode(body, preferred []byte) ([]byte, []byte, bool) {
+	if strings.HasPrefix(strings.TrimSpace(string(body)), "#EXTM3U") {
+		return body, nil, false
+	}
+	decoded, ok := flixcloudBase64Body(body)
+	if !ok {
+		return body, nil, false
+	}
+	if len(preferred) == 32 {
+		if out := flixcloudXORDecode(decoded, preferred); flixcloudLooksPlain(out) {
+			return out, preferred, true
+		}
+	}
+	for _, pk := range flixcloudPKSnapshot() {
+		if len(pk) != 32 {
+			continue
+		}
+		if out := flixcloudXORDecode(decoded, pk); flixcloudLooksPlain(out) {
+			return out, pk, true
+		}
+	}
+	for _, opening := range flixcloudPlaylistOpenings {
+		if len(opening) < 32 || len(decoded) < 32 {
+			continue
+		}
+		key := make([]byte, 32)
+		for i := range key {
+			key[i] = decoded[i] ^ opening[i]
+		}
+		out := flixcloudXORDecode(decoded, key)
+		if bytes.HasPrefix(out, opening) && flixcloudLooksPlain(out) {
+			return out, key, true
+		}
+	}
+	return body, nil, false
+}
+
+var flixcloudURIAttrRe = regexp.MustCompile(`URI="([^"]+)"`)
+
+// flixcloudBindPlaylistFamily binds the key to the playlist URL and to every
+// child playlist it names. Variant bodies are wrapped with the same page key
+// as their master, but live at a different URL, so this is what keeps the
+// variant decode independent of the global candidate set.
+func flixcloudBindPlaylistFamily(rawURL string, plain, pk []byte) {
+	flixcloudBindURLKey(rawURL, pk)
+	base, err := url.Parse(rawURL)
+	if err != nil {
+		return
+	}
+	bind := func(ref string) {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || strings.HasPrefix(ref, "data:") {
+			return
+		}
+		u, err := url.Parse(ref)
+		if err != nil {
+			return
+		}
+		abs := base.ResolveReference(u)
+		if !strings.HasSuffix(strings.ToLower(abs.Path), ".m3u8") {
+			return
+		}
+		flixcloudBindURLKey(abs.String(), pk)
+	}
+	for _, line := range strings.Split(string(plain), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			for _, m := range flixcloudURIAttrRe.FindAllStringSubmatch(line, -1) {
+				bind(m[1])
+			}
+			continue
+		}
+		bind(line)
+	}
+}
+
 // DecodeFlixcloudPlaylist unwraps the base64(XOR(plaintext, pk)) wrapper
 // flixcloud puts around every m3u8 body. Plaintext passes through unchanged;
 // on any decode failure the raw body is returned so the proxy's own error
 // classification still handles it (an undecodable body can never be a valid
 // playlist anyway).
 func DecodeFlixcloudPlaylist(body []byte) []byte {
-	trimmed := strings.TrimSpace(string(body))
-	if strings.HasPrefix(trimmed, "#EXTM3U") {
-		return body
+	out, _, _ := flixcloudDecode(body, nil)
+	return out
+}
+
+// DecodeFlixcloudPlaylistForURL is the proxy entry point: it decodes with
+// the key bound to this URL's family first, then falls back to the global
+// set and known-plaintext recovery. On success it caches the key and binds
+// every child playlist so the variant request decodes with the same key.
+func DecodeFlixcloudPlaylistForURL(rawURL string, body []byte) []byte {
+	out, pk, ok := flixcloudDecode(body, flixcloudURLKey(rawURL))
+	if !ok || len(pk) != 32 {
+		return out
 	}
-	decoded, err := base64.StdEncoding.DecodeString(trimmed)
-	if err != nil || len(decoded) < 32 {
-		return body
-	}
-	for _, pk := range flixcloudPKSnapshot() {
-		out := make([]byte, len(decoded))
-		copy(out, decoded)
-		for i := range out {
-			out[i] ^= pk[i%len(pk)]
-		}
-		if strings.HasPrefix(string(out[:8]), "#EXTM3U") {
-			return out
-		}
-	}
-	return body
+	flixcloudStorePlaylistKey(pk)
+	flixcloudBindPlaylistFamily(rawURL, out, pk)
+	return out
 }
