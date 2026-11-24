@@ -83,6 +83,25 @@ func TestDecodeFlixcloudPlaylistForURLBindsVariant(t *testing.T) {
 	}
 }
 
+// Variant playlists can start with the key tag directly (no VERSION line).
+// That opening was missing from the recovery table, so a body whose URL
+// binding was absent stayed wrapped forever.
+func TestDecodeFlixcloudPlaylistRecoversKeyFirstVariant(t *testing.T) {
+	resetFlixcloudDecodeState(t)
+
+	pk := make([]byte, 32)
+	for i := range pk {
+		pk[i] = byte(0x11 + i*7)
+	}
+	plain := "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x0fc0f6959de0a47ff34b7fb43b2b7e79\n" +
+		"#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:6\n#EXT-X-MEDIA-SEQUENCE:0\n" +
+		"#EXTINF:6.006000,\nseg-0-f1-v1-a0.webp\n#EXT-X-ENDLIST\n"
+
+	if got := DecodeFlixcloudPlaylist(flixcloudWrapForTest(plain, pk)); string(got) != plain {
+		t.Fatalf("key-first variant decode failed:\n got %q\nwant %q", got, plain)
+	}
+}
+
 func TestFlixcloudURLKeyIgnoresTokenQuery(t *testing.T) {
 	resetFlixcloudDecodeState(t)
 

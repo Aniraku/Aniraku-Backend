@@ -846,6 +846,14 @@ var flixcloudPlaylistOpenings = [][]byte{
 	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-MEDIA:TYPE=AUDIO"),
 	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-KEY:METHOD=AES-128"),
 	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-KEY:METHOD=AES-128"),
+	// Variant playlists observed WITHOUT a VERSION line: the key tag is the
+	// first tag after the magic. Missing this opening made every such body
+	// undecodable whenever the URL binding was absent (fresh process, stale
+	// k-link, evicted key) — the "still wrapped after decode" failure.
+	[]byte("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128"),
+	[]byte("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,"),
+	[]byte("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH="),
+	[]byte("#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD"),
 	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-STREAM-INF"),
 	[]byte("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-STREAM-INF"),
 	[]byte("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-PLAYLIST-TYPE:VOD"),
