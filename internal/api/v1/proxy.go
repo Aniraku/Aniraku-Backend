@@ -707,6 +707,41 @@ func (h *Handlers) Proxy(w http.ResponseWriter, r *http.Request) { // Default: n
 		h.respondError(w, http.StatusBadGateway, "upstream request failed")
 		return
 	}
+
+	// FlixCloud master token rejected (the JWT is IP-bound and the server's
+	// egress can rotate): transparently re-resolve the embed and fetch the
+	// fresh master. The player keeps the same k-link and never sees a 403.
+	// Child playlists/segments carry no token, so the in-flight session
+	// continues on the new master's children.
+	if resp.StatusCode == http.StatusForbidden && isFlixcloudSource(decodedURL) &&
+		strings.HasSuffix(pathLower, "master.m3u8") {
+		if fresh, ok := streaming.FlixcloudReresolveMaster(r.Context(), decodedURL); ok {
+			if al := r.URL.Query().Get("al"); al != "" {
+				if fu, aerr := url.Parse(fresh); aerr == nil && fu.Query().Get("al") == "" {
+					fresh = withAudioLang(fresh, al)
+				}
+			}
+			req2 := req.Clone(r.Context())
+			req2.URL, _ = url.Parse(fresh)
+			req2.Host = ""
+			if resp2, err2 := h.doRequest(req2, parsed.Scheme == "https"); err2 == nil && resp2.StatusCode == http.StatusOK {
+				io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				resp = resp2
+				decodedURL = fresh
+				parsed, _ = url.Parse(fresh)
+				pathLower = strings.ToLower(parsed.Path)
+				h.log.Info().Str("proxy_url", decodedURL).Msg("flixcloud: transparent master re-resolve succeeded")
+			} else {
+				if err2 == nil {
+					resp2.Body.Close()
+				}
+				// The aliased/fresh master died too: drop the alias so the
+				// next attempt performs a real re-resolve.
+				streaming.FlixcloudInvalidateMasterAlias(decodedURL)
+			}
+		}
+	}
 	defer resp.Body.Close()
 
 	// ponytail: debug, log upstream status for proxy issues

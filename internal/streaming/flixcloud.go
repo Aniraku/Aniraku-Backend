@@ -68,6 +68,13 @@ type FlixCloudProvider struct {
 	// resolution is cached rather than repeated per player request.
 	resolvedMu sync.Mutex
 	resolved   map[string]flixcloudResolve
+
+	// masterEmbed maps a normalized master URL back to the embed URL that
+	// minted it; masterAlias maps an old master URL to the fresh one that
+	// replaced it after an upstream 403. Together they let the proxy
+	// transparently re-resolve a dead token without the player noticing.
+	masterEmbed map[string]string
+	masterAlias map[string]string
 }
 
 const flixcloudResolveTTL = 45 * time.Minute
@@ -96,6 +103,8 @@ func NewFlixCloudProvider(log zerolog.Logger) *FlixCloudProvider {
 		reanimeBase: reanimeBase,
 		flixBase:    flixBase,
 		resolved:    map[string]flixcloudResolve{},
+		masterEmbed: map[string]string{},
+		masterAlias: map[string]string{},
 	}
 }
 
@@ -578,6 +587,50 @@ func FlixcloudRefreshKeys(ctx context.Context) bool {
 	return fn(ctx)
 }
 
+// bindMasterEmbed records the reverse mapping used by the transparent
+// re-resolve path (master URL -> embed URL) and promotes any pending alias.
+func (p *FlixCloudProvider) bindMasterEmbed(master, embedURL string) {
+	id := flixcloudURLKeyID(master)
+	if id == "" || embedURL == "" {
+		return
+	}
+	p.resolvedMu.Lock()
+	defer p.resolvedMu.Unlock()
+	if len(p.masterEmbed) > 8192 {
+		p.masterEmbed = map[string]string{}
+		p.masterAlias = map[string]string{}
+	}
+	p.masterEmbed[id] = embedURL
+}
+
+// FlixcloudMasterReresolver is the transparent-recovery hook installed by
+// the provider: given a master URL whose token was rejected upstream, it
+// returns a freshly resolved master URL (new token, new JWT window).
+var FlixcloudMasterReresolver func(ctx context.Context, masterURL string) (string, bool)
+
+// FlixcloudMasterAliasInvalidator drops a cached old→fresh master mapping.
+// The proxy calls it when the aliased master also fails, so the next 403
+// forces a real re-resolve instead of replaying a dead alias.
+var FlixcloudMasterAliasInvalidator func(masterURL string)
+
+// FlixcloudInvalidateMasterAlias is the exported invalidator hook.
+func FlixcloudInvalidateMasterAlias(masterURL string) {
+	if fn := FlixcloudMasterAliasInvalidator; fn != nil {
+		fn(masterURL)
+	}
+}
+
+// FlixcloudReresolveMaster asks the provider for a fresh master URL for a
+// dead one. The proxy calls this on a FlixCloud master 403 so playback
+// continues without surfacing an error to the viewer.
+func FlixcloudReresolveMaster(ctx context.Context, masterURL string) (string, bool) {
+	fn := FlixcloudMasterReresolver
+	if fn == nil {
+		return "", false
+	}
+	return fn(ctx, masterURL)
+}
+
 // resolveDirect resolves one embed URL to a direct master playlist URL,
 // retrying once on a fresh page when the single-use token was already gone.
 func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) (string, []core.Subtitle, error) {
@@ -586,6 +639,7 @@ func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) 
 	// window) is minted instead of reusing the previous one.
 	if !IsRefresh(ctx) {
 		if cached := p.cachedResolve(embedURL); cached != nil {
+			p.bindMasterEmbed(cached.url, embedURL)
 			return cached.url, cached.subs, nil
 		}
 	}
@@ -600,6 +654,7 @@ func (p *FlixCloudProvider) resolveDirect(ctx context.Context, embedURL string) 
 			return "", nil, err
 		}
 	}
+	p.bindMasterEmbed(master, embedURL)
 	// The master's JWT is the real lifetime: cache only until 15 minutes
 	// before it lapses, never the fixed TTL past it. Refresh requests still
 	// store (bounded the same way) so the next plain request is fast.
@@ -647,6 +702,45 @@ func (p *FlixCloudProvider) rememberEmbed(ctx context.Context, embedURL string) 
 			}
 			flixcloudStorePlaylistKey(pk)
 			return true
+		}
+	}
+	if FlixcloudMasterReresolver == nil {
+		FlixcloudMasterReresolver = func(ctx context.Context, masterURL string) (string, bool) {
+			id := flixcloudURLKeyID(masterURL)
+			p.resolvedMu.Lock()
+			if fresh := p.masterAlias[id]; fresh != "" {
+				p.resolvedMu.Unlock()
+				return fresh, true
+			}
+			embed := p.masterEmbed[id]
+			p.resolvedMu.Unlock()
+			if embed == "" {
+				return "", false
+			}
+			// Force a fresh page + single-use token; the old master's JWT
+			// was rejected upstream (IP rotation or expiry).
+			rctx := context.WithValue(ctx, refreshKey, true)
+			fresh, _, err := p.resolveDirect(rctx, embed)
+			if err != nil || fresh == "" || fresh == masterURL {
+				return "", false
+			}
+			p.resolvedMu.Lock()
+			if len(p.masterEmbed) > 8192 {
+				p.masterEmbed = map[string]string{}
+				p.masterAlias = map[string]string{}
+			}
+			p.masterEmbed[flixcloudURLKeyID(fresh)] = embed
+			p.masterAlias[id] = fresh
+			p.resolvedMu.Unlock()
+			p.log.Info().Str("old", truncateForLog(masterURL, 120)).Str("new", truncateForLog(fresh, 120)).
+				Msg("flixcloud: re-resolved master after upstream token rejection")
+			return fresh, true
+		}
+		FlixcloudMasterAliasInvalidator = func(masterURL string) {
+			id := flixcloudURLKeyID(masterURL)
+			p.resolvedMu.Lock()
+			delete(p.masterAlias, id)
+			p.resolvedMu.Unlock()
 		}
 	}
 }

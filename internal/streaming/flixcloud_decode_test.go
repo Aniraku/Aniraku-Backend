@@ -2,6 +2,7 @@ package streaming
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"testing"
 )
@@ -110,5 +111,31 @@ func TestFlixcloudURLKeyIgnoresTokenQuery(t *testing.T) {
 	got := flixcloudURLKey("https://fetch9.flixcloud.cc/_v7/id/master.m3u8?token=two")
 	if !bytes.Equal(got, pk) {
 		t.Fatalf("token rotation lost the bound key: got %x", got)
+	}
+}
+
+// The transparent-recovery hooks must be callable without a provider
+// instance (the proxy only has the package-level entry points).
+func TestFlixcloudMasterReresolveHooks(t *testing.T) {
+	oldR, oldI := FlixcloudMasterReresolver, FlixcloudMasterAliasInvalidator
+	t.Cleanup(func() {
+		FlixcloudMasterReresolver, FlixcloudMasterAliasInvalidator = oldR, oldI
+	})
+
+	resolved := false
+	FlixcloudMasterReresolver = func(ctx context.Context, masterURL string) (string, bool) {
+		resolved = true
+		return "https://fetch10.flixcloud.cc/_v7/new/master.m3u8?token=fresh", true
+	}
+	invalidated := false
+	FlixcloudMasterAliasInvalidator = func(masterURL string) { invalidated = true }
+
+	got, ok := FlixcloudReresolveMaster(context.Background(), "https://fetch9.flixcloud.cc/_v7/old/master.m3u8?token=dead")
+	if !ok || !resolved || got == "" {
+		t.Fatalf("re-resolve hook not invoked: ok=%v resolved=%v got=%q", ok, resolved, got)
+	}
+	FlixcloudInvalidateMasterAlias("https://fetch9.flixcloud.cc/_v7/old/master.m3u8?token=dead")
+	if !invalidated {
+		t.Fatal("alias invalidator hook not invoked")
 	}
 }
